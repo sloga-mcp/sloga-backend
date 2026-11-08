@@ -57,6 +57,23 @@ auto_derived!(
         /// additive replenishment.
         #[serde(default)]
         pub replace_one_time_keys: bool,
+        /// First publication only: the device this one is split from (an
+        /// install that shared `split_from` with another install becomes a
+        /// separate device). Must be one of the caller's own devices
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub split_from: Option<String>,
+        /// Ed25519 signature by `split_from`'s identity key over the
+        /// canonical split payload (old id, new id, new Ed25519 key, session)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub split_proof: Option<String>,
+    }
+
+    /// Response to revoking one of the current user's E2EE devices
+    pub struct ResponseRevokeE2EEDevice {
+        /// The caller's E2EE devices left after this revocation, counted
+        /// server side after the delete (the client clears the
+        /// account-wide `e2ee_enabled` flag only at 0)
+        pub remaining_devices: u32,
     }
 
     /// Response to publishing keys
@@ -124,6 +141,16 @@ auto_derived!(
         /// One-time keys remaining (own devices only; drives replenishment)
         #[serde(skip_serializing_if = "Option::is_none")]
         pub one_time_key_count: Option<u64>,
+        /// Current fallback key (own devices only; clone detection compares
+        /// it with this install's own fallback history)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub fallback_key: Option<E2EESignedKey>,
+        /// Previous fallback key, if one was retained (own devices only)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub previous_fallback_key: Option<E2EESignedKey>,
+        /// Name of the session the device is bound to (own devices only)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session_name: Option<String>,
     }
 
     /// An encrypted envelope submitted for relay
@@ -417,5 +444,100 @@ mod tests {
             }])
         );
         assert_eq!(serde_json::from_value::<E2EEMessage>(value).unwrap(), text);
+    }
+
+    fn signed_key(key_id: &str) -> super::E2EESignedKey {
+        super::E2EESignedKey {
+            key_id: key_id.to_string(),
+            key: "a2V5".to_string(),
+            signature: "c2ln".to_string(),
+        }
+    }
+
+    /// Multi-device D5: a publish body from an older client (no split keys)
+    /// parses with both absent, and a body without them serializes without
+    /// them; a split publication carries both under their own names
+    #[test]
+    fn publish_split_fields_are_optional_and_named() {
+        let old = serde_json::json!({
+            "device_id": "a".repeat(32),
+            "protocol_version": 1,
+            "ed25519_key": "ZWQ",
+            "curve25519_key": "Y3Vy",
+            "signature": "c2ln",
+            "fallback_key": { "key_id": "f0", "key": "a2V5", "signature": "c2ln" }
+        });
+        let parsed: super::DataPublishE2EEKeys =
+            serde_json::from_value(old).expect("a publish body without split keys parses");
+        assert_eq!(parsed.split_from, None);
+        assert_eq!(parsed.split_proof, None);
+
+        let value = serde_json::to_value(&parsed).unwrap();
+        for key in ["split_from", "split_proof"] {
+            assert!(value.get(key).is_none(), "{key} on a non-split body: {value}");
+        }
+
+        let split = super::DataPublishE2EEKeys {
+            split_from: Some("b".repeat(32)),
+            split_proof: Some("cHJvb2Y".to_string()),
+            ..parsed
+        };
+        let value = serde_json::to_value(&split).unwrap();
+        assert_eq!(value["split_from"], serde_json::json!("b".repeat(32)));
+        assert_eq!(value["split_proof"], serde_json::json!("cHJvb2Y"));
+        assert_eq!(
+            serde_json::from_value::<super::DataPublishE2EEKeys>(value).unwrap(),
+            split
+        );
+    }
+
+    /// Multi-device D6: the own-listing fields are absent (not `null`) when
+    /// unset, so the peer listing keeps its earlier shape
+    #[test]
+    fn device_info_own_listing_fields_are_absent_when_unset() {
+        let peer = super::E2EEDeviceInfo {
+            device_id: "a".repeat(32),
+            protocol_version: 1,
+            ed25519_key: "ZWQ".to_string(),
+            curve25519_key: "Y3Vy".to_string(),
+            signature: "c2ln".to_string(),
+            created_at: None,
+            last_seen_at: None,
+            one_time_key_count: None,
+            fallback_key: None,
+            previous_fallback_key: None,
+            session_name: None,
+        };
+        let value = serde_json::to_value(&peer).unwrap();
+        assert_eq!(
+            value.as_object().unwrap().len(),
+            5,
+            "a peer entry carries only the identity: {value}"
+        );
+
+        let own = super::E2EEDeviceInfo {
+            fallback_key: Some(signed_key("f1")),
+            previous_fallback_key: Some(signed_key("f0")),
+            session_name: Some("Desktop".to_string()),
+            ..peer
+        };
+        let value = serde_json::to_value(&own).unwrap();
+        assert_eq!(value["fallback_key"]["key_id"], "f1");
+        assert_eq!(value["previous_fallback_key"]["key_id"], "f0");
+        assert_eq!(value["session_name"], "Desktop");
+        assert_eq!(
+            serde_json::from_value::<super::E2EEDeviceInfo>(value).unwrap(),
+            own
+        );
+    }
+
+    /// Multi-device D7: the revoke response names its one field
+    #[test]
+    fn revoke_response_carries_remaining_devices() {
+        let value = serde_json::to_value(super::ResponseRevokeE2EEDevice {
+            remaining_devices: 2,
+        })
+        .unwrap();
+        assert_eq!(value, serde_json::json!({ "remaining_devices": 2 }));
     }
 }
