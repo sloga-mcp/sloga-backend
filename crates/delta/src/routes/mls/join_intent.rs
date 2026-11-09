@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 
 use iso8601_timestamp::Timestamp;
+use revolt_database::voice::{get_channel_node, is_screen_leg, VoiceClient};
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref, mls_join_intent_payload,
     mls_text_enforced_device_cap, Database, E2EEIdentity, MlsGroup, MlsJoinIntent, MlsMemberDevice,
     SeatListBody, Session, User, MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 
@@ -38,6 +39,84 @@ pub(crate) fn all_member_devices_rejoining(
     })
 }
 
+/// What the call path does with a join intent from a user whose OTHER
+/// device holds the group's only leaf
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingVerdict {
+    /// The plain "another device" 400
+    Refuse,
+    /// Close the group: its only leaf-holder has left the call
+    CloseUnservable,
+}
+
+/// The sibling close's decision (sibling-device plan §3), pure. `live` is
+/// the call's SFU-live member devices as (user, device), `None` when the
+/// SFU gave no answer to act on: an unanswered SFU never closes. A sibling
+/// still in the call refuses too (two live seats, a failed eviction).
+pub(crate) fn sibling_verdict(
+    user_id: &str,
+    sibling_device_id: &str,
+    live: Option<&HashSet<(String, String)>>,
+) -> SiblingVerdict {
+    match live {
+        None => SiblingVerdict::Refuse,
+        Some(live) if live.contains(&(user_id.to_string(), sibling_device_id.to_string())) => {
+            SiblingVerdict::Refuse
+        }
+        Some(_) => SiblingVerdict::CloseUnservable,
+    }
+}
+
+/// Whether the sibling's registration read says its identity row is gone,
+/// by error type. A read error is no evidence either way. Pure.
+pub(crate) fn sibling_registration_gone<T>(registration: &Result<T>) -> bool {
+    matches!(registration, Err(error) if matches!(error.error_type, ErrorType::NotFound))
+}
+
+/// The member devices among SFU participant identities, as (user, device).
+/// A screen leg is a helper of its owner, never a member, and a bare
+/// identity names no device, so neither counts; only an identity of exactly
+/// two non-empty `:` segments does. Pure.
+pub(crate) fn live_member_devices(
+    identities: impl IntoIterator<Item = String>,
+) -> HashSet<(String, String)> {
+    identities
+        .into_iter()
+        .filter(|identity| !is_screen_leg(identity))
+        .filter_map(|identity| {
+            let mut segments = identity.split(':');
+            match (segments.next(), segments.next(), segments.next()) {
+                (Some(user), Some(device), None) if !user.is_empty() && !device.is_empty() => {
+                    Some((user.to_string(), device.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The call's SFU-live member devices, or `None` when there is no answer
+/// to act on: no node pinned for the channel, a Redis failure, no such room
+/// on the SFU, or a failed listing. Never an error; the caller refuses on
+/// `None`.
+async fn live_call_devices(
+    voice_client: &VoiceClient,
+    channel_id: &str,
+) -> Option<HashSet<(String, String)>> {
+    let node = get_channel_node(channel_id).await.ok().flatten()?;
+    match voice_client
+        .list_participants_if_present(&node, channel_id)
+        .await
+    {
+        Ok(Some(participants)) => Some(live_member_devices(
+            participants
+                .into_iter()
+                .map(|participant| participant.identity),
+        )),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 /// # Signal MLS Join Intent
 ///
 /// Store a signed join intent for a call group and fan out
@@ -58,6 +137,7 @@ pub(crate) fn all_member_devices_rejoining(
 #[post("/groups/<group_id>/join_intent", data = "<data>")]
 pub async fn join_intent(
     db: &State<Database>,
+    voice_client: &State<VoiceClient>,
     user: User,
     session: Session,
     group_id: String,
@@ -71,7 +151,7 @@ pub async fn join_intent(
             super::as_unknown_group(db, &user, Some(&session)).await
         }
         GroupDispatch::CallOrUnknown(Some(_)) => {
-            call_join_intent(db, user, session, group_id, data.into_inner()).await
+            call_join_intent(db, voice_client, user, session, group_id, data.into_inner()).await
         }
         GroupDispatch::Text(group) => {
             text_join_intent(db, &user, &session, group, data.into_inner()).await
@@ -82,6 +162,7 @@ pub async fn join_intent(
 /// The call path, unchanged by protected channels
 async fn call_join_intent(
     db: &Database,
+    voice_client: &VoiceClient,
     user: User,
     session: Session,
     group_id: String,
@@ -114,6 +195,18 @@ async fn call_join_intent(
 
     // One device per user per call (plan §1.5), enforced at the DS — two
     // native layers on two devices share no state; only the DS sees both.
+    // A user holds one seat in a call: a second device's join
+    // force-disconnects the first, so a second leaf of one user is only
+    // ever a stale one.
+    // ANOTHER device of the user as the SOLE member = a stale sibling
+    // (sibling-device plan §3): the only leaf-holder is this user's own
+    // device, evicted by this newer join, so nobody is left to admit
+    // anyone. Mirroring the solo-stale close below, close the group, on
+    // positive evidence only: the sibling's registration is gone (a removed
+    // device, checked before the SFU is asked), or the SFU answered and the
+    // sibling is not in the call. NotFound sends the joiner straight to
+    // CREATE through the client's not_found arm. Anything else, a failed
+    // registration read included, keeps the 400.
     // SAME device already a member = a REJOIN: the device wiped its local
     // group state (rejoin-fresh) but its stale leaf is still in the roster,
     // and it can never remove itself (RFC 9420 forbids self-removal). Fan
@@ -123,6 +216,32 @@ async fn call_join_intent(
     let mut rejoin = false;
     if let Some(existing) = group.member_device_of(&user.id) {
         if existing.device_id != data.device_id {
+            if revolt_config::config().await.features.mls_sibling_close && group.members.len() == 1
+            {
+                let registration = db.fetch_e2ee_identity(&user.id, &existing.device_id).await;
+                if sibling_registration_gone(&registration) {
+                    db.close_mls_group(&group.id).await?;
+                    log::info!(
+                        "mls: closed call group {} in channel {}: sole leaf was a removed sibling",
+                        group.id,
+                        group.channel_id
+                    );
+                    return Err(create_error!(NotFound));
+                }
+
+                let live = live_call_devices(voice_client, &group.channel_id).await;
+                if sibling_verdict(&user.id, &existing.device_id, live.as_ref())
+                    == SiblingVerdict::CloseUnservable
+                {
+                    db.close_mls_group(&group.id).await?;
+                    log::info!(
+                        "mls: closed call group {} in channel {}: sole leaf was a stale sibling",
+                        group.id,
+                        group.channel_id
+                    );
+                    return Err(create_error!(NotFound));
+                }
+            }
             return Err(create_error!(FailedValidation {
                 error: "another device of this user is already in the call group".to_string()
             }));
@@ -431,8 +550,15 @@ mod tests {
         group_id: &str,
         data: v0::DataMlsJoinIntent,
     ) -> Result<EmptyResponse> {
+        use revolt_database::voice::VoiceClient;
+        use std::collections::HashMap;
+
+        // No SFU nodes: the Text path never lists, and on a call group the
+        // sibling close gets no SFU answer, so it refuses
+        let voice_client = VoiceClient::new(HashMap::new());
         join_intent(
             <&State<Database>>::from(db),
+            <&State<VoiceClient>>::from(&voice_client),
             user.clone(),
             session.clone(),
             group_id.to_string(),
@@ -1683,5 +1809,775 @@ mod tests {
             .await;
             hidden_and_deleted_text_groups_answer_as_unknown().await
         })
+    }
+
+    /// The call path's sibling close (sibling-device plan §3, §4): the
+    /// user's device B joins a call group whose only leaf is the same
+    /// user's device A. The call path is driven directly with a
+    /// `VoiceClient` whose one node is a loopback stub answering as a
+    /// LiveKit Twirp endpoint does, and the channel is pinned to that node
+    /// in Redis as `join_call` pins it. The flag case is its own `#[test]`,
+    /// as above.
+    mod sibling_close {
+        use std::{
+            collections::HashMap,
+            io::{Read, Write},
+            net::{SocketAddr, TcpListener, TcpStream},
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex, PoisonError,
+            },
+            thread::JoinHandle,
+            time::Duration,
+        };
+
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+        use iso8601_timestamp::Timestamp;
+        use revolt_config::LiveKitNode;
+        use revolt_database::{
+            voice::{delete_channel_node, screen_leg_identity, set_channel_node, VoiceClient},
+            Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, Session,
+            User,
+        };
+        use revolt_models::v0;
+        use revolt_result::{create_database_error, create_error, Result};
+        use rocket_empty::EmptyResponse;
+        use ulid::Ulid;
+
+        use super::super::{call_join_intent, sibling_registration_gone};
+        use super::{leaf, new_bound_device, refused, signed_intent, stored_intents};
+        use crate::util::test::{TestE2EEDevice, TestHarness};
+
+        /// The node the stub is registered under (in no `Revolt.toml`)
+        const NODE: &str = "sibling-close-stub-node";
+
+        /// The one SFU call the sibling close makes
+        const LIST: &str = "/twirp/livekit.RoomService/ListParticipants";
+
+        /// The refusal the client cites, unchanged by the sibling close
+        const SIBLING_REFUSAL: &str = "another device of this user is already in the call group";
+
+        /// (status line, content type, body)
+        type Reply = (&'static str, &'static str, Vec<u8>);
+
+        /// A Twirp 200 carrying a protobuf `ListParticipantsResponse`
+        fn listed(body: Vec<u8>) -> Reply {
+            ("HTTP/1.1 200 OK", "application/protobuf", body)
+        }
+
+        /// The SFU's structured "no such room": `Ok(None)` to the listing
+        fn no_such_room() -> Reply {
+            (
+                "HTTP/1.1 404 Not Found",
+                "application/json",
+                br#"{"code":"not_found","msg":"stub: not found"}"#.to_vec(),
+            )
+        }
+
+        /// A real SFU failure: `Err` to the listing
+        fn internal() -> Reply {
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "application/json",
+                br#"{"code":"internal","msg":"stub: boom"}"#.to_vec(),
+            )
+        }
+
+        fn encode_varint(mut value: usize, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+
+        fn length_delimited(tag: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![(tag << 3) | 2];
+            encode_varint(payload.len(), &mut out);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// Protobuf wire bytes of a `ListParticipantsResponse` listing each
+        /// identity: `participants` = field 1, ParticipantInfo `identity` =
+        /// field 2, the layout `revolt-database`'s
+        /// `sfu_stub::list_participants_response` encodes (its decoding
+        /// test reads it back through the real client). No identities = an
+        /// empty body, a room with nobody in it.
+        fn listing(identities: &[&str]) -> Vec<u8> {
+            identities
+                .iter()
+                .flat_map(|identity| length_delimited(1, &length_delimited(2, identity.as_bytes())))
+                .collect()
+        }
+
+        /// A `VoiceClient` with one node, [`NODE`], at `url`
+        fn stub_client(url: &str) -> VoiceClient {
+            VoiceClient::new(HashMap::from([(
+                NODE.to_string(),
+                LiveKitNode {
+                    url: url.to_string(),
+                    lat: 0.0,
+                    lon: 0.0,
+                    key: "stubkey".to_string(),
+                    secret: "stubsecret-stubsecret-stubsecret".to_string(),
+                    private: true,
+                    remote: false,
+                },
+            )]))
+        }
+
+        /// A loopback SFU answering its n-th request with the n-th reply,
+        /// and any request past them with [`internal`]
+        struct Stub {
+            url: String,
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            /// Every request read, as (path, body)
+            seen: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl Stub {
+            fn serve(replies: Vec<Reply>) -> Stub {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+                let addr = listener.local_addr().expect("local addr");
+                let stop = Arc::new(AtomicBool::new(false));
+                let seen = Arc::new(Mutex::new(Vec::new()));
+
+                let thread = {
+                    let (stop, seen) = (stop.clone(), seen.clone());
+                    std::thread::spawn(move || {
+                        let mut replies = replies.into_iter();
+                        for stream in listener.incoming() {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Ok(mut stream) = stream else { continue };
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            let Some((head, body)) = read_request(&mut stream) else {
+                                continue;
+                            };
+                            let path = head
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_string();
+                            seen.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push((path, body));
+                            let reply = replies.next().unwrap_or_else(internal);
+                            let _ = write_response(&mut stream, &reply);
+                        }
+                    })
+                };
+
+                Stub {
+                    url: format!("http://{addr}"),
+                    addr,
+                    stop,
+                    seen,
+                    thread: Some(thread),
+                }
+            }
+
+            /// Stop the stub and return every request it read, in order
+            fn finish(mut self) -> Vec<(String, Vec<u8>)> {
+                if let Some(thread) = self.stop_thread() {
+                    thread.join().expect("the SFU stub thread panicked");
+                }
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }
+
+            fn stop_thread(&mut self) -> Option<JoinHandle<()>> {
+                let thread = self.thread.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                // Wake the blocking accept; the loop sees `stop` and ends
+                let _ = TcpStream::connect(self.addr);
+                Some(thread)
+            }
+        }
+
+        impl Drop for Stub {
+            fn drop(&mut self) {
+                if let Some(thread) = self.stop_thread() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        /// Read one whole HTTP request (head plus `content-length` body, so
+        /// closing never resets an unread request). `None` if the peer
+        /// closed or stalled first.
+        fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    return None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().to_string())
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    if request.len() >= end + 4 + length {
+                        let body = request[end + 4..end + 4 + length].to_vec();
+                        return Some((head, body));
+                    }
+                }
+            }
+        }
+
+        /// Write one reply and let the connection close
+        fn write_response(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
+            let (status_line, content_type, body) = reply;
+            let mut response = format!(
+                "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            stream.write_all(&response)
+        }
+
+        struct Sibling {
+            harness: TestHarness,
+            user: User,
+            /// Bound to `joiner`
+            session: Session,
+            /// Device A, bound to the user's first session: the leaf
+            sibling: TestE2EEDevice,
+            /// Device B, which joins
+            joiner: TestE2EEDevice,
+            channel_id: String,
+        }
+
+        /// A user owning a server channel, with two registered devices
+        async fn sibling_fixture() -> Sibling {
+            let harness = TestHarness::new().await;
+            let (account, first_session, user) = harness.new_user().await;
+            let (_, channel) = harness.new_protectable_channel(&user).await;
+            let sibling = harness
+                .new_e2ee_device(&user, &first_session.id, 0x50)
+                .await;
+            let (session, joiner) = new_bound_device(&harness, &account, &user, 0x51).await;
+            assert_ne!(sibling.device_id, joiner.device_id);
+
+            Sibling {
+                harness,
+                user,
+                session,
+                sibling,
+                joiner,
+                channel_id: channel.id().to_string(),
+            }
+        }
+
+        /// An open call group in the fixture's channel holding `members`
+        /// (the first is its creator), stored through the database primitive
+        async fn call_group(fixture: &Sibling, members: Vec<MlsMemberDevice>) -> MlsGroup {
+            let db = &fixture.harness.db;
+            let group = MlsGroup {
+                id: format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0),
+                channel_id: fixture.channel_id.clone(),
+                open: true,
+                created_by: members[0].clone(),
+                created_at: Timestamp::now_utc(),
+                current_epoch: 0,
+                members,
+                closed_at: None,
+                superseded_by: None,
+                kind: MlsGroupKind::Call,
+                generation: None,
+                seat_list_ad_sha256: None,
+                pending_removals: vec![],
+                member_added: vec![],
+            };
+            assert!(matches!(
+                db.create_mls_group(&group, None).await.expect("call group"),
+                MlsGroupCreateOutcome::Created
+            ));
+            db.fetch_mls_group(&group.id).await.expect("the call group")
+        }
+
+        /// `data` through the call path as the fixture's user on B's
+        /// session, against a stub SFU answering `replies`, with the
+        /// group's channel pinned to the stub's node when `pinned` (and
+        /// unpinned before returning). Returns the answer and every request
+        /// the SFU read, as (path, whether it names the channel as the room).
+        async fn join(
+            fixture: &Sibling,
+            group: &MlsGroup,
+            data: v0::DataMlsJoinIntent,
+            pinned: bool,
+            replies: Vec<Reply>,
+        ) -> (Result<EmptyResponse>, Vec<(String, bool)>) {
+            let stub = Stub::serve(replies);
+            let voice_client = stub_client(&stub.url);
+            if pinned {
+                set_channel_node(&group.channel_id, NODE)
+                    .await
+                    .expect("pin the node");
+            }
+            let result = call_join_intent(
+                &fixture.harness.db,
+                &voice_client,
+                fixture.user.clone(),
+                fixture.session.clone(),
+                group.id.clone(),
+                data,
+            )
+            .await;
+            if pinned {
+                delete_channel_node(&group.channel_id)
+                    .await
+                    .expect("unpin the node");
+            }
+
+            let room = group.channel_id.as_bytes();
+            let seen = stub
+                .finish()
+                .into_iter()
+                .map(|(path, body)| {
+                    let names_room = body.windows(room.len()).any(|window| window == room);
+                    (path, names_room)
+                })
+                .collect();
+            (result, seen)
+        }
+
+        /// B's valid intent for `group`
+        fn intent(fixture: &Sibling, group: &MlsGroup) -> v0::DataMlsJoinIntent {
+            signed_intent(&fixture.joiner, &group.id, "b1")
+        }
+
+        /// The listing the SFU really answers once the sibling has gone:
+        /// B itself is live (it sends the intent from inside the call), A's
+        /// screen leg lingers, another user holds a seat, and A's own seat
+        /// is absent
+        fn stale_sibling_listing(fixture: &Sibling) -> Vec<u8> {
+            let joiner = format!("{}:{}", fixture.user.id, fixture.joiner.device_id);
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let sibling_leg = screen_leg_identity(&sibling);
+            let other = format!("{}:{:032x}", Ulid::new(), 0xf0_0002);
+            listing(&[joiner.as_str(), sibling_leg.as_str(), other.as_str()])
+        }
+
+        /// The one listing of the group's room
+        fn one_listing() -> Vec<(String, bool)> {
+            vec![(LIST.to_string(), true)]
+        }
+
+        /// The plain "another device" 400, message and all
+        #[track_caller]
+        fn assert_sibling_refusal(result: Result<EmptyResponse>, case: &str) {
+            let body = refused(result, "FailedValidation", case);
+            assert_eq!(body["error"], SIBLING_REFUSAL, "{}: {}", case, body);
+        }
+
+        /// Whether the group is open (and `closed_at` agrees)
+        async fn is_open(db: &Database, group_id: &str) -> bool {
+            let group = db.fetch_mls_group(group_id).await.expect("the group");
+            assert_eq!(group.open, group.closed_at.is_none(), "{:?}", group);
+            group.open
+        }
+
+        /// The closing answer, then the group closed with no intent stored
+        async fn assert_closed(db: &Database, group: &MlsGroup, result: Result<EmptyResponse>) {
+            refused(result, "NotFound", "a sole stale sibling");
+            assert!(!is_open(db, &group.id).await, "the group was left open");
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        /// Delete A's identity row (and its keys) through the driver
+        /// primitive, the state a device removal leaves behind
+        async fn remove_sibling(fixture: &Sibling) {
+            let db = &fixture.harness.db;
+            let (user_id, device_id) = (&fixture.user.id, &fixture.sibling.device_id);
+            assert!(db
+                .delete_e2ee_device(user_id, device_id)
+                .await
+                .expect("delete the sibling's row"));
+            refused(
+                db.fetch_e2ee_identity(user_id, device_id).await,
+                "NotFound",
+                "the removed sibling's row",
+            );
+        }
+
+        #[test]
+        fn a_sole_stale_sibling_closes_the_group() {
+            crate::util::test::rt().block_on(a_sole_stale_sibling_closes_the_group_case())
+        }
+
+        async fn a_sole_stale_sibling_closes_the_group_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The SFU answers for the room, and the sibling is not in it:
+            // only its screen leg is, beside the live joiner and another
+            // user. A verdict on the joiner's seat would see B live and
+            // refuse.
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn a_live_sibling_is_refused() {
+            crate::util::test::rt().block_on(a_live_sibling_is_refused_case())
+        }
+
+        async fn a_live_sibling_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The sibling is still registered: its row is no evidence, and
+            // the listing decides
+            assert!(db
+                .fetch_e2ee_identity(&fixture.user.id, &fixture.sibling.device_id)
+                .await
+                .is_ok());
+
+            // The sibling still holds its seat (a failed eviction) and the
+            // joiner is not listed, so only the sibling's own seat can
+            // refuse: a verdict on the joiner's seat would close
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[sibling.as_str()]))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_sibling_refusal(result, "a live sibling");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn a_sibling_beside_another_member_is_refused() {
+            crate::util::test::rt().block_on(a_sibling_beside_another_member_is_refused_case())
+        }
+
+        async fn a_sibling_beside_another_member_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let other = MlsMemberDevice {
+                user_id: Ulid::new().to_string(),
+                device_id: format!("{:032x}", 0xf0_0001),
+            };
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling), other]).await;
+
+            // Every member absent from the SFU: another user's leaf may
+            // still hold the group, so this is never a sibling close, and
+            // the SFU is not even asked
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "a sibling beside another member");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn a_forged_sibling_intent_never_closes() {
+            crate::util::test::rt().block_on(a_forged_sibling_intent_never_closes_case())
+        }
+
+        async fn a_forged_sibling_intent_never_closes_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // A closable group, but the intent is not signed by B: refused
+            // by the signature check, before the SFU is asked
+            let mut forged = intent(&fixture, &group);
+            forged.signature = STANDARD_NO_PAD.encode([0u8; 64]);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                forged,
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            let body = refused(result, "FailedValidation", "a forged intent");
+            assert_eq!(body["error"], "invalid join intent signature", "{}", body);
+            assert!(
+                is_open(db, &group.id).await,
+                "a forged intent closed the group"
+            );
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: B's genuine intent on the same setup closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn an_unpinned_channel_is_refused() {
+            crate::util::test::rt().block_on(an_unpinned_channel_is_refused_case())
+        }
+
+        async fn an_unpinned_channel_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // No node pinned for the channel: no SFU to ask, no answer
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                false,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "no node pinned");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: pinned, the same intent closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn an_unanswered_listing_is_refused() {
+            crate::util::test::rt().block_on(an_unanswered_listing_is_refused_case())
+        }
+
+        async fn an_unanswered_listing_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The SFU has no such room (`Ok(None)`), or the listing fails
+            // (`Err`): neither is an answer to close on
+            for (case, reply) in [
+                ("no such room", no_such_room()),
+                ("a failed listing", internal()),
+            ] {
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    true,
+                    vec![reply],
+                )
+                .await;
+                assert_eq!(seen, one_listing(), "{}", case);
+                assert_sibling_refusal(result, case);
+                assert!(is_open(db, &group.id).await, "{}", case);
+            }
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: an answered listing without the sibling closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn the_sibling_close_off_keeps_the_refusal() {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.mls_sibling_close = false;
+                })
+                .await;
+
+                let fixture = sibling_fixture().await;
+                let db = &fixture.harness.db;
+                let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+                // A sole stale sibling, which closes with the flag on
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    true,
+                    vec![listed(stale_sibling_listing(&fixture))],
+                )
+                .await;
+                assert_eq!(seen, vec![]);
+                assert_sibling_refusal(result, "the kill switch off");
+                assert!(is_open(db, &group.id).await);
+                assert!(stored_intents(db, &group.id).await.is_empty());
+            })
+        }
+
+        #[test]
+        fn only_a_missing_row_reads_as_a_removed_sibling() {
+            assert!(sibling_registration_gone::<()>(&Err(create_error!(
+                NotFound
+            ))));
+            assert!(!sibling_registration_gone(&Ok(())));
+            assert!(!sibling_registration_gone::<()>(&Err(
+                create_database_error!("find_one", "e2ee_identities")
+            )));
+            assert!(!sibling_registration_gone::<()>(&Err(create_error!(
+                InternalError
+            ))));
+        }
+
+        #[test]
+        fn a_sole_removed_sibling_closes_the_group() {
+            crate::util::test::rt().block_on(a_sole_removed_sibling_closes_the_group_case())
+        }
+
+        async fn a_sole_removed_sibling_closes_the_group_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            remove_sibling(&fixture).await;
+
+            // No node pinned, so the SFU has no answer to give: the missing
+            // registration alone closes the group, and the SFU is not asked
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                false,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+
+            // Pinned, with the sibling's seat still listed (a listing alone
+            // would refuse): the missing registration closes it first, and
+            // the SFU is still not asked
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[sibling.as_str()]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn a_removed_sibling_beside_another_member_is_refused() {
+            crate::util::test::rt()
+                .block_on(a_removed_sibling_beside_another_member_is_refused_case())
+        }
+
+        async fn a_removed_sibling_beside_another_member_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let other = MlsMemberDevice {
+                user_id: Ulid::new().to_string(),
+                device_id: format!("{:032x}", 0xf0_0003),
+            };
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling), other]).await;
+            remove_sibling(&fixture).await;
+
+            // Another user's leaf still holds the group, which members
+            // repair by removing the sibling's leaf: never a close
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "a removed sibling beside another member");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn the_sibling_close_off_keeps_the_refusal_for_a_removed_sibling() {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.mls_sibling_close = false;
+                })
+                .await;
+
+                let fixture = sibling_fixture().await;
+                let db = &fixture.harness.db;
+                let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+                remove_sibling(&fixture).await;
+
+                // A sole removed sibling, which closes with the flag on
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    false,
+                    vec![listed(stale_sibling_listing(&fixture))],
+                )
+                .await;
+                assert_eq!(seen, vec![]);
+                assert_sibling_refusal(result, "the kill switch off, a removed sibling");
+                assert!(is_open(db, &group.id).await);
+                assert!(stored_intents(db, &group.id).await.is_empty());
+            })
+        }
     }
 }

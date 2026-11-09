@@ -9,7 +9,7 @@ use revolt_database::{
         delete_screen_leg, delete_voice_connection, delete_voice_connections, get_screen_leg_sid,
         get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
         get_voice_state, is_in_voice_channel, is_screen_leg, is_screenshare_video, is_video_source,
-        mls_cap_would_refuse, record_screen_leg, record_voice_connection,
+        mls_cap_would_refuse, participant_leg, record_screen_leg, record_voice_connection,
         recorded_voice_connections, remove_user_from_voice_channel, screen_leg_identity,
         screen_leg_left, set_voice_participant_identity, update_voice_state,
         update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
@@ -564,6 +564,32 @@ pub async fn ingress(
                 // mis-announced as a move.
                 let _ = get_user_moved_to_voice(channel_id, user_id).await;
                 log::info!("Evicted {identity} from {channel_id}: not confirmed allowed to connect.");
+                return Ok(EmptyResponse);
+            }
+
+            // Registration check, its own and NOT part of the Connect
+            // re-check above: a device whose registration is gone cannot hold
+            // a seat. `join_call` checks the registration when it mints a
+            // token, and a token outlives that check, so the join re-reads
+            // it. A device-qualified connection whose identity row is gone is
+            // evicted here, before anything is written, by its exact
+            // identity, and leaves no trace, as a refused one does above (the
+            // move marker drained the same way).
+            //
+            // It fails OPEN, unlike the re-check: only a lookup answering
+            // NotFound evicts, and a failed read admits the connection as it
+            // was admitted before this check existed (`seat_registration`
+            // logs it). A failed eviction answers 500 so LiveKit retries. A
+            // bare identity names no device and is not read; screen legs
+            // never reach this arm.
+            if seat_registration(db, channel_id, identity).await == SeatRegistration::Gone {
+                voice_client
+                    .remove_connection_if_present(node, identity, channel_id)
+                    .await?;
+                let _ = get_user_moved_to_voice(channel_id, user_id).await;
+                log::info!(
+                    "Evicted a connection from {channel_id}: its device is no longer registered."
+                );
                 return Ok(EmptyResponse);
             }
 
@@ -1306,6 +1332,62 @@ async fn screen_leg_owner_may_publish(
         .denies_publishing())
 }
 
+/// What the member join's registration check found for a connection: a
+/// device whose registration is gone cannot hold a seat, and only `Gone`
+/// evicts. Every other answer admits the connection unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatRegistration {
+    /// Not a device-qualified primary ([`registered_device`]): nothing is
+    /// read.
+    Unchecked,
+    /// The device's identity row is there.
+    Registered,
+    /// The lookup answered NotFound, by error type: the row is gone.
+    Gone,
+    /// The lookup failed otherwise. Fails OPEN: admitted as before.
+    Unread,
+}
+
+/// The `(user, device)` a device-qualified PRIMARY identity names: exactly
+/// two segments, both non-empty. `None` for a bare identity, for any
+/// identity with a third segment (a screen leg among them, read through
+/// `participant_leg`), and for an empty segment. Pure.
+fn registered_device(identity: &str) -> Option<(&str, &str)> {
+    if participant_leg(identity).is_some() {
+        return None;
+    }
+    let user_id = user_id_from_participant_identity(identity);
+    let device_id = identity.strip_prefix(user_id)?.strip_prefix(':')?;
+    (!user_id.is_empty() && !device_id.is_empty()).then_some((user_id, device_id))
+}
+
+/// How an identity-row lookup reads for the registration check: `Ok` is
+/// `Registered`, an error whose TYPE is NotFound is `Gone`, and any other
+/// error is `Unread`. Pure.
+fn registration_of<T>(lookup: &Result<T>) -> SeatRegistration {
+    match lookup {
+        Ok(_) => SeatRegistration::Registered,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => SeatRegistration::Gone,
+        Err(_) => SeatRegistration::Unread,
+    }
+}
+
+/// The member join's registration check for the connection `identity` in
+/// `channel_id`: one point read of the device's identity row, for a
+/// device-qualified primary only. An `Unread` is logged at WARN, with the
+/// channel and the cause only.
+async fn seat_registration(db: &Database, channel_id: &str, identity: &str) -> SeatRegistration {
+    let Some((user_id, device_id)) = registered_device(identity) else {
+        return SeatRegistration::Unchecked;
+    };
+    let lookup = db.fetch_e2ee_identity(user_id, device_id).await;
+    let registration = registration_of(&lookup);
+    if let (Err(error), SeatRegistration::Unread) = (&lookup, registration) {
+        log::warn!("Device registration read for a connection in {channel_id} failed ({error}); admitting it unchecked.");
+    }
+    registration
+}
+
 /// Forget this room's screen-leg marker for `user_id`, but only while it
 /// still names the leg `sid` (BE-1): a leg whose owner is no longer in this
 /// channel left, or stopped publishing. A marker naming another sid belongs
@@ -2002,10 +2084,14 @@ mod tests {
             );
         }
         let refused = once(&body, "if !allowed \u{7b}");
+        // The registration check follows the refused branch and has a return
+        // of its own (pinned in `the_registration_check_evicts_and_returns`),
+        // so the refused branch's one return is counted up to it.
+        let registration = once(&body, "seat_registration(");
         let record = once(&body, "record_voice_connection(");
-        assert!(refused < record, "{body}");
+        assert!(refused < registration && registration < record, "{body}");
         assert_eq!(
-            body[refused..record]
+            body[refused..registration]
                 .matches("return Ok(EmptyResponse); \u{7d}")
                 .count(),
             1,
@@ -2030,6 +2116,66 @@ mod tests {
         assert!(
             decision.trim_end().ends_with("false \u{7d} \u{7d};"),
             "a failed re-check must answer `false` (evict): {decision}"
+        );
+    }
+
+    /// The member join's registration check: its own check, after the
+    /// Connect re-check's refused branch and before the record and the
+    /// mapping are written, handed the EVENT identity. It evicts only on
+    /// `Gone`, by that identity, propagating the eviction's error, and
+    /// returns before anything is written. What `seat_registration` answers
+    /// is pinned by value in `the_registration_check_reads_the_identity_row`.
+    /// Mutations this catches: the guard widened past `Gone` (`!=
+    /// SeatRegistration::Registered`, which evicts on a failed read and so
+    /// fails closed); the check handed `user_id` or moved after
+    /// `record_voice_connection` / `set_voice_participant_identity`; the
+    /// eviction's error discarded (`let _ =`); and the `return` deleted,
+    /// which records and announces an evicted connection.
+    #[test]
+    fn the_registration_check_evicts_and_returns() {
+        let body = member_arm("participant_joined");
+        let refused = once(&body, "if !allowed \u{7b}");
+        let check = once(
+            &body,
+            "if seat_registration(db, channel_id, identity).await == SeatRegistration::Gone \u{7b}",
+        );
+        let record = once(&body, "record_voice_connection(");
+        let mapping = once(&body, "set_voice_participant_identity(");
+        assert!(
+            refused < check && check < record && check < mapping,
+            "{body}"
+        );
+        let end = check
+            + body[check..]
+                .find("return Ok(EmptyResponse); \u{7d}")
+                .expect("the registration check returns");
+        assert!(
+            end < record,
+            "the registration check must return before the record: {body}"
+        );
+        let branch = &body[check..end];
+        once(
+            branch,
+            "voice_client .remove_connection_if_present(node, identity, channel_id) .await?;",
+        );
+        for banned in [
+            "let _ = voice_client",
+            "remove_identity(",
+            "record_",
+            "set_voice_",
+            "create_voice_state(",
+            "EventV1::",
+        ] {
+            assert!(
+                !branch.contains(banned),
+                "the registration check's eviction must write nothing and propagate its error \
+                 (`{banned}`): {branch}"
+            );
+        }
+        assert_eq!(
+            dense().matches("seat_registration(").count(),
+            2,
+            "one definition and one call"
         );
     }
 
@@ -2211,8 +2357,9 @@ mod tests {
     /// not stay live on a revoked grant; the fifth to seventh are the leg's
     /// orphan ejects (Wave 4j: the join's BE-1 and voice-state checks, and a
     /// track going live with its owner elsewhere), whose leg would otherwise
-    /// stay live with nothing left to catch it. The one leg eject still
-    /// best-effort, the limits disconnect's `remove_identity`, is not counted.
+    /// stay live with nothing left to catch it; the eighth is the member
+    /// join's registration check. The one leg eject still best-effort, the
+    /// limits disconnect's `remove_identity`, is not counted.
     #[test]
     fn every_ingress_enforcement_addresses_the_event_identity() {
         let dense = dense();
@@ -2220,9 +2367,9 @@ mod tests {
         let mutes = call_args(&dense, "mute_track_identity(");
         assert_eq!(
             removals.len(),
-            7,
-            "the three member eviction sites, the leg's BE-3 eviction and its \
-             three orphan ejects"
+            8,
+            "the three member eviction sites, the leg's BE-3 eviction, its \
+             three orphan ejects and the member join's registration check"
         );
         assert_eq!(mutes.len(), 4, "two leg mutes and two member mutes");
         for args in removals.iter().chain(&mutes) {
@@ -3179,5 +3326,123 @@ mod tests {
         // Only the departed connection's leg is listed: nothing survives.
         let listed = vec![participant("u:B:screen", "PA_leg_b", &[(3, false)])];
         assert_eq!(flags(&survivor_track_flags(&listed, "u", "PA_gone")), OFF);
+    }
+
+    use super::{
+        registered_device, registration_of, seat_registration, Database, SeatRegistration,
+    };
+    use revolt_database::{iso8601_timestamp::Timestamp, E2EEIdentity, E2EESignedKey};
+    use revolt_result::create_error;
+
+    /// Only a device-qualified primary is read: exactly two segments, both
+    /// non-empty. Mutations this catches: the `participant_leg` guard
+    /// dropped (a screen leg, or any third segment, then reads as device
+    /// `d:screen`), and the empty-segment guard dropped.
+    #[test]
+    fn registered_device_reads_only_a_two_segment_primary() {
+        assert_eq!(registered_device("u:d"), Some(("u", "d")));
+        for skipped in [
+            "u",
+            "u:d:screen",
+            "u::screen",
+            "u:d:x",
+            "u:d:",
+            "u:",
+            ":d",
+            ":",
+            "",
+        ] {
+            assert_eq!(registered_device(skipped), None, "`{skipped}`");
+        }
+    }
+
+    /// NotFound is read by error TYPE; every other failure fails open.
+    /// Mutations this catches: every error read as `Gone` (a failed read
+    /// then evicts, failing closed), NotFound read as `Unread` (nothing is
+    /// ever evicted), and a match on the error's text rather than its type
+    /// (the `FailedValidation` case says "not found").
+    #[test]
+    fn registration_of_reads_not_found_by_type() {
+        let ok: revolt_result::Result<()> = Ok(());
+        assert_eq!(registration_of(&ok), SeatRegistration::Registered);
+
+        let not_found: revolt_result::Result<()> = Err(create_error!(NotFound));
+        assert_eq!(registration_of(&not_found), SeatRegistration::Gone);
+
+        for failed in [
+            create_error!(DatabaseError {
+                operation: "find_one".to_string(),
+                collection: "e2ee_identities".to_string()
+            }),
+            create_error!(InternalError),
+            create_error!(FailedValidation {
+                error: "not found".to_string()
+            }),
+        ] {
+            let lookup: revolt_result::Result<()> = Err(failed);
+            assert_eq!(
+                registration_of(&lookup),
+                SeatRegistration::Unread,
+                "{lookup:?}"
+            );
+        }
+    }
+
+    fn identity_row(user_id: &str, device_id: &str) -> E2EEIdentity {
+        E2EEIdentity {
+            id: E2EEIdentity::composite_id(user_id, device_id),
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            protocol_version: 1,
+            ed25519_key: "ed25519".to_string(),
+            curve25519_key: "curve25519".to_string(),
+            signature: "signature".to_string(),
+            fallback_key: E2EESignedKey {
+                key_id: "fallback0".to_string(),
+                key: "key".to_string(),
+                signature: "signature".to_string(),
+            },
+            previous_fallback_key: None,
+            created_at: Timestamp::now_utc(),
+            last_seen_at: Timestamp::now_utc(),
+            last_session_id: "session0".to_string(),
+        }
+    }
+
+    /// The registration check through the real lookup, on the reference
+    /// database: a registered device is `Registered`; a device-qualified
+    /// connection with no identity row is `Gone`, which is what the real
+    /// lookup's NotFound reads as (the join then evicts it and records
+    /// nothing, pinned in `the_registration_check_evicts_and_returns`); and
+    /// a bare identity or a screen leg is `Unchecked` even with no row behind
+    /// it, so it is never evicted. A failed read cannot be injected here; it
+    /// is pinned by value in `registration_of_reads_not_found_by_type`.
+    /// Mutations this catches: the lookup handed the wrong user or device
+    /// (the registered device reads `Gone`), and the `registered_device`
+    /// filter removed so every identity is read (the bare identity and the
+    /// legs then read `Gone`).
+    #[test]
+    fn the_registration_check_reads_the_identity_row() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            db.insert_e2ee_identity(&identity_row("RUSER1", "dev1"))
+                .await
+                .unwrap();
+
+            for (identity, want) in [
+                ("RUSER1:dev1", SeatRegistration::Registered),
+                ("RUSER1:dev2", SeatRegistration::Gone),
+                ("RUSER2:dev1", SeatRegistration::Gone),
+                ("RUSER2", SeatRegistration::Unchecked),
+                ("RUSER2:dev1:screen", SeatRegistration::Unchecked),
+                ("RUSER1:dev2:screen", SeatRegistration::Unchecked),
+            ] {
+                assert_eq!(
+                    seat_registration(&db, "RCHANNEL", identity).await,
+                    want,
+                    "`{identity}`"
+                );
+            }
+        });
     }
 }

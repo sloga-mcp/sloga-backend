@@ -1,6 +1,8 @@
 use revolt_result::Result;
 
-use crate::{E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
+use crate::{
+    E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, E2EERemovedDevice,
+};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -32,6 +34,17 @@ pub trait AbstractE2EE: Sync + Send {
         session_id: &str,
         at: iso8601_timestamp::Timestamp,
     ) -> Result<()>;
+
+    /// Set a device's `last_session_id` to `""` in ONE filtered update that
+    /// matches only while the row is bound to `session_id` (multi-device
+    /// D5). Returns whether a row matched; never touches `last_seen_at`,
+    /// never deletes, never clobbers a different binding.
+    async fn unbind_e2ee_identity_session_if(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<bool>;
 
     /// Delete a device: identity, one-time keys and queued envelopes.
     /// Idempotent; returns whether the identity existed.
@@ -161,4 +174,16 @@ pub trait AbstractE2EE: Sync + Send {
 
     /// Delete ALL of a user's key-backup blobs (account-deletion cascade).
     async fn delete_all_e2ee_backups(&self, user_id: &str) -> Result<usize>;
+
+    /// Record a removal tombstone (multi-device D8). Idempotent: an existing
+    /// tombstone for (user_id, device_id) is kept as it is, `removed_at`
+    /// included.
+    async fn upsert_e2ee_removed_device(&self, removed: &E2EERemovedDevice) -> Result<()>;
+
+    /// Whether (user_id, device_id) carries a removal tombstone
+    async fn is_e2ee_device_removed(&self, user_id: &str, device_id: &str) -> Result<bool>;
+
+    /// Delete ALL of a user's removal tombstones (account-deletion
+    /// cascade). Returns how many were removed.
+    async fn delete_all_e2ee_removed_devices(&self, user_id: &str) -> Result<usize>;
 }
