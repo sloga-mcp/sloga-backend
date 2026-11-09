@@ -990,6 +990,7 @@ mod tests {
                 &submission(CHANNEL, 2, &[USER_A, USER_C]),
                 true,
                 at(1),
+                Some("unseat B"),
             )
             .await
             .unwrap();
@@ -998,6 +999,7 @@ mod tests {
                 &submission(CHANNEL, 3, &[USER_A, USER_B, USER_C]),
                 true,
                 at(2),
+                None,
             )
             .await
             .unwrap();

@@ -329,8 +329,14 @@ async fn check_protected_send(
         .filter(|group| group.id == encrypted.group_id)
         .ok_or_else(|| resecuring("stale_group"))?;
 
-    // 5. No removal is pending
-    if !group.pending_removals.is_empty() {
+    // 5. The list signer's device is not lost, then no removal is pending,
+    // user or device (S2, 6.1). `owner_device_lost` answers first, as in the
+    // commit driver: only the owner's recovery list clears it, so waiting
+    // for a pending Remove to land would not let the send through.
+    if group.signer_lost.is_some() {
+        return Err(resecuring("owner_device_lost"));
+    }
+    if !group.pending_removals.is_empty() || !group.pending_device_removals.is_empty() {
         return Err(resecuring("pending_removal"));
     }
 
@@ -2328,6 +2334,266 @@ mod protected_tests {
             "NotSeated",
             "the removed member",
         );
+    }
+
+    /// The revocation pending pass, through the database primitive (6.3):
+    /// a pending device entry, or `signer_lost` for the list signer's device
+    async fn revoke_device(
+        harness: &TestHarness,
+        group: &MlsGroup,
+        device: &TestE2EEDevice,
+    ) -> MlsGroup {
+        let touched = harness
+            .db
+            .add_pending_device_removal(&device.user_id, &device.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+        assert_eq!(touched, vec![group.channel_id.clone()]);
+        let group = harness
+            .db
+            .fetch_mls_group(&group.id)
+            .await
+            .expect("the group");
+        assert!(group.has_member(&device.user_id, &device.device_id));
+        group
+    }
+
+    /// S2 step 5: a pending device entry refuses every send with
+    /// `pending_removal`, before the epoch and membership checks
+    #[test]
+    fn protected_send_waits_for_pending_device_removals() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_waits_for_pending_device_removals_case(),
+        ))
+    }
+
+    async fn protected_send_waits_for_pending_device_removals_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let owner = session_auth(&f.owner_session);
+        let owner_send = || encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+
+        assert_sent(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "before the revocation",
+        );
+
+        let group = revoke_device(h, &f.group, &f.member_device).await;
+        assert_eq!(group.pending_device_removals.len(), 1);
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, None);
+
+        assert_resecuring(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "pending_removal",
+            "a pending device",
+        );
+        let mut stale_epoch = f.protected.owner_device.encrypted_payload(&f.group);
+        stale_epoch.epoch = 0;
+        assert_resecuring(
+            &send(h, owner, channel_id, &encrypted_send(stale_epoch), false).await,
+            "pending_removal",
+            "a pending device + a stale epoch",
+        );
+        let loner_send = encrypted_send(f.loner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.loner_session),
+                channel_id,
+                &loner_send,
+                false,
+            )
+            .await,
+            "pending_removal",
+            "a pending device + not a member",
+        );
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.member_session),
+                channel_id,
+                &member_send,
+                false,
+            )
+            .await,
+            "pending_removal",
+            "the pending device itself",
+        );
+    }
+
+    /// S2 step 5: while the list signer's device is lost every send is
+    /// refused with `owner_device_lost`, before the epoch and membership
+    /// checks
+    #[test]
+    fn protected_send_pauses_while_the_signer_is_lost() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_pauses_while_the_signer_is_lost_case(),
+        ))
+    }
+
+    async fn protected_send_pauses_while_the_signer_is_lost_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let member = session_auth(&f.member_session);
+        let member_send = || encrypted_send(f.member_device.encrypted_payload(&f.group));
+
+        assert_sent(
+            &send(h, member.clone(), channel_id, &member_send(), false).await,
+            "before the revocation",
+        );
+
+        let group = revoke_device(h, &f.group, &f.protected.owner_device).await;
+        let lost = group.signer_lost.as_ref().expect("signer_lost");
+        assert_eq!(lost.device_id, f.protected.owner_device.device_id);
+        assert!(group.pending_removals.is_empty());
+        assert!(group.pending_device_removals.is_empty());
+
+        assert_resecuring(
+            &send(h, member.clone(), channel_id, &member_send(), false).await,
+            "owner_device_lost",
+            "the signer's device lost",
+        );
+        let mut stale_epoch = f.member_device.encrypted_payload(&f.group);
+        stale_epoch.epoch = 0;
+        assert_resecuring(
+            &send(h, member, channel_id, &encrypted_send(stale_epoch), false).await,
+            "owner_device_lost",
+            "the signer's device lost + a stale epoch",
+        );
+        let loner_send = encrypted_send(f.loner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.loner_session),
+                channel_id,
+                &loner_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "the signer's device lost + not a member",
+        );
+        let owner_send = encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.owner_session),
+                channel_id,
+                &owner_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "the lost device itself",
+        );
+    }
+
+    /// S2 step 5 order: `owner_device_lost` answers before
+    /// `pending_removal`, for a pending device and a pending user alike
+    #[test]
+    fn protected_send_signer_lost_answers_before_pending_removal() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_signer_lost_answers_before_pending_removal_case(),
+        ))
+    }
+
+    async fn protected_send_signer_lost_answers_before_pending_removal_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let owner = session_auth(&f.owner_session);
+        let owner_send = || encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+
+        revoke_device(h, &f.group, &f.member_device).await;
+        let group = revoke_device(h, &f.group, &f.protected.owner_device).await;
+        assert_eq!(group.pending_device_removals.len(), 1);
+        assert!(group.signer_lost.is_some());
+
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.member_session),
+                channel_id,
+                &member_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "a pending device + the signer's device lost (member)",
+        );
+        assert_resecuring(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "owner_device_lost",
+            "a pending device + the signer's device lost (owner)",
+        );
+
+        h.db.release_channel_seats_for_user(
+            &f.member.id,
+            Some(&f.protected.server.id),
+            Timestamp::now_utc(),
+        )
+        .await
+        .expect("release the member's seat");
+        let group = h.db.fetch_mls_group(&f.group.id).await.expect("the group");
+        assert!(group.has_pending_removal(&f.member.id));
+        assert!(group.signer_lost.is_some());
+        assert_resecuring(
+            &send(h, owner, channel_id, &owner_send(), false).await,
+            "owner_device_lost",
+            "both pending lists + the signer's device lost",
+        );
+    }
+
+    /// Decision 18 (W2) under S2's step 5: a caller who cannot view the
+    /// channel still gets the ordinary channel's answer, seated or not,
+    /// while the group carries `signer_lost` and a pending device
+    #[test]
+    fn protected_send_non_viewer_while_resecuring() {
+        crate::util::test::rt()
+            .block_on(Box::pin(protected_send_non_viewer_while_resecuring_case()))
+    }
+
+    async fn protected_send_non_viewer_while_resecuring_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        revoke_device(h, &f.group, &f.member_device).await;
+        revoke_device(h, &f.group, &f.protected.owner_device).await;
+
+        // Viewing, the seated member sees the S2 refusal
+        let member = session_auth(&f.member_session);
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(h, member.clone(), channel_id, &member_send, false).await,
+            "owner_device_lost",
+            "a viewer",
+        );
+
+        deny_view(h, &f.protected.channel).await;
+        deny_view(h, &f.ordinary).await;
+        let outsider = session_auth(&f.outsider_session);
+        let outsider_send = encrypted_send(f.outsider_device.encrypted_payload(&f.group));
+        for (auth, body, with_key, case) in [
+            (&member, &member_send, false, "seated, a payload"),
+            (&member, &member_send, true, "seated, a payload + a header"),
+            (&outsider, &outsider_send, false, "unseated, a payload"),
+            (
+                &outsider,
+                &json!({ "content": "x" }),
+                false,
+                "unseated, plaintext",
+            ),
+        ] {
+            let protected = send(h, auth.clone(), channel_id, body, with_key).await;
+            let ordinary = send(h, auth.clone(), f.ordinary.id(), body, with_key).await;
+            assert_refused(&ordinary, Status::Forbidden, "MissingPermission", case);
+            assert_eq!(protected, ordinary, "{case}");
+        }
     }
 
     /// 0. With E2EE off a protected send answers `FeatureDisabled { e2ee }`

@@ -1009,6 +1009,8 @@ async fn try_put_next_seat_list(
             },
             true,
             Timestamp::now_utc(),
+            // 4.3 step 4d: a list that drops a seat carries a reason
+            Some("seat PUT"),
         )
         .await?;
     // `unchanged` = a re-PUT of bytes an earlier (errored-but-committed)

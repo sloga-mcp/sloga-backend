@@ -32,6 +32,7 @@ mod messages_send;
 mod tests;
 pub(crate) mod text;
 mod text_group;
+mod welcome_fetch;
 
 /// Maximum stored one-time KeyPackages per device (mirrors
 /// `MAX_ONE_TIME_KEYS`)
@@ -193,6 +194,15 @@ pub(crate) enum TextGate {
     Available,
     /// Growth: [`require_protected_growth`]
     Growth,
+    /// Recovery (S2-D32; §6.3 "Recovery gates", §7.1 "Recovery gate"): the
+    /// available gate AND an entitlement that allows text traffic, with NO
+    /// growth flag. The route picks it from the operation (a rejoin, a
+    /// `rejoin_readd` re-Add and its claim, the successor of an existing
+    /// group, a `signer_lost` replacement), never from a client flag. Its
+    /// entitlement half reads the channel, so only [`require_text_gate_for`]
+    /// applies it.
+    #[allow(dead_code)] // the recovery routes adopt it in their own lanes
+    Recovery,
 }
 
 /// What [`dispatch_group`] found for a group id
@@ -280,11 +290,51 @@ pub(crate) async fn require_mls_caller(
 /// The Text plane's gate for a group-scoped route (§7.1), applied after
 /// ViewChannel and [`require_mls_caller`] (decision 1 (W2)), so which gate
 /// answers is visible only to a caller who can see the channel (decision 17
-/// (W2)).
+/// (W2)). [`TextGate::Recovery`] needs the channel's entitlement, so it is
+/// refused here: [`require_text_gate_for`] applies it.
 pub(crate) async fn require_text_gate(text_gate: TextGate) -> Result<()> {
     match text_gate {
         TextGate::Available => require_protected_available().await,
         TextGate::Growth => require_protected_growth().await,
+        // The flag half alone would pass a recovery on a missing or frozen
+        // entitlement: refused, never weakened to Available
+        TextGate::Recovery => Err(create_error!(InternalError)),
+    }
+}
+
+/// [`require_text_gate`] for a gate that may be [`TextGate::Recovery`]. For
+/// Recovery: the available gate first (with E2EE off the answer is `e2ee`
+/// whatever the entitlement), then the channel's entitlement must allow
+/// text traffic, else `InvalidOperation`, the answer the growth tier gives
+/// a new device. Available and Growth are exactly [`require_text_gate`].
+#[allow(dead_code)] // the recovery routes adopt it in their own lanes
+pub(crate) async fn require_text_gate_for(
+    db: &Database,
+    channel_id: &str,
+    text_gate: TextGate,
+) -> Result<()> {
+    match text_gate {
+        TextGate::Recovery => {
+            require_protected_available().await?;
+            require_text_traffic(db, channel_id).await
+        }
+        gate => require_text_gate(gate).await,
+    }
+}
+
+/// S5's `allows_text_traffic()` (§6.3 "Recovery gates": `Active` or
+/// `Grace`), which before S5 lands is `Active` only. S5b's
+/// `ChannelEntitlement::allows_text_traffic` replaces this at its merge.
+pub(crate) fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
+    entitlement.is_active()
+}
+
+/// The entitlement half of [`TextGate::Recovery`]: a missing entitlement,
+/// or one that does not allow text traffic, is `InvalidOperation`
+async fn require_text_traffic(db: &Database, channel_id: &str) -> Result<()> {
+    match db.fetch_channel_entitlement(channel_id).await? {
+        Some(entitlement) if allows_text_traffic(&entitlement) => Ok(()),
+        _ => Err(create_error!(InvalidOperation)),
     }
 }
 
@@ -411,6 +461,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         messages_send::send_message,
         group_open::open_group,
         text_group::fetch_text_group,
+        welcome_fetch::fetch_welcome,
     ]
 }
 
@@ -532,7 +583,7 @@ mod protected_gates {
     use super::{
         as_unknown_group, dispatch_group, effective_device_cap, require_channel_access,
         require_mls_caller, require_protected_available, require_protected_growth, require_seated,
-        require_text_gate, GroupDispatch, TextGate,
+        require_text_gate, require_text_gate_for, GroupDispatch, TextGate,
     };
     use crate::util::test::TestHarness;
 
@@ -1188,6 +1239,153 @@ mod protected_gates {
             .await;
             hidden_and_deleted_text_groups_answer_as_unknown().await
         })
+    }
+
+    /// `expected` is a unit variant; `ErrorType` has no `PartialEq`
+    #[track_caller]
+    fn assert_refused_as(result: Result<()>, expected: ErrorType, case: &str) {
+        match result {
+            Err(Error { error_type, .. }) => assert!(
+                std::mem::discriminant(&error_type) == std::mem::discriminant(&expected),
+                "{}: expected {:?}, got {:?}",
+                case,
+                expected,
+                error_type
+            ),
+            Ok(()) => panic!("{}: expected {:?}, passed", case, expected),
+        }
+    }
+
+    /// A new channel of the fixture's server whose entitlement is in
+    /// `state`, inserted through the database primitive
+    async fn channel_with_entitlement(fixture: &Fixture, state: ChannelEntitlementState) -> String {
+        let db = &fixture.harness.db;
+        let server = db.fetch_server(&fixture.server_id).await.expect("server");
+        let channel_id = fixture.harness.new_channel(&server).await.id().to_string();
+        let now = Timestamp::now_utc();
+        db.upsert_channel_entitlement(
+            &ChannelEntitlement {
+                id: Ulid::new().to_string(),
+                channel_id: channel_id.clone(),
+                server_id: fixture.server_id.clone(),
+                source: ChannelEntitlementSource::AdminGrant,
+                slot_cap: 10,
+                device_cap: None,
+                state,
+                granted_by: fixture.owner_id.clone(),
+                created_at: now,
+            },
+            now,
+        )
+        .await
+        .expect("entitlement");
+        channel_id
+    }
+
+    /// The recovery gate (S2-D32, §7.1 "Recovery gate"), every flag on: an
+    /// Active entitlement passes; a missing one, and every state that does
+    /// not allow text traffic, is `InvalidOperation` (Grace among them
+    /// until S5b's `allows_text_traffic` lands; its merge flips that row).
+    /// `require_text_gate` cannot read the entitlement and refuses Recovery;
+    /// the flag gates read no entitlement at all.
+    #[test]
+    fn recovery_gate_with_every_flag_on() {
+        crate::util::test::rt().block_on(recovery_gate_with_every_flag_on_case())
+    }
+
+    async fn recovery_gate_with_every_flag_on_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        require_text_gate_for(db, &fixture.channel_id, TextGate::Recovery)
+            .await
+            .expect("an Active entitlement");
+        assert_refused_as(
+            require_text_gate_for(db, &fixture.call_channel_id, TextGate::Recovery).await,
+            ErrorType::InvalidOperation,
+            "no entitlement",
+        );
+        for state in [
+            ChannelEntitlementState::Grace,
+            ChannelEntitlementState::Frozen,
+            ChannelEntitlementState::Deleted,
+        ] {
+            let case = format!("{state:?}");
+            let channel_id = channel_with_entitlement(&fixture, state).await;
+            assert_refused_as(
+                require_text_gate_for(db, &channel_id, TextGate::Recovery).await,
+                ErrorType::InvalidOperation,
+                &case,
+            );
+        }
+        assert_refused_as(
+            require_text_gate(TextGate::Recovery).await,
+            ErrorType::InternalError,
+            "Recovery without the channel",
+        );
+        for gate in GATES {
+            require_text_gate_for(db, &fixture.call_channel_id, gate)
+                .await
+                .expect("a flag gate");
+        }
+    }
+
+    /// Recovery passes with the growth flag off (§6.3 "Recovery gates",
+    /// O-16); its entitlement half still applies
+    #[test]
+    fn recovery_gate_with_growth_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            recovery_gate_with_growth_off_case().await
+        })
+    }
+
+    async fn recovery_gate_with_growth_off_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        require_text_gate_for(db, &fixture.channel_id, TextGate::Recovery)
+            .await
+            .expect("recovery with growth off");
+        assert_disabled(
+            require_text_gate_for(db, &fixture.channel_id, TextGate::Growth).await,
+            "protected_channels",
+            "Growth",
+        );
+        assert_refused_as(
+            require_text_gate_for(db, &fixture.call_channel_id, TextGate::Recovery).await,
+            ErrorType::InvalidOperation,
+            "no entitlement, growth off",
+        );
+    }
+
+    /// Availability answers first: with E2EE off Recovery is `e2ee`, with or
+    /// without an entitlement
+    #[test]
+    fn recovery_gate_with_e2ee_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee_enabled = false;
+            })
+            .await;
+            recovery_gate_with_e2ee_off_case().await
+        })
+    }
+
+    async fn recovery_gate_with_e2ee_off_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        for channel_id in [&fixture.channel_id, &fixture.call_channel_id] {
+            assert_disabled(
+                require_text_gate_for(db, channel_id, TextGate::Recovery).await,
+                "e2ee",
+                channel_id,
+            );
+        }
     }
 
     #[test]

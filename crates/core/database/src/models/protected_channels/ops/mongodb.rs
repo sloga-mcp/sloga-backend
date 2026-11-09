@@ -40,7 +40,7 @@ use crate::{
     ChannelSeat, MlsGroup, MlsGroupCreateOutcome, MlsPendingDeviceRemoval, MlsSignerLost,
     MlsSignerLostCause, MongoDb, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
     SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
-    SeatReleaseCause, MAX_CHANNEL_SLOT_CAP,
+    SeatReleaseCause, TextGroupCreator, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::reference::{is_derived_text_group_id, log_call_squat_evicted};
@@ -722,6 +722,7 @@ impl MongoDb {
         allow_claims: bool,
         formats_v2: bool,
         now: Timestamp,
+        removal_reason: Option<&str>,
     ) -> Attempt<SeatListWriteOutcome> {
         // N3 is decided before anything is written (claim order below)
         if kind == SeatListWriteKind::Protect {
@@ -820,6 +821,7 @@ impl MongoDb {
             allow_claims,
             formats_v2,
             text_group_users: &text_group_users,
+            removal_reason,
             now,
         })?;
 
@@ -932,6 +934,7 @@ impl MongoDb {
         session: &mut ClientSession,
         group: &MlsGroup,
         supersedes: Option<&str>,
+        creator: &TextGroupCreator,
     ) -> Attempt<(MlsGroupCreateOutcome, Option<(String, String)>)> {
         // FIRST operation: the superseded group this create closes, and a
         // Call squat at this create's id that it would evict (M9), so a
@@ -1001,7 +1004,7 @@ impl MongoDb {
             }
         }
 
-        let mut prepared = prepare_text_group(group, &list)?;
+        let mut prepared = prepare_text_group(group, &list, creator)?;
         prepared.signer_lost = carried_signer_lost;
 
         // The group binds this list's AD hash, so the create must serialize
@@ -1759,7 +1762,8 @@ impl AbstractProtectedChannels for MongoDb {
             submission,
             true,
             formats_v2,
-            now
+            now,
+            None
         ))
     }
 
@@ -1769,6 +1773,7 @@ impl AbstractProtectedChannels for MongoDb {
         submission: &SeatListSubmission,
         allow_claims: bool,
         now: Timestamp,
+        removal_reason: Option<&str>,
     ) -> Result<SeatListWriteOutcome> {
         let formats_v2 = revolt_config::config()
             .await
@@ -1782,19 +1787,22 @@ impl AbstractProtectedChannels for MongoDb {
             submission,
             allow_claims,
             formats_v2,
-            now
+            now,
+            removal_reason
         ))
     }
 
-    async fn create_text_mls_group(
+    async fn create_text_mls_group_as(
         &self,
         group: &MlsGroup,
         supersedes: Option<&str>,
+        creator: &TextGroupCreator,
     ) -> Result<MlsGroupCreateOutcome> {
         let (outcome, evicted) = run_transaction!(self, |session| self.create_text_group_attempt(
             &mut session,
             group,
-            supersedes
+            supersedes,
+            creator
         ))?;
         if let Some((call_channel_id, call_creator)) = evicted {
             log_call_squat_evicted(group, &call_channel_id, &call_creator);

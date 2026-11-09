@@ -3,11 +3,12 @@ use std::collections::HashSet;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref, mls_join_intent_payload,
-    mls_text_enforced_device_cap, Database, E2EEIdentity, MlsGroup, MlsJoinIntent, MlsMemberDevice,
-    SeatListBody, Session, User, MAX_MLS_GROUP_MEMBERS,
+    mls_text_enforced_device_cap, ChannelEntitlement, Database, E2EEIdentity, MlsGroup,
+    MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody, Session, TextJoinPayload, User,
+    MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 
@@ -44,16 +45,17 @@ pub(crate) fn all_member_devices_rejoining(
 /// `MlsJoinRequested` to member devices (plan §1.4 step 1).
 ///
 /// The signature — Ed25519 by the device identity key over the canonical
-/// `acutest:e2ee:mls-join:v1` payload — is verified server-side as defense
-/// in depth; the REAL trust decision is each admitting member's client-side
-/// re-verification against its own pinned identity for this device. The
-/// server can never grow a roster: an Add is only ever issued by a member
-/// that verified this intent itself.
+/// `acutest:e2ee:mls-join:v1` payload (on a protected channel whose list is
+/// v2, the Text join payload, design §3.13) — is verified server-side as
+/// defense in depth; the REAL trust decision is each admitting member's
+/// client-side re-verification against its own pinned identity for this
+/// device. The server can never grow a roster: an Add is only ever issued
+/// by a member that verified this intent itself.
 ///
 /// A protected channel's Text group takes its own path (protected channels
 /// design §6.1 "Join intent"): the caller must be seated, a user may join
-/// with several devices up to the enforced device cap, and the route never
-/// closes the group.
+/// with several devices up to the enforced device cap, recovery intents
+/// pass with the growth flag off, and the route never closes the group.
 #[openapi(tag = "MLS")]
 #[post("/groups/<group_id>/join_intent", data = "<data>")]
 pub async fn join_intent(
@@ -150,7 +152,7 @@ async fn call_join_intent(
         }));
     }
 
-    let intent = join_intent_row(&group, &user.id, &data);
+    let intent = join_intent_row(&group, &user.id, &data, None, None);
     store_join_intent(db, &intent).await?;
 
     // Dual-reload deadlock (rejoin plan §5): a rejoin is only ever served
@@ -169,7 +171,7 @@ async fn call_join_intent(
         }
     }
 
-    fan_out_join_requested(&group, &user.id, &data, rejoin).await;
+    fan_out_join_requested(&group, &intent, rejoin).await;
 
     Ok(EmptyResponse)
 }
@@ -178,8 +180,26 @@ async fn call_join_intent(
 /// order: the group's channel and ViewChannel, where any failure answers
 /// [`super::as_unknown_group`] so a hidden or deleted channel's group is
 /// indistinguishable from an unknown id; the shared caller checks; request
-/// validation; the growth gate (a join is growth, decision 5 (W2)); the
-/// caller's seat; then the join rules.
+/// validation; the recovery or growth gate; the caller's seat; then the
+/// join rules.
+///
+/// The gate follows the operation, never a client flag (§6.3 "Recovery
+/// gates", S2-D32, #213, #220). A rejoin (this device is already a member)
+/// and the signer user's replacement device while recovery is open
+/// ([`signer_replacement`]) are RECOVERY: the available gate and an
+/// entitlement that allows text traffic ([`allows_text_traffic`]), so they
+/// pass with the growth flag off. Any other new device is growth: the
+/// growth gate, and the same entitlement predicate at the cap check.
+///
+/// On a channel whose stored list is v2 the intent is signed over the Text
+/// join payload and its `generation` and `issued_at` are stored and fanned
+/// out (§3.13, #218); a v1 channel keeps the S1 payload and S1 rows.
+///
+/// A Text intent stays outstanding for `text_rejoin_window_secs` (24 h),
+/// measured from the row's server-stamped `created_at` by the driver's rule
+/// 6 and the routes that read intents; the signed `issued_at` is only
+/// bounds-checked (§3.13). The 30 s window of
+/// [`all_member_devices_rejoining`] is the Call plane's alone.
 ///
 /// Two call rules do not apply. A user may hold several member devices, up
 /// to the enforced device cap. And this route never closes the group (§2.5
@@ -203,7 +223,19 @@ async fn text_join_intent(
     }
     super::require_mls_caller(db, user, Some(session)).await?;
     validate_join_intent(&data)?;
-    super::require_text_gate(TextGate::Growth).await?;
+
+    // Device-aware: THIS device already a member is a rejoin (members
+    // remove its stale leaf under the rejoin case, §3.12.2, and re-Add it).
+    // Any other device is a NEW device of a user who may already have some
+    let rejoin = group.has_member(&user.id, &data.device_id);
+    let seat_list = db.fetch_seat_list(&group.channel_id).await?;
+    let recovery = rejoin || signer_replacement(db, &group, seat_list.as_ref(), &user.id).await?;
+    let gate = if recovery {
+        TextGate::Available
+    } else {
+        TextGate::Growth
+    };
+    super::require_text_gate(gate).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
 
     // A superseded group takes no joins; its successor does
@@ -212,45 +244,125 @@ async fn text_join_intent(
     }
 
     // The session must be bound to the joining device itself, and the
-    // intent signed by it, before anything below is reachable
+    // intent signed by it, before anything below is reachable. The payload
+    // depends on the stored list's format, so a Text group without one
+    // takes no intent at all
     let identity = bound_identity(db, &user.id, session, &data.device_id).await?;
-    verify_join_signature(&identity, &user.id, &group.id, &data)?;
+    let seat_list = seat_list.ok_or_else(|| create_error!(InvalidOperation))?;
+    let (generation, issued_at) =
+        verify_text_join_signature(&identity, &user.id, &group, &seat_list, &data)?;
 
-    // Device-aware: THIS device already a member is a rejoin (members
-    // remove its stale leaf under the rejoin case, §3.12.2, and its next
-    // intent is admitted as a new device). Any other device is a NEW device
-    // of a user who may already have some, refused once the user's member
-    // devices reach the enforced cap. The Text commit transaction enforces
-    // the same cap on the Add; this refusal only spares the admit round
-    // trip and tells the joiner why.
-    let rejoin = group.has_member(&user.id, &data.device_id);
-    if !rejoin {
+    // A rejoin is exempt from the cap (it is not new), but it is recovery,
+    // which still needs an entitlement that allows text traffic. A new
+    // device is refused once the user's counted member devices reach the
+    // enforced cap. The Text commit transaction enforces the cap again on
+    // the Add, counting every post-commit leaf; this refusal only spares
+    // the admit round trip and tells the joiner why.
+    if rejoin {
+        require_text_traffic(db, &group.channel_id).await?;
+    } else {
         let max = enforced_device_cap(db, &group.channel_id).await?;
-        if max != 0 && group.member_devices_of(&user.id).count() >= max as usize {
+        if max != 0 && capped_device_count(&group, &user.id) >= max as usize {
             return Err(create_error!(DeviceCapReached { max: max as usize }));
         }
     }
 
-    let intent = join_intent_row(&group, &user.id, &data);
+    let intent = join_intent_row(&group, &user.id, &data, generation, issued_at);
     store_join_intent(db, &intent).await?;
 
-    fan_out_join_requested(&group, &user.id, &data, rejoin).await;
+    fan_out_join_requested(&group, &intent, rejoin).await;
 
     Ok(EmptyResponse)
+}
+
+/// Whether a NEW device of `user_id` is the signer user's replacement
+/// device while recovery is open (§6.1 "S2 additions", widened in #213):
+/// `user_id` is the stored list's signer user, and the open group carries
+/// `signer_lost` OR the list's signer device has no registered E2EE
+/// identity. The second is the server's own directory, so recovery never
+/// depends on `signer_lost` having been written. A read error other than
+/// an absent identity is returned, so it refuses (fails closed).
+async fn signer_replacement(
+    db: &Database,
+    group: &MlsGroup,
+    seat_list: Option<&SeatList>,
+    user_id: &str,
+) -> Result<bool> {
+    let Some(seat_list) = seat_list else {
+        return Ok(false);
+    };
+    if seat_list.signer_user_id != user_id {
+        return Ok(false);
+    }
+    if group.signer_lost.is_some() {
+        return Ok(true);
+    }
+
+    match db
+        .fetch_e2ee_identity(&seat_list.signer_user_id, &seat_list.signer_device_id)
+        .await
+    {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// The entitlement predicate every Text join needs, a new device and a
+/// recovery intent alike (design §6.3 "Recovery gates", #220): S5's
+/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, S2-D32
+/// amended) replaces this at its merge.
+fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
+    entitlement.is_active()
+}
+
+/// The entitlement half of the recovery gate for a rejoin (§6.3 "Recovery
+/// gates"): a missing entitlement, or one that does not allow text
+/// traffic, refuses it with `InvalidOperation`, as it refuses a new device
+async fn require_text_traffic(db: &Database, channel_id: &str) -> Result<()> {
+    db.fetch_channel_entitlement(channel_id)
+        .await?
+        .filter(allows_text_traffic)
+        .ok_or_else(|| create_error!(InvalidOperation))?;
+
+    Ok(())
+}
+
+/// The user's member devices that count against the enforced cap at the
+/// join intent (§6.1 "S2 additions", #212): every member device of the
+/// user, a revoked device whose leaf is still there and a lost signer
+/// device included, EXCEPT one listed in `pending_device_removals`. The Add
+/// that follows must remove those in the same commit (Add-clears-pending),
+/// so they never coexist with the new device. That is the only exclusion:
+/// the commit transaction counts every post-commit leaf, as every receiver
+/// does.
+fn capped_device_count(group: &MlsGroup, user_id: &str) -> usize {
+    group
+        .member_devices_of(user_id)
+        .filter(|device| {
+            !group.pending_device_removals.iter().any(|pending| {
+                pending.user_id == device.user_id && pending.device_id == device.device_id
+            })
+        })
+        .count()
 }
 
 /// The enforced per-user device cap of a channel's Text group (§2.5,
 /// W0-fix3): `min(signed-list device_cap, effective entitlement cap)`, `0`
 /// meaning unlimited in either operand, so `0` here is unlimited too.
 ///
-/// A new device is an Add to come, and an Add needs an Active entitlement
-/// (§6.1 errors), so a missing or inactive one refuses the new device here
-/// rather than at the admitter's commit.
+/// A new device is an Add to come, and an Add of a seated member's new
+/// device needs an entitlement that allows text traffic
+/// ([`allows_text_traffic`]; §6.1 errors, §6.3 "Recovery gates"), so a
+/// missing or inactive one refuses the new device here rather than at the
+/// admitter's commit. The signer user's replacement device meets the same
+/// check under the recovery gate.
 async fn enforced_device_cap(db: &Database, channel_id: &str) -> Result<u32> {
     let entitlement = db
         .fetch_channel_entitlement(channel_id)
         .await?
-        .filter(|entitlement| entitlement.is_active())
+        .filter(allows_text_traffic)
         .ok_or_else(|| create_error!(InvalidOperation))?;
     let seat_list = db
         .fetch_seat_list(channel_id)
@@ -326,8 +438,73 @@ fn verify_join_signature(
     Ok(())
 }
 
-/// The stored intent row, stamped now
-fn join_intent_row(group: &MlsGroup, user_id: &str, data: &v0::DataMlsJoinIntent) -> MlsJoinIntent {
+/// Verify a Text intent's signature by the joining device and return the
+/// signed `(generation, issued_at)` to store and fan out (design §3.13).
+///
+/// On a channel whose stored list is v2 (#218, whatever `formats_v2` says)
+/// both fields are required, `generation` must be the stored group's, and
+/// the signature must verify over the Text join payload built from the
+/// server's own group id and channel; `issued_at` is only bounds-checked.
+/// Every refusal is `FailedValidation`.
+///
+/// On a v1 channel the S1 payload is verified and the two fields are
+/// IGNORED, never stored or fanned out, so the channel behaves exactly as
+/// in S1 (§3.13: "on a v1 channel the S1 payload is used and the two
+/// fields are ignored"). Relaying them would be wrong, not just redundant:
+/// admitters choose the payload by the carrier (both fields present means
+/// the Text payload), so they would refuse an intent the server accepted
+/// over the S1 payload.
+fn verify_text_join_signature(
+    identity: &E2EEIdentity,
+    user_id: &str,
+    group: &MlsGroup,
+    seat_list: &SeatList,
+    data: &v0::DataMlsJoinIntent,
+) -> Result<(Option<u32>, Option<i64>)> {
+    if !seat_list.is_v2() {
+        verify_join_signature(identity, user_id, &group.id, data)?;
+        return Ok((None, None));
+    }
+
+    let (Some(generation), Some(issued_at)) = (data.generation, data.issued_at) else {
+        return Err(create_error!(FailedValidation {
+            error: "a join intent on a v2 channel needs generation and issued_at".to_string()
+        }));
+    };
+    if group.generation != Some(generation) {
+        return Err(create_error!(FailedValidation {
+            error: "join intent generation is not the group's".to_string()
+        }));
+    }
+
+    let payload = TextJoinPayload {
+        user_id: user_id.to_string(),
+        device_id: data.device_id.clone(),
+        channel_id: group.channel_id.clone(),
+        generation,
+        group_id: group.id.clone(),
+        key_package_ref: data.key_package_ref.clone(),
+        issued_at,
+    }
+    .build()?;
+    if !identity.verify_payload(&payload, &data.signature) {
+        return Err(create_error!(FailedValidation {
+            error: "invalid join intent signature".to_string()
+        }));
+    }
+
+    Ok((Some(generation), Some(issued_at)))
+}
+
+/// The stored intent row, stamped now. `generation` and `issued_at` are
+/// the verified Text join payload fields (`None` on Call and v1 intents).
+fn join_intent_row(
+    group: &MlsGroup,
+    user_id: &str,
+    data: &v0::DataMlsJoinIntent,
+    generation: Option<u32>,
+    issued_at: Option<i64>,
+) -> MlsJoinIntent {
     MlsJoinIntent {
         id: MlsJoinIntent::composite_id(&group.id, user_id, &data.device_id),
         group_id: group.id.clone(),
@@ -336,8 +513,8 @@ fn join_intent_row(group: &MlsGroup, user_id: &str, data: &v0::DataMlsJoinIntent
         key_package_ref: data.key_package_ref.clone(),
         signature: data.signature.clone(),
         created_at: Timestamp::now_utc(),
-        generation: None,
-        issued_at: None,
+        generation,
+        issued_at,
     }
 }
 
@@ -370,13 +547,10 @@ async fn store_join_intent(db: &Database, intent: &MlsJoinIntent) -> Result<()> 
 }
 
 /// Fan out to each member USER's private topic; member devices filter
-/// and self-schedule admission with leaf-index staggered timers
-async fn fan_out_join_requested(
-    group: &MlsGroup,
-    user_id: &str,
-    data: &v0::DataMlsJoinIntent,
-    rejoin: bool,
-) {
+/// and self-schedule admission with leaf-index staggered timers. The event
+/// carries the stored row's signed fields, so an admitter rebuilds the
+/// payload the server verified (§3.13 "Carriers").
+async fn fan_out_join_requested(group: &MlsGroup, intent: &MlsJoinIntent, rejoin: bool) {
     let member_users: HashSet<String> = group
         .members
         .iter()
@@ -387,13 +561,13 @@ async fn fan_out_join_requested(
         EventV1::MlsJoinRequested {
             group_id: group.id.clone(),
             channel_id: group.channel_id.clone(),
-            user_id: user_id.to_string(),
-            device_id: data.device_id.clone(),
-            key_package_ref: data.key_package_ref.clone(),
-            signature: data.signature.clone(),
+            user_id: intent.user_id.clone(),
+            device_id: intent.device_id.clone(),
+            key_package_ref: intent.key_package_ref.clone(),
+            signature: intent.signature.clone(),
             rejoin,
-            generation: None,
-            issued_at: None,
+            generation: intent.generation,
+            issued_at: intent.issued_at,
         }
         .private(member_user)
         .await;
@@ -403,15 +577,17 @@ async fn fan_out_join_requested(
 /// The Text path (W2 decisions 1, 5 and 7, design §6.1 "Join intent").
 /// Every flag case is its own `#[test]`: `overwrite_config` runs once per
 /// process, BEFORE the harness primes the config cache, so these need
-/// nextest (one process per test). The test config has every flag on.
+/// nextest (one process per test). The test config has every flag on
+/// except `formats_v2`, which the v2 cases turn on.
 #[cfg(test)]
 mod tests {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-    use iso8601_timestamp::Timestamp;
+    use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         events::client::EventV1, mls_join_intent_payload, Account, BotInformation,
         ChannelEntitlementState, Database, MlsCommit, MlsCommitOutcome, MlsGroup, MlsMemberDevice,
-        PartialChannel, Session, User,
+        PartialChannel, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListV2Lines,
+        Session, TextJoinPayload, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -423,8 +599,8 @@ mod tests {
     use super::super::{dispatch_group, require_channel_access, GroupDispatch};
     use super::join_intent;
     use crate::util::test::{
-        ProtectedChannel, TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_SLOT_CAP,
-        MEMBER_DEVICE_SEED,
+        ProtectedChannel, TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_ISSUED_AT,
+        FIXTURE_SLOT_CAP, MEMBER_DEVICE_SEED, NEW_OWNER_DEVICE_SEED, OWNER_DEVICE_SEED,
     };
 
     /// Call the route as rocket does
@@ -463,6 +639,51 @@ mod tests {
             signature: device.sign(&payload),
             generation: None,
             issued_at: None,
+        }
+    }
+
+    /// The Text join payload (design §3.13) of `device` for `group`
+    fn text_payload(
+        device: &TestE2EEDevice,
+        group: &MlsGroup,
+        key_package_ref: &str,
+        generation: u32,
+        issued_at: i64,
+    ) -> String {
+        TextJoinPayload {
+            user_id: device.user_id.clone(),
+            device_id: device.device_id.clone(),
+            channel_id: group.channel_id.clone(),
+            generation,
+            group_id: group.id.clone(),
+            key_package_ref: key_package_ref.to_string(),
+            issued_at,
+        }
+        .build()
+        .expect("a text join payload")
+    }
+
+    /// A v2 join intent by `device` for `group`: the Text join payload at
+    /// the group's generation, signed by it, carrying both signed fields
+    fn signed_text_intent(
+        device: &TestE2EEDevice,
+        group: &MlsGroup,
+        key_package_ref: &str,
+        issued_at: i64,
+    ) -> v0::DataMlsJoinIntent {
+        let generation = group.generation.expect("a Text group generation");
+        v0::DataMlsJoinIntent {
+            device_id: device.device_id.clone(),
+            key_package_ref: key_package_ref.to_string(),
+            signature: device.sign(&text_payload(
+                device,
+                group,
+                key_package_ref,
+                generation,
+                issued_at,
+            )),
+            generation: Some(generation),
+            issued_at: Some(issued_at),
         }
     }
 
@@ -548,6 +769,51 @@ mod tests {
         group
     }
 
+    /// One Text commit by `committer` at the next epoch of `group_id`,
+    /// adding `added` and removing `removed`, stamped `created_at`, through
+    /// the database primitive (the AD hash is the stored seat list's; the
+    /// entitlement operand is unlimited). Rule 6 measures the Text window
+    /// back from `created_at`, so a later stamp ages every stored intent.
+    async fn commit_at(
+        harness: &TestHarness,
+        group_id: &str,
+        committer: &TestE2EEDevice,
+        added: Vec<MlsMemberDevice>,
+        removed: Vec<MlsMemberDevice>,
+        created_at: Timestamp,
+    ) -> Result<MlsCommitOutcome> {
+        let db = &harness.db;
+        let group = db.fetch_mls_group(group_id).await.expect("the group");
+        let hash = db
+            .fetch_seat_list(&group.channel_id)
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .commit_ad_sha256()
+            .expect("the AD hash");
+        let epoch = group.current_epoch + 1;
+        let commit = b"opaque text commit";
+        db.insert_mls_text_commit(
+            &MlsCommit {
+                id: MlsCommit::composite_id(group_id, epoch),
+                group_id: group_id.to_string(),
+                epoch,
+                committer: leaf(committer),
+                commit: STANDARD_NO_PAD.encode(commit),
+                size: commit.len() as i64,
+                added,
+                removed,
+                created_at,
+                rejoin_intents: vec![],
+                removed_reasons: vec![],
+                welcome: None,
+            },
+            &hash,
+            0,
+        )
+        .await
+    }
+
     /// The refusal's response body; panics when the request was accepted or
     /// refused with another error type
     #[track_caller]
@@ -630,15 +896,106 @@ mod tests {
         }
     }
 
+    /// The 3.1.1 group salt of the v2 fixture list
+    fn v2_group_salt() -> String {
+        "ab".repeat(32)
+    }
+
+    /// As [`text_fixture`], but the genesis list is a v2 list (§4.1.1, no
+    /// authority, `history: hidden`, `pre_history: kept`). Needs
+    /// `formats_v2` on: protect takes a v2 genesis only then (#218).
+    async fn text_v2_fixture() -> Text {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (member_account, member_session, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        let entitlement = harness
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        harness.join_server(&server, &member).await;
+
+        let body = SeatListBody {
+            channel_id: channel.id().to_string(),
+            version: 1,
+            device_cap: FIXTURE_DEVICE_CAP,
+            issued_at: FIXTURE_ISSUED_AT,
+            signer_user_id: owner.id.clone(),
+            signer_device_id: owner_device.device_id.clone(),
+            seats: vec![owner.id.clone(), member.id.clone()],
+            v2: Some(SeatListV2Lines {
+                authority_sha256: None,
+                history: SeatListHistory::Hidden,
+                history_boundary: None,
+                pre_history: SeatListPreHistory::Kept,
+                group_salt: v2_group_salt(),
+            }),
+        }
+        .build()
+        .expect("a canonical v2 seat list body");
+        let protect = v0::DataProtectChannel {
+            seat_list: v0::DataSeatList {
+                signature: owner_device.sign(&body),
+                body,
+                signer_device_id: owner_device.device_id.clone(),
+                handover: None,
+                authority: None,
+            },
+        };
+        harness.protect_with_db(&channel, &protect).await;
+        let channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the protected channel");
+        assert!(harness
+            .db
+            .fetch_seat_list(channel.id())
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .is_v2());
+
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        let group = harness
+            .new_text_group(&channel, &owner_device, 0, None)
+            .await;
+        assert_eq!(group.members, vec![leaf(&owner_device)]);
+
+        Text {
+            harness,
+            owner,
+            owner_account,
+            owner_session,
+            member,
+            member_account,
+            member_session,
+            member_device,
+            protected: ProtectedChannel {
+                server,
+                channel,
+                entitlement,
+                owner_device,
+                seat_list: protect.seat_list,
+            },
+            group,
+        }
+    }
+
     /// The `MlsJoinRequested` on `topic_user`'s private topic for `device`
-    /// and `key_package_ref`; returns its `rejoin` flag
-    async fn join_requested(
+    /// and `key_package_ref`; returns its signed Text payload fields and
+    /// its `rejoin` flag, `(generation, issued_at, rejoin)`
+    async fn join_request_carriers(
         harness: &mut TestHarness,
         topic_user: &str,
         group_id: &str,
         device: &TestE2EEDevice,
         key_package_ref: &str,
-    ) -> bool {
+    ) -> (Option<u32>, Option<i64>, bool) {
         let event = harness
             .wait_for_event(&format!("{topic_user}!"), |event| {
                 matches!(
@@ -656,13 +1013,30 @@ mod tests {
             .await;
         match event {
             EventV1::MlsJoinRequested {
-                user_id, rejoin, ..
+                user_id,
+                rejoin,
+                generation,
+                issued_at,
+                ..
             } => {
                 assert_eq!(user_id, device.user_id);
-                rejoin
+                (generation, issued_at, rejoin)
             }
             other => panic!("not a join request: {:?}", other),
         }
+    }
+
+    /// As [`join_request_carriers`]; returns its `rejoin` flag
+    async fn join_requested(
+        harness: &mut TestHarness,
+        topic_user: &str,
+        group_id: &str,
+        device: &TestE2EEDevice,
+        key_package_ref: &str,
+    ) -> bool {
+        join_request_carriers(harness, topic_user, group_id, device, key_package_ref)
+            .await
+            .2
     }
 
     #[test]
@@ -1021,19 +1395,38 @@ mod tests {
         assert_eq!(entitlement.state, ChannelEntitlementState::Frozen);
     }
 
+    /// S1 took a rejoin here ("a rejoin only needs a Remove"). S2 makes a
+    /// rejoin a recovery operation (S2-D32, §6.3 "Recovery gates"): the
+    /// available gate AND an entitlement that allows text traffic, which
+    /// Frozen does not, so the rejoin is refused as the new device is
     #[test]
-    fn an_inactive_entitlement_refuses_new_devices_only() {
-        crate::util::test::rt().block_on(an_inactive_entitlement_refuses_new_devices_only_case())
+    fn a_frozen_entitlement_refuses_new_devices_and_rejoins() {
+        crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(None))
     }
 
-    async fn an_inactive_entitlement_refuses_new_devices_only_case() {
+    /// Deleted refuses a new device as Frozen does, and a rejoin with it.
+    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` takes the
+    /// rejoin, under the S1 rule that S2-D32 replaces.)
+    #[test]
+    fn a_deleted_entitlement_refuses_new_devices_and_rejoins() {
+        crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(Some(
+            ChannelEntitlementState::Deleted,
+        )))
+    }
+
+    /// `state` `None` = Frozen through [`freeze_entitlement`]
+    async fn inactive_entitlement_refuses_joins(state: Option<ChannelEntitlementState>) {
         let text = text_fixture().await;
         let db = &text.harness.db;
         let group_id = &text.group.id;
 
-        freeze_entitlement(db, text.protected.channel.id()).await;
+        match state {
+            None => freeze_entitlement(db, text.protected.channel.id()).await,
+            Some(state) => set_entitlement_state(db, text.protected.channel.id(), state).await,
+        }
 
-        // A new device would need an Add, and Adds need an Active entitlement
+        // A new device would need an Add, and an Add of a seated member's
+        // new device needs an entitlement that allows text traffic
         refused(
             post(
                 db,
@@ -1047,16 +1440,60 @@ mod tests {
             "a new device",
         );
 
-        // A rejoin only needs a Remove, which never needs the entitlement
-        post(
-            db,
-            &text.owner,
-            &text.owner_session,
-            group_id,
-            signed_intent(&text.protected.owner_device, group_id, "o1"),
-        )
-        .await
-        .expect("a rejoin");
+        // A rejoin is recovery, which needs the same predicate
+        refused(
+            post(
+                db,
+                &text.owner,
+                &text.owner_session,
+                group_id,
+                signed_intent(&text.protected.owner_device, group_id, "o1"),
+            )
+            .await,
+            "InvalidOperation",
+            "a rejoin",
+        );
+        assert!(stored_intents(db, group_id).await.is_empty());
+    }
+
+    /// Set the channel's entitlement state, raw (S1 has no primitive for it)
+    async fn set_entitlement_state(
+        db: &Database,
+        channel_id: &str,
+        state: ChannelEntitlementState,
+    ) {
+        match db {
+            Database::Reference(reference) => {
+                let mut found = 0;
+                for entitlement in reference.channel_entitlements.lock().await.values_mut() {
+                    if entitlement.channel_id == channel_id {
+                        entitlement.state = state.clone();
+                        found += 1;
+                    }
+                }
+                assert_eq!(found, 1);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_bson, Document};
+
+                let result = mongo
+                    .col::<Document>("channel_entitlements")
+                    .update_one(
+                        doc! { "channel_id": channel_id },
+                        doc! { "$set": { "state": to_bson(&state).expect("a state") } },
+                    )
+                    .await
+                    .expect("raw state write");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        let entitlement = db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .expect("an entitlement");
+        assert_eq!(entitlement.state, state);
     }
 
     #[test]
@@ -1207,9 +1644,10 @@ mod tests {
         .expect("the successor");
     }
 
-    /// The flag cases: a seated member's new device, and the owner's rejoin.
-    /// `refusal` is the expected `FeatureDisabled` feature, `None` = served.
-    async fn text_join_under_flags(refusal: Option<&str>) {
+    /// The flag cases: a seated member's new device (growth) and the owner's
+    /// rejoin (recovery, S2-D32). Each refusal is the expected
+    /// `FeatureDisabled` feature, `None` = served.
+    async fn text_join_under_flags(new_device_refusal: Option<&str>, rejoin_refusal: Option<&str>) {
         let text = text_fixture().await;
         let db = &text.harness.db;
         let group_id = &text.group.id;
@@ -1231,36 +1669,41 @@ mod tests {
         )
         .await;
 
-        match refusal {
-            None => {
-                new_device.expect("a new device");
-                rejoin.expect("a rejoin");
-                assert_eq!(stored_intents(db, group_id).await.len(), 2);
-            }
-            Some(feature) => {
-                for (case, result) in [("new device", new_device), ("rejoin", rejoin)] {
+        let mut served = 0;
+        for (case, result, refusal) in [
+            ("new device", new_device, new_device_refusal),
+            ("rejoin", rejoin, rejoin_refusal),
+        ] {
+            match refusal {
+                None => {
+                    result.expect(case);
+                    served += 1;
+                }
+                Some(feature) => {
                     let body = refused(result, "FeatureDisabled", case);
                     assert_eq!(body["feature"], feature, "{}: {}", case, body);
                 }
-                assert!(stored_intents(db, group_id).await.is_empty());
             }
         }
+        assert_eq!(stored_intents(db, group_id).await.len(), served);
         assert_open_with(db, group_id, &text.group.members).await;
     }
 
     #[test]
     fn a_text_join_with_every_flag_on_is_accepted() {
-        crate::util::test::rt().block_on(text_join_under_flags(None))
+        crate::util::test::rt().block_on(text_join_under_flags(None, None))
     }
 
+    /// S1 refused the rejoin here too; S2 makes it recovery (S2-D32, §7.1
+    /// flag-off table #220), so growth off stops the new device only
     #[test]
-    fn a_text_join_with_growth_off_is_refused() {
+    fn a_text_join_with_growth_off_refuses_new_devices_only() {
         crate::util::test::rt().block_on(async {
             revolt_config::overwrite_config(|settings| {
                 settings.features.protected_channels.enabled = false;
             })
             .await;
-            text_join_under_flags(Some("protected_channels")).await
+            text_join_under_flags(Some("protected_channels"), None).await
         })
     }
 
@@ -1271,7 +1714,7 @@ mod tests {
                 settings.features.e2ee_enabled = false;
             })
             .await;
-            text_join_under_flags(Some("e2ee")).await
+            text_join_under_flags(Some("e2ee"), Some("e2ee")).await
         })
     }
 
@@ -1282,7 +1725,491 @@ mod tests {
                 settings.features.media_e2ee_enabled = false;
             })
             .await;
-            text_join_under_flags(None).await
+            text_join_under_flags(None, None).await
+        })
+    }
+
+    /// v2 (§3.13, #218): a seated member's new device and the owner's
+    /// rejoin sign the Text join payload; both signed fields are stored and
+    /// fanned out
+    #[test]
+    fn a_v2_intent_verifies_over_the_text_join_payload() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_intent_verifies_over_the_text_join_payload_case().await
+        })
+    }
+
+    async fn a_v2_intent_verifies_over_the_text_join_payload_case() {
+        let mut text = text_v2_fixture().await;
+        let group_id = text.group.id.clone();
+        let owner_id = text.owner.id.clone();
+
+        post(
+            &text.harness.db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            signed_text_intent(&text.member_device, &text.group, "m1", FIXTURE_ISSUED_AT),
+        )
+        .await
+        .expect("a new device's v2 intent");
+        let stored = text
+            .harness
+            .db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            (stored[0].generation, stored[0].issued_at),
+            (Some(0), Some(FIXTURE_ISSUED_AT))
+        );
+        assert_eq!(
+            join_request_carriers(
+                &mut text.harness,
+                &owner_id,
+                &group_id,
+                &text.member_device,
+                "m1"
+            )
+            .await,
+            (Some(0), Some(FIXTURE_ISSUED_AT), false)
+        );
+
+        let owner_device = &text.protected.owner_device;
+        post(
+            &text.harness.db,
+            &text.owner,
+            &text.owner_session,
+            &group_id,
+            signed_text_intent(owner_device, &text.group, "o1", FIXTURE_ISSUED_AT + 1),
+        )
+        .await
+        .expect("the owner's v2 rejoin");
+        assert_eq!(
+            join_request_carriers(&mut text.harness, &owner_id, &group_id, owner_device, "o1")
+                .await,
+            (Some(0), Some(FIXTURE_ISSUED_AT + 1), true)
+        );
+    }
+
+    /// v2 (§3.13, #218): an intent without `generation` or `issued_at`,
+    /// signed over the S1 payload (with or without the two fields), at
+    /// another generation, or with an out-of-range `issued_at` is
+    /// `FailedValidation`, and nothing is stored
+    #[test]
+    fn a_v2_channel_refuses_an_intent_without_the_text_payload() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_channel_refuses_an_intent_without_the_text_payload_case().await
+        })
+    }
+
+    async fn a_v2_channel_refuses_an_intent_without_the_text_payload_case() {
+        let text = text_v2_fixture().await;
+        let db = &text.harness.db;
+        let group = &text.group;
+        let group_id = &group.id;
+        let device = &text.member_device;
+        let good = || signed_text_intent(device, group, "m1", FIXTURE_ISSUED_AT);
+
+        let mut no_generation = good();
+        no_generation.generation = None;
+        let mut no_issued_at = good();
+        no_issued_at.issued_at = None;
+        let s1 = signed_intent(device, group_id, "m1");
+        let mut s1_with_fields = signed_intent(device, group_id, "m1");
+        s1_with_fields.generation = Some(0);
+        s1_with_fields.issued_at = Some(FIXTURE_ISSUED_AT);
+        let mut other_generation = good();
+        other_generation.generation = Some(1);
+        other_generation.signature =
+            device.sign(&text_payload(device, group, "m1", 1, FIXTURE_ISSUED_AT));
+        let mut out_of_range = good();
+        out_of_range.issued_at = Some(-1);
+
+        for (case, body) in [
+            ("no generation", no_generation),
+            ("no issued_at", no_issued_at),
+            ("the S1 payload", s1),
+            ("the S1 payload with both fields", s1_with_fields),
+            ("another generation", other_generation),
+            ("issued_at out of range", out_of_range),
+        ] {
+            refused(
+                post(db, &text.member, &text.member_session, group_id, body).await,
+                "FailedValidation",
+                case,
+            );
+        }
+        assert!(stored_intents(db, group_id).await.is_empty());
+
+        post(db, &text.member, &text.member_session, group_id, good())
+            .await
+            .expect("the Text join payload");
+    }
+
+    /// v1 (§3.13): the S1 payload is verified and `generation`/`issued_at`
+    /// are ignored, never stored or fanned out; an intent signed over the
+    /// Text payload is refused
+    #[test]
+    fn a_v1_channel_ignores_the_text_fields() {
+        crate::util::test::rt().block_on(a_v1_channel_ignores_the_text_fields_case())
+    }
+
+    async fn a_v1_channel_ignores_the_text_fields_case() {
+        let mut text = text_fixture().await;
+        let group_id = text.group.id.clone();
+        let owner_id = text.owner.id.clone();
+
+        let mut with_fields = signed_intent(&text.member_device, &group_id, "m1");
+        with_fields.generation = Some(0);
+        with_fields.issued_at = Some(FIXTURE_ISSUED_AT);
+        post(
+            &text.harness.db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            with_fields,
+        )
+        .await
+        .expect("the S1 payload on a v1 channel");
+        let stored = text
+            .harness
+            .db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents");
+        assert_eq!(stored.len(), 1);
+        assert_eq!((stored[0].generation, stored[0].issued_at), (None, None));
+        assert_eq!(
+            join_request_carriers(
+                &mut text.harness,
+                &owner_id,
+                &group_id,
+                &text.member_device,
+                "m1"
+            )
+            .await,
+            (None, None, false)
+        );
+
+        let (second_session, second) = new_bound_device(
+            &text.harness,
+            &text.member_account,
+            &text.member,
+            MEMBER_DEVICE_SEED + 1,
+        )
+        .await;
+        refused(
+            post(
+                &text.harness.db,
+                &text.member,
+                &second_session,
+                &group_id,
+                signed_text_intent(&second, &text.group, "m2", FIXTURE_ISSUED_AT),
+            )
+            .await,
+            "FailedValidation",
+            "the Text payload on a v1 channel",
+        );
+    }
+
+    /// S2-D28: a Text intent the route stored stays outstanding for
+    /// `text_rejoin_window_secs` (24 h by default), measured from its
+    /// server `created_at`: the rule-6 eviction it justifies is refused
+    /// 25 h on and admitted 23 h on, never at the 30 s Call window
+    #[test]
+    fn a_text_intent_stays_outstanding_for_the_text_window() {
+        crate::util::test::rt().block_on(a_text_intent_stays_outstanding_for_the_text_window_case())
+    }
+
+    async fn a_text_intent_stays_outstanding_for_the_text_window_case() {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+        let member_leaf = leaf(&text.member_device);
+
+        // Added a minute ago, so the rejoin intent is newer than the Add, as
+        // rule 6 requires
+        let added_at = Timestamp::now_utc()
+            .checked_sub(Duration::seconds(60))
+            .expect("a time");
+        let added = commit_at(
+            harness,
+            &group_id,
+            owner_device,
+            vec![member_leaf.clone()],
+            vec![],
+            added_at,
+        )
+        .await;
+        assert!(matches!(added, Ok(MlsCommitOutcome::Won)), "{:?}", added);
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            signed_intent(&text.member_device, &group_id, "m1"),
+        )
+        .await
+        .expect("the rejoin intent");
+        let intent = db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents")
+            .into_iter()
+            .find(|intent| intent.device_id == member_leaf.device_id)
+            .expect("the stored intent");
+        let later = |hours: i64| {
+            intent
+                .created_at
+                .checked_add(Duration::hours(hours))
+                .expect("a time")
+        };
+        let is_member =
+            |group: &MlsGroup| group.has_member(&member_leaf.user_id, &member_leaf.device_id);
+
+        // 25 h on: past the window, so no rule admits the Remove
+        refused(
+            commit_at(
+                harness,
+                &group_id,
+                owner_device,
+                vec![],
+                vec![member_leaf.clone()],
+                later(25),
+            )
+            .await,
+            "FailedValidation",
+            "a 25 h old intent",
+        );
+        assert!(is_member(
+            &db.fetch_mls_group(&group_id).await.expect("the group")
+        ));
+
+        // 23 h on: still outstanding, so it evicts (rule 6, recorded for the
+        // recovery re-Add) and is consumed
+        let evicted = commit_at(
+            harness,
+            &group_id,
+            owner_device,
+            vec![],
+            vec![member_leaf.clone()],
+            later(23),
+        )
+        .await;
+        assert!(
+            matches!(evicted, Ok(MlsCommitOutcome::Won)),
+            "{:?}",
+            evicted
+        );
+        let group = db.fetch_mls_group(&group_id).await.expect("the group");
+        assert!(!is_member(&group));
+        assert!(group.rejoin_readd.iter().any(|entry| {
+            entry.user_id == member_leaf.user_id && entry.device_id == member_leaf.device_id
+        }));
+        assert!(stored_intents(db, &group_id).await.is_empty());
+    }
+
+    /// #212: the join intent's cap count leaves out a device listed in
+    /// `pending_device_removals` (the Add that follows must remove it in
+    /// the same commit), and nothing else
+    #[test]
+    fn the_device_cap_excludes_pending_device_removals_only() {
+        crate::util::test::rt()
+            .block_on(the_device_cap_excludes_pending_device_removals_only_case())
+    }
+
+    async fn the_device_cap_excludes_pending_device_removals_only_case() {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+
+        // Entitlement cap 2, and the member holds 2 member devices
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, Some(2))
+            .await;
+        let second = registered_leaf(harness, &text.member, 0x21).await;
+        add_to_group(
+            harness,
+            &group_id,
+            owner_device,
+            vec![leaf(&text.member_device), second.clone()],
+        )
+        .await;
+        let (third_session, third) =
+            new_bound_device(harness, &text.member_account, &text.member, 0x23).await;
+        let third_intent = || signed_intent(&third, &group_id, "m3");
+        let body = refused(
+            post(db, &text.member, &third_session, &group_id, third_intent()).await,
+            "DeviceCapReached",
+            "at the cap",
+        );
+        assert_eq!(body["max"], 2, "{}", body);
+
+        // The second device is queued for removal, so it no longer counts
+        let channels = db
+            .add_pending_device_removal(&second.user_id, &second.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending entry");
+        assert_eq!(channels, vec![text.protected.channel.id().to_string()]);
+        post(db, &text.member, &third_session, &group_id, third_intent())
+            .await
+            .expect("under the cap once the pending device is left out");
+        assert!(stored_intents(db, &group_id)
+            .await
+            .contains(&(text.member.id.clone(), third.device_id.clone())));
+    }
+
+    /// How the list signer's device was lost
+    enum SignerLoss {
+        /// The open group carries `signer_lost`; the identity is still there
+        Flagged,
+        /// The identity is gone and nothing set `signer_lost`
+        IdentityGone,
+    }
+
+    /// #213 with the growth flag off: the signer user's replacement device
+    /// is growth until the signer device is lost, then recovery; the lost
+    /// device's leaf still counts toward the cap (#212); a seated member's
+    /// new device stays growth throughout
+    async fn the_signer_users_replacement_is_recovery(loss: SignerLoss) {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+        let (replacement_session, replacement) = new_bound_device(
+            harness,
+            &text.owner_account,
+            &text.owner,
+            NEW_OWNER_DEVICE_SEED,
+        )
+        .await;
+        let replacement_intent = || signed_intent(&replacement, &group_id, "r1");
+
+        let body = refused(
+            post(
+                db,
+                &text.owner,
+                &replacement_session,
+                &group_id,
+                replacement_intent(),
+            )
+            .await,
+            "FeatureDisabled",
+            "before the loss",
+        );
+        assert_eq!(body["feature"], "protected_channels", "{}", body);
+
+        match loss {
+            SignerLoss::Flagged => {
+                let channels = db
+                    .add_pending_device_removal(
+                        &owner_device.user_id,
+                        &owner_device.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                    .expect("signer_lost");
+                assert_eq!(channels, vec![text.protected.channel.id().to_string()]);
+                let group = db.fetch_mls_group(&group_id).await.expect("the group");
+                assert!(group.signer_lost.is_some());
+                db.fetch_e2ee_identity(&owner_device.user_id, &owner_device.device_id)
+                    .await
+                    .expect("the signer identity is still registered");
+            }
+            SignerLoss::IdentityGone => {
+                assert!(db
+                    .delete_e2ee_device(&owner_device.user_id, &owner_device.device_id)
+                    .await
+                    .expect("the identity delete"));
+                let group = db.fetch_mls_group(&group_id).await.expect("the group");
+                assert!(group.signer_lost.is_none());
+            }
+        }
+
+        // The lost device still holds its leaf: at cap 1 the replacement is
+        // refused, and recovery goes through a successor instead (§6.3)
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, Some(1))
+            .await;
+        let body = refused(
+            post(
+                db,
+                &text.owner,
+                &replacement_session,
+                &group_id,
+                replacement_intent(),
+            )
+            .await,
+            "DeviceCapReached",
+            "the lost leaf counts",
+        );
+        assert_eq!(body["max"], 1, "{}", body);
+
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        post(
+            db,
+            &text.owner,
+            &replacement_session,
+            &group_id,
+            replacement_intent(),
+        )
+        .await
+        .expect("the replacement device, growth off");
+        assert!(stored_intents(db, &group_id)
+            .await
+            .contains(&(text.owner.id.clone(), replacement.device_id.clone())));
+
+        let body = refused(
+            post(
+                db,
+                &text.member,
+                &text.member_session,
+                &group_id,
+                signed_intent(&text.member_device, &group_id, "m1"),
+            )
+            .await,
+            "FeatureDisabled",
+            "a member's new device",
+        );
+        assert_eq!(body["feature"], "protected_channels", "{}", body);
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_while_signer_lost() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::Flagged).await
+        })
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_when_its_identity_is_gone() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::IdentityGone).await
         })
     }
 
@@ -1452,8 +2379,10 @@ mod tests {
             .await
             .expect("the hidden channel");
 
-        // The owner (a viewer, seated, bound) reaches the join rules: served
-        // whenever the growth gate passes, media flag or not
+        // The owner (a viewer, seated, bound) reaches the join rules. Its
+        // device holds the group's leaf, so its intent is a rejoin, which is
+        // recovery (S2-D32): served whenever E2EE is on, growth or media
+        // flag or not
         let owner_answer = post(
             db,
             &oracle.owner,
@@ -1462,10 +2391,11 @@ mod tests {
             signed_intent(&oracle.owner_device, &oracle.hidden_group_id, "o1"),
         )
         .await;
-        if features.e2ee_enabled && features.protected_channels.enabled {
+        if features.e2ee_enabled {
             owner_answer.expect("the owner is served");
         } else {
-            refused(owner_answer, "FeatureDisabled", "the owner, a gate off");
+            let body = refused(owner_answer, "FeatureDisabled", "the owner, E2EE off");
+            assert_eq!(body["feature"], "e2ee", "{}", body);
         }
 
         for caller in &oracle.callers {

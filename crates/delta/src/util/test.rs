@@ -1074,7 +1074,8 @@ impl TestHarness {
     }
 
     /// Store `data` as `channel`'s next seat list through the database
-    /// primitive, claims allowed (no signature or route check)
+    /// primitive, claims allowed, with a removal reason (no signature or
+    /// route check)
     pub async fn put_seats_with_db(
         &self,
         channel: &Channel,
@@ -1086,6 +1087,7 @@ impl TestHarness {
                 &SeatListSubmission::from(data.clone()),
                 true,
                 Timestamp::now_utc(),
+                Some("test fixture"),
             )
             .await
             .expect("Failed to store test seat list")

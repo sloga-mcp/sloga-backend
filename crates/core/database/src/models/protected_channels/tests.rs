@@ -18,18 +18,20 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     channel_seats_used, check_removal_reason, check_seat_list_authority, check_seat_list_v2_lines,
-    plan_seat_list_write, resolve_signer_lost, retain_member_pending_device_removals,
-    seat_list_removed_users, text_group_id_v2, text_group_id_v2_input, AuthorityOwnerDevice,
-    AuthorityUserDevice, Channel, ChannelAuthority, ChannelAuthorityBody, ChannelEntitlement,
-    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
-    E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval, MlsPendingRemoval,
-    MlsRejoinReadd, MlsSignerLost, MlsSignerLostCause, SeatList, SeatListBody, SeatListHistory,
-    SeatListPreHistory, SeatListSubmission, SeatListV2Lines, SeatListWriteDecision,
-    SeatListWriteInput, SeatListWriteKind, SeatListWritePlan, SeatReleaseCause, Server,
-    SignedAuthority, SignedHandover, SignerLostResolution, SuccessionStatement, TextJoinPayload,
-    E2EE_PROTOCOL_VERSION, MAX_COMMIT_AD_LEN, MAX_SEAT_LIST_HANDOVERS, PROTECTED_SCOPE_SEATS,
-    PROTECTED_SCOPE_TEXT_GROUP, SEAT_COOLDOWN_DAYS,
+    plan_seat_list_write, prepare_text_group, resolve_signer_lost,
+    retain_member_pending_device_removals, seat_list_removed_users, text_group_id_v2,
+    text_group_id_v2_input, AuthorityOwnerDevice, AuthorityUserDevice, Channel, ChannelAuthority,
+    ChannelAuthorityBody, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
+    ChannelSeat, Database, E2EEContentType, E2EEEnvelope, HandoverBody, Member, MemberCompositeKey,
+    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberAdded, MlsMemberDevice,
+    MlsPendingDeviceRemoval, MlsPendingRemoval, MlsRejoinReadd, MlsSignerLost, MlsSignerLostCause,
+    SeatList, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListSubmission,
+    SeatListV2Lines, SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind,
+    SeatListWritePlan, SeatReleaseCause, Server, SignedAuthority, SignedHandover,
+    SignerLostResolution, SuccessionStatement, TextGroupCreator, TextJoinPayload,
+    E2EE_PROTOCOL_VERSION, MAX_COMMIT_AD_LEN, MAX_SEAT_LIST_HANDOVERS, MAX_TEXT_GROUP_GENERATION,
+    MAX_TEXT_GROUP_GENERATION_V2, PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP,
+    SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -41,6 +43,10 @@ const DEVICE_A: &str = "00112233445566778899aabbccddeeff";
 const DEVICE_A2: &str = "0123456789abcdef0123456789abcdef";
 const DEVICE_B: &str = "ffeeddccbbaa99887766554433221100";
 const SERVER: &str = "01HZXSERVERSERVERSERVERSER";
+
+/// The `X-Audit-Log-Reason` every seat PUT here carries unless a test is
+/// about step 4d (a list that releases anyone needs one)
+const SEAT_PUT_REASON: &str = "seat list test";
 
 // Section 5.3 / 5.4 / 5.7 vectors
 const VECTOR_BODY: &str = "sloga-seat-list-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:3\ndevice_cap:5\nissued_at:1790812800000\nsigner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nseats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC";
@@ -679,7 +685,13 @@ async fn protect_and_put_follow_the_version_rule() {
         // Strictly stored + 1
         for version in [3, 4, 1_000] {
             let error = db
-                .put_seat_list(CHANNEL, &submit(version, &[USER_A, USER_B]), true, at(0))
+                .put_seat_list(
+                    CHANNEL,
+                    &submit(version, &[USER_A, USER_B]),
+                    true,
+                    at(0),
+                    Some(SEAT_PUT_REASON),
+                )
                 .await
                 .unwrap_err();
             assert!(is_failed_validation(&error), "version {version}");
@@ -689,7 +701,7 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut other_v1 = submit(1, &[USER_A]);
         other_v1.body = body_with(1, 1_790_812_800_001, &[USER_A]);
         let error = db
-            .put_seat_list(CHANNEL, &other_v1, true, at(0))
+            .put_seat_list(CHANNEL, &other_v1, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -698,13 +710,19 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut resigned_v1 = submit(1, &[USER_A]);
         resigned_v1.signature = signature(40);
         let error = db
-            .put_seat_list(CHANNEL, &resigned_v1, true, at(0))
+            .put_seat_list(CHANNEL, &resigned_v1, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(!outcome.unchanged);
@@ -714,7 +732,13 @@ async fn protect_and_put_follow_the_version_rule() {
         // Byte-identical re-PUT: stored success, no side effects
         let seats_before = db.fetch_channel_seats(CHANNEL).await.unwrap();
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -724,7 +748,13 @@ async fn protect_and_put_follow_the_version_rule() {
 
         // A different list at version 2 is refused
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -733,7 +763,7 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut wrong_device = submit(3, &[USER_A]);
         wrong_device.signer_device_id = DEVICE_A2.to_string();
         let error = db
-            .put_seat_list(CHANNEL, &wrong_device, true, at(0))
+            .put_seat_list(CHANNEL, &wrong_device, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -743,6 +773,7 @@ async fn protect_and_put_follow_the_version_rule() {
                 &submit(3, &[USER_A]),
                 true,
                 at(0),
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -797,9 +828,15 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
             .await
             .unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         // S2 (2.3, S2-D21): B holds a device in the Text group, so its
         // releases cool; a seat whose user never received the keys frees at
         // once (`an_unused_seat_frees_its_slot_at_once_on_every_release_path`)
@@ -813,7 +850,13 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         .await;
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -826,14 +869,26 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
 
         // A new user does not fit while B cools
         let error = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // Re-seating the cooling user reactivates the row, no new slot
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -844,26 +899,50 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         assert_eq!(seats.len(), 2);
 
         // Release again at day 1: cooling until day 15
-        db.put_seat_list(CHANNEL, &submit(5, &[USER_A]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(5, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // Day 14 is still inside the cooldown
         let error = db
-            .put_seat_list(CHANNEL, &submit(6, &[USER_A, USER_C]), true, at(14))
+            .put_seat_list(
+                CHANNEL,
+                &submit(6, &[USER_A, USER_C]),
+                true,
+                at(14),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // A removal-only list is never refused by the cap (7.1)
         // (here: the same seats, so nothing is claimed)
-        db.put_seat_list(CHANNEL, &submit(6, &[USER_A]), true, at(14))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(6, &[USER_A]),
+            true,
+            at(14),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // Day 16: B's cooldown is over and its slot is free
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(7, &[USER_A, USER_C]), true, at(16))
+            .put_seat_list(
+                CHANNEL,
+                &submit(7, &[USER_A, USER_C]),
+                true,
+                at(16),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_C]);
@@ -929,6 +1008,7 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     &submit(2, &[USER_A, winner.as_str(), new.as_str()]),
                     true,
                     at(0),
+                    Some(SEAT_PUT_REASON),
                 )
                 .await
             }));
@@ -986,7 +1066,8 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     handover: None,
                     authority: None,
                 };
-                db.put_seat_list(CHANNEL, &submission, true, at(0)).await
+                db.put_seat_list(CHANNEL, &submission, true, at(0), Some(SEAT_PUT_REASON))
+                    .await
             }));
         }
         let mut landed = Vec::new();
@@ -1045,7 +1126,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // Unseat B: released, pending removal, and the new hash, together
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -1070,7 +1157,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // An identical re-PUT adds nothing
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -1084,7 +1177,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // A later list never duplicates the pending entry, but moves the hash
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(outcome.pending_removals_added.is_empty());
@@ -1109,23 +1208,41 @@ async fn byte_identical_reput_succeeds_after_the_signer_lost_its_leaf() {
             .unwrap();
         let group = text_group(0xbb, &owner, 0);
         db.create_text_mls_group(&group, None).await.unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // The signer device's leaf is gone (rejoin case)
         set_group_members(&db, &group.id, vec![device(USER_B, DEVICE_B)]).await;
 
         // 5b refuses a NEW list from a signer without a leaf
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // ... but the lost-response retry of the stored list still succeeds
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -1234,7 +1351,7 @@ async fn handover_chain_is_append_only_and_capped() {
                 signature: signature(version),
             });
             let outcome = db
-                .put_seat_list(CHANNEL, &submission, true, at(0))
+                .put_seat_list(CHANNEL, &submission, true, at(0), Some(SEAT_PUT_REASON))
                 .await
                 .unwrap();
             assert_eq!(outcome.list.handovers.len() as i64, version - 1);
@@ -1251,14 +1368,20 @@ async fn handover_chain_is_append_only_and_capped() {
             signature: signature(next),
         });
         let error = db
-            .put_seat_list(CHANNEL, &over, true, at(0))
+            .put_seat_list(CHANNEL, &over, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // Without a handover the list still advances; the chain is kept
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(next, &[USER_A]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(next, &[USER_A]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.list.handovers.len(), MAX_SEAT_LIST_HANDOVERS);
@@ -1336,7 +1459,13 @@ async fn forced_release_releases_the_seat_and_adds_one_pending_removal() {
 
         // The owner's later unseat neither re-releases nor duplicates
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(outcome.released.is_empty());
@@ -1509,7 +1638,7 @@ async fn text_group_create_never_binds_a_stale_seat_list() {
             let next = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (created, put) = tokio::join!(
                 db.create_text_mls_group(&group, None),
-                db.put_seat_list(&channel_id, &next, true, at(0))
+                db.put_seat_list(&channel_id, &next, true, at(0), Some(SEAT_PUT_REASON))
             );
             assert_eq!(
                 created.expect("create must not error"),
@@ -1544,7 +1673,7 @@ async fn lowering_the_slot_cap_never_skews_against_a_seat_claim() {
             let claim = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (granted, put) = tokio::join!(
                 db.upsert_channel_entitlement(&lowered, at(0)),
-                db.put_seat_list(&channel_id, &claim, true, at(0))
+                db.put_seat_list(&channel_id, &claim, true, at(0), Some(SEAT_PUT_REASON))
             );
 
             // Exactly one lands; the other sees it and hits the cap
@@ -1686,8 +1815,14 @@ async fn seat_put_lands_while_text_commits_stream_in() {
                     };
                     let submission = submit_in(&channel_id, version, seats);
                     results.push(
-                        db.put_seat_list(&channel_id, &submission, true, at(0))
-                            .await,
+                        db.put_seat_list(
+                            &channel_id,
+                            &submission,
+                            true,
+                            at(0),
+                            Some(SEAT_PUT_REASON),
+                        )
+                        .await,
                     );
                 }
                 // Keep streaming until a commit lands on the newest hash
@@ -1791,9 +1926,15 @@ async fn genesis_reprotect_is_the_stored_success_and_writes_nothing() {
         assert!(is_invalid_operation(&error), "{error:?}");
 
         // Once the stored list is past version 1, the genesis retry is refused
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         let error = db
             .protect_channel(CHANNEL, &genesis, at(5))
             .await
@@ -1828,7 +1969,13 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
 
         // Flag off: a new claim is refused and nothing is written
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), false, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                false,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
@@ -1841,7 +1988,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag on: B and C are seated
         let seated = submit(2, &[USER_A, USER_B, USER_C]);
         let outcome = db
-            .put_seat_list(CHANNEL, &seated, true, at(0))
+            .put_seat_list(CHANNEL, &seated, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B, USER_C]);
@@ -1854,7 +2001,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag off: the byte-identical retry of the list that landed still
         // succeeds, although applying it again would reactivate C's seat
         let again = db
-            .put_seat_list(CHANNEL, &seated, false, at(1))
+            .put_seat_list(CHANNEL, &seated, false, at(1), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert!(again.unchanged, "{again:?}");
@@ -1862,14 +2009,26 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // C1 (W2 audit): a list that still names C, whom the server removed
         // since v2, is refused before the flag is even looked at
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                false,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_removed_users(&error, &[USER_C]), "{error:?}");
 
         // Flag off: a removal-only list lands
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), false, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                false,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -1878,7 +2037,13 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag off: reactivating a cooling seat is a claim (B's, which the
         // owner's v3 released)
         let error = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), false, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                false,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
@@ -1903,7 +2068,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
             authority: None,
         };
         let outcome = db
-            .put_seat_list(CHANNEL, &capped, false, at(2))
+            .put_seat_list(CHANNEL, &capped, false, at(2), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert!(!outcome.unchanged);
@@ -2001,6 +2166,7 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
                 &submit(2, &[USER_A, USER_C, stranger.as_str()]),
                 true,
                 at(0),
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -2012,7 +2178,13 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
         .await
         .unwrap();
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B, USER_C]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error), "{error:?}");
@@ -2029,9 +2201,15 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
         })
         .await
         .unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_C]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
     });
 }
 
@@ -2064,7 +2242,13 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
 
         // The stored list's retry is still the stored success
         let again = db
-            .put_seat_list(CHANNEL, &submit(1, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(1, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged, "{again:?}");
@@ -2076,6 +2260,7 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
                     &submit(2, &[USER_A, USER_B, USER_C]),
                     allow_claims,
                     at(1),
+                    Some(SEAT_PUT_REASON),
                 )
                 .await
                 .unwrap_err();
@@ -2103,7 +2288,13 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
 
         // The list without B lands
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_C]);
@@ -2112,12 +2303,24 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
         // Only now is B's re-seat an ordinary claim: refused with the
         // growth flag off, landed with it on
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                false,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -2155,12 +2358,24 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
 
         // The owner unseats B, then seats B again
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -2177,6 +2392,7 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
                 &submit(4, &[USER_A, USER_B, USER_C]),
                 true,
                 expired,
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -2187,7 +2403,13 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
             .await
             .unwrap();
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, expired)
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                true,
+                expired,
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_A]);
@@ -2337,7 +2559,13 @@ async fn a_removed_user_whose_seat_row_is_gone_is_still_refused() {
             .all(|seat| seat.user_id != USER_B));
 
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_removed_users(&error, &[USER_B]), "{error:?}");
@@ -2495,7 +2723,9 @@ async fn seat_puts_racing_a_kick_never_seat_a_non_member() {
                     };
                     let list = submit_in(&channel_id, version, seats);
                     let started = Instant::now();
-                    let put = db.put_seat_list(&channel_id, &list, true, at(0)).await;
+                    let put = db
+                        .put_seat_list(&channel_id, &list, true, at(0), Some(SEAT_PUT_REASON))
+                        .await;
                     if step % 2 == 0 {
                         tally.claims.push((started, Instant::now()));
                     }
@@ -5079,13 +5309,33 @@ fn active_seats(users: &[&str]) -> Vec<ChannelSeat> {
         .collect()
 }
 
-/// The planner as a driver calls it (no open Text group, claims allowed)
+/// The planner as a driver calls it (no open Text group, claims allowed,
+/// a removal reason)
 fn plan(
     kind: SeatListWriteKind,
     submission: &SeatListSubmission,
     stored: Option<&SeatList>,
     seats: &[ChannelSeat],
     formats_v2: bool,
+) -> revolt_result::Result<SeatListWriteDecision> {
+    plan_with_reason(
+        kind,
+        submission,
+        stored,
+        seats,
+        formats_v2,
+        Some(SEAT_PUT_REASON),
+    )
+}
+
+/// [`plan`] with the PUT's `removal_reason` as given (4.3 step 4d)
+fn plan_with_reason(
+    kind: SeatListWriteKind,
+    submission: &SeatListSubmission,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+    formats_v2: bool,
+    removal_reason: Option<&str>,
 ) -> revolt_result::Result<SeatListWriteDecision> {
     let entitlement = entitlement(100);
     plan_seat_list_write(&SeatListWriteInput {
@@ -5099,6 +5349,7 @@ fn plan(
         allow_claims: true,
         formats_v2,
         text_group_users: &BTreeSet::new(),
+        removal_reason,
         now: at(1),
     })
 }
@@ -5773,6 +6024,98 @@ fn step4d_a_release_needs_a_non_empty_reason() {
     assert!(check_removal_reason(&[], None).is_ok());
 }
 
+/// 4.3 step 4d wired into the planner: a list that releases B is refused
+/// without a reason (absent, empty, whitespace only) and lands with one;
+/// the byte-identical retry of the stored list and a list that only claims
+/// need none. Control: the `check_removal_reason` call removed from
+/// `plan_seat_list_write`.
+#[test]
+fn step4d_the_planner_refuses_a_release_without_a_reason() {
+    let stored = stored_row(&submit(1, &[USER_A, USER_B]));
+    let seats = active_seats(&[USER_A, USER_B]);
+    let unseat = submit(2, &[USER_A]);
+    let put = |submission: &SeatListSubmission, reason: Option<&str>| {
+        plan_with_reason(
+            SeatListWriteKind::Put,
+            submission,
+            Some(&stored),
+            &seats,
+            false,
+            reason,
+        )
+    };
+
+    for reason in [None, Some(""), Some("  ")] {
+        let error = put(&unseat, reason).unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{reason:?}: {error:?}"
+        );
+    }
+    let landed = applied(put(&unseat, Some("left the team")).unwrap());
+    assert_eq!(landed.released, vec![USER_B.to_string()]);
+
+    let retry = put(&submit(1, &[USER_A, USER_B]), None).unwrap();
+    assert!(
+        matches!(retry, SeatListWriteDecision::Unchanged(_)),
+        "{retry:?}"
+    );
+
+    let growth = applied(put(&submit(2, &[USER_A, USER_B, USER_C]), None).unwrap());
+    assert_eq!(growth.claimed, vec![USER_C.to_string()]);
+    assert!(growth.released.is_empty());
+}
+
+/// 4.3 step 4d through both drivers: a PUT that releases B without a
+/// reason is `RemovalReasonRequired` and writes nothing (neither the list
+/// nor B's seat); with one it lands, and its byte-identical retry without
+/// one is the stored success. Control: the reason check moved after the
+/// write (the refused PUT then leaves version 2 stored).
+#[tokio::test]
+async fn step4d_a_releasing_put_without_a_reason_writes_nothing() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let sorted_seats = |mut seats: Vec<ChannelSeat>| {
+            seats.sort_by(|a, b| a.id.cmp(&b.id));
+            seats
+        };
+        let list_before = db.fetch_seat_list(CHANNEL).await.unwrap();
+        let seats_before = sorted_seats(db.fetch_channel_seats(CHANNEL).await.unwrap());
+
+        let unseat = submit(2, &[USER_A]);
+        let error = db
+            .put_seat_list(CHANNEL, &unseat, true, at(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{error:?}"
+        );
+        assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap(), list_before);
+        assert_eq!(
+            sorted_seats(db.fetch_channel_seats(CHANNEL).await.unwrap()),
+            seats_before
+        );
+
+        let outcome = db
+            .put_seat_list(CHANNEL, &unseat, true, at(1), Some("left the team"))
+            .await
+            .unwrap();
+        assert!(!outcome.unchanged);
+        assert_eq!(outcome.released, vec![USER_B.to_string()]);
+
+        let retry = db
+            .put_seat_list(CHANNEL, &unseat, true, at(2), None)
+            .await
+            .unwrap();
+        assert!(retry.unchanged);
+        assert_eq!(retry.list.version, 2);
+    });
+}
+
 // --- 4.3 step 7 (`signer_lost`; #222, #224) ----------------------------------
 
 /// An open Text group whose `signer_lost` names A's first device
@@ -6205,12 +6548,24 @@ async fn release_channel_seat_is_a_compare_and_set_on_seated_at() {
 
         // The owner re-seats B (C1: a list without B lands first); a
         // reconcile that read the old seat now matches nothing
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(2))
-            .await
-            .unwrap();
-        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         let seat = seat_of(&db, CHANNEL, USER_B).await;
         assert_eq!(seat.seated_at, at(2));
         assert_eq!(seat.release_cause, None, "a re-seat clears the cause");
@@ -6331,14 +6686,26 @@ async fn an_unused_seat_frees_its_slot_at_once_on_every_release_path() {
 
         // The owner's unseat; the slot is free at once (cap 2)
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
         assert_freed(seat_of(&db, CHANNEL, USER_B).await);
-        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_C]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_C]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // The reconciler's release
         assert!(db
@@ -6348,12 +6715,24 @@ async fn an_unused_seat_frees_its_slot_at_once_on_every_release_path() {
         assert_freed(seat_of(&db, CHANNEL, USER_C).await);
 
         // The forced release, with a Text group that never held B
-        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(2))
-            .await
-            .unwrap();
-        db.put_seat_list(CHANNEL, &submit(5, &[USER_A, USER_B]), true, at(2))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(5, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         db.create_text_mls_group(&text_group(0xcc, &device(USER_A, DEVICE_A), 0), None)
             .await
             .unwrap();
@@ -6423,6 +6802,7 @@ async fn a_used_seat_cools_on_every_release_path() {
                 &submit(2, &[user_d.as_str(), USER_A, USER_C]),
                 true,
                 at(1),
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap();
@@ -6593,9 +6973,15 @@ async fn every_seat_list_write_drops_pending_device_entries_of_non_members() {
         })
         .await;
 
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             open_group(&db, CHANNEL).await.pending_device_removals,
             vec![pending_device(USER_B, DEVICE_B, 0)]
@@ -6603,9 +6989,15 @@ async fn every_seat_list_write_drops_pending_device_entries_of_non_members() {
 
         // B's device leaves; the next write drops the last entry
         set_group_members(&db, &group_id, vec![device(USER_A, DEVICE_A)]).await;
-        db.put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         assert!(open_group(&db, CHANNEL)
             .await
             .pending_device_removals
@@ -6706,6 +7098,7 @@ async fn while_signer_lost_is_set_a_list_without_a_recovery_authority_is_refused
                     &submit_by(signer_device, 2, &[USER_A]),
                     true,
                     at(1),
+                    Some(SEAT_PUT_REASON),
                 )
                 .await
                 .unwrap_err();
@@ -6719,10 +7112,16 @@ async fn while_signer_lost_is_set_a_list_without_a_recovery_authority_is_refused
         assert_eq!(open_group(&db, CHANNEL).await, before);
 
         assert!(
-            db.put_seat_list(CHANNEL, &submit(1, &[USER_A, USER_B]), true, at(1))
-                .await
-                .unwrap()
-                .unchanged
+            db.put_seat_list(
+                CHANNEL,
+                &submit(1, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON)
+            )
+            .await
+            .unwrap()
+            .unchanged
         );
     });
 }
@@ -6780,7 +7179,7 @@ async fn a_recovery_list_clears_signer_lost_and_queues_the_lost_leaf() {
             authority: Some(recovery),
         };
         let outcome = db
-            .put_seat_list(CHANNEL, &submission, true, at(1))
+            .put_seat_list(CHANNEL, &submission, true, at(1), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert!(outcome.signer_lost_cleared);
@@ -6886,7 +7285,9 @@ async fn protect_and_put_read_formats_v2_from_the_config() {
         // The upgrade over a stored v1 list
         replace_seat_list(&db, &stored_row(&v1)).await;
         let upgrade = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
-        let result = db.put_seat_list(CHANNEL, &upgrade, true, at(1)).await;
+        let result = db
+            .put_seat_list(CHANNEL, &upgrade, true, at(1), Some(SEAT_PUT_REASON))
+            .await;
         if formats_v2 {
             assert!(result.unwrap().list.is_v2());
         } else {
@@ -6914,7 +7315,13 @@ async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
         .await;
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -6924,7 +7331,13 @@ async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
 
         // The re-seat reactivates the cooling row and keeps the stamp
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -6934,7 +7347,13 @@ async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
 
         // The second unseat cools from now; it is not `DeviceNeverJoined`
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -6948,7 +7367,13 @@ async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
 
         // So the slot does not pass to C
         let error = db
-            .put_seat_list(CHANNEL, &submit(5, &[USER_A, USER_C]), true, at(4))
+            .put_seat_list(
+                CHANNEL,
+                &submit(5, &[USER_A, USER_C]),
+                true,
+                at(4),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2), "{error:?}");
@@ -6973,21 +7398,39 @@ async fn a_reseat_after_a_never_joined_release_still_frees_at_once() {
             assert_eq!(seat.cooldown_until, None);
         };
 
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         assert_freed(seat_of(&db, CHANNEL, USER_B).await);
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
         assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
 
-        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, at(2))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         assert_freed(seat_of(&db, CHANNEL, USER_B).await);
         assert_eq!(
             channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(2)),
@@ -7011,25 +7454,43 @@ async fn a_reseat_after_the_cooldown_ended_starts_unstamped() {
         })
         .await;
 
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         let seat = seat_of(&db, CHANNEL, USER_B).await;
         assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
 
         let expired = at(1 + SEAT_COOLDOWN_DAYS + 1);
         assert!(!seat.is_cooling(expired));
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B]), true, expired)
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                expired,
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
         assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
 
         let later = at(1 + SEAT_COOLDOWN_DAYS + 2);
-        db.put_seat_list(CHANNEL, &submit(4, &[USER_A]), true, later)
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            later,
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         let seat = seat_of(&db, CHANNEL, USER_B).await;
         assert_eq!(
             seat.release_cause,
@@ -7061,4 +7522,158 @@ fn a_cooling_reseat_of_a_fallback_release_stamps_the_release_time() {
         .unwrap();
     assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
     assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+}
+
+// --- 6.1 Text create: the generation cap and the creator rule ---------------
+
+/// CHANNEL's stored v1 list (version 1, seats A and B), signed by A's first
+/// device
+fn stored_text_list() -> SeatList {
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: 1,
+        body: body_with(1, 1_790_812_800_000, &[USER_A, USER_B]),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(1),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: None,
+    }
+}
+
+/// `prepare_text_group` of a creator-only group by `creator` at
+/// `generation`, against [`stored_text_list`]
+fn prepare_by(
+    creator: &MlsMemberDevice,
+    generation: u32,
+    rule: &TextGroupCreator,
+) -> revolt_result::Result<MlsGroup> {
+    prepare_text_group(&text_group(0x01, creator, generation), &stored_text_list(), rule)
+}
+
+/// S2-D33 (#204): one cap, 65535, on both the S1 and the v2 names; every
+/// generation up to it is prepared, 65536 is refused. Control: cap at 63.
+#[test]
+fn prepare_text_group_caps_the_generation_at_65535() {
+    assert_eq!(MAX_TEXT_GROUP_GENERATION, 65_535);
+    assert_eq!(MAX_TEXT_GROUP_GENERATION_V2, MAX_TEXT_GROUP_GENERATION);
+
+    let owner = device(USER_A, DEVICE_A);
+    for generation in [0, 63, 64, 65_535] {
+        let prepared = prepare_by(&owner, generation, &TextGroupCreator::SignerDevice).unwrap();
+        assert_eq!(prepared.generation, Some(generation));
+        assert_eq!(prepared.kind, MlsGroupKind::Text);
+    }
+    let error = prepare_by(&owner, 65_536, &TextGroupCreator::SignerDevice).unwrap_err();
+    assert!(is_failed_validation(&error));
+}
+
+/// 6.1 (S2-D17d, #213), pure: under the rule only the list's signer device
+/// creates; under the recovery exception another device of the signer USER
+/// creates a successor, but never a first group, never from the lost device
+/// itself, never for another user, and never once the list names a signer
+/// device other than the lost one. Controls: drop each recovery condition.
+#[test]
+fn prepare_text_group_admits_another_signer_user_device_only_for_recovery() {
+    let signer = device(USER_A, DEVICE_A);
+    let other = device(USER_A, DEVICE_A2);
+    let recovery = TextGroupCreator::SignerUserRecovery {
+        lost_device_id: DEVICE_A.to_string(),
+    };
+
+    prepare_by(&signer, 0, &TextGroupCreator::SignerDevice).unwrap();
+    prepare_by(&signer, 1, &TextGroupCreator::SignerDevice).unwrap();
+    let error = prepare_by(&other, 1, &TextGroupCreator::SignerDevice).unwrap_err();
+    assert!(is_failed_validation(&error), "another device under the rule");
+
+    let prepared = prepare_by(&other, 1, &recovery).unwrap();
+    assert_eq!(prepared.created_by, other);
+    assert_eq!(prepared.members, vec![other.clone()]);
+    assert_eq!(prepared.member_added.len(), 1);
+    assert_eq!(prepared.member_added[0].device_id, DEVICE_A2);
+    assert_eq!(prepared.member_added[0].epoch, 0);
+    assert_eq!(prepared.signer_lost, None);
+
+    let stale = TextGroupCreator::SignerUserRecovery {
+        lost_device_id: DEVICE_C.to_string(),
+    };
+    for (case, creator, generation, rule) in [
+        ("a first group", &other, 0, &recovery),
+        ("the lost device itself", &signer, 1, &recovery),
+        ("another user", &device(USER_B, DEVICE_B), 1, &recovery),
+        ("the list names another signer device", &other, 1, &stale),
+    ] {
+        let error = prepare_by(creator, generation, rule).unwrap_err();
+        assert!(is_failed_validation(&error), "{case}: {error:?}");
+    }
+}
+
+/// 6.1 (S2-D17d, #213) through both drivers: a recovery successor by another
+/// device of the signer user lands and carries `signer_lost` over; the same
+/// create under the signer-device rule, and a recovery once a list naming
+/// another signer device has landed, are refused and write nothing.
+/// Control: the drivers ignore `creator` (always the signer-device rule).
+#[tokio::test]
+async fn a_recovery_successor_by_a_signer_user_device_lands_through_both_drivers() {
+    database_test!(|db| async move {
+        let first = protected_with_group(&db, &[USER_A, USER_B], vec![device(USER_A, DEVICE_A)])
+            .await;
+        edit_group(&db, &first, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+        let recovery = TextGroupCreator::SignerUserRecovery {
+            lost_device_id: DEVICE_A.to_string(),
+        };
+
+        // Under the rule another device of the owner is refused
+        let successor = text_group(0xdd, &device(USER_A, DEVICE_A2), 1);
+        let error = db
+            .create_text_mls_group(&successor, Some(&first))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error));
+        assert_eq!(open_group(&db, CHANNEL).await.id, first);
+
+        assert_eq!(
+            db.create_text_mls_group_as(&successor, Some(&first), &recovery)
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.id, successor.id);
+        assert_eq!(stored.created_by, device(USER_A, DEVICE_A2));
+        assert_eq!(stored.signer_lost, Some(lost(DEVICE_A, 0)));
+        assert_eq!(stored.member_added.len(), 1);
+        assert_eq!(stored.member_added[0].device_id, DEVICE_A2);
+
+        // A list naming another signer device landed after the route's
+        // reads: the recovery premise is stale
+        let mut row = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+        let moved = submit_by(DEVICE_A2, 2, &[USER_A, USER_B]);
+        row.version = 2;
+        row.body = moved.body;
+        row.signature = moved.signature;
+        row.signer_device_id = DEVICE_A2.to_string();
+        replace_seat_list(&db, &row).await;
+
+        let stale = text_group(0xee, &device(USER_A, DEVICE_C), 2);
+        let error = db
+            .create_text_mls_group_as(&stale, Some(&successor.id), &recovery)
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error));
+        assert_eq!(open_group(&db, CHANNEL).await.id, successor.id);
+
+        // The new signer device creates it under the rule
+        let next = text_group(0xee, &device(USER_A, DEVICE_A2), 2);
+        assert_eq!(
+            db.create_text_mls_group(&next, Some(&successor.id))
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+    });
 }

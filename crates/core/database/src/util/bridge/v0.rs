@@ -3865,9 +3865,15 @@ mod seat_list_authority_driver_tests {
 
     async fn put(db: &crate::Database, list: v0::DataSeatList) -> crate::SeatList {
         let submission: crate::SeatListSubmission = list.into();
-        db.put_seat_list(CHANNEL, &submission, true, Timestamp::now_utc())
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submission,
+            true,
+            Timestamp::now_utc(),
+            Some("test"),
+        )
+        .await
+        .unwrap();
         db.fetch_seat_list(CHANNEL).await.unwrap().unwrap()
     }
 

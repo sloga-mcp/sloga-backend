@@ -90,6 +90,8 @@ async fn fetch_call_commits(
             .map(|commit| commit.into_commit_info(&group.channel_id))
             .collect(),
         current_epoch: group.current_epoch,
+        // Text groups only (S2-D30): absent here, so the Call answer stays
+        // the S1 bytes
         oldest_epoch: None,
     }))
 }
@@ -131,6 +133,11 @@ async fn fetch_text_commits(
     super::require_text_gate(TextGate::Available).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
 
+    // The oldest stored Text commit of the group, not of this page (S2-D30).
+    // Read before the page: retention only deletes, so the page never
+    // starts below it
+    let oldest_epoch = db.fetch_mls_text_oldest_epoch(&group.id).await?;
+
     // Text-marked rows only (R22): an unmarked row under the group id is a
     // Call-plane stray and is never served as a Text commit
     let commits = db
@@ -138,14 +145,16 @@ async fn fetch_text_commits(
         .await?;
 
     // `into_commit_info` fills each rejoin intent's `channel_id` from the
-    // group's channel (§8.1); the stored row does not carry it
+    // group's channel (§8.1); the stored row does not carry it. It never
+    // copies the row's stored Welcome (S2-D29: the Welcome route alone
+    // serves it)
     Ok(Json(v0::ResponseFetchMlsCommits {
         commits: commits
             .into_iter()
             .map(|commit| commit.into_commit_info(&group.channel_id))
             .collect(),
         current_epoch: group.current_epoch,
-        oldest_epoch: None,
+        oldest_epoch,
     }))
 }
 
@@ -175,6 +184,8 @@ mod tests {
 
     const VIEWER_DEVICE_SEED: u8 = 0x40;
     const UNBOUND_DEVICE_SEED: u8 = 0x60;
+    /// The Welcome the fixture's epoch 1 Text Add and its Call commit store
+    const STORED_WELCOME: &str = "V2VsY29tZS1zdG9yZWQtb25seQ";
 
     /// The route, called as Rocket calls it
     async fn fetch(
@@ -334,16 +345,20 @@ mod tests {
         let owner_leaf = leaf(&protected.owner_device);
         let member_leaf = leaf(&member_device);
 
+        // The Add stores a Welcome, as the submit route does (S2-D29)
         assert_won(
             db.insert_mls_text_commit(
-                &commit(
-                    &group,
-                    1,
-                    &owner_leaf,
-                    vec![member_leaf.clone()],
-                    vec![],
-                    seconds_ago(20),
-                ),
+                &MlsCommit {
+                    welcome: Some(STORED_WELCOME.to_string()),
+                    ..commit(
+                        &group,
+                        1,
+                        &owner_leaf,
+                        vec![member_leaf.clone()],
+                        vec![],
+                        seconds_ago(20),
+                    )
+                },
                 &hash,
                 0,
             )
@@ -415,15 +430,20 @@ mod tests {
                 .expect("the call group"),
             MlsGroupCreateOutcome::Created
         ));
+        // A Call row never gets a Welcome from a route; this one stores one
+        // so the Call fetch is shown not to serve it either
         assert_won(
-            db.insert_mls_commit(&commit(
-                &call_group,
-                1,
-                &owner_leaf,
-                vec![],
-                vec![],
-                Timestamp::now_utc(),
-            ))
+            db.insert_mls_commit(&MlsCommit {
+                welcome: Some(STORED_WELCOME.to_string()),
+                ..commit(
+                    &call_group,
+                    1,
+                    &owner_leaf,
+                    vec![],
+                    vec![],
+                    Timestamp::now_utc(),
+                )
+            })
             .await,
             "the call Update",
         );
@@ -1137,5 +1157,214 @@ mod tests {
             "{}",
             wire
         );
+    }
+
+    /// S2-D30: a Text fetch reports the oldest STORED Text commit of the
+    /// group, not of the page asked for, and follows retention (R9): once
+    /// the epoch 1 row is pruned the oldest is epoch 2, and the gap shows
+    /// as a first commit above `from_epoch`. The Call group still reports
+    /// none.
+    #[test]
+    fn text_fetch_reports_the_oldest_stored_epoch() {
+        crate::util::test::rt().block_on(text_fetch_reports_the_oldest_stored_epoch_case())
+    }
+
+    async fn text_fetch_reports_the_oldest_stored_epoch_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+        let group_id = &fixture.text_group_id;
+
+        // Every page, even an empty one above the current epoch
+        for from_epoch in [0, 2, 3] {
+            let served = fetch(
+                db,
+                &fixture.owner,
+                &fixture.owner_session,
+                group_id,
+                from_epoch,
+            )
+            .await
+            .expect("the owner is served");
+            assert_eq!(served.oldest_epoch, Some(1), "from_epoch {}", from_epoch);
+            let wire = serde_json::to_value(&served).expect("JSON");
+            assert_eq!(wire["oldest_epoch"], serde_json::json!(1), "{}", wire);
+        }
+        let served = fetch(db, &fixture.member, &fixture.member_session, group_id, 2)
+            .await
+            .expect("the seated member is served");
+        assert_eq!(served.oldest_epoch, Some(1));
+
+        // Retention at the epoch 2 row's own time: the epoch 1 row (20 s
+        // older) goes, epoch 2 stays (the bound is strict)
+        let newest = db
+            .fetch_mls_text_commits_from(group_id, 2, 1)
+            .await
+            .expect("commit read")
+            .remove(0);
+        assert_eq!(newest.epoch, 2);
+        let pruned = db
+            .prune_mls_text_commits(newest.created_at)
+            .await
+            .expect("the prune");
+        assert!(pruned >= 1, "pruned {}", pruned);
+
+        for from_epoch in [0, 2] {
+            let served = fetch(
+                db,
+                &fixture.owner,
+                &fixture.owner_session,
+                group_id,
+                from_epoch,
+            )
+            .await
+            .expect("the owner is served after the prune");
+            assert_eq!(served.current_epoch, 2);
+            assert_eq!(served.oldest_epoch, Some(2), "from_epoch {}", from_epoch);
+            assert_eq!(
+                served
+                    .commits
+                    .iter()
+                    .map(|commit| commit.epoch)
+                    .collect::<Vec<_>>(),
+                vec![2],
+                "from_epoch {}",
+                from_epoch
+            );
+        }
+
+        let served = fetch(
+            db,
+            &fixture.owner,
+            &fixture.owner_session,
+            &fixture.call_group_id,
+            0,
+        )
+        .await
+        .expect("the call member is served after the prune");
+        assert_eq!(served.commits.len(), 1);
+        assert_eq!(served.oldest_epoch, None);
+    }
+
+    /// S2-D30 is Text-only: a Call fetch has no `oldest_epoch` key, so its
+    /// body is byte-identical to the S1 response, which had exactly
+    /// `commits` and `current_epoch`
+    #[test]
+    fn call_fetch_has_no_oldest_epoch_key() {
+        crate::util::test::rt().block_on(call_fetch_has_no_oldest_epoch_key_case())
+    }
+
+    async fn call_fetch_has_no_oldest_epoch_key_case() {
+        // The S1 response, field for field
+        #[derive(serde::Serialize)]
+        struct S1Response<'a> {
+            commits: &'a [v0::MlsCommitInfo],
+            current_epoch: i64,
+        }
+
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        let served = fetch(
+            db,
+            &fixture.owner,
+            &fixture.owner_session,
+            &fixture.call_group_id,
+            0,
+        )
+        .await
+        .expect("the call member is served");
+        assert_eq!(served.commits.len(), 1);
+        assert_eq!(served.oldest_epoch, None);
+
+        let body = serde_json::to_string(&served).expect("JSON");
+        let s1 = serde_json::to_string(&S1Response {
+            commits: &served.commits,
+            current_epoch: served.current_epoch,
+        })
+        .expect("JSON");
+        assert_eq!(body, s1);
+        let wire: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let mut keys: Vec<&str> = wire
+            .as_object()
+            .expect("a response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["commits", "current_epoch"]);
+    }
+
+    /// S2-D29: only the Welcome route serves a stored Welcome. The
+    /// fixture's epoch 1 Text Add and its Call commit both store one; no
+    /// commit fetch carries a `welcome` key or the Welcome's bytes.
+    #[test]
+    fn no_commit_fetch_serves_the_stored_welcome() {
+        crate::util::test::rt().block_on(no_commit_fetch_serves_the_stored_welcome_case())
+    }
+
+    async fn no_commit_fetch_serves_the_stored_welcome_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        // The rows store it, so the checks below are not vacuous
+        let text_row = db
+            .fetch_mls_text_commits_from(&fixture.text_group_id, 1, 1)
+            .await
+            .expect("text commit read")
+            .remove(0);
+        assert_eq!(text_row.epoch, 1);
+        assert_eq!(text_row.welcome.as_deref(), Some(STORED_WELCOME));
+        let call_row = db
+            .fetch_mls_commits_from(&fixture.call_group_id, 1, 1)
+            .await
+            .expect("call commit read")
+            .remove(0);
+        assert_eq!(call_row.welcome.as_deref(), Some(STORED_WELCOME));
+        // ...and the Welcome route's read serves it
+        let added = &text_row.added[0];
+        let welcome_row = db
+            .fetch_mls_text_welcome(&fixture.text_group_id, &added.user_id, &added.device_id)
+            .await
+            .expect("welcome read")
+            .expect("the row that added the device");
+        assert_eq!(welcome_row.welcome.as_deref(), Some(STORED_WELCOME));
+
+        let mut served = Vec::new();
+        for (user, session) in [
+            (&fixture.owner, &fixture.owner_session),
+            (&fixture.member, &fixture.member_session),
+        ] {
+            for from_epoch in [0, 1] {
+                let page = fetch(db, user, session, &fixture.text_group_id, from_epoch)
+                    .await
+                    .expect("a seated caller is served");
+                served.push((format!("{} Text from {}", user.id, from_epoch), page));
+            }
+        }
+        let page = fetch(
+            db,
+            &fixture.owner,
+            &fixture.owner_session,
+            &fixture.call_group_id,
+            0,
+        )
+        .await
+        .expect("the call member is served");
+        served.push(("the Call fetch".to_string(), page));
+
+        for (case, page) in &served {
+            assert!(
+                page.commits.iter().any(|commit| commit.epoch == 1),
+                "{}: the page holds the row that stores a Welcome",
+                case
+            );
+            let body = serde_json::to_string(page).expect("JSON");
+            assert!(!body.contains(STORED_WELCOME), "{}: {}", case, body);
+            assert!(!body.contains("\"welcome\""), "{}: {}", case, body);
+            let wire: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            for commit in wire["commits"].as_array().expect("a commit list") {
+                assert!(commit.get("welcome").is_none(), "{}: {}", case, body);
+            }
+        }
     }
 }

@@ -43,7 +43,7 @@ use crate::{
     DeviceRemovalEffect, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
     ReferenceDb, ReleaseGroupEffect, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
     SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
-    SeatReleaseCause, MAX_CHANNEL_SLOT_CAP,
+    SeatReleaseCause, TextGroupCreator, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::AbstractProtectedChannels;
@@ -378,6 +378,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             allow_claims: true,
             formats_v2,
             text_group_users: &text_group_users,
+            removal_reason: None,
             now,
         })?;
         check_members(&members, &server_id, &decision)?;
@@ -402,6 +403,7 @@ impl AbstractProtectedChannels for ReferenceDb {
         submission: &SeatListSubmission,
         allow_claims: bool,
         now: Timestamp,
+        removal_reason: Option<&str>,
     ) -> Result<SeatListWriteOutcome> {
         let formats_v2 = revolt_config::config()
             .await
@@ -441,6 +443,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             allow_claims,
             formats_v2,
             text_group_users: &text_group_users,
+            removal_reason,
             now,
         })?;
         // Claims need an active entitlement (the planner refused
@@ -462,10 +465,11 @@ impl AbstractProtectedChannels for ReferenceDb {
         Ok(decision.outcome())
     }
 
-    async fn create_text_mls_group(
+    async fn create_text_mls_group_as(
         &self,
         group: &MlsGroup,
         supersedes: Option<&str>,
+        creator: &TextGroupCreator,
     ) -> Result<MlsGroupCreateOutcome> {
         let seat_lists = self.channel_seat_lists.lock().await;
         let mut groups = self.mls_groups.lock().await;
@@ -510,7 +514,7 @@ impl AbstractProtectedChannels for ReferenceDb {
             }
         }
 
-        let mut prepared = prepare_text_group(group, list)?;
+        let mut prepared = prepare_text_group(group, list, creator)?;
         // #213: a successor carries `signer_lost` over
         if let Some(superseded) = supersedes.and_then(|id| groups.get(id)) {
             prepared.signer_lost = superseded.signer_lost.clone();

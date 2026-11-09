@@ -3,7 +3,7 @@ use revolt_result::Result;
 
 use crate::{
     ChannelEntitlement, ChannelSeat, MlsGroup, MlsGroupCreateOutcome, SeatList, SeatListSnapshot,
-    SeatListSubmission, SeatListWriteOutcome, SeatReleaseCause,
+    SeatListSubmission, SeatListWriteOutcome, SeatReleaseCause, TextGroupCreator,
 };
 
 #[cfg(feature = "mongodb")]
@@ -137,12 +137,19 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// Every write also drops the open group's `pending_device_removals`
     /// entries whose device holds no leaf (2.5 "Clearing"), and every seat
     /// it releases gets `OwnerUnseat` (or `DeviceNeverJoined`, 2.3).
+    ///
+    /// S2 step 4d (S2-D20): a list that releases anyone needs a non-empty
+    /// `removal_reason` (the route's sanitized `X-Audit-Log-Reason`), else
+    /// `RemovalReasonRequired` and nothing is written. It is decided inside
+    /// the transaction against the planned releases, after the byte-identical
+    /// return, so a retry without it still succeeds.
     async fn put_seat_list(
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
         allow_claims: bool,
         now: Timestamp,
+        removal_reason: Option<&str>,
     ) -> Result<SeatListWriteOutcome>;
 
     /// Create a Text group (or a Text successor), in one transaction with
@@ -162,10 +169,25 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// S2 (#213): the new group starts with both pending lists empty and
     /// no `rejoin_readd`; a successor COPIES the superseded group's
     /// `signer_lost`, so only the 4.3 step-7 list write ever clears it.
+    ///
+    /// The creator is the signer device; [`Self::create_text_mls_group_as`]
+    /// names the creator rule explicitly.
     async fn create_text_mls_group(
         &self,
         group: &MlsGroup,
         supersedes: Option<&str>,
+    ) -> Result<MlsGroupCreateOutcome> {
+        self.create_text_mls_group_as(group, supersedes, &TextGroupCreator::SignerDevice).await
+    }
+
+    /// [`Self::create_text_mls_group`] under the 6.1 creator rule `creator`:
+    /// `SignerUserRecovery` is the S2-D17d exception (#213), checked by
+    /// `prepare_text_group` against the list this transaction reads
+    async fn create_text_mls_group_as(
+        &self,
+        group: &MlsGroup,
+        supersedes: Option<&str>,
+        creator: &TextGroupCreator,
     ) -> Result<MlsGroupCreateOutcome>;
 
     /// Server-forced removal (kick, ban, leave, account deletion; 6.3):

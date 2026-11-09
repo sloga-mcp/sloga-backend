@@ -53,13 +53,13 @@ pub const MAX_HANDOVER_BODY_LEN: usize = 1024;
 /// varint can carry (3.12.1, W0-fix3)
 pub const MAX_COMMIT_AD_LEN: usize = 16383;
 
-/// Highest Text group generation (6.1)
-pub const MAX_TEXT_GROUP_GENERATION: u32 = 63;
+/// Highest Text group generation (3.1, 6.1): S2 replaces the S1 cap of 63
+/// with 65535 on both sides (S2-D33, #204)
+pub const MAX_TEXT_GROUP_GENERATION: u32 = 65_535;
 
-/// Highest generation the v2 formats carry (3.1.1, 3.13; S2-D33, #204).
-/// `MAX_TEXT_GROUP_GENERATION` is raised to it together with the
-/// `groups_create` route, whose S1 cap message and tests pin 63.
-pub const MAX_TEXT_GROUP_GENERATION_V2: u32 = 65_535;
+/// The v2 formats' name for [`MAX_TEXT_GROUP_GENERATION`] (3.1.1, 3.13):
+/// one cap since S2 raised it, so the two can never disagree
+pub const MAX_TEXT_GROUP_GENERATION_V2: u32 = MAX_TEXT_GROUP_GENERATION;
 
 /// Byte limit of a channel authority body (4.10)
 pub const MAX_CHANNEL_AUTHORITY_LEN: usize = 3072;
@@ -1698,6 +1698,10 @@ pub struct SeatListWriteInput<'a> {
     pub formats_v2: bool,
     /// `text_group_user_ids` of the channel (the 2.3 no-cooldown fallback)
     pub text_group_users: &'a BTreeSet<String>,
+    /// The PUT's `X-Audit-Log-Reason` (4.3 step 4d, S2-D20), already
+    /// sanitized by the route; protect passes `None` (a genesis releases
+    /// nobody)
+    pub removal_reason: Option<&'a str>,
     pub now: Timestamp,
 }
 
@@ -1785,8 +1789,9 @@ impl SeatListWriteDecision {
 /// Step 7 (S2) is wired: the `signer_lost` resolution (`resolve_signer_lost`,
 /// refusing before any claim), every release's `release_cause` and the 2.3
 /// no-cooldown rule (`ChannelSeat::release`), and the 2.5 "Clearing" of the
-/// open group's `pending_device_removals`. Not wired, because the planner
-/// does not hold its input: 4d (`check_removal_reason`, the reason header).
+/// open group's `pending_device_removals`. So is 4d (`check_removal_reason`):
+/// a plan that releases anyone without `removal_reason` is refused before
+/// any write, after the step-4 retry return.
 pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWriteDecision> {
     let submission = input.submission;
     let now = input.now;
@@ -1920,6 +1925,11 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
             seat_rows.push(seat);
         }
     }
+
+    // Step 4d (S2-D20): a list that releases anyone carries a reason. Here,
+    // after the step-4 retry return, so the retry of a list that landed
+    // succeeds without the header.
+    check_removal_reason(&released, input.removal_reason)?;
 
     // Decision 5 (W2): with the growth flag off, a list that claims or
     // reactivates a seat is refused; a removal-only or `device_cap`-only
@@ -2313,9 +2323,8 @@ pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) 
 /// non-empty `X-Audit-Log-Reason` (a whitespace-only one counts as empty),
 /// else `RemovalReasonRequired`. Checked against the planner's `released`
 /// set AFTER step 4, so the retry of a list that landed (an `Unchanged`
-/// decision, nothing released) succeeds without the header. Not wired into
-/// `plan_seat_list_write`: the drivers do not pass the reason yet, and
-/// refusing every release without it would break today's PUTs.
+/// decision, nothing released) succeeds without the header.
+/// `plan_seat_list_write` runs it on `SeatListWriteInput.removal_reason`.
 pub fn check_removal_reason(released: &[String], reason: Option<&str>) -> Result<()> {
     if !released.is_empty() && reason.is_none_or(|reason| reason.trim().is_empty()) {
         return Err(create_error!(RemovalReasonRequired));
@@ -2406,13 +2415,35 @@ pub fn retain_member_pending_device_removals(group: &mut MlsGroup) {
         .collect();
 }
 
+/// Who a Text group create may name as its creator (6.1). The route decides
+/// it from its own reads; [`prepare_text_group`] re-checks it against the
+/// newest list the create's transaction read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextGroupCreator {
+    /// The rule (6.1, DECISION (W0-fix)): the device that signed the newest
+    /// stored list
+    SignerDevice,
+    /// The S2-D17d recovery exception (6.1, #213): another device of the
+    /// signer USER creates a successor while the open group carries
+    /// `signer_lost` or the stored list's signer device has no registered
+    /// identity. `lost_device_id` is the signer device the route found
+    /// lost: a list naming another signer device has landed since, so the
+    /// premise no longer holds and the create is refused.
+    SignerUserRecovery { lost_device_id: String },
+}
+
 /// Validate a Text group create request against the newest seat list and
 /// fill in the server-owned Text fields (2.5, 6.1): `kind = Text`,
 /// `seat_list_ad_sha256` from `list`, no pending removals of either kind,
 /// no `signer_lost` and no `rejoin_readd` (S2; a successor create copies
 /// the superseded group's `signer_lost` itself, #213), and the creator's
-/// `member_added` entry at epoch 0.
-pub fn prepare_text_group(group: &MlsGroup, list: &SeatList) -> Result<MlsGroup> {
+/// `member_added` entry at epoch 0. `creator` names the 6.1 creator rule
+/// the route applied; a recovery create is never a first group.
+pub fn prepare_text_group(
+    group: &MlsGroup,
+    list: &SeatList,
+    creator: &TextGroupCreator,
+) -> Result<MlsGroup> {
     match group.generation {
         Some(generation) if generation <= MAX_TEXT_GROUP_GENERATION => {}
         _ => return Err(invalid("text group generation")),
@@ -2427,12 +2458,26 @@ pub fn prepare_text_group(group: &MlsGroup, list: &SeatList) -> Result<MlsGroup>
     if group.members != vec![group.created_by.clone()] {
         return Err(invalid("text group must start with its creator only"));
     }
-    if group.created_by.user_id != list.signer_user_id
-        || group.created_by.device_id != list.signer_device_id
-    {
-        return Err(invalid(
-            "only the current seat list signer device may create",
-        ));
+    let by_signer_user = group.created_by.user_id == list.signer_user_id;
+    match creator {
+        TextGroupCreator::SignerDevice => {
+            if !by_signer_user || group.created_by.device_id != list.signer_device_id {
+                return Err(invalid(
+                    "only the current seat list signer device may create",
+                ));
+            }
+        }
+        TextGroupCreator::SignerUserRecovery { lost_device_id } => {
+            if !by_signer_user
+                || group.generation == Some(0)
+                || list.signer_device_id != *lost_device_id
+                || group.created_by.device_id == *lost_device_id
+            {
+                return Err(invalid(
+                    "only a device of the seat list signer may create a recovery successor",
+                ));
+            }
+        }
     }
 
     let mut prepared = group.clone();

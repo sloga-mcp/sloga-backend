@@ -1,6 +1,12 @@
-use revolt_database::{util::reference::Reference, Database, MlsGroupKind, Session, User};
-use revolt_models::v0;
-use revolt_result::{create_error, Error, Result};
+use std::collections::HashSet;
+
+use iso8601_timestamp::{Duration, Timestamp};
+use revolt_database::{
+    mls_text_rejoin_window_seconds, util::reference::Reference, Database, MlsGroup, MlsGroupKind,
+    Session, User,
+};
+use revolt_models::v0::{self, UserFlags};
+use revolt_result::{create_error, Error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 
 use super::TextGate;
@@ -12,6 +18,10 @@ use super::TextGate;
 /// `member_added`. ViewChannel; the MLS caller checks (not a bot, a session
 /// bound to one of the caller's devices); maintenance gate. The media flag
 /// plays no part. 404 when the channel has no open Text group.
+///
+/// A SEATED caller also gets `join_requests`, `pending_device_removals` and
+/// `signer_lost` (S2, §6.3 "Async Text join", R24, #222, #228). An unseated
+/// viewer gets the S1 body, byte for byte.
 ///
 /// A missing channel, and a channel the caller cannot view, get that same
 /// 404 before any other check (decision 18 (W2)), so a non-viewer cannot
@@ -46,12 +56,143 @@ pub async fn fetch_text_group(
         .await?
         .ok_or_else(no_text_group)?;
 
+    // Seated = an ACTIVE seat in this channel, `require_seated`'s predicate
+    // (§2.3: a cooling seat is not a seat), read once for the caller and
+    // for the intent filter alike
+    let seated: HashSet<String> = db
+        .fetch_channel_seats(channel.id())
+        .await?
+        .into_iter()
+        .filter(|seat| seat.channel_id == channel.id() && seat.is_active())
+        .map(|seat| seat.user_id)
+        .collect();
+    let response = if seated.contains(&user.id) {
+        seated_response(db, &user, channel.id(), &seated, group).await?
+    } else {
+        group.into_text_group_response()
+    };
+
     // A stored Text group always carries its generation. One without is
     // corrupt, and a 404 would invite a fresh create over it.
-    group
-        .into_text_group_response()
+    response
         .map(Json)
         .ok_or_else(|| create_error!(InternalError))
+}
+
+/// The seated caller's body (§7.2): the stored join intents of SEATED users
+/// still inside the Text window (§6.3 "Async Text join"; the bridge keeps
+/// those of this group newer than the device's `member_added.at`), the
+/// pending device removals and `signer_lost`, relabelled
+/// `account_unavailable` while the signer user's account is unavailable
+/// (#222), or derived for the signer user when nothing is stored (#228)
+async fn seated_response(
+    db: &Database,
+    user: &User,
+    channel_id: &str,
+    seated: &HashSet<String>,
+    group: MlsGroup,
+) -> Result<Option<v0::ResponseTextGroup>> {
+    let window = mls_text_rejoin_window_seconds(
+        revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .text_rejoin_window_secs,
+    );
+    // The driver's rule-6 bound (`created_at >= start`). A window reaching
+    // before the epoch has no lower bound.
+    let window_start = Timestamp::now_utc().checked_sub(Duration::seconds(window));
+    let intents: Vec<_> = db
+        .fetch_mls_join_intents_for_group(&group.id)
+        .await?
+        .into_iter()
+        .filter(|intent| seated.contains(&intent.user_id))
+        .filter(|intent| window_start.is_none_or(|start| intent.created_at >= start))
+        .collect();
+
+    let signer_account_unavailable = match &group.signer_lost {
+        Some(lost) => signer_user_unavailable(db, &lost.user_id).await?,
+        None => false,
+    };
+
+    let Some(mut response) =
+        group.into_text_group_response_for_seated(intents, signer_account_unavailable)
+    else {
+        return Ok(None);
+    };
+    if response.signer_lost.is_none() {
+        response.signer_lost = derived_signer_lost(db, user, channel_id).await?;
+    }
+
+    Ok(Some(response))
+}
+
+/// Whether `user`'s account is unavailable at `now` (#222): Deleted,
+/// Banned, or SuspendedUntil while the suspension is in effect. An elapsed
+/// timed suspension keeps its flag until the next login, so its end time
+/// decides; one without an end time is indefinite.
+fn account_unavailable(user: &User, now: Timestamp) -> bool {
+    let flags = user.flags.unwrap_or_default();
+    if flags & (UserFlags::Deleted as i32 | UserFlags::Banned as i32) != 0 {
+        return true;
+    }
+
+    flags & UserFlags::SuspendedUntil as i32 != 0
+        && user
+            .suspended_until
+            .as_ref()
+            .is_none_or(|until| *until > now)
+}
+
+/// [`account_unavailable`] for the stored `signer_lost`'s user, read now.
+/// A signer user with no user row at all is unavailable too.
+async fn signer_user_unavailable(db: &Database, user_id: &str) -> Result<bool> {
+    match db.fetch_user(user_id).await {
+        Ok(signer) => Ok(account_unavailable(&signer, Timestamp::now_utc())),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// #228: for a caller who is the stored list's signer USER, a `signer_lost`
+/// derived at read time when none is stored but the list's signer device
+/// has no registered identity (the authority-less solo owner, a revocation
+/// with `formats_v2` off), so its UI can offer recovery. Never stored, and
+/// send gating still reads the stored flag only (§7.2). The cause follows
+/// #222; `at` is the list's `updated_at` (no loss time is recorded, and a
+/// fixed value keeps repeated reads equal).
+async fn derived_signer_lost(
+    db: &Database,
+    user: &User,
+    channel_id: &str,
+) -> Result<Option<v0::MlsSignerLostInfo>> {
+    let Some(list) = db.fetch_seat_list(channel_id).await? else {
+        return Ok(None);
+    };
+    if list.signer_user_id != user.id {
+        return Ok(None);
+    }
+
+    match db
+        .fetch_e2ee_identity(&list.signer_user_id, &list.signer_device_id)
+        .await
+    {
+        Ok(_) => return Ok(None),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => {}
+        Err(error) => return Err(error),
+    }
+
+    let cause = if account_unavailable(user, Timestamp::now_utc()) {
+        v0::MlsSignerLostCause::AccountUnavailable
+    } else {
+        v0::MlsSignerLostCause::DeviceRevoked
+    };
+    Ok(Some(v0::MlsSignerLostInfo {
+        user_id: list.signer_user_id,
+        device_id: list.signer_device_id,
+        cause,
+        at: list.updated_at,
+    }))
 }
 
 /// The one `NotFound` this route answers, for a missing channel, a channel
@@ -63,13 +204,21 @@ fn no_text_group() -> Error {
 
 #[cfg(test)]
 mod tests {
-    use revolt_database::{BotInformation, Channel, PartialChannel, PartialUser, Session, User};
+    use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_database::{
+        mls_text_rejoin_window_seconds, BotInformation, Channel, ChannelSeat, Database, FieldsUser,
+        MlsGroup, MlsJoinIntent, MlsPendingDeviceRemoval, MlsSignerLost, PartialChannel,
+        PartialUser, SeatReleaseCause, Session, User,
+    };
+    use revolt_models::v0::UserFlags;
     use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{Header, Status};
     use ulid::Ulid;
 
     use super::super::{require_channel_access, text::text_group_id};
-    use crate::util::test::{TestHarness, MEMBER_DEVICE_SEED};
+    use crate::util::test::{
+        TestHarness, FIXTURE_ISSUED_AT, MEMBER_DEVICE_SEED, NEW_OWNER_DEVICE_SEED,
+    };
 
     /// One caller of the matrix, with the session it calls under
     struct Caller {
@@ -546,5 +695,504 @@ mod tests {
                 .await;
             assert_eq!(response.status(), Status::Unauthorized);
         })
+    }
+
+    /// A fresh device id (32 lowercase hex chars)
+    fn device_id() -> String {
+        format!("{:032x}", Ulid::new().0)
+    }
+
+    /// `seconds` ago
+    fn ago(seconds: i64) -> Timestamp {
+        Timestamp::now_utc()
+            .checked_sub(Duration::seconds(seconds))
+            .expect("a time")
+    }
+
+    /// Apply `edit` to the stored group `id`, straight to the store (the S2
+    /// fields have no write path a read test can drive in isolation). On
+    /// MongoDB the edited group is `$set`, so a field serialized away
+    /// (`None`, empty) keeps its stored value.
+    async fn edit_group(harness: &TestHarness, id: &str, edit: impl FnOnce(&mut MlsGroup)) {
+        match &harness.db {
+            Database::Reference(reference) => {
+                edit(
+                    reference
+                        .mls_groups
+                        .lock()
+                        .await
+                        .get_mut(id)
+                        .expect("the group row"),
+                );
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_document};
+
+                let collection = mongo.col::<MlsGroup>("mls_groups");
+                let mut group = collection
+                    .find_one(doc! { "_id": id })
+                    .await
+                    .expect("the group read")
+                    .expect("the group row");
+                edit(&mut group);
+                let mut set = to_document(&group).expect("the group as BSON");
+                set.remove("_id");
+                let result = collection
+                    .update_one(doc! { "_id": id }, doc! { "$set": set })
+                    .await
+                    .expect("the group write");
+                assert_eq!(result.matched_count, 1, "the group row");
+            }
+        }
+    }
+
+    /// Store a join intent by a fresh device of `user_id` for `group_id`,
+    /// created `age` seconds ago
+    async fn store_intent(
+        harness: &TestHarness,
+        group_id: &str,
+        user_id: &str,
+        age: i64,
+    ) -> MlsJoinIntent {
+        let device_id = device_id();
+        let intent = MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(group_id, user_id, &device_id),
+            group_id: group_id.to_string(),
+            user_id: user_id.to_string(),
+            device_id: device_id.clone(),
+            key_package_ref: format!("kp-{device_id}"),
+            signature: format!("sig-{device_id}"),
+            created_at: ago(age),
+            generation: Some(0),
+            issued_at: Some(FIXTURE_ISSUED_AT),
+        };
+        harness
+            .db
+            .upsert_mls_join_intent(&intent)
+            .await
+            .expect("the join intent");
+        intent
+    }
+
+    /// R24 (#222), §6.3 "Async Text join": a seated caller gets the
+    /// outstanding join intents of SEATED users only (inside the Text
+    /// window, not the Call one) and the pending device removals; an
+    /// unseated viewer gets the S1 body byte for byte; a non-viewer, and a
+    /// seated member who cannot view, still get the missing answer
+    #[test]
+    fn seated_callers_get_the_s2_fields_and_unseated_viewers_the_s1_body() {
+        crate::util::test::rt().block_on(Box::pin(seated_and_unseated_case()))
+    }
+
+    async fn seated_and_unseated_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let window = mls_text_rejoin_window_seconds(
+            revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .text_rejoin_window_secs,
+        );
+        assert!(window > 3600, "the case needs a Text window above an hour");
+
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, viewer_session, viewer) = harness.new_user().await;
+        let (_, outsider_session, outsider) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        harness.join_server(&protected.server, &viewer).await;
+        harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        harness
+            .new_e2ee_device(&viewer, &viewer_session.id, MEMBER_DEVICE_SEED + 1)
+            .await;
+        harness
+            .new_e2ee_device(&outsider, &outsider_session.id, MEMBER_DEVICE_SEED + 2)
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let channel_id = protected.channel.id();
+
+        let pending = MlsPendingDeviceRemoval {
+            user_id: member.id.clone(),
+            device_id: device_id(),
+            created_at: Timestamp::now_utc(),
+        };
+        edit_group(&harness, &group.id, |group| {
+            group.pending_device_removals = vec![pending.clone()];
+        })
+        .await;
+
+        // Seated users: outstanding (an hour old, which a 30 s Call window
+        // would drop) and expired. The unseated viewer: outstanding.
+        let owner_outstanding = store_intent(&harness, &group.id, &owner.id, 3600).await;
+        let member_outstanding = store_intent(&harness, &group.id, &member.id, 60).await;
+        let member_expired = store_intent(&harness, &group.id, &member.id, window + 60).await;
+        let viewer_outstanding = store_intent(&harness, &group.id, &viewer.id, 60).await;
+
+        let stored = db.fetch_mls_group(&group.id).await.expect("the group");
+        assert_eq!(stored.pending_device_removals.len(), 1);
+        let intents = db
+            .fetch_mls_join_intents_for_group(&group.id)
+            .await
+            .expect("the intents");
+        assert_eq!(intents.len(), 4, "every intent is stored");
+        let kept: Vec<MlsJoinIntent> = intents
+            .into_iter()
+            .filter(|intent| {
+                intent.id == owner_outstanding.id || intent.id == member_outstanding.id
+            })
+            .collect();
+        let seated_body = serde_json::to_value(
+            stored
+                .clone()
+                .into_text_group_response_for_seated(kept, false)
+                .expect("a Text group"),
+        )
+        .expect("JSON");
+        let s1_body =
+            serde_json::to_string(&stored.into_text_group_response().expect("a Text group"))
+                .expect("JSON");
+
+        for (class, session) in [("owner", &owner_session), ("member", &member_session)] {
+            let answer = get(&harness, session, channel_id).await;
+            assert_eq!(answer.0, Status::Ok, "{}: {:?}", class, answer);
+            let value = body(&answer);
+            assert_eq!(value, seated_body, "{}", class);
+            let devices: Vec<&str> = value["join_requests"]
+                .as_array()
+                .expect("join_requests")
+                .iter()
+                .map(|request| request["device_id"].as_str().expect("a device id"))
+                .collect();
+            // Oldest first
+            assert_eq!(
+                devices,
+                vec![
+                    owner_outstanding.device_id.as_str(),
+                    member_outstanding.device_id.as_str()
+                ],
+                "{}: neither the unseated ({}) nor the expired ({}) intent",
+                class,
+                viewer_outstanding.device_id,
+                member_expired.device_id
+            );
+            assert_eq!(
+                value["pending_device_removals"][0]["device_id"], pending.device_id,
+                "{}",
+                class
+            );
+            assert!(
+                value.get("signer_lost").is_none(),
+                "{}: {}",
+                class,
+                answer.1
+            );
+        }
+
+        let answer = get(&harness, &viewer_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "viewer: {:?}", answer);
+        assert_eq!(answer.1, s1_body, "the unseated viewer gets the S1 body");
+        let value = body(&answer);
+        for field in ["join_requests", "pending_device_removals", "signer_lost"] {
+            assert!(value.get(field).is_none(), "viewer {}: {}", field, answer.1);
+        }
+
+        // Oracle parity (decision 1): the S2 state changes nothing for a
+        // non-viewer, nor for a seated member who cannot view
+        let missing_id = Ulid::new().to_string();
+        let missing = get(&harness, &outsider_session, &missing_id).await;
+        assert_own_not_found(&missing, "outsider");
+        let answer = get(&harness, &outsider_session, channel_id).await;
+        assert_eq!(answer, missing, "outsider");
+        deny_view(&harness, &protected.channel).await;
+        let missing = get(&harness, &member_session, &missing_id).await;
+        assert_own_not_found(&missing, "seated non-viewer");
+        let answer = get(&harness, &member_session, channel_id).await;
+        assert_eq!(answer, missing, "seated non-viewer");
+    }
+
+    /// A released (cooling) seat is not a seat (§2.3, `require_seated`'s
+    /// predicate): its holder, still a viewer, gets the S1 body, and its
+    /// intents are not served to seated callers
+    #[test]
+    fn a_cooling_seat_is_not_seated() {
+        crate::util::test::rt().block_on(Box::pin(cooling_seat_case()))
+    }
+
+    async fn cooling_seat_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let channel_id = protected.channel.id();
+
+        let owner_intent = store_intent(&harness, &group.id, &owner.id, 60).await;
+        let member_intent = store_intent(&harness, &group.id, &member.id, 60).await;
+        harness.mark_keys_received(channel_id, &member.id).await;
+        let seat_of = |seats: Vec<ChannelSeat>| {
+            seats
+                .into_iter()
+                .find(|seat| seat.user_id == member.id)
+                .expect("the member's seat")
+        };
+        let seat = seat_of(db.fetch_channel_seats(channel_id).await.expect("seats"));
+        assert!(db
+            .release_channel_seat(
+                channel_id,
+                &member.id,
+                seat.seated_at,
+                SeatReleaseCause::OwnerUnseat,
+                Timestamp::now_utc(),
+            )
+            .await
+            .expect("the release"));
+        let seat = seat_of(db.fetch_channel_seats(channel_id).await.expect("seats"));
+        assert!(!seat.is_active(), "released");
+        assert!(seat.is_cooling(Timestamp::now_utc()), "cooling");
+
+        let stored = db.fetch_mls_group(&group.id).await.expect("the group");
+        let answer = get(&harness, &member_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "cooling member: {:?}", answer);
+        assert_eq!(
+            answer.1,
+            serde_json::to_string(&stored.into_text_group_response().expect("a Text group"))
+                .expect("JSON"),
+            "the cooling member gets the S1 body"
+        );
+
+        let answer = get(&harness, &owner_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "owner: {:?}", answer);
+        let value = body(&answer);
+        let devices: Vec<&str> = value["join_requests"]
+            .as_array()
+            .expect("join_requests")
+            .iter()
+            .map(|request| request["device_id"].as_str().expect("a device id"))
+            .collect();
+        assert_eq!(
+            devices,
+            vec![owner_intent.device_id.as_str()],
+            "not the cooling member's ({})",
+            member_intent.device_id
+        );
+    }
+
+    /// #222: a stored `signer_lost` (cause `device_revoked`) is served as
+    /// `account_unavailable` while the signer user's account is suspended
+    /// (the suspension in effect), deleted or banned, read per request; an
+    /// unseated viewer never sees it
+    #[test]
+    fn a_stored_signer_lost_reads_account_unavailable_for_an_unavailable_signer() {
+        crate::util::test::rt().block_on(Box::pin(account_unavailable_case()))
+    }
+
+    async fn account_unavailable_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, viewer_session, viewer) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        harness.join_server(&protected.server, &viewer).await;
+        harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        harness
+            .new_e2ee_device(&viewer, &viewer_session.id, MEMBER_DEVICE_SEED + 1)
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let channel_id = protected.channel.id();
+        let signer = &protected.owner_device;
+
+        let lost = MlsSignerLost {
+            user_id: owner.id.clone(),
+            device_id: signer.device_id.clone(),
+            cause: revolt_database::MlsSignerLostCause::DeviceRevoked,
+            at: Timestamp::now_utc(),
+        };
+        edit_group(&harness, &group.id, |group| {
+            group.signer_lost = Some(lost.clone());
+        })
+        .await;
+        let stored = db.fetch_mls_group(&group.id).await.expect("the group");
+        assert!(stored.signer_lost.is_some(), "the stored signer_lost");
+
+        let (revoked, unavailable) = ("device_revoked", "account_unavailable");
+        let suspended = UserFlags::SuspendedUntil as i32;
+        let deleted = UserFlags::Deleted as i32;
+        let banned = UserFlags::Banned as i32;
+        let later = Timestamp::now_utc()
+            .checked_add(Duration::days(1))
+            .expect("a time");
+        for (case, flags, until, cause) in [
+            ("no flag", 0, None, revoked),
+            ("indefinite suspension", suspended, None, unavailable),
+            ("suspension in effect", suspended, Some(later), unavailable),
+            ("elapsed suspension", suspended, Some(ago(86400)), revoked),
+            ("deleted", deleted, None, unavailable),
+            ("banned", banned, None, unavailable),
+        ] {
+            let remove = if until.is_none() {
+                vec![FieldsUser::Suspension]
+            } else {
+                vec![]
+            };
+            db.update_user(
+                &owner.id,
+                &PartialUser {
+                    flags: Some(flags),
+                    suspended_until: until,
+                    ..Default::default()
+                },
+                remove,
+            )
+            .await
+            .expect("the signer's flags");
+
+            let answer = get(&harness, &member_session, channel_id).await;
+            assert_eq!(answer.0, Status::Ok, "{}: {:?}", case, answer);
+            let value = body(&answer);
+            let served = &value["signer_lost"];
+            assert_eq!(served["cause"], cause, "{}: {}", case, answer.1);
+            assert_eq!(served["user_id"], owner.id, "{}", case);
+            assert_eq!(served["device_id"], signer.device_id, "{}", case);
+
+            let answer = get(&harness, &viewer_session, channel_id).await;
+            assert_eq!(answer.0, Status::Ok, "{} viewer: {:?}", case, answer);
+            assert!(
+                body(&answer).get("signer_lost").is_none(),
+                "{} viewer: {}",
+                case,
+                answer.1
+            );
+        }
+    }
+
+    /// #228: with no `signer_lost` stored, a signer-USER caller gets one
+    /// derived when the stored list's signer device has no registered
+    /// identity (here a revocation with `formats_v2` off); a seated member
+    /// who is not the signer user gets none and an unseated viewer the S1
+    /// body. Nothing is stored, and the cause follows the account (#222).
+    #[test]
+    fn a_signer_user_gets_a_derived_signer_lost_when_the_signer_device_is_gone() {
+        crate::util::test::rt().block_on(Box::pin(derived_signer_lost_case()))
+    }
+
+    async fn derived_signer_lost_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, viewer_session, viewer) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        harness.join_server(&protected.server, &viewer).await;
+        harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        harness
+            .new_e2ee_device(&viewer, &viewer_session.id, MEMBER_DEVICE_SEED + 1)
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let channel_id = protected.channel.id();
+        let signer = &protected.owner_device;
+
+        // The signer device is registered: nothing to derive
+        let answer = get(&harness, &owner_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        assert!(body(&answer).get("signer_lost").is_none(), "{}", answer.1);
+
+        // Its identity goes and nothing is stored; the owner calls from a
+        // replacement device bound to the same session
+        assert!(db
+            .delete_e2ee_device(&owner.id, &signer.device_id)
+            .await
+            .expect("the identity delete"));
+        harness
+            .new_e2ee_device(&owner, &owner_session.id, NEW_OWNER_DEVICE_SEED)
+            .await;
+        let list = db
+            .fetch_seat_list(channel_id)
+            .await
+            .expect("the list read")
+            .expect("the stored list");
+        assert_eq!(list.signer_user_id, owner.id);
+        assert_eq!(list.signer_device_id, signer.device_id);
+
+        let first = get(&harness, &owner_session, channel_id).await;
+        assert_eq!(first.0, Status::Ok, "{:?}", first);
+        assert_eq!(
+            body(&first)["signer_lost"],
+            serde_json::json!({
+                "user_id": owner.id,
+                "device_id": signer.device_id,
+                "cause": "device_revoked",
+                "at": list.updated_at,
+            }),
+            "{}",
+            first.1
+        );
+        // Derived per read, never stored, and the same on every read
+        let stored = db.fetch_mls_group(&group.id).await.expect("the group");
+        assert!(stored.signer_lost.is_none(), "nothing is stored");
+        assert_eq!(get(&harness, &owner_session, channel_id).await, first);
+
+        let answer = get(&harness, &member_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "member: {:?}", answer);
+        assert!(
+            body(&answer).get("signer_lost").is_none(),
+            "member: {}",
+            answer.1
+        );
+
+        let answer = get(&harness, &viewer_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "viewer: {:?}", answer);
+        assert_eq!(
+            answer.1,
+            serde_json::to_string(&stored.into_text_group_response().expect("a Text group"))
+                .expect("JSON"),
+            "the unseated viewer gets the S1 body"
+        );
+
+        db.update_user(
+            &owner.id,
+            &PartialUser {
+                flags: Some(UserFlags::Banned as i32),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the ban flag");
+        let answer = get(&harness, &owner_session, channel_id).await;
+        assert_eq!(answer.0, Status::Ok, "banned: {:?}", answer);
+        assert_eq!(
+            body(&answer)["signer_lost"]["cause"],
+            "account_unavailable",
+            "{}",
+            answer.1
+        );
     }
 }

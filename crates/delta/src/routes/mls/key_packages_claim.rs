@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use revolt_database::{
-    is_valid_device_id, is_valid_group_id, util::reference::Reference, Channel, Database, MlsGroup,
-    RatelimitEvent, RatelimitEventType, Session, User, MAX_MLS_GROUP_MEMBERS,
+    is_valid_device_id, is_valid_group_id, util::reference::Reference, Channel, ChannelEntitlement,
+    Database, MlsGroup, RatelimitEvent, RatelimitEventType, SeatList, Session, User,
+    MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -27,9 +28,11 @@ use super::{GroupDispatch, TextGate, MAX_CLAIMS_PER_TARGET_PER_MINUTE};
 ///
 /// For a Text group (protected channels design 6.1) the claimer must be a
 /// current member device of the group and seated, the growth flag must be
-/// on, and every target must be seated, hold ViewChannel, be a server
-/// member and be neither a bot nor staff; any other target reports
-/// `NotFound`. Blocked pairs and the friend/DM eligibility play no part.
+/// on unless the claim is recovery (S2-D32), the channel's entitlement must
+/// allow text traffic, and every target must be seated, hold ViewChannel,
+/// be a server member and be neither a bot nor staff; any other target
+/// reports `NotFound`. Blocked pairs and the friend/DM eligibility play no
+/// part.
 ///
 /// The claimer MUST verify each returned binding signature against its own
 /// pinned identity for the target — the server relay is never the trust
@@ -238,8 +241,19 @@ async fn claim_for_call_group(
 /// A Text group, in the design 6.1 order: the group's channel and
 /// ViewChannel (a missing channel, or one the caller cannot view, answers
 /// exactly like a group id the server does not know) -> the caller checks
-/// -> request validation -> the growth gate (decision 5 (W2): a claim is
-/// growth) -> seated -> the claim rules.
+/// -> request validation -> the available gate -> seated -> the growth gate
+/// unless the claim is recovery -> the entitlement -> the claim rules.
+///
+/// The gate follows the operation, never a client flag (§6.1 "KeyPackage
+/// claim (S2-D32)", §6.3 "Recovery gates", #213, #220): a recovery claim
+/// ([`is_recovery_claim`]) needs the available gate and an entitlement that
+/// allows text traffic, so it passes with the growth flag off; any other
+/// claim (decision 5 (W2): a claim is growth) also needs the growth flag.
+/// Growth is checked only once the caller is seated: whether a claim is
+/// recovery depends on its targets, `rejoin_readd` and a lost signer, which
+/// an unseated viewer must not learn from which gate answered (R24, #222).
+/// Both refusals come before the per-target rate limit, so a refused claim
+/// consumes no KeyPackage.
 async fn claim_for_text_group(
     db: &Database,
     user: User,
@@ -273,8 +287,16 @@ async fn claim_for_text_group(
     };
     claimer_identity.assert_bound_session(&session.id)?;
 
-    super::require_text_gate(TextGate::Growth).await?;
+    super::require_text_gate(TextGate::Available).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
+    if !is_recovery_claim(db, &group, &data.targets).await? {
+        super::require_text_gate(TextGate::Growth).await?;
+    }
+    // A claim is for an Add, so it needs what the Add needs (#220)
+    let entitlement = db.fetch_channel_entitlement(&group.channel_id).await?;
+    if !allows_text_traffic(entitlement.as_ref()) {
+        return Err(create_error!(InvalidOperation));
+    }
 
     // A claim admits a device into an OPEN group, and only a current member
     // device admits (decision 7 (W2))
@@ -352,6 +374,88 @@ fn validate_claim_request(data: &v0::DataClaimMlsKeyPackages) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether a Text claim is recovery (design §6.1 "KeyPackage claim
+/// (S2-D32)", §6.3 "Recovery gates"), decided from the stored group, list
+/// and directory, never from the request: EVERY target is the re-Add of a
+/// device whose rule-6 eviction `rejoin_readd` records, or a replacement
+/// device of the stored list's signer user (a device of that user that is
+/// not a member of the group) while recovery is open
+/// ([`signer_recovery_open`]). One other target makes the whole claim
+/// growth, as one other Add does on the commit.
+///
+/// The group is the route's read; a stale one at worst serves a package
+/// whose Add the commit transaction then refuses. Not here yet: the claim
+/// for a device that held a leaf in the predecessor generation (#226).
+async fn is_recovery_claim(
+    db: &Database,
+    group: &MlsGroup,
+    targets: &[v0::MlsMemberDevice],
+) -> Result<bool> {
+    let readd = |target: &v0::MlsMemberDevice| {
+        group
+            .rejoin_readd
+            .iter()
+            .any(|entry| entry.user_id == target.user_id && entry.device_id == target.device_id)
+    };
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    if targets.iter().all(|target| readd(target)) {
+        return Ok(true);
+    }
+
+    let Some(seat_list) = db.fetch_seat_list(&group.channel_id).await? else {
+        return Ok(false);
+    };
+    let replacement = |target: &v0::MlsMemberDevice| {
+        target.user_id == seat_list.signer_user_id
+            && !group.has_member(&target.user_id, &target.device_id)
+    };
+    if !targets
+        .iter()
+        .all(|target| readd(target) || replacement(target))
+    {
+        return Ok(false);
+    }
+
+    signer_recovery_open(db, group, &seat_list).await
+}
+
+/// Whether the signer user's recovery is open (§6.1, widened in #213): the
+/// group carries `signer_lost`, OR the stored list's signer device has no
+/// registered E2EE identity. The second is the server's own directory, so
+/// recovery never depends on `signer_lost` having been written. A read
+/// error other than an absent identity is returned, so it refuses (fails
+/// closed).
+async fn signer_recovery_open(
+    db: &Database,
+    group: &MlsGroup,
+    seat_list: &SeatList,
+) -> Result<bool> {
+    if group.signer_lost.is_some() {
+        return Ok(true);
+    }
+
+    match db
+        .fetch_e2ee_identity(&seat_list.signer_user_id, &seat_list.signer_device_id)
+        .await
+    {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// The entitlement predicate every Text claim needs, a growth claim and a
+/// recovery claim alike (design §6.3 "Recovery gates", #220): S5's
+/// `allows_text_traffic()`, which before S5 lands is `Active` only, and a
+/// missing entitlement refuses as on the Add. S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`) replaces
+/// this at its merge.
+fn allows_text_traffic(entitlement: Option<&ChannelEntitlement>) -> bool {
+    entitlement.is_some_and(|entitlement| entitlement.is_active())
 }
 
 /// Whether a Text group of `channel` may admit `target_user_id`: seated and
@@ -453,8 +557,9 @@ async fn claim_text_target(
 mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
-        BotInformation, Database, MemberCompositeKey, MlsKeyPackage, PartialChannel, PartialUser,
-        RelationshipStatus, Session, User,
+        BotInformation, ChannelEntitlementState, Database, MemberCompositeKey, MlsGroup,
+        MlsKeyPackage, MlsMemberDevice, MlsRejoinReadd, MlsSignerLost, MlsSignerLostCause,
+        PartialChannel, PartialUser, RelationshipStatus, Session, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -470,7 +575,9 @@ mod tests {
     use crate::routes::mls::{
         dispatch_group, require_channel_access, require_seated, GroupDispatch,
     };
-    use crate::util::test::{TestE2EEDevice, TestHarness, MEMBER_DEVICE_SEED};
+    use crate::util::test::{
+        ProtectedChannel, TestE2EEDevice, TestHarness, MEMBER_DEVICE_SEED, NEW_OWNER_DEVICE_SEED,
+    };
 
     /// A device id no device has
     const UNREGISTERED_DEVICE: &str = "abababababababababababababababab";
@@ -599,6 +706,91 @@ mod tests {
         assert_eq!(body["type"], error_type, "{}: {}", case, answer.1);
     }
 
+    /// A growth refusal over HTTP: `FeatureDisabled` for `protected_channels`
+    #[track_caller]
+    fn growth_refused(answer: &(Status, String), case: &str) {
+        refused(answer, Status::BadRequest, "FeatureDisabled", case);
+        let body: serde_json::Value = serde_json::from_str(&answer.1).expect("an error body");
+        assert_eq!(
+            body["feature"], "protected_channels",
+            "{}: {}",
+            case, answer.1
+        );
+    }
+
+    /// Edit a stored group in place, both drivers (no primitive writes
+    /// `rejoin_readd`, `signer_lost` or a member outside a commit)
+    async fn edit_group(db: &Database, group_id: &str, edit: impl FnOnce(&mut MlsGroup)) {
+        match db {
+            Database::Reference(reference) => {
+                edit(
+                    reference
+                        .mls_groups
+                        .lock()
+                        .await
+                        .get_mut(group_id)
+                        .expect("the group"),
+                );
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::doc;
+
+                let collection = mongo.col::<MlsGroup>("mls_groups");
+                let mut group = collection
+                    .find_one(doc! { "_id": group_id })
+                    .await
+                    .expect("the group read")
+                    .expect("the group");
+                edit(&mut group);
+                let result = collection
+                    .replace_one(doc! { "_id": group_id }, &group)
+                    .await
+                    .expect("the group write");
+                assert_eq!(result.matched_count, 1, "the group");
+            }
+        }
+    }
+
+    /// Set the channel's entitlement state, raw (S1 has no primitive for it)
+    async fn set_entitlement_state(
+        db: &Database,
+        channel_id: &str,
+        state: ChannelEntitlementState,
+    ) {
+        match db {
+            Database::Reference(reference) => {
+                let mut found = 0;
+                for entitlement in reference.channel_entitlements.lock().await.values_mut() {
+                    if entitlement.channel_id == channel_id {
+                        entitlement.state = state.clone();
+                        found += 1;
+                    }
+                }
+                assert_eq!(found, 1);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_bson, Document};
+
+                let result = mongo
+                    .col::<Document>("channel_entitlements")
+                    .update_one(
+                        doc! { "channel_id": channel_id },
+                        doc! { "$set": { "state": to_bson(&state).expect("a state") } },
+                    )
+                    .await
+                    .expect("raw state write");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+
+        let entitlement = db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .expect("an entitlement");
+        assert_eq!(entitlement.state, state);
+    }
+
     /// One caller class of the oracle: the caller, its session and the
     /// device it claims with
     struct Caller {
@@ -617,6 +809,8 @@ mod tests {
         hidden_group_id: String,
         deleted_group_id: String,
         unknown_group_id: String,
+        /// A device the hidden group's `rejoin_readd` records
+        recovery_target: (String, String),
     }
 
     /// A protected channel whose Text group exists but which members cannot
@@ -667,6 +861,23 @@ mod tests {
             .new_text_group(&hidden.channel, &hidden.owner_device, 0, None)
             .await;
         publish(db, &hidden.owner_device, "owner-0", false).await;
+        // The hidden group is mid-recovery as well, so a claim that would be
+        // recovery there is compared with the unknown answer too
+        let recovery_target = (member.id.clone(), member_device.device_id.clone());
+        edit_group(db, &hidden_group.id, |group| {
+            group.rejoin_readd.push(MlsRejoinReadd {
+                user_id: recovery_target.0.clone(),
+                device_id: recovery_target.1.clone(),
+                at: Timestamp::now_utc(),
+            });
+            group.signer_lost = Some(MlsSignerLost {
+                user_id: owner.id.clone(),
+                device_id: hidden.owner_device.device_id.clone(),
+                cause: MlsSignerLostCause::DeviceRevoked,
+                at: Timestamp::now_utc(),
+            });
+        })
+        .await;
 
         let (_, other_owner_session, other_owner) = harness.new_user().await;
         let deleted = harness
@@ -708,11 +919,13 @@ mod tests {
             hidden_group_id: hidden_group.id,
             deleted_group_id: deleted_group.id,
             unknown_group_id: format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0),
+            recovery_target,
         }
     }
 
     /// The oracle's request shapes for `group_id`: a valid claim of the
-    /// owner's device, and two malformed ones
+    /// owner's device, two malformed ones, and a valid claim that is
+    /// recovery on the hidden group
     fn oracle_requests(
         oracle: &Oracle,
         device_id: &str,
@@ -728,6 +941,17 @@ mod tests {
             (
                 "bad target device",
                 claim_body(device_id, group_id, &[(owner.0, "not a device")]),
+            ),
+            (
+                "recovery",
+                claim_body(
+                    device_id,
+                    group_id,
+                    &[(
+                        oracle.recovery_target.0.as_str(),
+                        oracle.recovery_target.1.as_str(),
+                    )],
+                ),
             ),
         ]
     }
@@ -1362,5 +1586,420 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&answer.1).expect("JSON");
         assert_eq!(body["feature"], "protected_channels", "{}", answer.1);
         assert_eq!(packages_left(db, &member_device).await, 1);
+    }
+
+    /// A protected channel whose open Text group holds the owner's signer
+    /// device (the genesis list's signer) and the seated member's device,
+    /// a second seated user whose new device is a growth target, and a
+    /// viewer who is a server member with a bound device but no seat
+    struct RecoveryFixture {
+        harness: TestHarness,
+        protected: ProtectedChannel,
+        owner: User,
+        owner_session: Session,
+        member: User,
+        member_session: Session,
+        member_device: TestE2EEDevice,
+        other_device: TestE2EEDevice,
+        viewer_session: Session,
+        viewer_device: TestE2EEDevice,
+        group_id: String,
+    }
+
+    async fn recovery_fixture() -> RecoveryFixture {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let (_, _, other) = harness.new_user().await;
+        let (_, viewer_session, viewer) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member, &other])
+            .await;
+        harness.join_server(&protected.server, &viewer).await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        let member_entry = MlsMemberDevice {
+            user_id: member.id.clone(),
+            device_id: member_device.device_id.clone(),
+        };
+        edit_group(&harness.db, &group.id, |group| {
+            group.members.push(member_entry)
+        })
+        .await;
+        let other_device = harness
+            .new_e2ee_device(&other, &Ulid::new().to_string(), 0x40)
+            .await;
+        publish(&harness.db, &other_device, "other-0", false).await;
+        let viewer_device = harness
+            .new_e2ee_device(&viewer, &viewer_session.id, 0x50)
+            .await;
+
+        RecoveryFixture {
+            harness,
+            protected,
+            owner,
+            owner_session,
+            member,
+            member_session,
+            member_device,
+            other_device,
+            viewer_session,
+            viewer_device,
+            group_id: group.id,
+        }
+    }
+
+    impl RecoveryFixture {
+        fn target(device: &TestE2EEDevice) -> (&str, &str) {
+            (device.user_id.as_str(), device.device_id.as_str())
+        }
+
+        /// A claim by `device` (bound to `session`) over HTTP
+        async fn claim_as(
+            &self,
+            session: &Session,
+            device: &TestE2EEDevice,
+            targets: &[(&str, &str)],
+        ) -> (Status, String) {
+            claim_http(
+                &self.harness,
+                session,
+                &claim_body(&device.device_id, &self.group_id, targets),
+            )
+            .await
+        }
+
+        /// R24 (#222): an unseated viewer gets the same `NotSeated` for a
+        /// claim that is recovery as for one that is growth, so it learns
+        /// nothing about `rejoin_readd` or a lost signer; nothing is consumed
+        async fn assert_unseated_cannot_tell(&self, recovery: &TestE2EEDevice) {
+            let db = &self.harness.db;
+            let (recovery_left, other_left) = (
+                packages_left(db, recovery).await,
+                packages_left(db, &self.other_device).await,
+            );
+            let as_recovery = self
+                .claim_as(
+                    &self.viewer_session,
+                    &self.viewer_device,
+                    &[Self::target(recovery)],
+                )
+                .await;
+            refused(
+                &as_recovery,
+                Status::Forbidden,
+                "NotSeated",
+                "unseated, recovery",
+            );
+            let as_growth = self
+                .claim_as(
+                    &self.viewer_session,
+                    &self.viewer_device,
+                    &[Self::target(&self.other_device)],
+                )
+                .await;
+            assert_eq!(as_recovery, as_growth, "unseated: recovery vs growth");
+            assert_eq!(packages_left(db, recovery).await, recovery_left);
+            assert_eq!(packages_left(db, &self.other_device).await, other_left);
+        }
+    }
+
+    /// S2-D32 (§6.1 "KeyPackage claim"): the claim for the re-Add of a
+    /// device whose rule-6 eviction `rejoin_readd` records is recovery. With
+    /// growth off it is served; a claim of any other device, alone or beside
+    /// it, is refused; it still needs an entitlement that allows text
+    /// traffic, and a refused claim consumes nothing
+    #[test]
+    fn a_rejoin_readd_claim_passes_with_growth_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            a_rejoin_readd_claim_passes_with_growth_off_case().await
+        })
+    }
+
+    async fn a_rejoin_readd_claim_passes_with_growth_off_case() {
+        let fixture = recovery_fixture().await;
+        let db = &fixture.harness.db;
+        let owner_device = &fixture.protected.owner_device;
+        let evicted = fixture
+            .harness
+            .new_e2ee_device(&fixture.member, &Ulid::new().to_string(), 0x60)
+            .await;
+        publish(db, &evicted, "evicted-0", false).await;
+        publish(db, &evicted, "evicted-1", false).await;
+        let entry = MlsRejoinReadd {
+            user_id: evicted.user_id.clone(),
+            device_id: evicted.device_id.clone(),
+            at: Timestamp::now_utc(),
+        };
+        edit_group(db, &fixture.group_id, |group| {
+            group.rejoin_readd.push(entry)
+        })
+        .await;
+        let evicted_target = RecoveryFixture::target(&evicted);
+        let other_target = RecoveryFixture::target(&fixture.other_device);
+
+        fixture.assert_unseated_cannot_tell(&evicted).await;
+
+        // Growth: another device, alone or beside the re-Add
+        for (case, targets) in [
+            ("another device", vec![other_target]),
+            (
+                "the re-Add beside another",
+                vec![evicted_target, other_target],
+            ),
+        ] {
+            let answer = fixture
+                .claim_as(&fixture.owner_session, owner_device, &targets)
+                .await;
+            growth_refused(&answer, case);
+        }
+        assert_eq!(packages_left(db, &evicted).await, 2);
+        assert_eq!(packages_left(db, &fixture.other_device).await, 1);
+
+        // Recovery still needs the entitlement, refused before any package
+        // is consumed
+        set_entitlement_state(
+            db,
+            fixture.protected.channel.id(),
+            ChannelEntitlementState::Frozen,
+        )
+        .await;
+        let answer = fixture
+            .claim_as(&fixture.owner_session, owner_device, &[evicted_target])
+            .await;
+        refused(
+            &answer,
+            Status::BadRequest,
+            "InvalidOperation",
+            "the re-Add, frozen",
+        );
+        assert_eq!(packages_left(db, &evicted).await, 2);
+        set_entitlement_state(
+            db,
+            fixture.protected.channel.id(),
+            ChannelEntitlementState::Active,
+        )
+        .await;
+
+        let (status, body) = fixture
+            .claim_as(&fixture.owner_session, owner_device, &[evicted_target])
+            .await;
+        assert!(
+            matches!(
+                &served(status, &body, "the re-Add")[..],
+                [v0::MlsClaimStatus::Claimed { reused: false, .. }]
+            ),
+            "{}",
+            body
+        );
+        assert_eq!(packages_left(db, &evicted).await, 1);
+    }
+
+    /// How the signer device is lost
+    #[derive(Debug, Clone, Copy)]
+    enum SignerLoss {
+        /// The open group carries `signer_lost`; the identity is still there
+        Flagged,
+        /// The identity is gone and nothing set `signer_lost` (#213)
+        IdentityGone,
+    }
+
+    /// S2-D32, #213: a claim for the signer user's replacement device (a
+    /// device of the stored list's signer user that is not a member) is
+    /// growth until the signer device is lost, then recovery: served with
+    /// growth off. The signer device itself, another user's device and a
+    /// mixed claim stay growth; the entitlement still applies, and a refused
+    /// claim consumes nothing
+    async fn the_signer_users_replacement_claim_is_recovery(loss: SignerLoss) {
+        let fixture = recovery_fixture().await;
+        let db = &fixture.harness.db;
+        let owner_device = &fixture.protected.owner_device;
+        let replacement = fixture
+            .harness
+            .new_e2ee_device(&fixture.owner, "elsewhere", NEW_OWNER_DEVICE_SEED)
+            .await;
+        publish(db, &replacement, "replacement-0", false).await;
+        publish(db, &replacement, "replacement-1", false).await;
+        publish(db, owner_device, "owner-0", false).await;
+        let replacement_target = RecoveryFixture::target(&replacement);
+        let other_target = RecoveryFixture::target(&fixture.other_device);
+
+        // Before the loss the replacement is a new device: growth
+        let answer = fixture
+            .claim_as(
+                &fixture.member_session,
+                &fixture.member_device,
+                &[replacement_target],
+            )
+            .await;
+        growth_refused(&answer, &format!("{loss:?}: before the loss"));
+        assert_eq!(packages_left(db, &replacement).await, 2);
+
+        match loss {
+            SignerLoss::Flagged => {
+                let lost = MlsSignerLost {
+                    user_id: fixture.owner.id.clone(),
+                    device_id: owner_device.device_id.clone(),
+                    cause: MlsSignerLostCause::DeviceRevoked,
+                    at: Timestamp::now_utc(),
+                };
+                edit_group(db, &fixture.group_id, |group| {
+                    group.signer_lost = Some(lost)
+                })
+                .await;
+            }
+            SignerLoss::IdentityGone => {
+                assert!(db
+                    .delete_e2ee_device(&fixture.owner.id, &owner_device.device_id)
+                    .await
+                    .expect("delete the signer device"));
+                let group = db
+                    .fetch_mls_group(&fixture.group_id)
+                    .await
+                    .expect("the group");
+                assert!(group.signer_lost.is_none(), "{loss:?}");
+            }
+        }
+
+        fixture.assert_unseated_cannot_tell(&replacement).await;
+
+        for (case, targets) in [
+            (
+                "the signer device itself",
+                vec![RecoveryFixture::target(owner_device)],
+            ),
+            ("another user's device", vec![other_target]),
+            (
+                "the replacement beside another",
+                vec![replacement_target, other_target],
+            ),
+        ] {
+            let answer = fixture
+                .claim_as(&fixture.member_session, &fixture.member_device, &targets)
+                .await;
+            growth_refused(&answer, &format!("{loss:?}: {case}"));
+        }
+        assert_eq!(packages_left(db, &replacement).await, 2);
+        assert_eq!(packages_left(db, owner_device).await, 1);
+        assert_eq!(packages_left(db, &fixture.other_device).await, 1);
+
+        set_entitlement_state(
+            db,
+            fixture.protected.channel.id(),
+            ChannelEntitlementState::Frozen,
+        )
+        .await;
+        let answer = fixture
+            .claim_as(
+                &fixture.member_session,
+                &fixture.member_device,
+                &[replacement_target],
+            )
+            .await;
+        refused(
+            &answer,
+            Status::BadRequest,
+            "InvalidOperation",
+            &format!("{loss:?}: frozen"),
+        );
+        assert_eq!(packages_left(db, &replacement).await, 2);
+        set_entitlement_state(
+            db,
+            fixture.protected.channel.id(),
+            ChannelEntitlementState::Active,
+        )
+        .await;
+
+        let (status, body) = fixture
+            .claim_as(
+                &fixture.member_session,
+                &fixture.member_device,
+                &[replacement_target],
+            )
+            .await;
+        assert_eq!(
+            tags(&served(
+                status,
+                &body,
+                &format!("{loss:?}: the replacement")
+            )),
+            ["Claimed"]
+        );
+        assert_eq!(packages_left(db, &replacement).await, 1);
+    }
+
+    #[test]
+    fn growth_off_serves_the_signer_users_replacement_while_signer_lost() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_claim_is_recovery(SignerLoss::Flagged).await
+        })
+    }
+
+    #[test]
+    fn growth_off_serves_the_signer_users_replacement_when_its_identity_is_gone() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_claim_is_recovery(SignerLoss::IdentityGone).await
+        })
+    }
+
+    /// #220: a growth claim needs an entitlement that allows text traffic
+    /// (on this branch `Active` only), refused after the seat check and
+    /// before any package is consumed
+    #[test]
+    fn an_entitlement_refusal_consumes_no_key_package() {
+        crate::util::test::rt().block_on(an_entitlement_refusal_consumes_no_key_package_case())
+    }
+
+    async fn an_entitlement_refusal_consumes_no_key_package_case() {
+        let fixture = recovery_fixture().await;
+        let db = &fixture.harness.db;
+        let owner_device = &fixture.protected.owner_device;
+        let targets = [RecoveryFixture::target(&fixture.other_device)];
+
+        for state in [
+            ChannelEntitlementState::Frozen,
+            ChannelEntitlementState::Deleted,
+        ] {
+            let case = format!("{state:?}");
+            set_entitlement_state(db, fixture.protected.channel.id(), state).await;
+            let answer = fixture
+                .claim_as(&fixture.owner_session, owner_device, &targets)
+                .await;
+            refused(&answer, Status::BadRequest, "InvalidOperation", &case);
+            assert_eq!(
+                packages_left(db, &fixture.other_device).await,
+                1,
+                "{}",
+                case
+            );
+        }
+
+        set_entitlement_state(
+            db,
+            fixture.protected.channel.id(),
+            ChannelEntitlementState::Active,
+        )
+        .await;
+        let (status, body) = fixture
+            .claim_as(&fixture.owner_session, owner_device, &targets)
+            .await;
+        assert_eq!(tags(&served(status, &body, "active")), ["Claimed"]);
+        assert_eq!(packages_left(db, &fixture.other_device).await, 0);
     }
 }

@@ -7,7 +7,7 @@ use revolt_models::v0;
 use revolt_result::{create_error, Error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 
-use super::protected_seat_validation::validate_protect;
+use super::protected_seat_validation::{after_seat_list_write, validate_protect};
 use crate::routes::mls::{
     require_channel_access, require_protected_available, require_protected_growth,
 };
@@ -47,7 +47,10 @@ pub async fn protect_channel(
 
     // 4.3 steps 1 to 3 (the signer is the caller and the server owner,
     // signing from a device this session is bound to), then N3: a
-    // byte-identical retry of a protect that landed skips steps 5 to 8
+    // byte-identical retry of a protect that landed skips steps 5 to 8.
+    // S2: a v2 genesis only while `formats_v2` is on and a v1 genesis only
+    // while it is off (step 1, #218), and the first authority of a v2
+    // genesis is verified under the signer device's directory key (3b).
     let validated = validate_protect(db, &channel, &server, &user, &session, &data).await?;
 
     // Decision 4 (W2): a retry runs before the staff-owner refusal and the
@@ -79,6 +82,12 @@ pub async fn protect_channel(
         );
     }
 
+    // 4.3 "After the claim commits" (S2-D12): the same recheck, event and
+    // entry as the seat PUT. A genesis releases nobody, so no reason. Kept
+    // and answered after the protect event below, which must go out either
+    // way; the protect stays written.
+    let after = after_seat_list_write(db, &server, &channel, &user, &outcome, None).await;
+
     // Every connected client sets its protected pin (9.4) now, on the
     // SERVER topic, the one `Channel::update` uses (decision 19 (W2)).
     // Re-emitted on N3 (#134): a protect that landed but answered 5xx never
@@ -93,6 +102,7 @@ pub async fn protect_channel(
     }
     .p(server.id.clone())
     .await;
+    after?;
 
     let channel = db.fetch_channel(channel.id()).await?;
     Ok(Json(channel.into()))
@@ -113,8 +123,9 @@ mod test {
     use std::collections::BTreeSet;
 
     use revolt_database::{
-        events::client::EventV1, BotInformation, Channel, ChannelSeat, Message, PartialChannel,
-        PartialUser, RemovalIntention, SeatList, Session, User,
+        events::client::EventV1, AuditLogAction, AuditLogEntry, AuditValue, BotInformation,
+        Channel, ChannelSeat, Message, PartialChannel, PartialUser, RemovalIntention, SeatList,
+        Session, User, PROTECTED_SCOPE_SEATS,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -122,6 +133,9 @@ mod test {
     use serde_json::json;
     use ulid::Ulid;
 
+    use crate::routes::channels::protected_seat_validation::v2_fixtures::{
+        authority, V2List, SALT,
+    };
     use crate::routes::mls::require_channel_access;
     use crate::util::test::{
         TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_SLOT_CAP, MEMBER_DEVICE_SEED,
@@ -225,6 +239,71 @@ mod test {
                 &[self.owner.id.clone(), self.member.id.clone()],
             )
         }
+
+        /// The first authority (4.10) of the channel, naming the owner
+        /// device under the public half of `listed`, signed with `signing`
+        fn first_authority(
+            &self,
+            listed: &ed25519_dalek::SigningKey,
+            signing: &ed25519_dalek::SigningKey,
+        ) -> v0::SignedAuthority {
+            authority(
+                self.channel.id(),
+                &self.owner.id,
+                &self.owner_device.device_id,
+                &[(self.owner_device.device_id.as_str(), listed)],
+                None,
+                signing,
+            )
+        }
+
+        /// The owner device's v2 genesis (4.1.1) seating the owner and the
+        /// member, carrying `authority`
+        fn v2_genesis(&self, authority: &v0::SignedAuthority) -> v0::DataProtectChannel {
+            v0::DataProtectChannel {
+                seat_list: V2List {
+                    channel_id: self.channel.id(),
+                    version: 1,
+                    signer_user_id: &self.owner.id,
+                    signer_device_id: &self.owner_device.device_id,
+                    key: &self.owner_device.signing_key,
+                    seats: &[self.owner.id.as_str(), self.member.id.as_str()],
+                    salt: SALT,
+                    authority,
+                }
+                .signed(),
+            }
+        }
+    }
+
+    /// Every `ProtectedSeatsUpdate` entry of `server_id`
+    async fn seats_updates(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(
+                server_id,
+                None,
+                50,
+                Some(AuditLogAction::ProtectedSeatsUpdate),
+                None,
+            )
+            .await
+            .expect("the audit log")
+    }
+
+    /// The 7.5 seat event for `channel_id`
+    fn seats_changed(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+        move |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                if id == channel_id && *scope == vec![PROTECTED_SCOPE_SEATS.to_string()])
+        }
+    }
+
+    async fn formats_v2_on() {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.protected_channels.formats_v2 = true;
+        })
+        .await;
     }
 
     /// `PUT /channels/:id/protect` as `session`: the status and the body
@@ -373,6 +452,35 @@ mod test {
             .harness
             .wait_for_event(&server_id, protect_update(&channel_id))
             .await;
+
+        // S2 (4.3 "After the claim commits", 7.5): the seat event on the
+        // CHANNEL topic and the protect's one `ProtectedSeatsUpdate`, with
+        // everyone it seated. Control: protect's `after_seat_list_write`
+        // call removed.
+        setup
+            .harness
+            .wait_for_event(&channel_id, seats_changed(&channel_id))
+            .await;
+        let entries = seats_updates(&setup.harness, &server_id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.actor.as_deref(), Some(setup.owner.id.as_str()));
+        assert_eq!(entry.channel.as_deref(), Some(channel_id.as_str()));
+        assert_eq!(entry.reason, None);
+        let mut seated = vec![setup.owner.id.clone(), setup.member.id.clone()];
+        seated.sort();
+        let changes: Vec<(String, Option<AuditValue>)> = entry
+            .changes
+            .iter()
+            .map(|change| (change.key.clone(), change.new.clone()))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("released".to_string(), Some(AuditValue::StringList(vec![]))),
+                ("seated".to_string(), Some(AuditValue::StringList(seated))),
+            ]
+        );
     }
 
     /// N3 (#128, #134): the protect landed through the database, so no event
@@ -399,6 +507,18 @@ mod test {
             .harness
             .wait_for_event(&server_id, protect_update(&channel_id))
             .await;
+
+        // S2: the retry changed nothing, so no seat event and no entry. The
+        // route publishes the seat event before the protect update and the
+        // subscription is FIFO, so one would be buffered by now. Control:
+        // the event and the entry emitted on `unchanged` too.
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, |event| {
+                matches!(event, EventV1::ProtectedChannelChanged { .. })
+            });
+        let entries = seats_updates(&setup.harness, &server_id).await;
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     #[test]
@@ -449,6 +569,106 @@ mod test {
             written(&setup.harness, &channel_id).await,
             Written::nothing()
         );
+    }
+
+    /// 4.3 step 1 (#218) with `formats_v2` off (the test config): a v2
+    /// genesis, honest authority and all, is refused 400 and nothing is
+    /// written; S1's v1 genesis is what lands (the tests above)
+    #[test]
+    fn a_v2_genesis_is_refused_while_formats_v2_is_off() {
+        crate::util::test::rt().block_on(Box::pin(a_v2_genesis_with_formats_v2_off_case()))
+    }
+
+    async fn a_v2_genesis_with_formats_v2_off_case() {
+        let setup = setup().await;
+        let channel_id = setup.channel_id();
+        let key = &setup.owner_device.signing_key;
+        let data = setup.v2_genesis(&setup.first_authority(key, key));
+
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({ "type": "FailedValidation", "error": "a v2 genesis list needs formats_v2" }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+    }
+
+    /// With `formats_v2` on: a v1 genesis is refused (#218); a v2 genesis
+    /// whose first authority lists the owner device under a key that is not
+    /// its directory key is refused by 4.3 step 3b, even though the
+    /// directory key signed it (so only the key compare stops it); neither
+    /// writes anything. The honest v2 genesis lands with its authority, and
+    /// the seat event goes out. Control: the route's directory-key compare
+    /// removed.
+    #[test]
+    fn with_formats_v2_on_only_an_honest_v2_genesis_lands() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            formats_v2_on().await;
+            with_formats_v2_on_only_an_honest_v2_genesis_lands_case().await
+        }))
+    }
+
+    async fn with_formats_v2_on_only_an_honest_v2_genesis_lands_case() {
+        let mut setup = setup().await;
+        let channel_id = setup.channel_id();
+        let key = setup.owner_device.signing_key.clone();
+        let foreign = TestE2EEDevice::signing_key_for(MEMBER_DEVICE_SEED);
+
+        let answer = protect(
+            &setup.harness,
+            &setup.owner_session,
+            &channel_id,
+            &setup.genesis(),
+        )
+        .await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({
+                "type": "FailedValidation",
+                "error": "a genesis list must be v2 while formats_v2 is on"
+            }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+
+        let forged = setup.v2_genesis(&setup.first_authority(&foreign, &key));
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &forged).await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({
+                "type": "FailedValidation",
+                "error": "authority signer key is not the signer device key"
+            }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+
+        let honest_authority = setup.first_authority(&key, &key);
+        let honest = setup.v2_genesis(&honest_authority);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &honest).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        let list = written(&setup.harness, &channel_id)
+            .await
+            .list
+            .expect("the v2 genesis is stored");
+        assert!(list.is_v2());
+        let stored_authority = list.authority.expect("its authority");
+        assert_eq!(stored_authority.body, honest_authority.body);
+        assert_eq!(stored_authority.signature, honest_authority.signature);
+        setup
+            .harness
+            .wait_for_event(&channel_id, seats_changed(&channel_id))
+            .await;
     }
 
     /// MUST CLOSE 5, 2.3 (W0-fix): a privileged owner cannot protect
