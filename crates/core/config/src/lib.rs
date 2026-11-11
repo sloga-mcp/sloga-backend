@@ -1371,6 +1371,9 @@ pub struct LegalLinks {
     pub privacy_policy: String,
     /// Guidelines URL
     pub guidelines: String,
+    /// Take It Down page URL; empty = not linked
+    #[serde(default)]
+    pub take_it_down: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1924,6 +1927,163 @@ impl E2EEFeatures {
     }
 }
 
+/// `[features.takedown]`: Take It Down Act requests (public form, reviewer
+/// queue, crond alerts and clean-up).
+///
+/// Ships OFF. Prod sets it in Revolt.overrides.toml under an explicit
+/// `[features.takedown]` header (env form `REVOLT__FEATURES__TAKEDOWN__...`,
+/// double underscores; `data_key` belongs there or in the environment, never
+/// in a committed file), then RESTARTS delta AND crond: config sources are
+/// frozen into each process at first access. Without a valid `data_key` the
+/// feature stays off (`active()`), and the site falls back to email.
+///
+/// `Default` is hand-written for the numbers and the status URL, and `Debug`
+/// is hand-written so `init()`'s config dump never prints the key, the
+/// webhook URL or the staff addresses.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct FeaturesTakedown {
+    /// Master switch; also needs a valid `data_key`
+    pub enabled: bool,
+    /// AES-256 key sealing requester details: 64 hex characters. Empty = off
+    pub data_key: String,
+    /// User ids allowed to review requests (each also needs `privileged`
+    /// and active MFA). A TOML list, or one comma-separated string (the
+    /// environment form)
+    #[serde(deserialize_with = "takedown_list")]
+    pub reviewers: Vec<String>,
+    /// Addresses that get staff alert emails; same forms as `reviewers`
+    #[serde(deserialize_with = "takedown_list")]
+    pub staff_alert_emails: Vec<String>,
+    /// Webhook that gets each staff alert as a plain-text POST body (ntfy
+    /// style); empty = none
+    pub alert_webhook_url: String,
+    /// Status page the received email links to (`#<reference>.<token>` is
+    /// appended)
+    pub status_url_base: String,
+    /// Hour after receipt at which an unreviewed request auto-hides the
+    /// attachment it linked directly (restorable); 0 = never
+    pub auto_hide_hour: u64,
+    /// Most auto-hides per requester address per day
+    pub auto_hide_daily_cap: u64,
+    /// Copy count above which a removal needs `confirm_copies`
+    pub copy_confirm_threshold: u64,
+    /// Requests per contact address per day before new ones are throttled
+    /// (queued slower, never refused)
+    pub per_address_daily_soft_limit: u64,
+    /// Days after closing that removed adult images are held before deletion
+    pub retention_adult_days: u64,
+    /// Days after closing before requester details are purged (only the
+    /// contact fingerprint stays)
+    pub retention_requester_days: u64,
+    /// Whether reviewers may restore removed content
+    pub restore_enabled: bool,
+}
+
+impl Default for FeaturesTakedown {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_key: String::new(),
+            reviewers: Vec::new(),
+            staff_alert_emails: Vec::new(),
+            alert_webhook_url: String::new(),
+            status_url_base: "https://sloga.gg/legal/take-it-down-status.html".to_string(),
+            auto_hide_hour: 44,
+            auto_hide_daily_cap: 3,
+            copy_confirm_threshold: 25,
+            per_address_daily_soft_limit: 5,
+            retention_adult_days: 30,
+            retention_requester_days: 365,
+            restore_enabled: false,
+        }
+    }
+}
+
+impl FeaturesTakedown {
+    /// On, with a key that is 64 hex characters
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self.data_key.len() == 64
+            && self.data_key.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
+impl std::fmt::Debug for FeaturesTakedown {
+    /// Same output as the derive, except `data_key` and `alert_webhook_url`
+    /// print as `"<redacted>"` (or `"<unset>"` when empty) and
+    /// `staff_alert_emails` as a count
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(secret: &str) -> &'static str {
+            if secret.is_empty() {
+                "<unset>"
+            } else {
+                "<redacted>"
+            }
+        }
+
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let FeaturesTakedown {
+            enabled,
+            data_key,
+            reviewers,
+            staff_alert_emails,
+            alert_webhook_url,
+            status_url_base,
+            auto_hide_hour,
+            auto_hide_daily_cap,
+            copy_confirm_threshold,
+            per_address_daily_soft_limit,
+            retention_adult_days,
+            retention_requester_days,
+            restore_enabled,
+        } = self;
+
+        f.debug_struct("FeaturesTakedown")
+            .field("enabled", enabled)
+            .field("data_key", &redact(data_key))
+            .field("reviewers", reviewers)
+            .field("staff_alert_emails", &staff_alert_emails.len())
+            .field("alert_webhook_url", &redact(alert_webhook_url))
+            .field("status_url_base", status_url_base)
+            .field("auto_hide_hour", auto_hide_hour)
+            .field("auto_hide_daily_cap", auto_hide_daily_cap)
+            .field("copy_confirm_threshold", copy_confirm_threshold)
+            .field("per_address_daily_soft_limit", per_address_daily_soft_limit)
+            .field("retention_adult_days", retention_adult_days)
+            .field("retention_requester_days", retention_requester_days)
+            .field("restore_enabled", restore_enabled)
+            .finish()
+    }
+}
+
+/// `reviewers` and `staff_alert_emails` from a list, or from one
+/// comma-separated string (an environment variable cannot carry a list).
+/// Entries are trimmed and empty ones dropped, so an empty string is an empty
+/// list.
+fn takedown_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum List {
+        List(Vec<String>),
+        Joined(String),
+    }
+
+    let entries = match List::deserialize(deserializer)? {
+        List::List(entries) => entries,
+        List::Joined(joined) => joined.split(',').map(str::to_string).collect(),
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect())
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Features {
     pub limits: FeaturesLimitsCollection,
@@ -2025,6 +2185,12 @@ pub struct Features {
     /// default
     #[serde(default)]
     pub e2ee: E2EEFeatures,
+
+    /// Take It Down requests (ships off; see FeaturesTakedown docs); a
+    /// missing table keeps every default. Boxed for the same stack reason
+    /// as `payments`
+    #[serde(default)]
+    pub takedown: Box<FeaturesTakedown>,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -4265,5 +4431,174 @@ prot_shell_return_url = "https://example.test/prot/thanks/"
         assert_eq!(payments.prot_blocked_countries, ["DE", "FR"]);
         assert_eq!(payments.prot_packs, default_packs());
         assert!(!settings.features.boosts.enabled);
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`, so no
+// local Revolt.overrides.toml or environment variable can skew the result.
+#[cfg(test)]
+mod takedown_config_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{FeaturesTakedown, Settings};
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.takedown]\n";
+    const HEX_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    fn build(toml: &[&str], env: &[(&str, &str)]) -> Settings {
+        let mut builder = Config::builder();
+        for source in toml {
+            builder = builder.add_source(File::from_str(source, FileFormat::Toml));
+        }
+        builder
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(
+                        env.iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                            .collect(),
+                    )),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.takedown]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(
+            !cut.contains("copy_confirm_threshold"),
+            "the cut left the table behind"
+        );
+        cut
+    }
+
+    fn assert_defaults(takedown: &FeaturesTakedown) {
+        assert!(!takedown.enabled);
+        assert!(takedown.data_key.is_empty());
+        assert!(takedown.reviewers.is_empty());
+        assert!(takedown.staff_alert_emails.is_empty());
+        assert!(takedown.alert_webhook_url.is_empty());
+        assert_eq!(
+            takedown.status_url_base,
+            "https://sloga.gg/legal/take-it-down-status.html"
+        );
+        assert_eq!(takedown.auto_hide_hour, 44);
+        assert_eq!(takedown.auto_hide_daily_cap, 3);
+        assert_eq!(takedown.copy_confirm_threshold, 25);
+        assert_eq!(takedown.per_address_daily_soft_limit, 5);
+        assert_eq!(takedown.retention_adult_days, 30);
+        assert_eq!(takedown.retention_requester_days, 365);
+        assert!(!takedown.restore_enabled);
+        assert!(!takedown.active());
+    }
+
+    #[test]
+    fn hand_written_default_has_the_planned_values() {
+        assert_defaults(&FeaturesTakedown::default());
+    }
+
+    /// The embedded table must not drift from the code default
+    #[test]
+    fn embedded_table_matches_the_code_default() {
+        let settings = build(&[EMBEDDED], &[]);
+        assert_defaults(&settings.features.takedown);
+        assert!(settings.features.legal_links.take_it_down.is_empty());
+    }
+
+    #[test]
+    fn missing_table_takes_the_defaults() {
+        let cut = embedded_without_the_table();
+        let without_link = cut
+            .lines()
+            .filter(|line| !line.starts_with("take_it_down"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settings = build(&[&without_link], &[]);
+        assert_defaults(&settings.features.takedown);
+        assert!(settings.features.legal_links.take_it_down.is_empty());
+    }
+
+    /// A partial table (what an overrides file holds) keeps every other default
+    #[test]
+    fn partial_table_keeps_the_other_defaults() {
+        let settings = build(
+            &[
+                &embedded_without_the_table(),
+                "[features.takedown]\nenabled = true\nreviewers = [\" 01ABC \", \"\"]\n",
+            ],
+            &[],
+        );
+        let takedown = &settings.features.takedown;
+        assert!(takedown.enabled);
+        assert_eq!(takedown.reviewers, ["01ABC"]);
+        assert_eq!(takedown.copy_confirm_threshold, 25);
+        assert_eq!(takedown.retention_requester_days, 365);
+        // No key yet, so still off
+        assert!(!takedown.active());
+    }
+
+    #[test]
+    fn environment_form_sets_the_key_and_comma_lists() {
+        let settings = build(
+            &[EMBEDDED],
+            &[
+                ("REVOLT__FEATURES__TAKEDOWN__ENABLED", "true"),
+                ("REVOLT__FEATURES__TAKEDOWN__DATA_KEY", HEX_KEY),
+                ("REVOLT__FEATURES__TAKEDOWN__REVIEWERS", "01AAA, 01BBB,,"),
+                ("REVOLT__FEATURES__TAKEDOWN__STAFF_ALERT_EMAILS", ""),
+                ("REVOLT__FEATURES__TAKEDOWN__AUTO_HIDE_HOUR", "0"),
+            ],
+        );
+        let takedown = &settings.features.takedown;
+        assert!(takedown.active());
+        assert_eq!(takedown.reviewers, ["01AAA", "01BBB"]);
+        assert!(takedown.staff_alert_emails.is_empty());
+        assert_eq!(takedown.auto_hide_hour, 0);
+    }
+
+    #[test]
+    fn active_needs_the_switch_and_a_64_hex_key() {
+        let with = |enabled: bool, key: &str| FeaturesTakedown {
+            enabled,
+            data_key: key.to_string(),
+            ..Default::default()
+        };
+
+        assert!(with(true, HEX_KEY).active());
+        assert!(with(true, &HEX_KEY.to_uppercase()).active());
+        assert!(!with(false, HEX_KEY).active());
+        assert!(!with(true, "").active());
+        assert!(!with(true, &HEX_KEY[..63]).active());
+        assert!(!with(true, &format!("{HEX_KEY}0")).active());
+        assert!(!with(true, &format!("{}zz", &HEX_KEY[..62])).active());
+    }
+
+    #[test]
+    fn debug_never_prints_the_secrets() {
+        let takedown = FeaturesTakedown {
+            enabled: true,
+            data_key: HEX_KEY.to_string(),
+            staff_alert_emails: vec!["staff-alerts@example.com".to_string()],
+            alert_webhook_url: "https://ntfy.example/secret-topic".to_string(),
+            ..Default::default()
+        };
+        let printed = format!("{takedown:?}");
+        assert!(!printed.contains(HEX_KEY));
+        assert!(!printed.contains("staff-alerts@example.com"));
+        assert!(!printed.contains("secret-topic"));
+        assert!(printed.contains("data_key: \"<redacted>\""));
+        assert!(printed.contains("staff_alert_emails: 1"));
+        assert!(printed.contains("auto_hide_hour: 44"));
+        assert!(format!("{:?}", FeaturesTakedown::default()).contains("data_key: \"<unset>\""));
     }
 }
