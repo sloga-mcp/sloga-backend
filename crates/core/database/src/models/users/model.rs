@@ -1565,6 +1565,10 @@ impl User {
         // where they die — the ONLY implicit deletion of a backup (design §5).
         db.delete_all_e2ee_backups(&self.id).await?;
 
+        // Removal tombstones (multi-device D8) outlive device revocation by
+        // design; they die with the account.
+        db.delete_all_e2ee_removed_devices(&self.id).await?;
+
         // Streaming connections hold YouTube refresh tokens — revoke
         // (best-effort) and delete here or they outlive the account and the
         // live poller keeps touching a deleted user.
@@ -2569,6 +2573,54 @@ mod tests {
             user.delete(&db)
                 .await
                 .expect("the retried deletion succeeds");
+        });
+    }
+
+    /// Multi-device D8: deleting the account removes its E2EE removal
+    /// tombstones, and no other account's
+    #[tokio::test]
+    async fn delete_removes_the_accounts_e2ee_removal_tombstones() {
+        database_test!(|db| async move {
+            const OTHER: &str = "01JA00000000000000000OTHER";
+            let mut user = User {
+                id: "01JA0000000000000000000TMB".to_string(),
+                username: "Tombstoned".to_string(),
+                discriminator: "1002".to_string(),
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+
+            let removed_at = iso8601_timestamp::Timestamp::now_utc();
+            for (user_id, fill) in [(user.id.as_str(), "a"), (user.id.as_str(), "b"), (OTHER, "a")] {
+                db.upsert_e2ee_removed_device(&crate::E2EERemovedDevice::new(
+                    user_id,
+                    &fill.repeat(32),
+                    removed_at,
+                ))
+                .await
+                .unwrap();
+            }
+            assert!(db
+                .is_e2ee_device_removed(&user.id, &"a".repeat(32))
+                .await
+                .unwrap());
+
+            user.delete(&db).await.unwrap();
+
+            for fill in ["a", "b"] {
+                assert!(
+                    !db.is_e2ee_device_removed(&user.id, &fill.repeat(32))
+                        .await
+                        .unwrap(),
+                    "the deleted account's tombstone for {fill} survived"
+                );
+            }
+            assert!(
+                db.is_e2ee_device_removed(OTHER, &"a".repeat(32))
+                    .await
+                    .unwrap(),
+                "another account's tombstone was removed"
+            );
         });
     }
 }

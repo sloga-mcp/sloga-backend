@@ -92,6 +92,45 @@ auto_derived!(
 );
 
 auto_derived!(
+    /// Tombstone of an E2EE device explicitly removed from its account
+    /// (multi-device plan D8)
+    ///
+    /// Written ONLY by the removal route (`DELETE /e2ee/keys/{device}`),
+    /// never by [`E2EEIdentity::revoke_device`] itself, so a device revoked
+    /// with its session (logout) can still re-enroll the same id. A
+    /// tombstoned id is refused on first publication and on device claim.
+    /// Removed by the account-deletion cascade only.
+    pub struct E2EERemovedDevice {
+        /// Composite id: `{user_id}:{device_id}`
+        #[serde(rename = "_id")]
+        pub id: String,
+        /// User the device belonged to
+        pub user_id: String,
+        /// The removed device id
+        pub device_id: String,
+        /// When the device was first removed (a repeated upsert keeps it)
+        pub removed_at: Timestamp,
+    }
+);
+
+impl E2EERemovedDevice {
+    /// Composite row id for a tombstone
+    pub fn composite_id(user_id: &str, device_id: &str) -> String {
+        format!("{user_id}:{device_id}")
+    }
+
+    /// Tombstone for (user, device), stamped `removed_at`
+    pub fn new(user_id: &str, device_id: &str, removed_at: Timestamp) -> Self {
+        E2EERemovedDevice {
+            id: Self::composite_id(user_id, device_id),
+            user_id: user_id.to_string(),
+            device_id: device_id.to_string(),
+            removed_at,
+        }
+    }
+}
+
+auto_derived!(
     /// A one-time prekey awaiting consumption
     pub struct E2EEOneTimeKey {
         /// Composite id: `{user_id}:{device_id}:{key_id}`
@@ -591,6 +630,38 @@ impl E2EEIdentity {
         format!("acutest:e2ee:device-claim\ndevice_id:{device_id}\nsession_id:{session_id}\nnonce:{nonce}")
     }
 
+    /// Verify a device-split proof (multi-device D5): THIS device's (the
+    /// old, shared device's) Ed25519 identity key signed the move to
+    /// `new_device_id` with identity key `new_ed25519`, from `session_id`.
+    /// The session is bound into the payload so a captured proof cannot be
+    /// replayed from another session. `proof` is unpadded standard base64
+    /// of the 64-byte signature, like every other signature here; a padded
+    /// one is refused.
+    pub fn verify_split_proof(
+        &self,
+        new_device_id: &str,
+        new_ed25519: &str,
+        session_id: &str,
+        proof: &str,
+    ) -> bool {
+        let Some(verifying_key) = self.verifying_key() else {
+            return false;
+        };
+
+        let payload = Self::split_payload(&self.device_id, new_device_id, new_ed25519, session_id);
+        verify_signature(&verifying_key, &payload, proof)
+    }
+
+    /// Canonical payload for a device-split proof (no trailing newline)
+    pub fn split_payload(
+        old_device_id: &str,
+        new_device_id: &str,
+        new_ed25519: &str,
+        session_id: &str,
+    ) -> String {
+        format!("acutest:e2ee:device-split\nold:{old_device_id}\nnew:{new_device_id}\nnew_ed25519:{new_ed25519}\nsession:{session_id}")
+    }
+
     /// Require that the calling session is bound to THIS device (design §8,
     /// assumption int-H3: web session tokens are refused on E2EE routes).
     ///
@@ -627,15 +698,55 @@ impl E2EEIdentity {
         Err(create_error!(NotAuthenticated))
     }
 
+    /// Unbind a device from `session_id`, and only from it (multi-device
+    /// D5): one filtered update sets `last_session_id` to `""` iff the row
+    /// is still bound to `session_id`, so it cannot clobber a twin install
+    /// that re-bound the device in the meantime. Returns whether a row was
+    /// unbound. The row itself stays; an empty `session_id` unbinds nothing.
+    ///
+    /// A `""`-bound row is still revoked by "log out other sessions"
+    /// (`Account::delete_all_sessions`), on purpose (plan D5).
+    pub async fn unbind_session_if(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        if session_id.is_empty() {
+            return Ok(false);
+        }
+
+        db.unbind_e2ee_identity_session_if(user_id, device_id, session_id)
+            .await
+    }
+
     /// Broadcast a device-list change to the account's other devices (private
     /// topic) and to DM peers (each direct-message channel topic) — device
     /// changes are loud, both add and remove
+    ///
+    /// `E2EEDeviceCreate.split_from` is for the account's own devices only
+    /// (multi-device D5): the twin re-claims on it. Peers get the same
+    /// event without it, so they learn of a new device and nothing about
+    /// which of the user's devices it left.
     pub async fn broadcast_device_change(db: &Database, user_id: &str, event: EventV1) {
-        event.clone().private(user_id.to_string()).await;
+        let peer_event = match &event {
+            EventV1::E2EEDeviceCreate {
+                user_id,
+                device_id,
+                split_from: Some(_),
+            } => EventV1::E2EEDeviceCreate {
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
+                split_from: None,
+            },
+            _ => event.clone(),
+        };
+
+        event.private(user_id.to_string()).await;
 
         if let Ok(channels) = db.find_direct_messages(user_id).await {
             for channel in channels {
-                event.clone().p(channel.id().to_string()).await;
+                peer_event.clone().p(channel.id().to_string()).await;
             }
         }
     }
@@ -645,7 +756,24 @@ impl E2EEIdentity {
     ///
     /// Wired into: `DELETE /e2ee/keys/{device}`, session revocation/logout
     /// (`Session::delete`) and the account-deletion cascade (`User::delete`).
+    ///
+    /// Never writes an [`E2EERemovedDevice`] tombstone: only the removal
+    /// route does, so a device revoked with its session can re-enroll.
+    ///
+    /// A revoked device leaves any call it is in (its `user:device` seat
+    /// and screen legs, best-effort, after the broadcast).
     pub async fn revoke_device(db: &Database, user_id: &str, device_id: &str) -> Result<bool> {
+        Self::revoke_device_inner(db, user_id, device_id, true).await
+    }
+
+    /// [`Self::revoke_device`], with the call-seat eviction only when
+    /// `evict`. Only the same-session predecessor sweep passes `false`.
+    async fn revoke_device_inner(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        #[cfg_attr(not(feature = "voice"), allow(unused_variables))] evict: bool,
+    ) -> Result<bool> {
         let existed = db.delete_e2ee_device(user_id, device_id).await?;
 
         // A revoked device's MLS KeyPackages must leave the directory with
@@ -663,6 +791,14 @@ impl E2EEIdentity {
                 },
             )
             .await;
+        }
+
+        // Only a device this call removed; without the `voice` feature
+        // the binary has no voice client and revocation stops here
+        #[cfg(feature = "voice")]
+        if existed && evict {
+            let voice_client = crate::voice::VoiceClient::from_revolt_config().await;
+            crate::voice::evict_revoked_device(&voice_client, user_id, device_id).await;
         }
 
         Ok(existed)
@@ -699,11 +835,18 @@ impl E2EEIdentity {
     /// not server-enforced. A COPIED session token that enables E2EE on a
     /// second install revokes the first install's device — loud and
     /// recoverable; token sharing is outside the supported model.
+    ///
+    /// `also_keep` is never swept either: a split publication passes its
+    /// `split_from` (multi-device D5), the device a twin install still
+    /// uses. The publication unbinds it first, so the sweep would not
+    /// match it anyway; the explicit exclusion keeps it safe from a
+    /// binding that changed in between. A device claim passes `None`.
     pub async fn revoke_same_session_predecessors(
         db: &Database,
         user_id: &str,
         session_id: &str,
         keep_device_id: &str,
+        also_keep: Option<&str>,
     ) {
         let Ok(identities) = db.fetch_e2ee_identities(user_id).await else {
             // Best-effort: an unreadable listing = no sweep this cycle
@@ -712,11 +855,14 @@ impl E2EEIdentity {
 
         for identity in identities {
             if identity.device_id != keep_device_id
+                && also_keep != Some(identity.device_id.as_str())
                 && identity.last_session_id == session_id
             {
                 // Best-effort per row; the broadcast inside revoke_device
-                // keeps every successful removal loud
-                let _ = Self::revoke_device(db, user_id, &identity.device_id).await;
+                // keeps every successful removal loud. A predecessor is
+                // this same install under its old id, possibly still
+                // seated in a call, so its seat stays
+                let _ = Self::revoke_device_inner(db, user_id, &identity.device_id, false).await;
             }
         }
     }
@@ -966,5 +1112,329 @@ impl E2EEOneTimeKey {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod multi_device_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use super::super::tests::make_device;
+    use super::{E2EEIdentity, E2EERemovedDevice};
+    use crate::Database;
+
+    /// The stored tombstone for (user, device), read past the trait (which
+    /// deliberately has no fetch)
+    async fn stored_tombstone(db: &Database, user_id: &str, device_id: &str) -> Option<E2EERemovedDevice> {
+        let id = E2EERemovedDevice::composite_id(user_id, device_id);
+        match db {
+            Database::Reference(reference) => {
+                reference.e2ee_removed_devices.lock().await.get(&id).cloned()
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => mongo
+                .col::<E2EERemovedDevice>("e2ee_removed_devices")
+                .find_one(bson::doc! { "_id": &id })
+                .await
+                .expect("find_one"),
+        }
+    }
+
+    /// Multi-device D5: unbinding matches only while the row is bound to
+    /// the given session, keeps the row (bound to `""`), and never undoes a
+    /// binding another session made in the meantime
+    #[tokio::test]
+    async fn unbind_session_if_only_unbinds_its_own_binding() {
+        database_test!(|db| async move {
+            let device = make_device("user_unbind");
+            let device_id = device.identity.device_id.clone();
+            let mut identity = device.identity.clone();
+            identity.last_session_id = "S1".to_string();
+            db.insert_e2ee_identity(&identity).await.unwrap();
+            let seen = db
+                .fetch_e2ee_identity("user_unbind", &device_id)
+                .await
+                .unwrap()
+                .last_seen_at;
+
+            // Another session, another user, another device: no match
+            assert!(!E2EEIdentity::unbind_session_if(&db, "user_unbind", &device_id, "S2")
+                .await
+                .unwrap());
+            assert!(!E2EEIdentity::unbind_session_if(&db, "user_other", &device_id, "S1")
+                .await
+                .unwrap());
+            assert!(!E2EEIdentity::unbind_session_if(&db, "user_unbind", &"f".repeat(32), "S1")
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_e2ee_identity("user_unbind", &device_id)
+                    .await
+                    .unwrap()
+                    .last_session_id,
+                "S1",
+                "a non-matching unbind must leave the binding alone"
+            );
+
+            // The bound session: unbound, row kept, last_seen_at untouched
+            assert!(E2EEIdentity::unbind_session_if(&db, "user_unbind", &device_id, "S1")
+                .await
+                .unwrap());
+            let row = db
+                .fetch_e2ee_identity("user_unbind", &device_id)
+                .await
+                .expect("an unbound row stays");
+            assert_eq!(row.last_session_id, "");
+            assert_eq!(row.last_seen_at, seen);
+
+            // Once unbound, the same call no longer matches, and an empty
+            // session id never unbinds anything
+            assert!(!E2EEIdentity::unbind_session_if(&db, "user_unbind", &device_id, "S1")
+                .await
+                .unwrap());
+            assert!(!E2EEIdentity::unbind_session_if(&db, "user_unbind", &device_id, "")
+                .await
+                .unwrap());
+
+            // A twin re-binds the device (S_twin) after the caller last
+            // read it as S1: the caller's unbind for S1 must not undo it
+            db.update_e2ee_identity_session("user_unbind", &device_id, "S_twin", Timestamp::now_utc())
+                .await
+                .unwrap();
+            assert!(!db
+                .unbind_e2ee_identity_session_if("user_unbind", &device_id, "S1")
+                .await
+                .unwrap());
+            assert_eq!(
+                db.fetch_e2ee_identity("user_unbind", &device_id)
+                    .await
+                    .unwrap()
+                    .last_session_id,
+                "S_twin",
+                "an unbind for a stale session clobbered the twin's binding"
+            );
+        });
+    }
+
+    /// Multi-device D8: a tombstone upsert is idempotent (one row, the
+    /// first `removed_at` kept), scoped to (user, device), and removed for
+    /// one user only by the cascade op
+    #[tokio::test]
+    async fn removed_device_tombstones_are_idempotent_and_scoped() {
+        database_test!(|db| async move {
+            let (a, b) = ("a".repeat(32), "b".repeat(32));
+            assert!(!db.is_e2ee_device_removed("user_tomb", &a).await.unwrap());
+
+            let first = E2EERemovedDevice::new("user_tomb", &a, Timestamp::UNIX_EPOCH);
+            db.upsert_e2ee_removed_device(&first).await.unwrap();
+            db.upsert_e2ee_removed_device(&E2EERemovedDevice::new(
+                "user_tomb",
+                &a,
+                Timestamp::now_utc(),
+            ))
+            .await
+            .unwrap();
+
+            assert!(db.is_e2ee_device_removed("user_tomb", &a).await.unwrap());
+            assert!(!db.is_e2ee_device_removed("user_tomb", &b).await.unwrap());
+            assert!(!db.is_e2ee_device_removed("user_tomb_other", &a).await.unwrap());
+            assert_eq!(
+                stored_tombstone(&db, "user_tomb", &a).await,
+                Some(first),
+                "a repeated upsert must keep the first tombstone as it is"
+            );
+
+            db.upsert_e2ee_removed_device(&E2EERemovedDevice::new(
+                "user_tomb_other",
+                &a,
+                Timestamp::UNIX_EPOCH,
+            ))
+            .await
+            .unwrap();
+
+            // One row for the repeated upsert, and the other user's survives
+            assert_eq!(
+                db.delete_all_e2ee_removed_devices("user_tomb").await.unwrap(),
+                1
+            );
+            assert!(!db.is_e2ee_device_removed("user_tomb", &a).await.unwrap());
+            assert!(db.is_e2ee_device_removed("user_tomb_other", &a).await.unwrap());
+            assert_eq!(
+                db.delete_all_e2ee_removed_devices("user_tomb").await.unwrap(),
+                0
+            );
+        });
+    }
+
+    /// Multi-device D5 (audit MINOR-6b): the predecessor sweep spares the
+    /// kept device and `also_keep`, even while both are still bound to the
+    /// sweeping session, and revokes every other row bound to it
+    #[tokio::test]
+    async fn predecessor_sweep_spares_also_keep() {
+        database_test!(|db| async move {
+            let user = "user_sweep";
+            let [kept, split_from, predecessor, elsewhere] = std::array::from_fn(|n| {
+                let mut identity = make_device(user).identity;
+                identity.last_session_id = if n == 3 { "S2" } else { "S1" }.to_string();
+                identity
+            });
+            for identity in [&kept, &split_from, &predecessor, &elsewhere] {
+                db.insert_e2ee_identity(identity).await.unwrap();
+            }
+
+            E2EEIdentity::revoke_same_session_predecessors(
+                &db,
+                user,
+                "S1",
+                &kept.device_id,
+                Some(&split_from.device_id),
+            )
+            .await;
+
+            for (identity, survives) in [
+                (&kept, true),
+                (&split_from, true),
+                (&predecessor, false),
+                (&elsewhere, true),
+            ] {
+                assert_eq!(
+                    db.fetch_e2ee_identity(user, &identity.device_id).await.is_ok(),
+                    survives,
+                    "device {} (bound to {})",
+                    identity.device_id,
+                    identity.last_session_id
+                );
+            }
+
+            // Without `also_keep` the same row is an ordinary predecessor
+            E2EEIdentity::revoke_same_session_predecessors(&db, user, "S1", &kept.device_id, None)
+                .await;
+            assert!(db.fetch_e2ee_identity(user, &split_from.device_id).await.is_err());
+            assert!(db.fetch_e2ee_identity(user, &kept.device_id).await.is_ok());
+        });
+    }
+
+    /// Multi-device D8: revocation alone (the session-delete path) never
+    /// writes a tombstone, so the same install can re-enroll the id
+    #[tokio::test]
+    async fn revoke_device_writes_no_tombstone() {
+        database_test!(|db| async move {
+            let device = make_device("user_revoke");
+            db.insert_e2ee_identity(&device.identity).await.unwrap();
+
+            assert!(E2EEIdentity::revoke_device(&db, "user_revoke", &device.identity.device_id)
+                .await
+                .unwrap());
+            assert!(!db
+                .is_e2ee_device_removed("user_revoke", &device.identity.device_id)
+                .await
+                .unwrap());
+
+            // And the id can be published again
+            db.insert_e2ee_identity(&device.identity)
+                .await
+                .expect("a revoked (not removed) id re-enrolls");
+        });
+    }
+}
+
+#[cfg(test)]
+mod revoke_eviction_wiring_tests {
+    /// The body of `async fn fn_name` in this file: comment lines dropped,
+    /// and whitespace kept only between two identifier characters, so the
+    /// needles below do not depend on line breaks or a trailing comma
+    fn fn_body(fn_name: &str) -> String {
+        const SOURCE: &str = include_str!("model.rs");
+        let header = format!("async fn {fn_name}(");
+        assert_eq!(SOURCE.matches(&header).count(), 1, "{header}");
+        let at = SOURCE.find(&header).expect("the fn is defined");
+        let open = at + SOURCE[at..].find('{').expect("a body");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, ch) in SOURCE[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let text = SOURCE[open..=close.expect("a closed body")]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+        let chars: Vec<char> = text.chars().collect();
+        let mut body = String::new();
+        for (i, &ch) in chars.iter().enumerate() {
+            if !ch.is_whitespace() {
+                body.push(ch);
+                continue;
+            }
+            let before = body.chars().last();
+            let after = chars[i + 1..].iter().copied().find(|c| !c.is_whitespace());
+            if before.is_some_and(ident) && after.is_some_and(ident) {
+                body.push(' ');
+            }
+        }
+        body.replace(",)", ")")
+    }
+
+    /// Every public revocation evicts: `revoke_device` is the evicting
+    /// inner call and nothing else, and the session path goes through it
+    #[test]
+    fn public_revocation_takes_the_evicting_path() {
+        assert_eq!(
+            fn_body("revoke_device"),
+            "{Self::revoke_device_inner(db,user_id,device_id,true).await}"
+        );
+        let session = fn_body("revoke_devices_for_session");
+        assert!(
+            session.contains("Self::revoke_device(db,user_id,&identity.device_id).await?;"),
+            "{session}"
+        );
+    }
+
+    /// The same-session predecessor sweep keeps the seat: it reaches the
+    /// inner revocation with `false`, and never the public one
+    #[test]
+    fn predecessor_sweep_takes_the_non_evicting_path() {
+        let sweep = fn_body("revoke_same_session_predecessors");
+        assert_eq!(
+            sweep
+                .matches("Self::revoke_device_inner(db,user_id,&identity.device_id,false).await;")
+                .count(),
+            1,
+            "{sweep}"
+        );
+        assert_eq!(sweep.matches("revoke_device_inner(").count(), 1, "{sweep}");
+        assert_eq!(sweep.matches("revoke_device(").count(), 0, "{sweep}");
+    }
+
+    /// In the inner revocation the eviction follows the broadcast, runs
+    /// only for a device this call removed and only when asked, and sits
+    /// behind the `voice` feature
+    #[test]
+    fn eviction_follows_the_broadcast_and_is_gated() {
+        let inner = fn_body("revoke_device_inner");
+        let evict = "#[cfg(feature=\"voice\")]if existed&&evict{\
+                     let voice_client=crate::voice::VoiceClient::from_revolt_config().await;\
+                     crate::voice::evict_revoked_device(&voice_client,user_id,device_id).await;}";
+        assert_eq!(inner.matches(evict).count(), 1, "{inner}");
+        assert_eq!(inner.matches("evict_revoked_device(").count(), 1, "{inner}");
+
+        let broadcast = inner
+            .find("if existed{Self::broadcast_device_change(")
+            .expect("the broadcast");
+        let eviction = inner.find(evict).expect("the eviction");
+        let done = inner.find("Ok(existed)").expect("the result");
+        assert!(broadcast < eviction && eviction < done, "{inner}");
     }
 }

@@ -812,3 +812,92 @@ impl Account {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use iso8601_timestamp::Timestamp;
+
+    use crate::{Account, E2EEIdentity, E2EESignedKey, EmailVerification};
+
+    /// An identity row for the session bookkeeping below; the keys are never
+    /// verified on this path
+    fn identity(user_id: &str, fill: &str, session_id: &str) -> E2EEIdentity {
+        let device_id = fill.repeat(32);
+        E2EEIdentity {
+            id: E2EEIdentity::composite_id(user_id, &device_id),
+            user_id: user_id.to_string(),
+            device_id,
+            protocol_version: 1,
+            ed25519_key: "ZWQ".to_string(),
+            curve25519_key: "Y3Vy".to_string(),
+            signature: "c2ln".to_string(),
+            fallback_key: E2EESignedKey {
+                key_id: "f0".to_string(),
+                key: "a2V5".to_string(),
+                signature: "c2ln".to_string(),
+            },
+            previous_fallback_key: None,
+            created_at: Timestamp::now_utc(),
+            last_seen_at: Timestamp::now_utc(),
+            last_session_id: session_id.to_string(),
+        }
+    }
+
+    /// Multi-device D5 (audit M3), deliberate: a device a split left bound
+    /// to `""` is still revoked by "log out other sessions" from the
+    /// surviving session, so an injected device cannot split itself out of
+    /// a log-out-everyone. The device bound to the surviving session stays
+    #[tokio::test]
+    async fn delete_all_sessions_still_revokes_an_unbound_device() {
+        database_test!(|db| async move {
+            let account = Account {
+                id: "01JA00000000000000000ACCNT".to_string(),
+                email: "unbound@example.com".to_string(),
+                email_normalised: "unbound@example.com".to_string(),
+                password: String::new(),
+                disabled: false,
+                verification: EmailVerification::Verified,
+                password_reset: None,
+                deletion: None,
+                lockout: None,
+                mfa: Default::default(),
+                google_id: None,
+                apple_id: None,
+            };
+
+            let kept = identity(&account.id, "a", "S_current");
+            let split_from = identity(&account.id, "b", "S_current");
+            let elsewhere = identity(&account.id, "c", "S_other");
+            for row in [&kept, &split_from, &elsewhere] {
+                db.insert_e2ee_identity(row).await.unwrap();
+            }
+
+            assert!(E2EEIdentity::unbind_session_if(
+                &db,
+                &account.id,
+                &split_from.device_id,
+                "S_current"
+            )
+            .await
+            .unwrap());
+
+            account
+                .delete_all_sessions(&db, Some("S_current".to_string()))
+                .await
+                .unwrap();
+
+            let left: Vec<String> = db
+                .fetch_e2ee_identities(&account.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.device_id)
+                .collect();
+            assert_eq!(
+                left,
+                vec![kept.device_id.clone()],
+                "only the device bound to the surviving session may remain"
+            );
+        });
+    }
+}
