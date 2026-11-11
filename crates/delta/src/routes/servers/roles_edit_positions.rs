@@ -1,4 +1,5 @@
 use revolt_database::util::audit_reason::AuditLogReason;
+use revolt_database::util::protected_access::reconcile_server;
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference}, voice::{sync_server_voice_permissions, VoiceClient}, Database, User
 };
@@ -89,7 +90,8 @@ pub async fn edit_role_ranks(
 
     server.set_role_ordering(db, new_order).await?;
 
-    // Logged between the write and the sync: the sync stays the last step.
+    // Logged between the write and the sync: the sync stays the last step
+    // but for the kept reconcile result.
     if let Some(ranks) = logged_ranks {
         AuditLogEntry::record(
             db,
@@ -109,9 +111,29 @@ pub async fn edit_role_ranks(
         .await;
     }
 
+    // Protected channels 6.3 "Hooks" (S2-D11): a new order can flip which of
+    // two roles' allow and deny of ViewChannel wins, so the seats it took
+    // ViewChannel from are released, in every protected channel of the
+    // server. Run on every write, a resubmitted order included, so retrying
+    // the same edit repairs a pass that failed. The result is kept until the
+    // sync has run and a failure is logged at once, so a failing sync never
+    // hides it.
+    let reconciled = reconcile_server(db, &server.id).await;
+    if let Err(error) = &reconciled {
+        log::error!(
+            "protected channel reconcile failed after a role rank edit: server={}: {:?}",
+            server.id,
+            error
+        );
+    }
+
     // Every channel is tried before the first failure is answered (AFK S-3
     // D-6); `server` already carries the new ranks.
     sync_server_voice_permissions(db, voice_client, &server, None).await?;
+
+    // The reconcile's own error is answered once the sync has run; the new
+    // order stands.
+    reconciled?;
 
     Ok(Json(server.into()))
 }
@@ -124,12 +146,15 @@ mod test {
         AUDIT_LOG_REASON_HEADER, AUDIT_LOG_REASON_MAX_CHARS,
     };
     use revolt_database::{
-        fixture, AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, PartialServer, Server,
+        fixture, AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, PartialServer, Role,
+        Server,
     };
     use revolt_models::v0;
+    use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::Value;
 
+    use super::protected_hook::{end_call, hook_world, plain_world, HookWorld};
     use crate::util::test::TestHarness;
 
     #[test]
@@ -368,8 +393,12 @@ mod test {
     }
 
     /// The sync reads the POST-update server document, so it runs after the
-    /// route's write, and it is the route's last step before the answer.
-    /// Mutation: the sync moved above the write in one route.
+    /// route's write, and it is the route's last step before the answer:
+    /// only the kept reconcile result of protected channels 6.3 "Hooks"
+    /// (S2-D11) is handed back after it. Before S2 the answer followed the
+    /// sync directly; this pin was changed for that hook. Mutations: the
+    /// sync moved above the write in one route; the kept result answered
+    /// above the sync in one route.
     #[test]
     fn the_server_wide_syncs_follow_their_write() {
         for (file, source, handler, write, sync) in SYNCING_ROUTES {
@@ -390,12 +419,75 @@ mod test {
                 file,
                 body
             );
+            let after = body[synced + sync.len()..].trim_start();
             assert!(
-                body[synced + sync.len()..].trim_start().starts_with("Ok("),
-                "{} must answer right after the sync: {}",
+                after.starts_with(KEPT) && after[KEPT.len()..].trim_start().starts_with("Ok("),
+                "{} must answer right after the sync and its kept reconcile result: {}",
                 file,
                 body
             );
+        }
+    }
+
+    /// The reconcile result the four routes keep across the sync.
+    const RECONCILE: &str = "let reconciled = reconcile_server(db, &server.id).await;";
+    const KEPT: &str = "reconciled?;";
+
+    /// Protected channels 6.3 "Hooks" (S2-D11): each of the four routes
+    /// reconciles the server once, after its write and its audit entry and
+    /// before its voice sync, at the top level of its body (so on every
+    /// request that wrote, a no-change one included: a retry repairs a
+    /// failed pass), and gates it on no feature flag (removal always works).
+    /// Mutations: the reconcile run only on a change; the reconcile nested
+    /// in a block; the reconcile moved below the sync.
+    #[test]
+    fn the_server_wide_routes_reconcile_between_their_entry_and_their_sync() {
+        for (file, source, handler, write, sync) in SYNCING_ROUTES {
+            let body = route_body(file, source, handler);
+            for needle in [RECONCILE, "reconcile_server(", KEPT] {
+                assert_eq!(
+                    body.matches(needle).count(),
+                    1,
+                    "{} must carry `{}` exactly once: {}",
+                    file,
+                    needle,
+                    body
+                );
+            }
+            let at = |needle: &str| {
+                body.find(needle)
+                    .unwrap_or_else(|| panic!("{} lacks `{}`: {}", file, needle, body))
+            };
+            let reconciled = at(RECONCILE);
+            assert!(
+                at(write) < reconciled && at("AuditLogEntry::record(") < reconciled,
+                "{} must reconcile after its write and its entry: {}",
+                file,
+                body
+            );
+            assert!(
+                reconciled < at(sync),
+                "{} must reconcile before its sync: {}",
+                file,
+                body
+            );
+            let before = &body[..reconciled];
+            assert_eq!(
+                before.matches('\u{7b}').count(),
+                before.matches('\u{7d}').count() + 1,
+                "{} must reconcile at the top level of its body: {}",
+                file,
+                body
+            );
+            for flag in ["config(", "protected_channels"] {
+                assert!(
+                    !body.contains(flag),
+                    "{} must not gate the hook on `{}`: {}",
+                    file,
+                    flag,
+                    body
+                );
+            }
         }
     }
 
@@ -818,5 +910,534 @@ mod test {
             let entries = audit_log(&harness, &server.id).await;
             assert!(entries.is_empty(), "{:?}", entries);
         })
+    }
+
+    // ---- protected channels: the reconciler hook (6.3 "Hooks", S2-D11) ----
+    //
+    // The member holds two roles: `sight` allows ViewChannel and `blind`
+    // denies it. Roles apply from the lowest-ranked up, so whichever ranks
+    // higher wins: `sight` starts above `blind`, and a new order that puts
+    // `blind` on top takes ViewChannel away.
+
+    const VIEW: i64 = ChannelPermission::ViewChannel as i64;
+
+    /// The member's two conflicting roles, `sight` on top, written straight
+    /// to the store (no hook runs). Returns them.
+    async fn conflicting_roles(world: &HookWorld) -> (Role, Role) {
+        let sight = world.role(1, OverrideField { a: VIEW, d: 0 }).await;
+        let blind = world.role(2, OverrideField { a: 0, d: VIEW }).await;
+        world.set_roles(&world.member.id, &[&sight, &blind]).await;
+        (sight, blind)
+    }
+
+    /// The stored order with `sight` and `blind` swapped, `blind` on top.
+    async fn blind_on_top(world: &HookWorld, sight: &Role, blind: &Role) -> Vec<String> {
+        let mut ranks = ordered_ids(&world.server().await);
+        let position = |id: &str| {
+            ranks
+                .iter()
+                .position(|ranked| ranked == id)
+                .expect("a ranked role")
+        };
+        let (above, below) = (position(sight.id.as_str()), position(blind.id.as_str()));
+        assert!(above < below, "precondition: sight ranks above blind");
+        ranks.swap(above, below);
+        ranks
+    }
+
+    /// How many `role_ranks_update` entries the server has.
+    async fn rank_entries(world: &HookWorld) -> usize {
+        audit_log(&world.harness, &world.server_id)
+            .await
+            .into_iter()
+            .filter(|entry| entry.action == AuditLogAction::RoleRanksUpdate)
+            .count()
+    }
+
+    #[test]
+    fn ranking_a_denying_role_on_top_releases_its_holders_seat() {
+        crate::util::test::rt().block_on(async {
+            let mut world = hook_world().await;
+            let (sight, blind) = conflicting_roles(&world).await;
+            assert!(!world.member_lacks_access().await, "precondition: M views");
+            let ranks = blind_on_top(&world, &sight, &blind).await;
+            let call = world.unreachable_call().await;
+
+            // The owner puts `blind` on top: the hook releases M's seat
+            // (`AccessLost`, one entry, the seats event) and the owner, the
+            // list signer, keeps theirs. The unreachable call answers its
+            // `UnknownNode`, and the seat is released all the same: the
+            // reconcile runs BEFORE the sync. Controls: the hook removed; the
+            // reconcile moved below the sync.
+            let (status, body) = edit_ranks(
+                &world.harness,
+                &world.owner_session.token,
+                &world.server_id,
+                &ranks,
+                None,
+            )
+            .await;
+            end_call(&call).await;
+            assert_eq!(status, Status::BadRequest, "body: {}", body);
+            assert_eq!(body["type"], "UnknownNode", "body: {}", body);
+            assert_eq!(
+                ordered_ids(&world.server().await),
+                ranks,
+                "the order stands"
+            );
+            assert!(world.member_lacks_access().await, "M lost ViewChannel");
+            world.assert_member_released().await;
+        })
+    }
+
+    /// The reconcile fails (the protected channel's document is gone): the
+    /// new order stands and is logged, the voice sync still runs (with a call
+    /// it cannot reach, its own `UnknownNode` is the answer), and without
+    /// such a call the reconcile's own error is the answer (`NotFound`: the
+    /// document it reads is gone). Resubmitting the same order,
+    /// which logs nothing, releases the seat once the document is back.
+    /// Controls: the reconcile's error returned before the sync; its error
+    /// dropped; the hook run only on a change.
+    #[test]
+    fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write() {
+        crate::util::test::rt().block_on(async {
+            let mut world = hook_world().await;
+            let (sight, blind) = conflicting_roles(&world).await;
+            let ranks = blind_on_top(&world, &sight, &blind).await;
+            let parked = world.break_reconcile().await;
+
+            // The sync ran after the failed reconcile: its error answers first
+            let call = world.unreachable_call().await;
+            let (status, body) = edit_ranks(
+                &world.harness,
+                &world.owner_session.token,
+                &world.server_id,
+                &ranks,
+                Some("hook"),
+            )
+            .await;
+            end_call(&call).await;
+            assert_eq!(status, Status::BadRequest, "body: {}", body);
+            assert_eq!(body["type"], "UnknownNode", "body: {}", body);
+            assert_eq!(
+                ordered_ids(&world.server().await),
+                ranks,
+                "the order stands"
+            );
+            assert_eq!(rank_entries(&world).await, 1);
+
+            // No call: the kept failure is answered, the write is not undone
+            let (status, body) = edit_ranks(
+                &world.harness,
+                &world.owner_session.token,
+                &world.server_id,
+                &ranks,
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::NotFound, "body: {}", body);
+            assert_eq!(body["type"], "NotFound", "body: {}", body);
+            assert_eq!(
+                ordered_ids(&world.server().await),
+                ranks,
+                "the order stands"
+            );
+            assert!(
+                world.seat(&world.member.id).await.is_active(),
+                "a failed reconcile released nothing"
+            );
+            assert!(world.releases().await.is_empty());
+
+            // Repaired: the same order releases the seat
+            world.repair(&parked).await;
+            let (status, body) = edit_ranks(
+                &world.harness,
+                &world.owner_session.token,
+                &world.server_id,
+                &ranks,
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "body: {}", body);
+            assert_eq!(
+                rank_entries(&world).await,
+                1,
+                "the resubmitted orders are not logged"
+            );
+            world.assert_member_released().await;
+        })
+    }
+
+    /// No protected channel in the server: the same rank edit answers as
+    /// before S2, with no seat entry and no seats event.
+    #[test]
+    fn without_a_protected_channel_the_hook_changes_nothing() {
+        crate::util::test::rt().block_on(async {
+            let mut world = plain_world().await;
+            let (sight, blind) = conflicting_roles(&world).await;
+            let ranks = blind_on_top(&world, &sight, &blind).await;
+
+            let (status, body) = edit_ranks(
+                &world.harness,
+                &world.owner_session.token,
+                &world.server_id,
+                &ranks,
+                None,
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "body: {}", body);
+            assert_eq!(
+                ordered_ids(&world.server().await),
+                ranks,
+                "the order stands"
+            );
+            assert_eq!(rank_entries(&world).await, 1);
+            assert!(world.releases().await.is_empty());
+            world.assert_no_seats_event().await;
+        })
+    }
+}
+
+/// Protected channels 6.3 "Hooks" (S2-D11): the world and the observables
+/// the hook tests of the four server-wide role and permission routes share
+/// (`roles_delete`, `roles_edit_positions`, `permissions_set`,
+/// `permissions_set_default`). Needs RabbitMQ and Redis, like every route
+/// test.
+#[cfg(test)]
+pub(crate) mod protected_hook {
+    use revolt_database::{
+        events::client::EventV1,
+        util::protected_access::seat_holder_lacks_access,
+        voice::{delete_channel_node, set_channel_node},
+        AuditLogAction, Channel, ChannelSeat, Database, PartialMember, PartialRole, PartialServer,
+        Role, SeatReleaseCause, Server, Session, User, PROTECTED_SCOPE_SEATS,
+    };
+    use revolt_models::v0;
+    use revolt_permissions::OverrideField;
+    use ulid::Ulid;
+
+    use crate::util::test::TestHarness;
+
+    /// A node name absent from `Revolt.toml`: a voice sync addressed to it
+    /// fails with `UnknownNode` before any network.
+    const ABSENT_NODE: &str = "test-node-with-no-sfu";
+
+    /// A server owned by `owner`, with `member` joined. In a [`hook_world`]
+    /// `channel` is protected, both are seated, `owner` signed the list, and
+    /// the member's seat has received the keys (so its release is
+    /// `AccessLost` with the cooldown). In a [`plain_world`] nothing is
+    /// protected and `channel` is the server's first channel.
+    pub(crate) struct HookWorld {
+        pub(crate) harness: TestHarness,
+        pub(crate) owner: User,
+        pub(crate) owner_session: Session,
+        pub(crate) member: User,
+        pub(crate) server_id: String,
+        pub(crate) channel_id: String,
+        /// `channel_id`'s document as the world was built (it never changes
+        /// here), kept for the access check while it is broken away
+        channel: Channel,
+    }
+
+    pub(crate) async fn hook_world() -> HookWorld {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let channel = protected.channel;
+        harness.mark_keys_received(channel.id(), &member.id).await;
+
+        HookWorld {
+            harness,
+            owner,
+            owner_session,
+            member,
+            server_id: protected.server.id,
+            channel_id: channel.id().to_string(),
+            channel,
+        }
+    }
+
+    pub(crate) async fn plain_world() -> HookWorld {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&owner).await;
+        harness.join_server(&server, &owner).await;
+        harness.join_server(&server, &member).await;
+        let channel = channels
+            .into_iter()
+            .next()
+            .expect("the server's first channel");
+
+        HookWorld {
+            harness,
+            owner,
+            owner_session,
+            member,
+            server_id: server.id,
+            channel_id: channel.id().to_string(),
+            channel,
+        }
+    }
+
+    /// End the call [`HookWorld::unreachable_call`] pinned
+    pub(crate) async fn end_call(call: &Channel) {
+        delete_channel_node(call.id()).await.expect("node gone");
+    }
+
+    impl HookWorld {
+        pub(crate) async fn server(&self) -> Server {
+            self.harness
+                .db
+                .fetch_server(&self.server_id)
+                .await
+                .expect("server")
+        }
+
+        /// A role at `rank` with `permissions`; the rank is set after the
+        /// creation, which derives one from the server it is given
+        pub(crate) async fn role(&self, rank: i64, permissions: OverrideField) -> Role {
+            let server = self.server().await;
+            let mut role = self
+                .harness
+                .new_role(&server, rank, Some(permissions))
+                .await;
+            role.update(
+                &self.harness.db,
+                &server.id,
+                PartialRole {
+                    rank: Some(rank),
+                    ..Default::default()
+                },
+                Vec::new(),
+            )
+            .await
+            .expect("role rank");
+            role
+        }
+
+        /// `user_id`'s roles become `roles`, written straight to the store
+        pub(crate) async fn set_roles(&self, user_id: &str, roles: &[&Role]) {
+            let mut member = self
+                .harness
+                .db
+                .fetch_member(&self.server_id, user_id)
+                .await
+                .expect("member");
+            member
+                .update(
+                    &self.harness.db,
+                    PartialMember {
+                        roles: Some(roles.iter().map(|role| role.id.clone()).collect()),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .await
+                .expect("member roles");
+        }
+
+        /// The @everyone default becomes `permissions`, written straight to
+        /// the store
+        pub(crate) async fn set_default_permissions(&self, permissions: i64) {
+            self.harness
+                .db
+                .update_server(
+                    &self.server_id,
+                    &PartialServer {
+                        default_permissions: Some(permissions),
+                        ..Default::default()
+                    },
+                    vec![],
+                )
+                .await
+                .expect("the default");
+        }
+
+        /// The reconciler's own predicate for the member, on fresh reads of
+        /// the user, the membership and the server
+        pub(crate) async fn member_lacks_access(&self) -> bool {
+            let db = &self.harness.db;
+            let user = db.fetch_user(&self.member.id).await.expect("user");
+            let member = db
+                .fetch_member(&self.server_id, &self.member.id)
+                .await
+                .expect("member");
+            let server = self.server().await;
+            seat_holder_lacks_access(db, Some(&user), Some(&member), &self.channel, &server).await
+        }
+
+        pub(crate) async fn seat(&self, user_id: &str) -> ChannelSeat {
+            self.harness
+                .db
+                .fetch_channel_seats(&self.channel_id)
+                .await
+                .expect("seats")
+                .into_iter()
+                .find(|seat| seat.user_id == user_id)
+                .expect("a seat row")
+        }
+
+        /// `(target, channel)` of every `ProtectedSeatRelease` entry, sorted
+        pub(crate) async fn releases(&self) -> Vec<(String, String)> {
+            let mut releases: Vec<(String, String)> = self
+                .harness
+                .db
+                .fetch_audit_log(
+                    &self.server_id,
+                    None,
+                    50,
+                    Some(AuditLogAction::ProtectedSeatRelease),
+                    None,
+                )
+                .await
+                .expect("the audit log")
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.target.unwrap_or_default(),
+                        entry.channel.unwrap_or_default(),
+                    )
+                })
+                .collect();
+            releases.sort();
+            releases
+        }
+
+        /// The reconciler released the member's seat, as `AccessLost`, with
+        /// one `ProtectedSeatRelease` entry and the seats event on the
+        /// channel topic, and the owner, the list signer, kept theirs
+        pub(crate) async fn assert_member_released(&mut self) {
+            let seat = self.seat(&self.member.id).await;
+            assert!(
+                !seat.is_active(),
+                "the member's seat is released: {:?}",
+                seat
+            );
+            assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+            let owner = self.seat(&self.owner.id).await;
+            assert!(
+                owner.is_active(),
+                "the list signer keeps the seat: {:?}",
+                owner
+            );
+            assert_eq!(
+                self.releases().await,
+                vec![(self.member.id.clone(), self.channel_id.clone())]
+            );
+
+            let channel_id = self.channel_id.clone();
+            self.harness
+                .wait_for_event(&channel_id, |event| {
+                    matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                        if id == &channel_id && *scope == vec![PROTECTED_SCOPE_SEATS.to_string()])
+                })
+                .await;
+        }
+
+        /// No `ProtectedChannelChanged` went out on any channel of the
+        /// server. A marker on the owner's private topic is published and
+        /// awaited first: the harness reads every topic through ONE
+        /// subscription, FIFO, and the route awaited its publishes before it
+        /// answered, so anything it published is buffered by then.
+        pub(crate) async fn assert_no_seats_event(&mut self) {
+            let marker = Ulid::new().to_string();
+            EventV1::ChannelAck {
+                id: marker.clone(),
+                user: self.owner.id.clone(),
+                message_id: marker.clone(),
+            }
+            .private(self.owner.id.clone())
+            .await;
+            self.harness
+                .wait_for_event(&format!("{}!", self.owner.id), |event| match event {
+                    EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                    _ => false,
+                })
+                .await;
+
+            for channel_id in self.server().await.channels {
+                self.harness.assert_no_buffered_event(&channel_id, |event| {
+                    matches!(event, EventV1::ProtectedChannelChanged { .. })
+                });
+            }
+        }
+
+        /// Make every reconcile of this server fail after the route's write:
+        /// the protected channel's document is removed straight from the
+        /// store (its seat list, seats and entitlement stay), so the pass
+        /// fails reading it. Returns the document for [`Self::repair`].
+        pub(crate) async fn break_reconcile(&self) -> Channel {
+            let db = &self.harness.db;
+            let channel = db.fetch_channel(&self.channel_id).await.expect("channel");
+            match db {
+                Database::Reference(reference) => {
+                    reference
+                        .channels
+                        .lock()
+                        .await
+                        .remove(&self.channel_id)
+                        .expect("the channel row");
+                }
+                Database::MongoDb(mongo) => {
+                    use revolt_database::mongodb::bson::{doc, Document};
+
+                    let result = mongo
+                        .col::<Document>("channels")
+                        .delete_one(doc! { "_id": &self.channel_id })
+                        .await
+                        .expect("the channel delete");
+                    assert_eq!(result.deleted_count, 1, "the channel row");
+                }
+            }
+            assert!(
+                db.fetch_channel(&self.channel_id).await.is_err(),
+                "precondition: the channel read fails"
+            );
+            channel
+        }
+
+        /// Put back the document [`Self::break_reconcile`] removed
+        pub(crate) async fn repair(&self, channel: &Channel) {
+            self.harness
+                .db
+                .insert_channel(channel)
+                .await
+                .expect("the channel restored");
+        }
+
+        /// A voice channel of the server whose call is pinned to
+        /// [`ABSENT_NODE`], so the route's voice sync reaches it and fails
+        /// with `UnknownNode`. Undo with [`end_call`].
+        pub(crate) async fn unreachable_call(&self) -> Channel {
+            let mut server = self.server().await;
+            let channel = Channel::create_server_channel(
+                &self.harness.db,
+                &mut server,
+                v0::DataCreateServerChannel {
+                    channel_type: v0::LegacyServerChannelType::Text,
+                    name: "Call".to_string(),
+                    description: None,
+                    nsfw: Some(false),
+                    spoiler: None,
+                    voice: Some(v0::VoiceInformation {
+                        max_users: None,
+                        disabled: false,
+                    }),
+                    announcement: None,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await
+            .expect("voice channel");
+            set_channel_node(channel.id(), ABSENT_NODE)
+                .await
+                .expect("node");
+            channel
+        }
     }
 }

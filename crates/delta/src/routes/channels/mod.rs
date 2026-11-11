@@ -198,7 +198,8 @@ mod protected_openapi_completeness {
         (Method::Get, "/{target}/seats", "fetch_seats", "E2EE"),
     ];
 
-    /// The MLS routes W2 gave a Text path (mounted under `/mls`)
+    /// The MLS routes W2 gave a Text path, and the Welcome route S2 added
+    /// (mounted under `/mls`)
     const MLS: &[(Method, &str, &str, &str)] = &[
         (
             Method::Put,
@@ -241,6 +242,12 @@ mod protected_openapi_completeness {
             Method::Get,
             "/channels/{channel_id}/text_group",
             "fetch_text_group",
+            "MLS",
+        ),
+        (
+            Method::Get,
+            "/groups/{group_id}/welcome",
+            "fetch_welcome",
             "MLS",
         ),
     ];

@@ -1,7 +1,8 @@
 use revolt_database::{
     client_gate_is_set,
     util::{
-        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery,
+        protected_access::reconcile_channel, reference::Reference,
     },
     voice::{delete_voice_channel, UserVoiceChannel, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
@@ -12,6 +13,8 @@ use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
 use validator::Validate;
+
+use super::permissions_set::log_reconcile_failure;
 
 /// # Edit Channel
 ///
@@ -634,6 +637,23 @@ pub async fn edit(
     // below: its `?`s can still fail a request whose edit has already landed.
     record_channel_update(db, &user, &channel_before_edit, &channel, reason).await;
 
+    // Protected channels (6.3 "Hooks", S2-D11): clearing the @everyone
+    // override can take ViewChannel away (a channel allow over a server
+    // default without it), so that edit reconciles the channel; no other
+    // edit does, as nothing else this route writes is a permission. After
+    // the write and its entry and BEFORE the voice teardown and sync below,
+    // on every such edit (retrying it repairs a failed reconcile). The
+    // result is kept: those always run, then a failed reconcile answers 500
+    // with the edit in place (the `Member::remove` kept-second-release
+    // shape), its error unchanged. A failed voice step is answered instead,
+    // so the reconcile error is logged here. A channel without a seat list
+    // is a no-op.
+    let reconciled = if clears_default_permissions {
+        log_reconcile_failure(channel.id(), reconcile_channel(db, channel.id()).await)
+    } else {
+        Ok(Vec::new())
+    };
+
     if channel.voice().is_none() {
         // Pointer integrity: this PATCH may have just removed the channel's
         // voice information (remove: ["Voice"]) or disabled calling on it
@@ -674,6 +694,8 @@ pub async fn edit(
             .await?;
         }
     }
+
+    reconciled?;
 
     Ok(Json(channel.into()))
 }
@@ -3737,5 +3759,317 @@ mod tests {
                 body
             );
         }
+    }
+
+    // ---- Protected channels: the reconcile hook (6.3 "Hooks", S2-D11) -------
+
+    /// A protected channel seating its owner (the session's user) and `target`
+    struct Hooked {
+        session: revolt_database::Session,
+        target: revolt_database::User,
+        server: revolt_database::Server,
+        channel_id: String,
+    }
+
+    async fn hooked_channel(harness: &TestHarness) -> Hooked {
+        let (_, session, owner) = harness.new_user().await;
+        let (_, _, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session, &[&target])
+            .await;
+        let channel_id = protected.channel.id().to_string();
+        Hooked {
+            session,
+            target,
+            server: protected.server,
+            channel_id,
+        }
+    }
+
+    async fn hooked_seat_active(harness: &TestHarness, channel_id: &str, user_id: &str) -> bool {
+        harness
+            .db
+            .fetch_channel_seats(channel_id)
+            .await
+            .expect("the seats read")
+            .into_iter()
+            .find(|seat| seat.user_id == user_id)
+            .expect("a seat row")
+            .is_active()
+    }
+
+    async fn hooked_entries(
+        harness: &TestHarness,
+        server_id: &str,
+        action: revolt_database::AuditLogAction,
+    ) -> Vec<revolt_database::AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, Some(action), None)
+            .await
+            .expect("the audit log")
+    }
+
+    /// The server's own default loses ViewChannel and the channel's
+    /// @everyone override grants it back, both written straight to the store
+    async fn hide_behind_the_default_override(harness: &TestHarness, hooked: &Hooked) {
+        let server = harness
+            .db
+            .fetch_server(&hooked.server.id)
+            .await
+            .expect("server");
+        harness
+            .db
+            .update_server(
+                &server.id,
+                &revolt_database::PartialServer {
+                    default_permissions: Some(server.default_permissions & !(VIEW as i64)),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("a server default without ViewChannel");
+        harness
+            .db
+            .update_channel(
+                &hooked.channel_id,
+                &revolt_database::PartialChannel {
+                    default_permissions: Some(override_field(VIEW, 0)),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("the channel grants ViewChannel");
+    }
+
+    /// The server's default lacks ViewChannel and only the channel's
+    /// @everyone override grants it: clearing that override hides the
+    /// channel from T, and the PATCH releases T's seat with its
+    /// `ProtectedSeatRelease` entry and the seat event. Control: the hook
+    /// deleted.
+    #[test]
+    fn clearing_the_default_override_reconciles_a_protected_channel() {
+        crate::util::test::rt().block_on(Box::pin(
+            clearing_the_default_override_reconciles_a_protected_channel_case(),
+        ))
+    }
+
+    async fn clearing_the_default_override_reconciles_a_protected_channel_case() {
+        let mut harness = TestHarness::new().await;
+        let hooked = hooked_channel(&harness).await;
+        hide_behind_the_default_override(&harness, &hooked).await;
+        assert!(
+            revolt_database::util::protected_access::reconcile_channel(
+                &harness.db,
+                &hooked.channel_id
+            )
+            .await
+            .expect("reconciled")
+            .is_empty(),
+            "precondition: T still sees the channel"
+        );
+
+        let response = patch(
+            &harness,
+            &hooked.session,
+            &hooked.channel_id,
+            json!({ "remove": ["DefaultPermissions"] }),
+        )
+        .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            stored_default_override(&harness, &hooked.channel_id).await,
+            None
+        );
+        assert!(
+            !hooked_seat_active(&harness, &hooked.channel_id, &hooked.target.id).await,
+            "T's seat is released"
+        );
+
+        let releases = hooked_entries(
+            &harness,
+            &hooked.server.id,
+            revolt_database::AuditLogAction::ProtectedSeatRelease,
+        )
+        .await;
+        assert_eq!(releases.len(), 1, "{releases:?}");
+        assert_eq!(releases[0].target.as_deref(), Some(hooked.target.id.as_str()));
+        let channel_id = hooked.channel_id.clone();
+        harness
+            .wait_for_event(&channel_id, |event| {
+                matches!(
+                    event,
+                    revolt_database::events::client::EventV1::ProtectedChannelChanged { id, scope }
+                        if id == &channel_id
+                            && *scope == vec![revolt_database::PROTECTED_SCOPE_SEATS.to_string()]
+                )
+            })
+            .await;
+    }
+
+    /// T has lost ViewChannel behind the route's back (the @everyone
+    /// override written straight to the store): a rename, a description
+    /// and a `remove` of it go through and reconcile nothing, so T's seat
+    /// stays. Only clearing the default override reconciles (the test
+    /// above). Control: the hook run on every edit.
+    #[test]
+    fn other_edits_do_not_reconcile() {
+        crate::util::test::rt().block_on(Box::pin(other_edits_do_not_reconcile_case()))
+    }
+
+    async fn other_edits_do_not_reconcile_case() {
+        let harness = TestHarness::new().await;
+        let hooked = hooked_channel(&harness).await;
+        harness
+            .db
+            .update_channel(
+                &hooked.channel_id,
+                &revolt_database::PartialChannel {
+                    default_permissions: Some(override_field(0, VIEW)),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("hide the channel");
+
+        for body in [
+            json!({ "name": "renamed" }),
+            json!({ "description": "about" }),
+            json!({ "remove": ["Description"] }),
+        ] {
+            let response = patch(&harness, &hooked.session, &hooked.channel_id, body.clone()).await;
+            assert_eq!(response.status(), Status::Ok, "{body}");
+        }
+
+        assert!(
+            hooked_seat_active(&harness, &hooked.channel_id, &hooked.target.id).await,
+            "no other edit reconciles the channel"
+        );
+        let releases = hooked_entries(
+            &harness,
+            &hooked.server.id,
+            revolt_database::AuditLogAction::ProtectedSeatRelease,
+        )
+        .await;
+        assert!(releases.is_empty(), "{:?}", releases);
+    }
+
+    /// Every seat release refused (MONGODB only: the reference store cannot
+    /// fail a write): clearing the override answers the kept reconcile
+    /// error (500) after the edit landed and was recorded. Fault lifted,
+    /// the same PATCH again releases T's seat. Control: the kept result
+    /// dropped (the clear answers 200).
+    #[test]
+    fn a_failed_reconcile_answers_500_after_the_clear() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_failed_reconcile_answers_500_after_the_clear_case(),
+        ))
+    }
+
+    async fn a_failed_reconcile_answers_500_after_the_clear_case() {
+        use revolt_database::mongodb::bson::{doc, Document};
+
+        let harness = TestHarness::new().await;
+        let revolt_database::Database::MongoDb(mongo) = &harness.db else {
+            return;
+        };
+        let seat_validator = |validator: Document| {
+            doc! {
+                "collMod": "channel_seats",
+                "validator": validator,
+                "validationLevel": "strict",
+                "validationAction": "error",
+            }
+        };
+        let hooked = hooked_channel(&harness).await;
+        hide_behind_the_default_override(&harness, &hooked).await;
+        mongo
+            .db()
+            .run_command(seat_validator(doc! { "released_at": null }))
+            .await
+            .expect("the seat validator");
+
+        let clear = json!({ "remove": ["DefaultPermissions"] });
+        let response = patch(&harness, &hooked.session, &hooked.channel_id, clear.clone()).await;
+        let failed = (
+            response.status(),
+            response.into_string().await.unwrap_or_default(),
+        );
+        let kept_seat = hooked_seat_active(&harness, &hooked.channel_id, &hooked.target.id).await;
+        mongo
+            .db()
+            .run_command(seat_validator(doc! {}))
+            .await
+            .expect("the seat validator lifted");
+
+        assert_eq!(failed.0, Status::InternalServerError, "{:?}", failed);
+        assert!(failed.1.contains("DatabaseError"), "{:?}", failed);
+        assert!(kept_seat, "the refused release leaves the seat active");
+        assert_eq!(
+            stored_default_override(&harness, &hooked.channel_id).await,
+            None,
+            "the edit is never undone"
+        );
+        let updates = hooked_entries(
+            &harness,
+            &hooked.server.id,
+            revolt_database::AuditLogAction::ChannelUpdate,
+        )
+        .await;
+        assert_eq!(updates.len(), 1, "the edit is recorded: {updates:?}");
+
+        let response = patch(&harness, &hooked.session, &hooked.channel_id, clear).await;
+        assert_eq!(response.status(), Status::Ok);
+        drop(response);
+        assert!(
+            !hooked_seat_active(&harness, &hooked.channel_id, &hooked.target.id).await,
+            "the retry releases the seat"
+        );
+    }
+
+    /// 6.3 "Hooks" on `edit`'s text, the ORDER no single fault shows on a
+    /// protected channel (it never has voice, so the voice steps never fail
+    /// there): the reconcile is bound, whole, to a name and runs only for a
+    /// cleared default override, after the audit record and BEFORE the
+    /// de-voice block; the kept result is answered last, after every voice
+    /// step. Mutations: `?` on the reconcile; the reconcile moved below the
+    /// voice steps; the kept result dropped.
+    #[test]
+    fn the_default_clear_reconcile_is_kept_across_the_voice_steps() {
+        const KEPT: &str = "let reconciled = if clears_default_permissions \u{7b} \
+             log_reconcile_failure(channel.id(), reconcile_channel(db, channel.id()).await) \
+             \u{7d} else \u{7b} Ok(Vec::new()) \u{7d};";
+        const RECORD: &str =
+            "record_channel_update(db, &user, &channel_before_edit, &channel, reason).await;";
+        const DEVOICE: &str = "if channel.voice().is_none() \u{7b}";
+        const TAIL: &str = "reconciled?; Ok(Json(channel.into())) \u{7d}";
+
+        let body = route_body();
+        assert_eq!(body.matches("reconcile_channel(").count(), 1, "{}", body);
+        assert_eq!(
+            body.matches(KEPT).count(),
+            1,
+            "the reconcile must be kept, and only for a cleared override: {}",
+            body
+        );
+        let kept = body.find(KEPT).expect("counted above");
+        let record = body.find(RECORD).expect("the audit record");
+        let devoice = body.find(DEVOICE).expect("the de-voice block");
+        assert!(
+            record < kept && kept < devoice,
+            "after the audit record, before the voice steps: {}",
+            body
+        );
+        assert!(
+            body.ends_with(TAIL),
+            "the kept result is answered last: {}",
+            body
+        );
+        assert_eq!(body.matches("reconciled").count(), 2, "{}", body);
     }
 }

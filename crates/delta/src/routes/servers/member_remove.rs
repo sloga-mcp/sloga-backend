@@ -6,7 +6,7 @@ use revolt_database::{
     AuditLogAction, AuditLogDraft, AuditLogEntry, Database, RemovalIntention, User,
 };
 use revolt_permissions::{calculate_server_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::State;
 use rocket_empty::EmptyResponse;
 
@@ -48,6 +48,10 @@ pub async fn kick(
     {
         return Err(create_error!(NotElevated));
     }
+
+    // Protected channels 6.3 (S2-D20, O-2): after the rank check, before
+    // anything is written. Not keyed on the target's seat.
+    refuse_removal_without_reason(db, &server.id, reason.as_deref()).await?;
 
     // An error here is a kick that did not happen (the membership is still
     // in place, nothing to record or evict: a retry runs it all again). A
@@ -94,6 +98,48 @@ pub async fn kick(
     Ok(EmptyResponse)
 }
 
+/// `RemovalReasonRequired` for a kick or ban without a reason in a server
+/// with at least one protected channel (protected channels 6.3, S2-D20).
+/// `reason` is the route's sanitized reason; a blank one counts as none.
+///
+/// Never keyed on the target (O-2): a refusal only for seated targets would
+/// tell a moderator who cannot view the channel whether the target holds a
+/// seat. What the refusal does reveal, that the server has a protected
+/// channel, is residual R26.
+///
+/// "Protected channel" is the channel's `protected` flag, the read the
+/// client's reason prompt uses (S2-D40), so an entitlement granted to a
+/// channel that was never protected requires nothing. The channels looked
+/// at are the server's entitlements: protect needs an Active entitlement of
+/// the channel's server, and only the channel's delete cascade removes one,
+/// so every protected channel of the server is among them, and a server
+/// without one costs a single read. An entitlement whose channel is gone is
+/// skipped; any other read error is returned, so the removal is refused
+/// rather than let through on an unreadable channel. With a reason nothing
+/// is read.
+pub(crate) async fn refuse_removal_without_reason(
+    db: &Database,
+    server_id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    if reason.is_some_and(|reason| !reason.trim().is_empty()) {
+        return Ok(());
+    }
+
+    for channel_id in db.fetch_entitled_channel_ids(server_id).await? {
+        match db.fetch_channel(&channel_id).await {
+            Ok(channel) if channel.is_protected() => {
+                return Err(create_error!(RemovalReasonRequired));
+            }
+            Ok(_) => {}
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
@@ -109,6 +155,7 @@ mod test {
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
+    use revolt_result::ErrorType;
     use rocket::http::{Header, Status};
 
     // ---- behavior (needs RabbitMQ and Redis) ------------------------------
@@ -613,7 +660,9 @@ mod test {
     /// the `member_kick` entry is written and the target torn down from the
     /// server's calls, THEN the release's error is answered (500). MONGODB
     /// only: the reference store cannot fail a write. Control: the route's
-    /// `.remove(..).await?` of 2acdf5f0 (no entry, no eviction).
+    /// `.remove(..).await?` of 2acdf5f0 (no entry, no eviction). The kick
+    /// carries a reason, which a server with a protected channel requires
+    /// (S2-D20).
     async fn a_failed_second_release_still_records_and_evicts_then_fails_the_kick_case() {
         use crate::routes::servers::ban_create::test::{fail_the_claim_after_next, text_group_raw};
 
@@ -647,7 +696,8 @@ mod test {
         );
 
         fail_the_claim_after_next(mongo, GROUP).await;
-        let response = kick(&harness, &session_a.token, &server_id, &target.id).await;
+        let response =
+            kick_with_reason(&harness, &session_a.token, &server_id, &target.id, "c3").await;
         let status = response.status();
         let body = response.into_string().await.unwrap_or_default();
         let traces = voice_traces(&uvc, &target.id).await;
@@ -681,6 +731,275 @@ mod test {
             (0, false, false, false),
             "the kicked member is evicted before the error is answered"
         );
+    }
+
+    // ---- protected channels: the removal reason (6.3, S2-D20) --------------
+    //
+    // In a server with a protected channel every kick needs a reason, whether
+    // or not the target holds a seat (O-2). `refuse_removal_without_reason`
+    // is shared with the ban.
+
+    /// Whether `user_id` holds an active seat in `channel_id`
+    async fn seated(harness: &TestHarness, channel_id: &str, user_id: &str) -> bool {
+        harness
+            .db
+            .fetch_channel_seats(channel_id)
+            .await
+            .expect("the seats read")
+            .iter()
+            .any(|seat| seat.user_id == user_id && seat.is_active())
+    }
+
+    /// Every `member_kick` entry of `server_id`
+    async fn kick_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        audit_entries(harness, server_id)
+            .await
+            .into_iter()
+            .filter(|entry| entry.action == AuditLogAction::MemberKick)
+            .collect()
+    }
+
+    /// The status and the JSON body of a response
+    async fn answer(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+    ) -> (Status, serde_json::Value) {
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+        (status, value)
+    }
+
+    fn reason_required() -> (Status, serde_json::Value) {
+        (
+            Status::BadRequest,
+            serde_json::json!({ "type": "RemovalReasonRequired" }),
+        )
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_kick_without_a_reason_in_a_protected_server_is_refused_seated_or_not() {
+        crate::util::test::rt()
+            .block_on(a_kick_without_a_reason_in_a_protected_server_is_refused_seated_or_not_case())
+    }
+
+    /// A kick with no reason header in a server with a protected channel is
+    /// refused with `RemovalReasonRequired`, and nothing is written: the
+    /// target is still a member, still seated, and nothing is recorded. A
+    /// target who holds no seat gets the very same answer (O-2: no
+    /// seat-keyed oracle). Controls: the reason check moved below the
+    /// removal; the check made seat-keyed; the check removed.
+    async fn a_kick_without_a_reason_in_a_protected_server_is_refused_seated_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, seated_target) = harness.new_user().await;
+        let (_c, _session_c, unseated_target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&seated_target])
+            .await;
+        let server_id = protected.server.id.clone();
+        let channel_id = protected.channel.id().to_string();
+        harness
+            .join_server(&protected.server, &unseated_target)
+            .await;
+        assert!(
+            seated(&harness, &channel_id, &seated_target.id).await,
+            "precondition: the first target is seated"
+        );
+        assert!(
+            !seated(&harness, &channel_id, &unseated_target.id).await,
+            "precondition: the second target holds no seat"
+        );
+
+        let mut answers = vec![];
+        for (what, target) in [("seated", &seated_target), ("unseated", &unseated_target)] {
+            let response = kick(&harness, &session_a.token, &server_id, &target.id).await;
+            let refusal = answer(response).await;
+            assert_eq!(refusal, reason_required(), "the {what} target");
+            assert!(
+                harness
+                    .db
+                    .fetch_member(&server_id, &target.id)
+                    .await
+                    .is_ok(),
+                "a refused kick must leave the {} target a member",
+                what
+            );
+            answers.push(refusal);
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "the refusal must not tell a seated target from an unseated one"
+        );
+        assert!(
+            seated(&harness, &channel_id, &seated_target.id).await,
+            "a refused kick releases no seat"
+        );
+        let entries = kick_entries(&harness, &server_id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused kick records nothing: {:?}",
+            entries
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_blank_kick_reason_is_no_reason() {
+        crate::util::test::rt().block_on(a_blank_kick_reason_is_no_reason_case())
+    }
+
+    /// A reason that is blank once sanitized (spaces, a tab and a newline,
+    /// or only invisible format characters) is refused like a missing one,
+    /// through the route and in the shared check itself. Control: the
+    /// check's trim dropped (the direct calls then pass).
+    async fn a_blank_kick_reason_is_no_reason_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+
+        for header in ["   ", "%20%09%0A%20", "%E2%80%8B%E2%80%AE"] {
+            let response =
+                kick_with_reason(&harness, &session_a.token, &server_id, &target.id, header).await;
+            assert_eq!(answer(response).await, reason_required(), "{header:?}");
+            assert!(
+                harness
+                    .db
+                    .fetch_member(&server_id, &target.id)
+                    .await
+                    .is_ok(),
+                "{:?}: a refused kick must leave the target a member",
+                header
+            );
+        }
+        let entries = kick_entries(&harness, &server_id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused kick records nothing: {:?}",
+            entries
+        );
+
+        for reason in [None, Some(""), Some("   "), Some(" \t\n ")] {
+            let refused = super::refuse_removal_without_reason(&harness.db, &server_id, reason)
+                .await
+                .expect_err("a blank reason is refused");
+            assert!(
+                matches!(refused.error_type, ErrorType::RemovalReasonRequired),
+                "{:?}: {:?}",
+                reason,
+                refused
+            );
+        }
+        super::refuse_removal_without_reason(&harness.db, &server_id, Some(" spam "))
+            .await
+            .expect("a reason passes");
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_kick_with_a_reason_in_a_protected_server_lands_and_records_it() {
+        crate::util::test::rt()
+            .block_on(a_kick_with_a_reason_in_a_protected_server_lands_and_records_it_case())
+    }
+
+    /// With a reason the kick goes through in a server with a protected
+    /// channel: the membership is gone, the seat released, and the one
+    /// `member_kick` entry carries the reason.
+    async fn a_kick_with_a_reason_in_a_protected_server_lands_and_records_it_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+        let channel_id = protected.channel.id().to_string();
+
+        let response = kick_with_reason(
+            &harness,
+            &session_a.token,
+            &server_id,
+            &target.id,
+            "left%20the%20team",
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent, "the kick succeeds");
+
+        assert!(harness
+            .db
+            .fetch_member(&server_id, &target.id)
+            .await
+            .is_err());
+        assert!(
+            !seated(&harness, &channel_id, &target.id).await,
+            "the kicked member's seat is released"
+        );
+        let entries = kick_entries(&harness, &server_id).await;
+        assert_eq!(entries.len(), 1, "one kick, one entry: {entries:?}");
+        assert_eq!(entries[0].target.as_deref(), Some(target.id.as_str()));
+        assert_eq!(entries[0].actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entries[0].reason.as_deref(), Some("left the team"));
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_kick_needs_no_reason_without_a_protected_channel() {
+        crate::util::test::rt().block_on(a_kick_needs_no_reason_without_a_protected_channel_case())
+    }
+
+    /// As in S1, a kick needs no reason in a server with no protected
+    /// channel: one with no entitlement at all, and one whose channel holds
+    /// an entitlement but was never protected. Control: the check keyed on
+    /// the entitlements alone (the second kick is then refused).
+    async fn a_kick_needs_no_reason_without_a_protected_channel_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, plain_target) = harness.new_user().await;
+        let (_c, _session_c, granted_target) = harness.new_user().await;
+
+        let (plain, _channels) = harness.new_server(&owner).await;
+        harness.join_server(&plain, &plain_target).await;
+
+        let (granted, channel) = harness.new_protectable_channel(&owner).await;
+        harness.grant_entitlement(&channel, 10, None).await;
+        harness.join_server(&granted, &granted_target).await;
+        assert!(
+            !harness
+                .db
+                .fetch_channel(channel.id())
+                .await
+                .expect("the channel")
+                .is_protected(),
+            "precondition: the entitled channel is not protected"
+        );
+
+        for (what, server, target) in [
+            ("no entitlement", &plain, &plain_target),
+            ("an unprotected entitlement", &granted, &granted_target),
+        ] {
+            let response = kick(&harness, &session_a.token, &server.id, &target.id).await;
+            assert_eq!(
+                response.status(),
+                Status::NoContent,
+                "a kick in a server with {what} needs no reason"
+            );
+            assert!(
+                harness
+                    .db
+                    .fetch_member(&server.id, &target.id)
+                    .await
+                    .is_err(),
+                "{}: the target is kicked",
+                what
+            );
+            let entries = kick_entries(&harness, &server.id).await;
+            assert_eq!(entries.len(), 1, "{what}: {entries:?}");
+            assert_eq!(entries[0].reason, None, "{what}");
+        }
     }
 
     // ---- the kick's order, pinned on its text (AFK S-3 D-2) ----------------
@@ -787,6 +1106,38 @@ mod test {
             body.contains("action: AuditLogAction::MemberKick,"),
             "the kick records a member_kick: {}",
             body
+        );
+    }
+
+    /// Protected channels 6.3 (S2-D20): the removal reason is checked once,
+    /// after the rank check (a moderator who cannot kick the target learns
+    /// nothing of the server's channels) and before the removal, with the
+    /// validated reason and nothing about the target. Controls: the check
+    /// moved above the rank check; the check moved below the removal.
+    #[test]
+    fn the_kick_checks_the_removal_reason_after_the_rank_check() {
+        const RANK: &str = "return Err(create_error!(NotElevated));";
+        const REASON: &str =
+            "refuse_removal_without_reason(db, &server.id, reason.as_deref()).await?;";
+        const REMOVE: &str =
+            ".remove_with_outcome(db, &server, RemovalIntention::Kick, false) .await?;";
+
+        let body = route_body();
+        let mut last = 0;
+        for needle in [RANK, REASON, REMOVE] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the kick must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        assert_eq!(
+            body.matches("refuse_removal_without_reason(").count(),
+            1,
+            "one reason check: {body}"
         );
     }
 }

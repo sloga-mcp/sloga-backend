@@ -1,6 +1,7 @@
 use revolt_database::{
     util::{
-        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery,
+        protected_access::reconcile_server, reference::Reference,
     },
     voice::{sync_server_voice_permissions, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, User,
@@ -64,7 +65,8 @@ pub async fn set_role_permission(
         .await?;
 
     // Recorded after the write and before the sync, which must stay the last
-    // step before the answer (`the_server_wide_syncs_follow_their_write`).
+    // step before the answer but for the kept reconcile result
+    // (`the_server_wide_syncs_follow_their_write`).
     // A PUT of the values already stored changes nothing and is not logged.
     if old_value.a != new_value.a || old_value.d != new_value.d {
         AuditLogEntry::record(
@@ -93,15 +95,36 @@ pub async fn set_role_permission(
         .await;
     }
 
+    // Protected channels 6.3 "Hooks" (S2-D11): release the seats this edit
+    // took ViewChannel from, in every protected channel of the server. Run
+    // on every write, a no-change one included, so retrying the same edit
+    // repairs a pass that failed. The result is kept until the sync has run
+    // and a failure is logged at once, so a failing sync never hides it.
+    let reconciled = reconcile_server(db, &server.id).await;
+    if let Err(error) = &reconciled {
+        log::error!(
+            "protected channel reconcile failed after a role permission edit: server={}: {:?}",
+            server.id,
+            error
+        );
+    }
+
     // Every channel is tried before the first failure is answered (AFK S-3
     // D-6); `server` already carries the new permission.
     sync_server_voice_permissions(db, voice_client, &server, Some(&role_id)).await?;
+
+    // The reconcile's own error is answered once the sync has run; the
+    // permission write stands.
+    reconciled?;
 
     Ok(Json(server.into()))
 }
 
 #[cfg(test)]
 mod test {
+    use crate::routes::servers::roles_edit_positions::protected_hook::{
+        end_call, hook_world, plain_world,
+    };
     use crate::util::test::TestHarness;
     use revolt_database::{
         util::audit_reason::{AUDIT_LOG_REASON_HEADER, AUDIT_LOG_REASON_MAX_CHARS},
@@ -515,9 +538,12 @@ mod test {
     /// recorded once, only when a value changed, after the write and before
     /// the voice sync (which stays the last step, see
     /// `the_server_wide_syncs_follow_their_write` in
-    /// `roles_edit_positions.rs`). Mutations: the record moved above the
-    /// write (a failed write would still be logged); `validated()?` moved
-    /// below the write; the changed-values condition dropped.
+    /// `roles_edit_positions.rs`). Protected channels 6.3 "Hooks" (S2-D11)
+    /// put the reconcile between the entry and the sync and answer its kept
+    /// result after the sync, so this pin gained those two needles.
+    /// Mutations: the record moved above the write (a failed write would
+    /// still be logged); `validated()?` moved below the write; the
+    /// changed-values condition dropped; the reconcile moved above the entry.
     #[test]
     fn the_entry_is_recorded_between_the_write_and_the_sync() {
         let body = route_body();
@@ -536,11 +562,179 @@ mod test {
         let written = find(".set_role_permission(db, &role_id, data.permissions.into()) .await?;");
         let changed = find("if old_value.a != new_value.a || old_value.d != new_value.d");
         let recorded = find("AuditLogEntry::record(");
+        let reconciled = find("let reconciled = reconcile_server(db, &server.id).await;");
         let synced = find("sync_server_voice_permissions(");
+        let kept = find("reconciled?;");
         assert!(validated < loaded, "validate first: {}", body);
         assert!(written < changed, "compare after the write: {}", body);
         assert!(changed < recorded, "record only on a change: {}", body);
         assert!(written < recorded, "record after the write: {}", body);
         assert!(recorded < synced, "record before the sync: {}", body);
+        assert!(recorded < reconciled, "reconcile after the entry: {}", body);
+        assert!(reconciled < synced, "reconcile before the sync: {}", body);
+        assert!(
+            synced < kept,
+            "answer the kept result after the sync: {}",
+            body
+        );
+    }
+
+    // ---- protected channels: the reconciler hook (6.3 "Hooks", S2-D11) ----
+
+    /// How many `server_permissions_update` entries `server` has.
+    async fn permission_entries(harness: &TestHarness, server: &Server) -> usize {
+        audit_log(harness, server)
+            .await
+            .into_iter()
+            .filter(|entry| entry.action == AuditLogAction::ServerPermissionsUpdate)
+            .count()
+    }
+
+    #[test]
+    fn denying_view_channel_to_a_role_releases_its_holders_seat() {
+        crate::util::test::rt()
+            .block_on(denying_view_channel_to_a_role_releases_its_holders_seat_case())
+    }
+
+    /// The owner denies ViewChannel on the seated member's role: the hook
+    /// releases the member's seat (`AccessLost`, one `ProtectedSeatRelease`
+    /// entry, the seats event on the channel topic) and the owner, the list
+    /// signer, keeps theirs. A call the voice sync cannot reach answers its
+    /// `UnknownNode`, and the seat is released all the same: the reconcile
+    /// runs BEFORE the sync. Controls: the hook removed; the reconcile moved
+    /// below the sync.
+    async fn denying_view_channel_to_a_role_releases_its_holders_seat_case() {
+        let mut world = hook_world().await;
+        let role = world.role(5, OverrideField { a: 0, d: 0 }).await;
+        world.set_roles(&world.member.id, &[&role]).await;
+        assert!(!world.member_lacks_access().await, "precondition: M views");
+        let server = world.server().await;
+        let call = world.unreachable_call().await;
+
+        let blind = OverrideField { a: 0, d: VIEW };
+        let (status, body) = set_permissions(
+            &world.harness,
+            &world.owner_session,
+            &server,
+            &role.id,
+            blind,
+            None,
+        )
+        .await;
+        end_call(&call).await;
+        assert_eq!(status, Status::BadRequest, "body: {}", body);
+        assert_eq!(body["type"], "UnknownNode", "body: {}", body);
+        assert_eq!(stored(&world.harness, &server, &role.id).await, blind);
+        assert!(world.member_lacks_access().await, "M lost ViewChannel");
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write() {
+        crate::util::test::rt()
+            .block_on(a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case())
+    }
+
+    /// The reconcile fails (the protected channel's document is gone): the
+    /// permission write stands and is logged, the voice sync still runs
+    /// (with a call it cannot reach, its own `UnknownNode` is the answer),
+    /// and without such a call the reconcile's own error is the answer
+    /// (`NotFound`: the document it reads is gone). Retrying the
+    /// same edit, now a no-change one that logs nothing, releases the seat
+    /// once the document is back. Controls: the reconcile's error returned
+    /// before the sync; its error dropped; the hook run only on a change.
+    async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case() {
+        let mut world = hook_world().await;
+        let role = world.role(5, OverrideField { a: 0, d: 0 }).await;
+        world.set_roles(&world.member.id, &[&role]).await;
+        let server = world.server().await;
+        let blind = OverrideField { a: 0, d: VIEW };
+        let parked = world.break_reconcile().await;
+
+        // The sync ran after the failed reconcile: its error answers first
+        let call = world.unreachable_call().await;
+        let (status, body) = set_permissions(
+            &world.harness,
+            &world.owner_session,
+            &server,
+            &role.id,
+            blind,
+            Some("hook"),
+        )
+        .await;
+        end_call(&call).await;
+        assert_eq!(status, Status::BadRequest, "body: {}", body);
+        assert_eq!(body["type"], "UnknownNode", "body: {}", body);
+        assert_eq!(stored(&world.harness, &server, &role.id).await, blind);
+        assert_eq!(permission_entries(&world.harness, &server).await, 1);
+
+        // No call: the kept failure is answered, the write is not undone
+        let (status, body) = set_permissions(
+            &world.harness,
+            &world.owner_session,
+            &server,
+            &role.id,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "body: {}", body);
+        assert_eq!(body["type"], "NotFound", "body: {}", body);
+        assert_eq!(stored(&world.harness, &server, &role.id).await, blind);
+        assert!(
+            world.seat(&world.member.id).await.is_active(),
+            "a failed reconcile released nothing"
+        );
+        assert!(world.releases().await.is_empty());
+
+        // Repaired: the same edit releases the seat
+        world.repair(&parked).await;
+        let (status, body) = set_permissions(
+            &world.harness,
+            &world.owner_session,
+            &server,
+            &role.id,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "body: {}", body);
+        assert_eq!(
+            permission_entries(&world.harness, &server).await,
+            1,
+            "the no-change retries are not logged"
+        );
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn without_a_protected_channel_the_hook_changes_nothing() {
+        crate::util::test::rt()
+            .block_on(without_a_protected_channel_the_hook_changes_nothing_case())
+    }
+
+    /// No protected channel in the server: the same edit answers as before
+    /// S2, with no seat entry and no seats event.
+    async fn without_a_protected_channel_the_hook_changes_nothing_case() {
+        let mut world = plain_world().await;
+        let role = world.role(5, OverrideField { a: 0, d: 0 }).await;
+        world.set_roles(&world.member.id, &[&role]).await;
+        let server = world.server().await;
+
+        let blind = OverrideField { a: 0, d: VIEW };
+        let (status, body) = set_permissions(
+            &world.harness,
+            &world.owner_session,
+            &server,
+            &role.id,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "body: {}", body);
+        assert_eq!(stored(&world.harness, &server, &role.id).await, blind);
+        assert_eq!(permission_entries(&world.harness, &server).await, 1);
+        assert!(world.releases().await.is_empty());
+        world.assert_no_seats_event().await;
     }
 }

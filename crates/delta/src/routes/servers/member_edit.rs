@@ -4,7 +4,8 @@ use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     util::{
         audit_reason::AuditLogReason, name_filter::contains_blocked_slur,
-        permissions::DatabasePermissionQuery, reference::Reference,
+        permissions::DatabasePermissionQuery, protected_access::reconcile_member_in_server,
+        reference::Reference,
     },
     voice::{
         assert_voice_move_admissible, drop_voice_participant_session, get_channel_node,
@@ -888,6 +889,7 @@ pub async fn edit(
     // Decide these before `data` is destructured below.
     let affects_voice_permissions = edit_affects_voice_permissions(&data);
     let timeout_set = data.timeout.is_some();
+    let roles_edited = data.roles.is_some() || data.remove.contains(&FieldsMember::Roles);
 
     // Apply edits to the member object
     let v0::DataMemberEdit {
@@ -954,6 +956,23 @@ pub async fn edit(
             .await;
         }
     }
+
+    // Protected channels (6.3 "Hooks", S2-D11): a roles edit can take
+    // ViewChannel on a protected channel away from the member, so their seats
+    // in this server are reconciled. Every roles edit runs it, changed or
+    // not, so retrying the same edit repairs a reconcile that failed. After
+    // the write and its audit entries, BEFORE the voice step. The result is
+    // kept, not returned: the voice step below always runs, and a failed
+    // reconcile is answered at the very end; the member write is never
+    // undone. The reconcile records and announces its own releases. A
+    // timeout keeps ViewChannel (`ALLOW_IN_TIMEOUT`), so it has no hook.
+    let reconciled = if roles_edited {
+        reconcile_member_in_server(db, &server.id, &target_user.id)
+            .await
+            .map(|_| ())
+    } else {
+        Ok(())
+    };
 
     if let Some((new_voice_channel, source_id, expected_session)) = new_voice_channel {
         // The move itself is server-authoritative and lives in the database
@@ -1297,6 +1316,10 @@ pub async fn edit(
             }
         }
     }
+
+    // The kept reconcile result (the hook above), once every voice step has
+    // run: a failed reconcile fails the edit, though the edit itself landed.
+    reconciled?;
 
     Ok(Json(member.into()))
 }
@@ -7911,5 +7934,630 @@ mod test {
             entry.reason.as_deref().map(|reason| reason.chars().count()),
             Some(512)
         );
+    }
+
+    // ---- protected channels: the roles-edit reconcile (6.3 "Hooks") -------
+    //
+    // Route tests (RabbitMQ, Redis and the database, both TEST_DB drivers).
+    // The owner sends at most three requests per harness.
+    mod protected_hook {
+        use super::{
+            audit_entries, change, channel_override, connect_publishing, edit_member, error_of,
+            give_role, in_one_hour, is_publishing, only_entry, ranked_role, text, voice_channel,
+        };
+        use crate::util::test::{ProtectedChannel, TestHarness};
+        use revolt_database::{
+            events::client::EventV1, util::protected_access::seat_holder_lacks_access,
+            voice::delete_channel_voice_state, AuditLogAction, AuditLogEntry, Channel, ChannelSeat,
+            Database, PartialChannel, PartialMember, Role, SeatReleaseCause, Server, User,
+            PROTECTED_SCOPE_SEATS,
+        };
+        use revolt_permissions::{ChannelPermission, OverrideField};
+        use rocket::http::Status;
+
+        /// The owner (the list signer) and a member, both seated in a
+        /// protected channel nobody may view by default. `access` is a role
+        /// the member holds whose override on that channel allows
+        /// ViewChannel. The member's seat carries `keys_received_at`, so a
+        /// release cools and stores `AccessLost` (S2-D21).
+        struct Fixture {
+            harness: TestHarness,
+            owner: User,
+            owner_token: String,
+            server: Server,
+            channel: Channel,
+            member: User,
+            access: Role,
+        }
+
+        async fn fixture() -> Fixture {
+            let harness = TestHarness::new().await;
+            let (_o, owner_session, owner) = harness.new_user().await;
+            let (_m, _member_session, member) = harness.new_user().await;
+            let ProtectedChannel {
+                server, channel, ..
+            } = harness
+                .new_protected_channel(&owner, &owner_session, &[&member])
+                .await;
+            harness.mark_keys_received(channel.id(), &member.id).await;
+
+            let access = ranked_role(&harness, &server, 1, 0).await;
+            give_role(&harness, &server, &member, &access).await;
+            channel_override(
+                &harness,
+                &channel,
+                &access,
+                ChannelPermission::ViewChannel as u64,
+                0,
+            )
+            .await;
+            let mut stored = harness
+                .db
+                .fetch_channel(channel.id())
+                .await
+                .expect("channel read");
+            stored
+                .update(
+                    &harness.db,
+                    PartialChannel {
+                        default_permissions: Some(OverrideField {
+                            a: 0,
+                            d: ChannelPermission::ViewChannel as i64,
+                        }),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .await
+                .expect("channel default permissions");
+
+            assert!(
+                seat_of(&harness, channel.id(), &member.id)
+                    .await
+                    .is_active(),
+                "setup: the member is seated"
+            );
+            assert!(
+                !lacks_access(&harness, &server.id, channel.id(), &member.id).await,
+                "setup: the role lets the member view the channel"
+            );
+
+            Fixture {
+                harness,
+                owner,
+                owner_token: owner_session.token,
+                server,
+                channel,
+                member,
+                access,
+            }
+        }
+
+        async fn seat_of(harness: &TestHarness, channel_id: &str, user_id: &str) -> ChannelSeat {
+            harness
+                .db
+                .fetch_channel_seats_for_user(user_id)
+                .await
+                .expect("seats read")
+                .into_iter()
+                .find(|seat| seat.channel_id == channel_id)
+                .expect("a seat row")
+        }
+
+        /// The reconciler's own predicate, on fresh reads
+        async fn lacks_access(
+            harness: &TestHarness,
+            server_id: &str,
+            channel_id: &str,
+            user_id: &str,
+        ) -> bool {
+            let db = &harness.db;
+            let server = db.fetch_server(server_id).await.expect("server read");
+            let channel = db.fetch_channel(channel_id).await.expect("channel read");
+            let user = db.fetch_user(user_id).await.expect("user read");
+            let member = db
+                .fetch_member(server_id, user_id)
+                .await
+                .expect("member read");
+            seat_holder_lacks_access(db, Some(&user), Some(&member), &channel, &server).await
+        }
+
+        async fn roles_of(harness: &TestHarness, server_id: &str, user_id: &str) -> Vec<String> {
+            harness
+                .db
+                .fetch_member(server_id, user_id)
+                .await
+                .expect("member read")
+                .roles
+        }
+
+        /// The `ProtectedSeatRelease` entries of `server_id`
+        async fn seat_releases(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+            audit_entries(harness, server_id)
+                .await
+                .into_iter()
+                .filter(|entry| entry.action == AuditLogAction::ProtectedSeatRelease)
+                .collect()
+        }
+
+        /// The one `access_lost` release entry of `user_id` in `channel_id`,
+        /// by the system
+        fn assert_access_lost_entry(entries: &[AuditLogEntry], channel_id: &str, user_id: &str) {
+            assert_eq!(entries.len(), 1, "one release entry: {entries:?}");
+            let entry = &entries[0];
+            assert_eq!(entry.actor, None, "{entry:?}");
+            assert_eq!(entry.target.as_deref(), Some(user_id), "{entry:?}");
+            assert_eq!(entry.channel.as_deref(), Some(channel_id), "{entry:?}");
+            assert_eq!(
+                entry.changes,
+                vec![change("cause", None, text("access_lost"))],
+                "{entry:?}"
+            );
+        }
+
+        /// Released by the reconciler: no longer active, `AccessLost`, cooling
+        fn assert_released_for_access_lost(seat: &ChannelSeat) {
+            assert!(!seat.is_active(), "the seat must be released: {:?}", seat);
+            assert_eq!(
+                seat.release_cause,
+                Some(SeatReleaseCause::AccessLost),
+                "{seat:?}"
+            );
+            assert!(seat.cooldown_until.is_some(), "{:?}", seat);
+        }
+
+        /// Overwrite the stored channel with `channel`, straight in the store
+        /// (no guard, no event)
+        async fn store_channel(harness: &TestHarness, channel: &Channel) {
+            match &harness.db {
+                Database::Reference(reference) => {
+                    reference
+                        .channels
+                        .lock()
+                        .await
+                        .insert(channel.id().to_string(), channel.clone());
+                }
+                Database::MongoDb(mongo) => {
+                    use revolt_database::mongodb::bson::doc;
+
+                    let result = mongo
+                        .col::<Channel>("channels")
+                        .replace_one(doc! { "_id": channel.id() }, channel)
+                        .await
+                        .expect("the channel write");
+                    assert_eq!(result.matched_count, 1, "the channel row");
+                }
+            }
+        }
+
+        /// Make every reconcile of the protected channel fail: its stored row
+        /// becomes a non-server channel, so the reconciler's channel read
+        /// answers `InternalError` (a seat list on anything but a server
+        /// TextChannel is corrupt data). Returns the row to put back.
+        async fn break_reconcile(f: &Fixture) -> Channel {
+            let stored = f
+                .harness
+                .db
+                .fetch_channel(f.channel.id())
+                .await
+                .expect("channel read");
+            store_channel(
+                &f.harness,
+                &Channel::SavedMessages {
+                    id: f.channel.id().to_string(),
+                    user: f.owner.id.clone(),
+                },
+            )
+            .await;
+            stored
+        }
+
+        /// The 7.5 seat event for `channel_id`
+        fn seats_changed(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+            move |event| {
+                matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                    if id == channel_id && *scope == vec![PROTECTED_SCOPE_SEATS.to_string()])
+            }
+        }
+
+        #[test]
+        fn a_role_removal_that_drops_view_releases_the_seat() {
+            crate::util::test::rt().block_on(Box::pin(
+                a_role_removal_that_drops_view_releases_the_seat_case(),
+            ))
+        }
+
+        /// S2-D11: taking away the role that let the member view the
+        /// protected channel releases their seat there (`AccessLost`,
+        /// cooling), records one `ProtectedSeatRelease` by the system and
+        /// publishes `ProtectedChannelChanged { scope: ["seats"] }` on the
+        /// channel topic. The edit answers 200 and its own entry is
+        /// recorded. Control: the hook deleted (the seat stays active).
+        async fn a_role_removal_that_drops_view_releases_the_seat_case() {
+            let mut f = fixture().await;
+            let channel_id = f.channel.id().to_string();
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            let status = response.status();
+            let answer = response.into_string().await;
+            assert_eq!(status, Status::Ok, "{answer:?}");
+            assert!(roles_of(&f.harness, &f.server.id, &f.member.id)
+                .await
+                .is_empty());
+            assert!(
+                lacks_access(&f.harness, &f.server.id, &channel_id, &f.member.id).await,
+                "the edit took ViewChannel away"
+            );
+
+            assert_released_for_access_lost(&seat_of(&f.harness, &channel_id, &f.member.id).await);
+            let entries = audit_entries(&f.harness, &f.server.id).await;
+            only_entry(&entries, AuditLogAction::MemberRoleUpdate);
+            assert_access_lost_entry(
+                &seat_releases(&f.harness, &f.server.id).await,
+                &channel_id,
+                &f.member.id,
+            );
+            f.harness
+                .wait_for_event(&channel_id, seats_changed(&channel_id))
+                .await;
+        }
+
+        #[test]
+        fn regaining_access_never_reseats() {
+            crate::util::test::rt().block_on(Box::pin(regaining_access_never_reseats_case()))
+        }
+
+        /// S2-D16: giving the role back restores ViewChannel but not the
+        /// seat. The member stays released (same `released_at`), and the
+        /// second edit records no second release.
+        async fn regaining_access_never_reseats_case() {
+            let f = fixture().await;
+            let channel_id = f.channel.id().to_string();
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            let released = seat_of(&f.harness, &channel_id, &f.member.id).await;
+            assert_released_for_access_lost(&released);
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [f.access.id] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert!(
+                !lacks_access(&f.harness, &f.server.id, &channel_id, &f.member.id).await,
+                "the role came back, and ViewChannel with it"
+            );
+
+            let seat = seat_of(&f.harness, &channel_id, &f.member.id).await;
+            assert!(
+                !seat.is_active(),
+                "regaining access must not re-seat: {:?}",
+                seat
+            );
+            assert_eq!(seat.released_at, released.released_at, "{seat:?}");
+            assert_access_lost_entry(
+                &seat_releases(&f.harness, &f.server.id).await,
+                &channel_id,
+                &f.member.id,
+            );
+        }
+
+        #[test]
+        fn a_failed_reconcile_answers_500_after_the_write_and_a_retry_repairs_it() {
+            crate::util::test::rt().block_on(Box::pin(
+                a_failed_reconcile_answers_500_after_the_write_and_a_retry_repairs_it_case(),
+            ))
+        }
+
+        /// S2-D11: a reconcile that fails never undoes the edit. The roles
+        /// are written and recorded, the seat is untouched, and the edit
+        /// answers 500. The hook runs on every roles edit, changed or not,
+        /// so the same edit sent again (the roles are already stored, nothing
+        /// is recorded) repairs it. Controls: the hook deleted (the first
+        /// edit answers 200); the hook run only when the roles changed (the
+        /// retry releases nothing).
+        async fn a_failed_reconcile_answers_500_after_the_write_and_a_retry_repairs_it_case() {
+            let f = fixture().await;
+            let channel_id = f.channel.id().to_string();
+            let stored = break_reconcile(&f).await;
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert_eq!(status, Status::InternalServerError, "{error:?}");
+            assert!(
+                matches!(error, revolt_result::ErrorType::InternalError),
+                "the reconcile's own error: {:?}",
+                error
+            );
+            assert!(
+                roles_of(&f.harness, &f.server.id, &f.member.id)
+                    .await
+                    .is_empty(),
+                "the roles write is never undone"
+            );
+            let entries = audit_entries(&f.harness, &f.server.id).await;
+            only_entry(&entries, AuditLogAction::MemberRoleUpdate);
+            assert!(
+                seat_of(&f.harness, &channel_id, &f.member.id)
+                    .await
+                    .is_active(),
+                "the failed reconcile released nothing"
+            );
+            assert!(seat_releases(&f.harness, &f.server.id).await.is_empty());
+
+            store_channel(&f.harness, &stored).await;
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert_released_for_access_lost(&seat_of(&f.harness, &channel_id, &f.member.id).await);
+            assert_access_lost_entry(
+                &seat_releases(&f.harness, &f.server.id).await,
+                &channel_id,
+                &f.member.id,
+            );
+            let entries = audit_entries(&f.harness, &f.server.id).await;
+            only_entry(&entries, AuditLogAction::MemberRoleUpdate);
+        }
+
+        #[test]
+        fn a_failed_reconcile_still_runs_the_voice_sync() {
+            crate::util::test::rt()
+                .block_on(Box::pin(a_failed_reconcile_still_runs_the_voice_sync_case()))
+        }
+
+        /// S2-D11: the reconcile's result is kept, so the voice sync runs
+        /// after a failed reconcile. The member, publishing in a call, is
+        /// granted a role denying Speak: the sync recomputes `is_publishing`
+        /// under it (see `connect_publishing`), then fails at the absent
+        /// node, and that error is the answer, as it was before the hook.
+        /// Control: `?` on the reconcile (500 before the sync, the member
+        /// keeps publishing).
+        async fn a_failed_reconcile_still_runs_the_voice_sync_case() {
+            let f = fixture().await;
+            let stored = break_reconcile(&f).await;
+            let voice = voice_channel(&f.harness, &f.server, "Voice").await;
+            let uvc = connect_publishing(&voice, &f.member.id).await;
+            let mute = f
+                .harness
+                .new_role(
+                    &f.server,
+                    2,
+                    Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::Speak as i64,
+                    }),
+                )
+                .await;
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [f.access.id, mute.id] }),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert!(
+                matches!(error, revolt_result::ErrorType::UnknownNode),
+                "the voice sync ran and its own error is the answer, got {} {:?}",
+                status,
+                error
+            );
+            assert!(
+                !is_publishing(&uvc, &f.member.id).await,
+                "the voice sync must run after a failed reconcile"
+            );
+            assert!(roles_of(&f.harness, &f.server.id, &f.member.id)
+                .await
+                .contains(&mute.id));
+            assert!(seat_releases(&f.harness, &f.server.id).await.is_empty());
+
+            store_channel(&f.harness, &stored).await;
+            delete_channel_voice_state(&uvc, &[f.member.id.clone()])
+                .await
+                .expect("cleanup");
+        }
+
+        #[test]
+        fn a_failing_voice_sync_does_not_skip_the_release() {
+            crate::util::test::rt().block_on(Box::pin(
+                a_failing_voice_sync_does_not_skip_the_release_case(),
+            ))
+        }
+
+        /// S2-D11: the reconcile runs BEFORE the voice sync. The member sits
+        /// in a call whose node is absent, so the sync fails and answers its
+        /// own error; the seat was released before it all the same.
+        /// Control: the hook moved below the move/timeout/sync branches (the
+        /// failed sync returns first and the seat stays active).
+        async fn a_failing_voice_sync_does_not_skip_the_release_case() {
+            let f = fixture().await;
+            let channel_id = f.channel.id().to_string();
+            let voice = voice_channel(&f.harness, &f.server, "Voice").await;
+            let uvc = connect_publishing(&voice, &f.member.id).await;
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            let (status, error) = error_of(response).await;
+            assert!(
+                matches!(error, revolt_result::ErrorType::UnknownNode),
+                "the failed sync's own error, got {} {:?}",
+                status,
+                error
+            );
+            assert_released_for_access_lost(&seat_of(&f.harness, &channel_id, &f.member.id).await);
+            assert_access_lost_entry(
+                &seat_releases(&f.harness, &f.server.id).await,
+                &channel_id,
+                &f.member.id,
+            );
+
+            delete_channel_voice_state(&uvc, &[f.member.id.clone()])
+                .await
+                .expect("cleanup");
+        }
+
+        #[test]
+        fn a_timeout_edit_does_not_reconcile() {
+            crate::util::test::rt().block_on(Box::pin(a_timeout_edit_does_not_reconcile_case()))
+        }
+
+        /// 6.3 "Hooks": a timeout keeps ViewChannel (`ALLOW_IN_TIMEOUT`), so
+        /// it has no hook, and a timeout edit does NOT reconcile (rather than
+        /// reconciling harmlessly). A timed-out member still passes the
+        /// predicate. Then the member's access is taken away behind the
+        /// route's back (a direct roles write): another timeout edit leaves
+        /// the seat alone, and a roles edit that changes nothing (the stored
+        /// roles sent again) releases it, so a reconcile there would have.
+        /// Control: the hook also run when a timeout is set (the second
+        /// timeout releases the seat).
+        async fn a_timeout_edit_does_not_reconcile_case() {
+            let f = fixture().await;
+            let channel_id = f.channel.id().to_string();
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "timeout": in_one_hour() }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert!(
+                !lacks_access(&f.harness, &f.server.id, &channel_id, &f.member.id).await,
+                "a timed-out member keeps ViewChannel"
+            );
+
+            let mut member = f
+                .harness
+                .db
+                .fetch_member(&f.server.id, &f.member.id)
+                .await
+                .expect("member read");
+            member
+                .update(
+                    &f.harness.db,
+                    PartialMember {
+                        roles: Some(vec![]),
+                        ..Default::default()
+                    },
+                    Vec::new(),
+                )
+                .await
+                .expect("roles write");
+            assert!(
+                lacks_access(&f.harness, &f.server.id, &channel_id, &f.member.id).await,
+                "setup: the member lost ViewChannel without a roles edit"
+            );
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "timeout": in_one_hour() }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert!(
+                seat_of(&f.harness, &channel_id, &f.member.id)
+                    .await
+                    .is_active(),
+                "a timeout edit must not reconcile"
+            );
+            assert!(seat_releases(&f.harness, &f.server.id).await.is_empty());
+
+            let response = edit_member(
+                &f.harness,
+                &f.owner_token,
+                &f.server.id,
+                &f.member.id,
+                serde_json::json!({ "roles": [] }),
+            )
+            .await;
+            assert_eq!(response.status(), Status::Ok);
+            assert_released_for_access_lost(&seat_of(&f.harness, &channel_id, &f.member.id).await);
+        }
+
+        #[test]
+        fn a_roles_edit_with_no_protected_channel_is_a_no_op() {
+            crate::util::test::rt().block_on(Box::pin(
+                a_roles_edit_with_no_protected_channel_is_a_no_op_case(),
+            ))
+        }
+
+        /// No protected channel in the server: the hook writes nothing and the
+        /// edit answers 200 with its role entry alone, granting or taking
+        /// away. Control: the hook's empty result taken as a failure (500).
+        async fn a_roles_edit_with_no_protected_channel_is_a_no_op_case() {
+            let harness = TestHarness::new().await;
+            let (_o, owner_session, owner) = harness.new_user().await;
+            let (_m, _member_session, member) = harness.new_user().await;
+            let (server, _channels) = harness.new_server(&owner).await;
+            harness.join_server(&server, &member).await;
+            let role = ranked_role(&harness, &server, 1, 0).await;
+
+            for (roles, written) in [(vec![role.id.clone()], 1), (vec![], 2)] {
+                let response = edit_member(
+                    &harness,
+                    &owner_session.token,
+                    &server.id,
+                    &member.id,
+                    serde_json::json!({ "roles": roles }),
+                )
+                .await;
+                assert_eq!(response.status(), Status::Ok, "roles {roles:?}");
+                assert_eq!(roles_of(&harness, &server.id, &member.id).await, roles);
+
+                let entries = audit_entries(&harness, &server.id).await;
+                assert_eq!(entries.len(), written, "{entries:?}");
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| entry.action == AuditLogAction::MemberRoleUpdate),
+                    "{entries:?}"
+                );
+            }
+        }
     }
 }

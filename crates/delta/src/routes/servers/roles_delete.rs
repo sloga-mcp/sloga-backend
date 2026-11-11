@@ -1,6 +1,7 @@
 use revolt_database::{
     util::{
-        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery,
+        protected_access::reconcile_server, reference::Reference,
     },
     voice::{sync_server_voice_permissions, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, User,
@@ -76,12 +77,30 @@ pub async fn delete(
     )
     .await;
 
+    // Protected channels 6.3 "Hooks" (S2-D11): release the seats of the
+    // holders the deletion took ViewChannel from, in every protected channel
+    // of the server. The result is kept until the sync has run and a failure
+    // is logged at once, so a failing sync never hides it.
+    let reconciled = reconcile_server(db, &server.id).await;
+    if let Err(error) = &reconciled {
+        log::error!(
+            "protected channel reconcile failed after a role deletion: server={}: {:?}",
+            server.id,
+            error
+        );
+    }
+
     // Everyone in every call re-syncs, not just the role's holders (AFK S-3
     // F-8): on MongoDB `delete_role` has already pulled the role from every
     // member, so a sync scoped to it would match nobody. `server` no longer
     // holds the role, so each grant is computed without it. The helper tries
     // every channel before answering its first failure (D-6).
     sync_server_voice_permissions(db, voice_client, &server, None).await?;
+
+    // The reconcile's own error is answered once the sync has run; the
+    // deletion stands, and any later hook route (or the sweep) completes the
+    // pass.
+    reconciled?;
 
     Ok(EmptyResponse)
 }
@@ -159,6 +178,9 @@ async fn throw_if_deleting_lifts_denies(
 
 #[cfg(test)]
 mod test {
+    use crate::routes::servers::roles_edit_positions::protected_hook::{
+        end_call, hook_world, plain_world, HookWorld,
+    };
     use crate::util::test::TestHarness;
     use revolt_database::{
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Member, PartialMember,
@@ -484,6 +506,170 @@ mod test {
         assert!(validate < read, "validate before the read: {}", body);
         assert!(delete < record, "record after the deletion: {}", body);
         assert!(record < sync, "record before the voice sync: {}", body);
+    }
+
+    // ---- protected channels: the reconciler hook (6.3 "Hooks", S2-D11) ----
+    //
+    // The member's ViewChannel comes from a role only (the @everyone default
+    // lacks it), so deleting that role takes it away. Both are written
+    // straight to the store, so no hook runs before the request under test.
+
+    const VIEW: i64 = ChannelPermission::ViewChannel as i64;
+
+    /// A role granting ViewChannel, held by the member, and a default
+    /// without it. Returns the role.
+    async fn sight_from_a_role_only(world: &HookWorld) -> Role {
+        let sight = world.role(5, OverrideField { a: VIEW, d: 0 }).await;
+        world.set_roles(&world.member.id, &[&sight]).await;
+        let default = world.server().await.default_permissions;
+        world.set_default_permissions(default & !VIEW).await;
+        assert!(!world.member_lacks_access().await, "precondition: M views");
+        sight
+    }
+
+    #[test]
+    fn deleting_the_role_that_grants_view_channel_releases_its_holders_seat() {
+        crate::util::test::rt()
+            .block_on(deleting_the_role_that_grants_view_channel_releases_its_holders_seat_case())
+    }
+
+    /// The owner deletes the only role that lets the member view the
+    /// protected channel: the hook releases the member's seat (`AccessLost`,
+    /// one `ProtectedSeatRelease` entry, the seats event on the channel
+    /// topic) and the owner, the list signer, keeps theirs. A call the voice
+    /// sync cannot reach answers its `UnknownNode`, and the seat is released
+    /// all the same: the reconcile runs BEFORE the sync. Controls: the hook
+    /// removed; the reconcile moved below the sync.
+    async fn deleting_the_role_that_grants_view_channel_releases_its_holders_seat_case() {
+        let mut world = hook_world().await;
+        let sight = sight_from_a_role_only(&world).await;
+        let call = world.unreachable_call().await;
+
+        let response = delete_role(
+            &world.harness,
+            &world.owner_session.token,
+            &world.server_id,
+            &sight.id,
+            "hook",
+        )
+        .await;
+        end_call(&call).await;
+        assert_rejected(response, Status::BadRequest, "UnknownNode").await;
+        assert!(!role_exists(&world.harness, &world.server_id, &sight.id).await);
+        assert!(world.member_lacks_access().await, "M lost ViewChannel");
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_deletion() {
+        crate::util::test::rt().block_on(
+            a_failed_reconcile_still_syncs_then_answers_its_error_after_the_deletion_case(),
+        )
+    }
+
+    /// The reconcile fails (the protected channel's document is gone): each
+    /// deletion stands and is logged, the voice sync still runs (with a call
+    /// it cannot reach, its own `UnknownNode` is the answer), and without
+    /// such a call the reconcile's own error is the answer (`NotFound`: the
+    /// document it reads is gone). A deleted role cannot be
+    /// deleted again, so the repair is the next hook request: once the
+    /// document is back, deleting an unrelated role releases the seat.
+    /// Controls: the reconcile's error returned before the sync; its error
+    /// dropped.
+    async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_deletion_case() {
+        let mut world = hook_world().await;
+        let sight = sight_from_a_role_only(&world).await;
+        let spare = world.role(6, OverrideField { a: 0, d: 0 }).await;
+        let last = world.role(7, OverrideField { a: 0, d: 0 }).await;
+        let parked = world.break_reconcile().await;
+
+        // The sync ran after the failed reconcile: its error answers first
+        let call = world.unreachable_call().await;
+        let response = delete_role(
+            &world.harness,
+            &world.owner_session.token,
+            &world.server_id,
+            &sight.id,
+            "hook",
+        )
+        .await;
+        end_call(&call).await;
+        assert_rejected(response, Status::BadRequest, "UnknownNode").await;
+        assert!(!role_exists(&world.harness, &world.server_id, &sight.id).await);
+        assert_eq!(
+            role_delete_entries(&world.harness, &world.server_id)
+                .await
+                .len(),
+            1
+        );
+        assert!(world.member_lacks_access().await, "M lost ViewChannel");
+
+        // No call: the kept failure is answered, the deletion is not undone
+        let response = delete_role(
+            &world.harness,
+            &world.owner_session.token,
+            &world.server_id,
+            &spare.id,
+            "hook",
+        )
+        .await;
+        assert_rejected(response, Status::NotFound, "NotFound").await;
+        assert!(!role_exists(&world.harness, &world.server_id, &spare.id).await);
+        assert_eq!(
+            role_delete_entries(&world.harness, &world.server_id)
+                .await
+                .len(),
+            2
+        );
+        assert!(
+            world.seat(&world.member.id).await.is_active(),
+            "a failed reconcile released nothing"
+        );
+        assert!(world.releases().await.is_empty());
+
+        // Repaired: the next deletion releases the seat
+        world.repair(&parked).await;
+        let response = delete_role(
+            &world.harness,
+            &world.owner_session.token,
+            &world.server_id,
+            &last.id,
+            "hook",
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn without_a_protected_channel_the_hook_changes_nothing() {
+        crate::util::test::rt()
+            .block_on(without_a_protected_channel_the_hook_changes_nothing_case())
+    }
+
+    /// No protected channel in the server: the same deletion answers as
+    /// before S2, with no seat entry and no seats event.
+    async fn without_a_protected_channel_the_hook_changes_nothing_case() {
+        let mut world = plain_world().await;
+        let sight = world.role(5, OverrideField { a: VIEW, d: 0 }).await;
+        world.set_roles(&world.member.id, &[&sight]).await;
+        let default = world.server().await.default_permissions;
+        world.set_default_permissions(default & !VIEW).await;
+
+        let response = delete_role(
+            &world.harness,
+            &world.owner_session.token,
+            &world.server_id,
+            &sight.id,
+            "hook",
+        )
+        .await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(!role_exists(&world.harness, &world.server_id, &sight.id).await);
+        assert!(world.releases().await.is_empty());
+        world.assert_no_seats_event().await;
     }
 }
 

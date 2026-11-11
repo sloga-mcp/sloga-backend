@@ -1,6 +1,7 @@
 use revolt_database::{
     util::{
-        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery, reference::Reference,
+        audit_reason::AuditLogReason, permissions::DatabasePermissionQuery,
+        protected_access::reconcile_server, reference::Reference,
     },
     voice::{sync_server_voice_permissions, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database,
@@ -64,7 +65,8 @@ pub async fn set_default_server_permissions(
         .await?;
 
     // Recorded once the write is durable and before the voice sync, which
-    // stays the route's last step before the answer. The @everyone default
+    // stays the route's last step before the answer but for the kept
+    // reconcile result. The @everyone default
     // is ONE permission value, not an allow/deny override like a role's, so
     // the entry carries an `allow` change only and never a `deny` key.
     // Re-saving the same value records nothing.
@@ -88,15 +90,36 @@ pub async fn set_default_server_permissions(
         .await;
     }
 
+    // Protected channels 6.3 "Hooks" (S2-D11): release the seats this edit
+    // took ViewChannel from, in every protected channel of the server. Run
+    // on every write, a re-save included, so retrying the same edit repairs
+    // a pass that failed. The result is kept until the sync has run and a
+    // failure is logged at once, so a failing sync never hides it.
+    let reconciled = reconcile_server(db, &server.id).await;
+    if let Err(error) = &reconciled {
+        log::error!(
+            "protected channel reconcile failed after a default permission edit: server={}: {:?}",
+            server.id,
+            error
+        );
+    }
+
     // Every channel is tried before the first failure is answered (AFK S-3
     // D-6); `server` already carries the new default permissions.
     sync_server_voice_permissions(db, voice_client, &server, None).await?;
+
+    // The reconcile's own error is answered once the sync has run; the new
+    // default stands.
+    reconciled?;
 
     Ok(Json(server.into()))
 }
 
 #[cfg(test)]
 mod test {
+    use crate::routes::servers::roles_edit_positions::protected_hook::{
+        end_call, hook_world, plain_world,
+    };
     use crate::util::test::{statement_at, without_comments, without_whitespace, TestHarness};
     use revolt_database::{
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Member, PartialServer, Session,
@@ -301,8 +324,11 @@ mod test {
 
     /// The route's order: the reason is validated before the write, the
     /// entry is recorded after the write and before the voice sync.
-    /// Mutation: the record moved below the sync, or the validation below
-    /// the write.
+    /// Protected channels 6.3 "Hooks" (S2-D11) put the reconcile between the
+    /// entry and the sync and answer its kept result after the sync, so this
+    /// pin gained those two statements. Mutations: the record moved below
+    /// the sync, or the validation below the write; the reconcile moved
+    /// below the sync.
     #[test]
     fn the_reason_is_validated_first_and_recorded_between_write_and_sync() {
         let source = include_str!("permissions_set_default.rs");
@@ -323,9 +349,184 @@ mod test {
             &code,
             "sync_server_voice_permissions(db,voice_client,&server,None).await?;",
         );
+        let reconcile = statement_at(
+            &code,
+            "letreconciled=reconcile_server(db,&server.id).await;",
+        );
+        let kept = statement_at(&code, "reconciled?;");
 
         assert!(validate < write, "validate before the write: {}", code);
         assert!(write < record, "record after the write: {}", code);
         assert!(record < sync, "record before the sync: {}", code);
+        assert!(record < reconcile, "reconcile after the entry: {}", code);
+        assert!(reconcile < sync, "reconcile before the sync: {}", code);
+        assert!(
+            sync < kept,
+            "answer the kept result after the sync: {}",
+            code
+        );
+    }
+
+    // ---- protected channels: the reconciler hook (6.3 "Hooks", S2-D11) ----
+
+    const VIEW: i64 = ChannelPermission::ViewChannel as i64;
+
+    #[test]
+    fn a_default_without_view_channel_releases_the_seat_of_a_member_without_roles() {
+        crate::util::test::rt().block_on(
+            a_default_without_view_channel_releases_the_seat_of_a_member_without_roles_case(),
+        )
+    }
+
+    /// The owner drops ViewChannel from the @everyone default: the hook
+    /// releases the seat of the member, who holds no role (`AccessLost`, one
+    /// `ProtectedSeatRelease` entry, the seats event on the channel topic),
+    /// and the owner, the list signer, keeps theirs. A call the voice sync
+    /// cannot reach answers its `UnknownNode`, and the seat is released all
+    /// the same: the reconcile runs BEFORE the sync. Controls: the hook
+    /// removed; the reconcile moved below the sync.
+    async fn a_default_without_view_channel_releases_the_seat_of_a_member_without_roles_case() {
+        let mut world = hook_world().await;
+        assert!(!world.member_lacks_access().await, "precondition: M views");
+        let blind = world.server().await.default_permissions & !VIEW;
+        let call = world.unreachable_call().await;
+
+        let (status, body) = set_default(
+            &world.harness,
+            &world.server_id,
+            &world.owner_session,
+            blind,
+            None,
+        )
+        .await;
+        end_call(&call).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert!(body.contains("UnknownNode"), "{}", body);
+        assert_eq!(
+            stored_default(&world.harness, &world.server_id).await,
+            blind
+        );
+        assert!(world.member_lacks_access().await, "M lost ViewChannel");
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write() {
+        crate::util::test::rt()
+            .block_on(a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case())
+    }
+
+    /// The reconcile fails (the protected channel's document is gone): the
+    /// new default stands and is logged, the voice sync still runs (with a
+    /// call it cannot reach, its own `UnknownNode` is the answer), and
+    /// without such a call the reconcile's own error is the answer
+    /// (`NotFound`: the document it reads is gone). Re-saving the same
+    /// default, which logs nothing, releases the seat once the document is
+    /// back. Controls: the reconcile's error returned before the sync; its
+    /// error dropped; the hook run only on a change.
+    async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case() {
+        let mut world = hook_world().await;
+        let blind = world.server().await.default_permissions & !VIEW;
+        let parked = world.break_reconcile().await;
+
+        // The sync ran after the failed reconcile: its error answers first
+        let call = world.unreachable_call().await;
+        let (status, body) = set_default(
+            &world.harness,
+            &world.server_id,
+            &world.owner_session,
+            blind,
+            Some("hook"),
+        )
+        .await;
+        end_call(&call).await;
+        assert_eq!(status, Status::BadRequest, "{}", body);
+        assert!(body.contains("UnknownNode"), "{}", body);
+        assert_eq!(
+            stored_default(&world.harness, &world.server_id).await,
+            blind
+        );
+        assert_eq!(
+            permission_entries(&world.harness, &world.server_id)
+                .await
+                .len(),
+            1
+        );
+
+        // No call: the kept failure is answered, the write is not undone
+        let (status, body) = set_default(
+            &world.harness,
+            &world.server_id,
+            &world.owner_session,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::NotFound, "{}", body);
+        assert!(body.contains("NotFound"), "{}", body);
+        assert_eq!(
+            stored_default(&world.harness, &world.server_id).await,
+            blind
+        );
+        assert!(
+            world.seat(&world.member.id).await.is_active(),
+            "a failed reconcile released nothing"
+        );
+        assert!(world.releases().await.is_empty());
+
+        // Repaired: the same re-save releases the seat
+        world.repair(&parked).await;
+        let (status, body) = set_default(
+            &world.harness,
+            &world.server_id,
+            &world.owner_session,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{}", body);
+        assert_eq!(
+            permission_entries(&world.harness, &world.server_id)
+                .await
+                .len(),
+            1,
+            "the re-saves are not logged"
+        );
+        world.assert_member_released().await;
+    }
+
+    #[test]
+    fn without_a_protected_channel_the_hook_changes_nothing() {
+        crate::util::test::rt()
+            .block_on(without_a_protected_channel_the_hook_changes_nothing_case())
+    }
+
+    /// No protected channel in the server: the same edit answers as before
+    /// S2, with no seat entry and no seats event.
+    async fn without_a_protected_channel_the_hook_changes_nothing_case() {
+        let mut world = plain_world().await;
+        let blind = world.server().await.default_permissions & !VIEW;
+
+        let (status, body) = set_default(
+            &world.harness,
+            &world.server_id,
+            &world.owner_session,
+            blind,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{}", body);
+        assert_eq!(
+            stored_default(&world.harness, &world.server_id).await,
+            blind
+        );
+        assert_eq!(
+            permission_entries(&world.harness, &world.server_id)
+                .await
+                .len(),
+            1
+        );
+        assert!(world.releases().await.is_empty());
+        world.assert_no_seats_event().await;
     }
 }
