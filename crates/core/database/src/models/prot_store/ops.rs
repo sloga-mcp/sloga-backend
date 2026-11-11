@@ -26,6 +26,14 @@ pub trait AbstractProtStore: Sync + Send {
         user_id: &str,
         now: i64,
     ) -> Result<Vec<ProtStoreIntent>>;
+    /// The user's intents not Used with expires_at > now: the Open ones and the
+    /// cancelled ones (Expired) that can still bind a late purchase. The
+    /// wallet cap counts these (R62); the three-slot limit counts Open only.
+    async fn fetch_live_prot_store_intents(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<ProtStoreIntent>>;
     /// Open → Expired for expires_at <= now, at most `limit`; returns how many moved
     async fn expire_prot_store_intents(&self, now: i64, limit: i64) -> Result<u64>;
     async fn fetch_prot_store_purchase(&self, id: &str) -> Result<Option<ProtStorePurchase>>;
@@ -2256,7 +2264,7 @@ mod tests {
                 Some(open.clone())
             );
 
-            // Only unexpired Open intents count against the cap
+            // Only unexpired Open intents fill the three slots
             assert_eq!(
                 db.fetch_open_prot_store_intents(&owner, NOW).await.unwrap(),
                 vec![open.clone()]
@@ -2323,6 +2331,106 @@ mod tests {
                     .unwrap(),
                 0
             );
+        });
+    }
+
+    /// R62: the wallet cap's live intents are the user's unexpired ones not
+    /// Used (Open, and cancelled ones that can still bind a late purchase);
+    /// the three slots count Open only
+    #[tokio::test]
+    async fn store_live_intents_keep_cancelled_ones_until_expiry() {
+        database_test!(|db| async move {
+            install_indexes(&db).await;
+            let owner = user(22);
+            let other = user(23);
+            let open = intent(
+                "01INTS6L1C0000000000000221",
+                Some(&owner),
+                v0::ProtStoreIntentState::Open,
+            );
+            let to_cancel = intent(
+                "01INTS6L1C0000000000000222",
+                Some(&owner),
+                v0::ProtStoreIntentState::Open,
+            );
+            let used = ProtStoreIntent {
+                purchase_id: Some(apple(22)),
+                ..intent(
+                    "01INTS6L1C0000000000000223",
+                    Some(&owner),
+                    v0::ProtStoreIntentState::Used,
+                )
+            };
+            let lapsed = ProtStoreIntent {
+                expires_at: NOW,
+                ..intent(
+                    "01INTS6L1C0000000000000224",
+                    Some(&owner),
+                    v0::ProtStoreIntentState::Open,
+                )
+            };
+            let lapsed_cancel = ProtStoreIntent {
+                expires_at: NOW - 1,
+                ..intent(
+                    "01INTS6L1C0000000000000225",
+                    Some(&owner),
+                    v0::ProtStoreIntentState::Expired,
+                )
+            };
+            let theirs = intent(
+                "01INTS6L1C0000000000000226",
+                Some(&other),
+                v0::ProtStoreIntentState::Open,
+            );
+            let theirs_cancelled = intent(
+                "01INTS6L1C0000000000000227",
+                Some(&other),
+                v0::ProtStoreIntentState::Expired,
+            );
+            let unlinked = intent(
+                "01INTS6L1C0000000000000228",
+                None,
+                v0::ProtStoreIntentState::Open,
+            );
+            for issued in [
+                &open,
+                &to_cancel,
+                &used,
+                &lapsed,
+                &lapsed_cancel,
+                &theirs,
+                &theirs_cancelled,
+                &unlinked,
+            ] {
+                db.insert_prot_store_intent(issued).await.unwrap();
+            }
+            let cancelled = db
+                .cancel_prot_store_intent(&to_cancel.id, &owner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(cancelled.state, v0::ProtStoreIntentState::Expired);
+
+            // Open and cancelled-unexpired count; Used, lapsed and others' do not
+            assert_eq!(
+                db.fetch_live_prot_store_intents(&owner, NOW).await.unwrap(),
+                vec![open.clone(), cancelled.clone()]
+            );
+            assert_eq!(
+                db.fetch_open_prot_store_intents(&owner, NOW).await.unwrap(),
+                vec![open.clone()]
+            );
+            assert_eq!(
+                db.fetch_live_prot_store_intents(&other, NOW).await.unwrap(),
+                vec![theirs.clone(), theirs_cancelled.clone()]
+            );
+
+            // Once their time is up, a cancelled one stops counting too
+            assert!(db
+                .fetch_live_prot_store_intents(&owner, open.expires_at)
+                .await
+                .unwrap()
+                .is_empty());
         });
     }
 

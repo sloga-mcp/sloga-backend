@@ -160,6 +160,23 @@ impl AbstractProtStore for MongoDb {
         .await
     }
 
+    async fn fetch_live_prot_store_intents(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<ProtStoreIntent>> {
+        // Bounded by `prot_store_intents_user_state` (user_id prefix)
+        self.prot_store_intents(
+            doc! {
+                "user_id": user_id,
+                "state": { "$ne": "Used" },
+                "expires_at": { "$gt": now }
+            },
+            None,
+        )
+        .await
+    }
+
     async fn expire_prot_store_intents(&self, now: i64, limit: i64) -> Result<u64> {
         let due = doc! {
             "state": "Open",

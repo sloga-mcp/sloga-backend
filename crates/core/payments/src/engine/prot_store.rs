@@ -896,8 +896,10 @@ fn new_intent_token(store: v0::ProtStore) -> String {
 /// 5. a live payment of the user under dispute → `ProtNotEligible`
 /// 6. the product not on sale → `ProtStoreProductUnknown`
 /// 7. three open intents already → `PaymentPending`
-/// 8. the wallet cap (R5): balance + uncredited Stripe Prot + Held store rows
-///    + open intents + this product > `wallet_cap` → `ProtWalletCap`
+/// 8. the wallet cap (R5): balance, uncredited Stripe Prot, Held store rows,
+///    live intents (Open, and cancelled ones not yet expired, which still
+///    bind a late purchase; R62) and this product, summed, > `wallet_cap` →
+///    `ProtWalletCap`
 // The pinned contract signature (section 9.2)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_store_intent(
@@ -984,6 +986,8 @@ async fn issue_store_intent(
         return Err(create_error!(ProtStoreProductUnknown));
     };
 
+    // The three slots count Open intents only, so backing out of the store
+    // sheet (a cancel) frees a slot
     let open = db.fetch_open_prot_store_intents(user_id, now_ms).await?;
     if open.len() as u64 >= PROT_STORE_MAX_OPEN_INTENTS {
         return Err(create_error!(PaymentPending));
@@ -1000,7 +1004,12 @@ async fn issue_store_intent(
             uncredited = uncredited.saturating_add(catalog::sku_prot(&order.sku).unwrap_or(0));
         }
     }
-    let intents = open
+    // R62: a cancelled intent still binds a late purchase until it expires
+    // (E9), so the cap counts it; counting Open only let intent → cancel →
+    // intent buy past the cap
+    let intents = db
+        .fetch_live_prot_store_intents(user_id, now_ms)
+        .await?
         .iter()
         .fold(0_i64, |total, intent| total.saturating_add(intent.prot));
     let committed = wallet_balance(db, user_id)
@@ -1058,7 +1067,8 @@ async fn issue_store_intent(
 
 /// The caller's own intent, Open → Expired (an Expired intent still binds a
 /// late purchase, so a cancel never refuses money that arrives anyway; it
-/// frees the slot and the cap). Absent, malformed or another user's →
+/// frees the slot, but its Prot counts toward the cap until it expires,
+/// R62). Absent, malformed or another user's →
 /// `NotFound`; Used → `InvalidOperation`; already Expired → Ok.
 pub async fn cancel_store_intent(db: &Database, user_id: &str, intent_id: &str) -> Result<()> {
     if Ulid::from_string(intent_id).is_err() {
@@ -5595,6 +5605,75 @@ mod tests {
         assert!(intent_with(&h, &h.ps, &h.st, B, v0::ProtStore::Apple, P5)
             .await
             .is_ok());
+        done(h).await;
+    }
+
+    /// R62: a cancelled intent still binds a late purchase (E9), so its Prot
+    /// counts toward the cap until it expires: intent → cancel → intent stops
+    /// at the cap, while a cancel still frees one of the three slots.
+    /// Control: fold the open intents only again → this test fails.
+    #[tokio::test]
+    async fn cancelled_intents_still_count_toward_the_cap() {
+        let h = harness().await;
+        let capped = ProtSalesSettings {
+            wallet_cap: 3000,
+            ..h.ps.clone()
+        };
+
+        // 1,000 each: three fit (3,000 <= 3,000), the fourth does not
+        let mut issued = 0;
+        let refused = loop {
+            match intent_with(&h, &capped, &h.st, A, v0::ProtStore::Apple, P10).await {
+                Ok(intent) => {
+                    issued += 1;
+                    assert!(issued <= 3, "intent → cancel bought past the cap");
+                    cancel_store_intent(&h.db, A, &intent.intent_id)
+                        .await
+                        .unwrap();
+                }
+                Err(err) => break err.error_type,
+            }
+        };
+        assert_eq!(issued, 3);
+        // Every slot is free (all three were cancelled): the cap refuses,
+        // never the three-slot limit
+        assert!(
+            matches!(refused, ErrorType::ProtWalletCap { max: 3000 }),
+            "{refused:?}"
+        );
+        assert!(h
+            .db
+            .fetch_open_prot_store_intents(A, NOW)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Once the cancelled intents expire, they stop counting
+        create_store_intent(
+            &h.db,
+            &h.s,
+            &capped,
+            &h.st,
+            &h.play,
+            &h.apple,
+            A,
+            &intent_data(v0::ProtStore::Apple, P10),
+            None,
+            NOW + PROT_STORE_INTENT_TTL_MS,
+        )
+        .await
+        .expect("expired intents leave the cap");
+
+        // Under the default cap, a fourth intent after three cancels is issued
+        for _ in 0..3 {
+            let intent = new_intent(&h, B, v0::ProtStore::Apple, P5).await;
+            cancel_store_intent(&h.db, B, &intent.intent_id)
+                .await
+                .unwrap();
+        }
+        intent_with(&h, &h.ps, &h.st, B, v0::ProtStore::Apple, P5)
+            .await
+            .expect("a cancel frees its slot");
         done(h).await;
     }
 

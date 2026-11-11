@@ -131,9 +131,10 @@ pub async fn prot_store_verify(
 ///
 /// The caller's own open intent, Open → Expired. An Expired intent still
 /// binds a late purchase, so a cancel never refuses money that arrives
-/// anyway; it only frees the slot and the cap. Another user's intent, or one
-/// that does not exist, is `NotFound`; a used one is `InvalidOperation`; an
-/// already expired one answers 204 again. Not gated on the store switches.
+/// anyway; it frees the slot, but its Prot counts toward the wallet cap
+/// until it expires (R62). Another user's intent, or one that does not exist,
+/// is `NotFound`; a used one is `InvalidOperation`; an already expired one
+/// answers 204 again. Not gated on the store switches.
 #[openapi(tag = "Payments")]
 #[post("/prot/store/intent/<intent_id>/cancel")]
 pub async fn prot_store_intent_cancel(

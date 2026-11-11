@@ -81,6 +81,25 @@ impl AbstractProtStore for ReferenceDb {
         Ok(open)
     }
 
+    async fn fetch_live_prot_store_intents(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<ProtStoreIntent>> {
+        let intents = self.prot_store_intents.lock().await;
+        let mut live: Vec<ProtStoreIntent> = intents
+            .values()
+            .filter(|intent| {
+                intent.user_id.as_deref() == Some(user_id)
+                    && intent.state != v0::ProtStoreIntentState::Used
+                    && intent.expires_at > now
+            })
+            .cloned()
+            .collect();
+        live.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(live)
+    }
+
     async fn expire_prot_store_intents(&self, now: i64, limit: i64) -> Result<u64> {
         let mut intents = self.prot_store_intents.lock().await;
         let mut due: Vec<String> = intents
