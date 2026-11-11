@@ -416,14 +416,14 @@ mod test {
             .block_on(a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case())
     }
 
-    /// The reconcile fails (the protected channel's document is gone): the
-    /// new default stands and is logged, the voice sync still runs (with a
-    /// call it cannot reach, its own `UnknownNode` is the answer), and
-    /// without such a call the reconcile's own error is the answer
-    /// (`NotFound`: the document it reads is gone). Re-saving the same
-    /// default, which logs nothing, releases the seat once the document is
-    /// back. Controls: the reconcile's error returned before the sync; its
-    /// error dropped; the hook run only on a change.
+    /// The reconcile fails (the protected channel's row is stored as a
+    /// SavedMessages channel): the new default stands and is logged, the
+    /// voice sync still runs (with a call it cannot reach, its own
+    /// `UnknownNode` is the answer), and without such a call the
+    /// reconcile's own error is answered unchanged (`InternalError`).
+    /// Re-saving the same default, which logs nothing, releases the seat
+    /// once the row is back. Controls: the reconcile's error returned
+    /// before the sync; its error dropped; the hook run only on a change.
     async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case() {
         let mut world = hook_world().await;
         let blind = world.server().await.default_permissions & !VIEW;
@@ -462,8 +462,8 @@ mod test {
             None,
         )
         .await;
-        assert_eq!(status, Status::NotFound, "{}", body);
-        assert!(body.contains("NotFound"), "{}", body);
+        assert_eq!(status, Status::InternalServerError, "{}", body);
+        assert!(body.contains("InternalError"), "{}", body);
         assert_eq!(
             stored_default(&world.harness, &world.server_id).await,
             blind

@@ -77,6 +77,10 @@ pub async fn fetch_devices(
         } else {
             (None, None)
         };
+        // An identity bound to no session (an empty `last_session_id`) lists
+        // neither field
+        let session_id = session_id.filter(|id| !id.is_empty());
+        let session_name = session_name.filter(|_| session_id.is_some());
 
         devices.push(v0::E2EEDeviceInfo {
             created_at: own.then(|| identity.created_at.to_string()),
@@ -193,6 +197,36 @@ mod tests {
                 entry.get("session_name").is_none(),
                 "{}: the name must be absent: {}",
                 case,
+                entry
+            );
+        }
+    }
+
+    /// An own device bound to no session (an empty `last_session_id`) lists
+    /// neither field, never an empty session id. Control: list
+    /// `Some(last_session_id)` unfiltered.
+    #[test]
+    fn own_listing_omits_both_fields_for_an_unbound_device() {
+        crate::util::test::rt().block_on(own_listing_omits_both_fields_for_an_unbound_device_case())
+    }
+
+    async fn own_listing_omits_both_fields_for_an_unbound_device_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let bound = harness
+            .new_e2ee_device(&user, &session.id, OWNER_DEVICE_SEED)
+            .await;
+        let unbound = harness.new_e2ee_device(&user, "", MEMBER_DEVICE_SEED).await;
+
+        let entries = listing(&harness, &session, &user).await;
+        assert_eq!(entries.len(), 2, "{:?}", entries);
+        assert_eq!(entries[&bound.device_id]["session_id"], session.id.as_str());
+        let entry = &entries[&unbound.device_id];
+        for field in ["session_id", "session_name"] {
+            assert!(
+                entry.get(field).is_none(),
+                "{} for an unbound device: {}",
+                field,
                 entry
             );
         }

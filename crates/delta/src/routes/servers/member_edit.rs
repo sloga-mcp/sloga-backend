@@ -964,8 +964,10 @@ pub async fn edit(
     // the write and its audit entries, BEFORE the voice step. The result is
     // kept, not returned: the voice step below always runs, and a failed
     // reconcile is answered at the very end; the member write is never
-    // undone. The reconcile records and announces its own releases. A
-    // timeout keeps ViewChannel (`ALLOW_IN_TIMEOUT`), so it has no hook.
+    // undone. A failure is logged at once, so a failing voice step that
+    // answers first never hides it. The reconcile records and announces its
+    // own releases. A timeout keeps ViewChannel (`ALLOW_IN_TIMEOUT`), so it
+    // has no hook.
     let reconciled = if roles_edited {
         reconcile_member_in_server(db, &server.id, &target_user.id)
             .await
@@ -973,6 +975,14 @@ pub async fn edit(
     } else {
         Ok(())
     };
+    if let Err(error) = &reconciled {
+        log::error!(
+            "protected channel reconcile failed after a member roles edit: server={} user={}: {:?}",
+            server.id,
+            target_user.id,
+            error
+        );
+    }
 
     if let Some((new_voice_channel, source_id, expected_session)) = new_voice_channel {
         // The move itself is server-authoritative and lives in the database

@@ -4,7 +4,7 @@ use revolt_result::{create_error, Result};
 
 use crate::{
     events::client::EventV1, util::permissions::DatabasePermissionQuery, Channel, Database, File,
-    Server, SystemMessage, User,
+    Server, SystemMessage, User, PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP,
 };
 
 fn default_true() -> bool {
@@ -149,8 +149,10 @@ impl Member {
         // second release failed; it is released before the membership exists,
         // so a rejoin cannot quietly hand decryption access back. Runs after
         // the membership check, so a current member's seats are never touched.
-        db.release_channel_seats_for_user(&user.id, Some(&server.id), Timestamp::now_utc())
+        let released = db
+            .release_channel_seats_for_user(&user.id, Some(&server.id), Timestamp::now_utc())
             .await?;
+        Self::publish_seat_release(&released).await;
 
         let mut member = Member {
             id: MemberCompositeKey {
@@ -346,13 +348,17 @@ impl Member {
         // seats in this server's protected channels, plus a pending removal on
         // each open Text group they are in. It runs before every other step, so
         // a failure has no side effect at all: the membership, the thread rows
-        // and every event stay as they were.
-        db.release_channel_seats_for_user(
-            &self.id.user,
-            Some(&self.id.server),
-            Timestamp::now_utc(),
-        )
-        .await?;
+        // and every event stay as they were. What it released is announced at
+        // once, as a step below may still fail and a retry would release (and
+        // announce) nothing.
+        let first = db
+            .release_channel_seats_for_user(
+                &self.id.user,
+                Some(&self.id.server),
+                Timestamp::now_utc(),
+            )
+            .await?;
+        Self::publish_seat_release(&first).await;
 
         // Thread membership cascade: drop the member's thread rows in this server
         // so a departed member stops being a thread push target. This is hygiene,
@@ -388,6 +394,10 @@ impl Member {
                 Timestamp::now_utc(),
             )
             .await;
+        // Only a release that succeeded is announced
+        if let Ok(second) = &released {
+            Self::publish_seat_release(second).await;
+        }
 
         // Calendar cascade (slice F): drop the member's RSVP rows for this server so
         // they stop appearing as attendees/counts. Best-effort — a leave/kick/ban must
@@ -454,6 +464,62 @@ impl Member {
             Ok(_) => RemovalOutcome::Removed,
             Err(error) => RemovalOutcome::ReleasePending(error),
         })
+    }
+
+    /// `ProtectedChannelChanged` (7.5, S2-D18) for each channel a
+    /// server-forced release (`release_channel_seats_for_user`: kick, ban,
+    /// leave, rejoin, account deletion) returned, called only once that
+    /// release succeeded. The result does not tell a released seat from a
+    /// write to the open Text group (a pending removal, or `signer_lost`),
+    /// so each event names both scopes: the remaining members' removal duty
+    /// (S2-D19) reads `GET .../text_group`. On the channel topic, so only
+    /// viewers receive it, as the reconciler's event.
+    pub(crate) async fn publish_seat_release(channel_ids: &[String]) {
+        for channel_id in channel_ids {
+            let event = EventV1::ProtectedChannelChanged {
+                id: channel_id.clone(),
+                scope: vec![
+                    PROTECTED_SCOPE_SEATS.to_string(),
+                    PROTECTED_SCOPE_TEXT_GROUP.to_string(),
+                ],
+            };
+            #[cfg(test)]
+            record_seat_release_event(channel_id, &event);
+            event.p(channel_id.clone()).await;
+        }
+    }
+}
+
+// What `Member::publish_seat_release` published inside
+// `Member::capture_seat_release_events`, as `(topic, event JSON)`
+#[cfg(test)]
+tokio::task_local! {
+    static SEAT_RELEASE_EVENTS: std::cell::RefCell<Vec<(String, String)>>;
+}
+
+#[cfg(test)]
+fn record_seat_release_event(topic: &str, event: &EventV1) {
+    let _ = SEAT_RELEASE_EVENTS.try_with(|sent| {
+        sent.borrow_mut()
+            .push((topic.to_string(), serde_json::to_string(event).unwrap()))
+    });
+}
+
+#[cfg(test)]
+impl Member {
+    /// Run `run` and return what it published through
+    /// [`Member::publish_seat_release`], as `(topic, event JSON)`. The
+    /// capture is task-local, so tests running in parallel never see each
+    /// other's events.
+    pub(crate) async fn capture_seat_release_events<T>(
+        run: impl std::future::Future<Output = T>,
+    ) -> (T, Vec<(String, String)>) {
+        SEAT_RELEASE_EVENTS
+            .scope(std::cell::RefCell::new(Vec::new()), async move {
+                let output = run.await;
+                (output, SEAT_RELEASE_EVENTS.with(|sent| sent.take()))
+            })
+            .await
     }
 }
 
@@ -748,6 +814,19 @@ mod tests {
             .expect("a seat row")
     }
 
+    /// The 7.5 event a server-forced release owes `channel_id`, as
+    /// `(topic, event JSON)`: the exact topic is the CHANNEL topic (viewers
+    /// only, never the server or a user topic), and the exact JSON names no
+    /// user
+    fn seat_release_event(channel_id: &str) -> (String, String) {
+        (
+            channel_id.to_string(),
+            format!(
+                r#"{{"type":"ProtectedChannelChanged","id":"{channel_id}","scope":["seats","text_group"]}}"#
+            ),
+        )
+    }
+
     /// A kick releases the member's seat in that server's protected channels
     /// (active to cooling: the member had received the keys) and leaves
     /// their seat in another server alone. Mutation: both releases removed
@@ -849,6 +928,113 @@ mod tests {
         });
     }
 
+    /// 7.5 / S2-D18 (W2 audit MAJOR-1): a kick of a seated member announces
+    /// the channel once, on the channel topic, naming both scopes. On
+    /// MONGODB the member also holds a leaf in the open Text group, so the
+    /// same release queues their pending removal: the event is what starts
+    /// the remaining members' removal duty (S2-D19). Control: the first
+    /// release's announcement dropped.
+    #[tokio::test]
+    async fn a_kick_of_a_seated_member_announces_the_channel() {
+        database_test!(|db| async move {
+            let owner = User::create(&db, "01MRE Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let user = User::create(&db, "01MRE Member".to_string(), None, None)
+                .await
+                .unwrap();
+            let server = Server::create(&db, new_server("01MRE S"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+
+            let member = Member::create(&db, &server, &user, None).await.unwrap().0;
+            entitle(&db, SEATED_HERE, &server.id).await;
+            seat_raw(&db, SEATED_HERE, &user.id).await;
+            #[cfg(feature = "mongodb")]
+            if let Database::MongoDb(mongo) = &db {
+                text_group_raw(mongo, "01MREGROUP", SEATED_HERE, &[&owner.id, &user.id]).await;
+            }
+
+            let (removed, sent) = Member::capture_seat_release_events(member.remove(
+                &db,
+                &server,
+                RemovalIntention::Kick,
+                false,
+            ))
+            .await;
+            removed.expect("the kick went through");
+
+            assert!(!seat_of(&db, SEATED_HERE, &user.id).await.is_active());
+            assert_eq!(
+                sent,
+                vec![seat_release_event(SEATED_HERE)],
+                "a kick that released a seat announces its channel once (7.5)"
+            );
+            #[cfg(feature = "mongodb")]
+            if let Database::MongoDb(_) = &db {
+                let group = db.fetch_mls_group("01MREGROUP").await.unwrap();
+                assert!(
+                    group
+                        .pending_removals
+                        .iter()
+                        .any(|pending| pending.user_id == user.id),
+                    "precondition: the release queued the pending removal: {group:?}"
+                );
+            }
+        });
+    }
+
+    /// A kick of a member seated in none of the server's protected channels
+    /// announces nothing, not even the channel they are seated in in another
+    /// server (the release is scoped to the server). Control: the
+    /// announcement taken from the user's seats read before the release.
+    #[tokio::test]
+    async fn a_seat_free_kick_announces_nothing() {
+        database_test!(|db| async move {
+            let owner = User::create(&db, "01MRQ Owner".to_string(), None, None)
+                .await
+                .unwrap();
+            let user = User::create(&db, "01MRQ Member".to_string(), None, None)
+                .await
+                .unwrap();
+            let server = Server::create(&db, new_server("01MRQ S"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+            let other_server = Server::create(&db, new_server("01MRQ S2"), &owner, false)
+                .await
+                .unwrap()
+                .0;
+
+            let member = Member::create(&db, &server, &user, None).await.unwrap().0;
+            Member::create(&db, &other_server, &user, None)
+                .await
+                .unwrap();
+            entitle(&db, SEATED_HERE, &server.id).await;
+            entitle(&db, SEATED_ELSEWHERE, &other_server.id).await;
+            seat_raw(&db, SEATED_ELSEWHERE, &user.id).await;
+
+            let (removed, sent) = Member::capture_seat_release_events(member.remove(
+                &db,
+                &server,
+                RemovalIntention::Kick,
+                false,
+            ))
+            .await;
+            removed.expect("the kick went through");
+
+            assert!(
+                sent.is_empty(),
+                "a kick that released nothing announces nothing: {sent:?}"
+            );
+            assert!(
+                seat_of(&db, SEATED_ELSEWHERE, &user.id).await.is_active(),
+                "precondition: the seat in another server survives"
+            );
+        });
+    }
+
     /// A non-member never holds a seat: a rejoin releases one left behind (by
     /// a removal whose second release failed), and a repeated join by a
     /// CURRENT member is refused without touching their seats. Mutations: the
@@ -876,21 +1062,36 @@ mod tests {
                 "precondition: the seated user is not a member"
             );
 
-            Member::create(&db, &server, &user, None).await.unwrap();
+            let (joined, sent) =
+                Member::capture_seat_release_events(Member::create(&db, &server, &user, None))
+                    .await;
+            joined.unwrap();
 
             let left_behind = seat_of(&db, SEATED_HERE, &user.id).await;
             assert!(
                 !left_behind.is_active(),
                 "the rejoin must release the seat left behind: {left_behind:?}"
             );
+            assert_eq!(
+                sent,
+                vec![seat_release_event(SEATED_HERE)],
+                "the rejoin's release is announced (7.5)"
+            );
 
             // Now a member, seated legitimately: a repeated join is refused
-            // and releases nothing
+            // and releases (and announces) nothing
             seat_raw(&db, SEATED_LATER, &user.id).await;
-            let error = Member::create(&db, &server, &user, None).await.unwrap_err();
+            let (joined, sent) =
+                Member::capture_seat_release_events(Member::create(&db, &server, &user, None))
+                    .await;
+            let error = joined.unwrap_err();
             assert!(
                 matches!(error.error_type, ErrorType::AlreadyInServer),
                 "a repeated join is refused: {error:?}"
+            );
+            assert!(
+                sent.is_empty(),
+                "a refused join announces nothing: {sent:?}"
             );
             assert!(
                 seat_of(&db, SEATED_LATER, &user.id).await.is_active(),
@@ -970,10 +1171,18 @@ mod tests {
                 "precondition: the refused seat write fails a release"
             );
 
-            let removed = member
-                .remove(&db, &server, RemovalIntention::Kick, false)
-                .await;
+            let (removed, sent) = Member::capture_seat_release_events(member.remove(
+                &db,
+                &server,
+                RemovalIntention::Kick,
+                false,
+            ))
+            .await;
             assert!(removed.is_err(), "a failed release must fail the removal");
+            assert!(
+                sent.is_empty(),
+                "a failed release must announce nothing (7.5): {sent:?}"
+            );
 
             assert!(
                 db.fetch_member(&server.id, &user.id).await.is_ok(),
@@ -1146,10 +1355,16 @@ mod tests {
             };
 
             fail_the_claim_after_next(mongo, GROUP).await;
-            let outcome = kicked_member
-                .remove_with_outcome(&db, &server, RemovalIntention::Kick, false)
-                .await
-                .expect("the removal went through");
+            let (outcome, sent) = Member::capture_seat_release_events(
+                kicked_member.remove_with_outcome(&db, &server, RemovalIntention::Kick, false),
+            )
+            .await;
+            let outcome = outcome.expect("the removal went through");
+            assert_eq!(
+                sent,
+                vec![seat_release_event(SEATED_HERE)],
+                "the first release is announced, the failed second one is not (7.5)"
+            );
             let error = match outcome {
                 RemovalOutcome::ReleasePending(error) => error,
                 RemovalOutcome::Removed => {
@@ -1248,7 +1463,8 @@ mod tests {
     /// no single fault can show (the behaviour of a failed first and of a
     /// failed second release is driven for real by the two MONGODB tests
     /// above). In order: the first release, returned, before the thread
-    /// loop; the soft delete; the second release KEPT (no `?`, no `.ok()`);
+    /// loop, and what it released announced right after it (7.5); the soft
+    /// delete; the second release KEPT (no `?`, no `.ok()`);
     /// the leave event; the kept result handed back as the last statement,
     /// `ReleasePending` for its error, with nothing between the two able to
     /// return early. Exactly two releases, and no feature flag. `remove` is
@@ -1285,12 +1501,24 @@ mod tests {
             (end, &body[start..end])
         };
 
-        // 1. The first release returns its error, before the thread loop
-        let (_, first) = statement(calls[0]);
-        assert_eq!(
-            first,
-            format!("{RELEASE}?;"),
-            "the first release must return its error: {body}"
+        // 1. The first release returns its error, before the thread loop,
+        // and what it released is announced right after it (7.5)
+        let (first_end, first) = statement(calls[0]);
+        let announced = first
+            .strip_prefix("let ")
+            .and_then(|rest| rest.strip_suffix(format!("={RELEASE}?;").as_str()))
+            .filter(|name| {
+                *name != "_"
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            });
+        let Some(announced) = announced else {
+            panic!("the first release must return its error, its result bound to a name: {first}");
+        };
+        assert!(
+            body[first_end..]
+                .starts_with(&format!("Self::publish_seat_release(&{announced}).await;")),
+            "the first release's channels must be announced right after it: {body}"
         );
         let threads = body.find(THREADS).expect("the thread loop");
         assert!(

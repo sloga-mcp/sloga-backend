@@ -567,13 +567,13 @@ mod test {
         )
     }
 
-    /// The reconcile fails (the protected channel's document is gone): each
-    /// deletion stands and is logged, the voice sync still runs (with a call
-    /// it cannot reach, its own `UnknownNode` is the answer), and without
-    /// such a call the reconcile's own error is the answer (`NotFound`: the
-    /// document it reads is gone). A deleted role cannot be
-    /// deleted again, so the repair is the next hook request: once the
-    /// document is back, deleting an unrelated role releases the seat.
+    /// The reconcile fails (the protected channel's row is stored as a
+    /// SavedMessages channel): each deletion stands and is logged, the voice
+    /// sync still runs (with a call it cannot reach, its own `UnknownNode`
+    /// is the answer), and without such a call the reconcile's own error is
+    /// answered unchanged (`InternalError`). A deleted role cannot be
+    /// deleted again, so the repair is the next hook request: once the row
+    /// is back, deleting an unrelated role releases the seat.
     /// Controls: the reconcile's error returned before the sync; its error
     /// dropped.
     async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_deletion_case() {
@@ -613,7 +613,7 @@ mod test {
             "hook",
         )
         .await;
-        assert_rejected(response, Status::NotFound, "NotFound").await;
+        assert_rejected(response, Status::InternalServerError, "InternalError").await;
         assert!(!role_exists(&world.harness, &world.server_id, &spare.id).await);
         assert_eq!(
             role_delete_entries(&world.harness, &world.server_id)

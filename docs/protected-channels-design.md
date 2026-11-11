@@ -487,6 +487,12 @@ A hostile or compromised server (or an operator with database access):
   itself tells a moderator who can see no protected channel that the server has one.
   Accepted: a seat-keyed rule would be worse (it would tell whether the target holds a
   seat).
+  **Kick-vs-protect race (S2-W2; W2 wave audit ruling 7, ACCEPTED).** The reason check
+  reads the server's protected channels before the kick writes anything, outside any
+  transaction, so a protect landing between that read and the removal lets ONE kick through
+  without a reason (like R16's stale read). The kick still releases the seat and queues the
+  pending removal (6.3); only the reason is missing from its `MemberKick` entry. A ban
+  checks the same way, right before `ServerBan::create`.
 - **R27. A stolen owner device can act as the owner (S2-W0, #191; plan S2-R3; rewritten in
   the fix round, #216).** Any device in the newest authority's `owner_devices` may sign the
   next list, and members accept it with no dialog. A thief holding such a device with a live
@@ -507,6 +513,17 @@ A hostile or compromised server (or an operator with database access):
   other device X seated Y", 4.4.1 rule 9, #227). It is the S1 exposure of a stolen single
   owner device, multiplied by the number of listed devices; the detection shortens the
   window, it does not close it.
+  **Step 3b verification race (S2-W2; W2 wave audit ruling 1, ACCEPTED).** The route
+  verifies a CHANGED authority against the signer device's directory key BEFORE the write
+  transaction (4.3 step 3b), comparing with the stored authority it read outside the
+  transaction, and skips verification only for an authority EQUAL to the one it read. For
+  the driver to then see that same authority as a change, the stored authority would have
+  to move backward between the two reads. The planner forbids that: a change is the stored
+  version + 1 with `prev` = the stored body's hash, and an authority is never dropped (step
+  4c). The channel-delete cascade makes re-protecting the same channel id impossible, so the
+  stored authority never starts over. An unverified authority therefore never lands as a
+  change. Optional hardening, not built: pass the signer's directory key into
+  `SeatListWriteInput` and compare it inside the transaction.
 - **R28. A suspended or banned owner pauses their channels (S2-W0, #197; plan S2-R4).**
   Suspension revokes every device of the owner (R17), including the one that signed the
   current list, so every protected channel they own carries `signer_lost` and refuses sends
@@ -586,7 +603,7 @@ fields (serde default, omitted when `None`; no data migration):
 | Field | Type | Notes |
 |---|---|---|
 | `release_cause` | `Option<SeatReleaseCause>` | `OwnerUnseat`, `ServerRemoval`, `AccessLost`, `DeviceNeverJoined` (snake_case on the wire); written by every release: the S1 server-forced paths write `ServerRemoval`, the owner's list unseat `OwnerUnseat`, the reconciler `AccessLost`. The enum lives in `protected_channels/model.rs` |
-| `keys_received_at` | `Option<Timestamp>` | set by the Text commit transaction when the user's FIRST device is added (it already writes added users' seat rows) |
+| `keys_received_at` | `Option<Timestamp>` | set by the Text commit transaction when the user's FIRST device is added (it already writes added users' seat rows); a re-seat while the seat is still cooling keeps it, or sets it to `released_at` when it was `None` (#233) |
 
 - **An unused seat frees at once (S2-D21, O-3).** A release while `keys_received_at` is
   `None` writes `release_cause = DeviceNeverJoined` and NO cooldown (`cooldown_until` stays
@@ -596,12 +613,13 @@ fields (serde default, omitted when `None`; no data migration):
   seats keep their cooldown.
 - **Access-loss releases cool 14 days** like the others (O-4); otherwise a role removal
   would bypass slot cooldowns.
-- `channel_seats._id = {channel}:{user}`, so a re-seat overwrites `release_cause` and
-  `keys_received_at`; the `ProtectedSeatsUpdate` and `ProtectedSeatRelease` audit entries
-  (7.5) are the history (S9 needs seat-at-time). Re-seating a seat that is still cooling
-  keeps `keys_received_at` (the slot was already used; a cooling seat with no stamp gets
-  its release time), so its next release cools again; only a re-seat after a no-cooldown
-  release or after the cooldown expired clears it (#233).
+- `channel_seats._id = {channel}:{user}`, so a re-seat overwrites `release_cause` (and
+  `keys_received_at`, except while cooling, #233); the `ProtectedSeatsUpdate` and
+  `ProtectedSeatRelease` audit entries (7.5) are the history (S9 needs seat-at-time).
+  Re-seating a seat that is still cooling keeps `keys_received_at` (the slot was already
+  used; a cooling seat with no stamp gets its release time), so its next release cools
+  again; only a re-seat after a no-cooldown release or after the cooldown expired clears it
+  (#233).
 - Suspension never releases a seat (`Suspended` is not a cause; R17).
 
 ### 2.4 `channel_seat_lists` (new collection, both drivers)
@@ -979,7 +997,7 @@ byte-identical (the field-level rule of (b) above):
 |---|---|---|
 | `MlsGroup.pending_device_removals` | `Vec<MlsPendingDeviceRemoval { user_id, device_id, created_at }>` | a SEPARATE field from `pending_removals`, so an older binary ignores it instead of reading it as user-wide (S2-D17a) |
 | `MlsGroup.signer_lost` | `Option<MlsSignerLost { user_id, device_id, cause, at }>` | the device that signed the current list was revoked (S2-D17d, 6.3). The stored `cause` is only `device_revoked` ([S2b] `user_removed`); `account_unavailable` is never stored: `GET .../text_group` derives it at read time from the signer user's account flags (`UserFlags` `SuspendedUntil`, `Deleted`, `Banned`) (#222). COPIED into every successor created while it is set; only the 4.3 step-7 seat-list write clears it (#213) |
-| `MlsGroup.rejoin_readd` | `Vec<{ user_id, device_id, at }>` | written by a rule-6 eviction, consumed by that device's re-Add; marks the re-Add as recovery (S2-D32) |
+| `MlsGroup.rejoin_readd` | `Vec<{ user_id, device_id, at }>` | written by a rule-6 eviction, consumed by that device's re-Add; marks the re-Add as recovery (S2-D32). Never pruned today; pruning is owed before the `formats_v2` flip (6.3 "`rejoin_readd` lifetime") |
 | `MlsGroup.member_refreshed` | [S2b] | S2-D34 |
 | `MlsCommit.removed_reasons` | exists (B48, #169) | gains `pending_device` and [S2b] `idle` (6.1) |
 | `MlsCommit.welcome` | `Option<String>` | the commit's Welcome (b64), stored on Text commits with `added`, pruned with the row, NEVER serialized into `MlsCommitInfo` or `GET .../commits` (only the Welcome route serves it, 7.2; S2-D29) |
@@ -1105,12 +1123,15 @@ additive serde default). Index names are **DECISION (S2-W0)**:
    `{ key: { group_id: 1, "added.device_id": 1 }, name: "text_welcome_lookup" }` (the
    Welcome route's "newest commit that added this device", 7.2).
 
-Expected numbering: S1 `<= 75` / `LATEST_REVISION` 76 (above, as landed at `be915a8d`), then
-S5 `<= 76` / 77, then **S2 `<= 77` / 78**, then S4 `<= 78` / 79. The number is the next free
-one at land time: confirm it with the merge steward before S2-W1 commits. `init.rs` creates
-both indexes from the same specs as the block (the test database is not migrated). A dev
-database that ran an earlier numbering of this block must be reset (the revision-74 trap
-above).
+Numbering (the merge steward's chain of 2026-11-02): S1 `<= 75` / `LATEST_REVISION` 76
+(above, as landed at `be915a8d`), S5a `<= 76` / 77, add-device `<= 77` / 78, then **S2
+`<= 78` / 79**, S5b `<= 79` / 80, S4 `<= 80` / 81, S6 `<= 81` / 82. This branch carries the
+S2 block as `if revision <= 78` with `LATEST_REVISION = 79`; add-device's `<= 77` block is
+not on it yet, so the gap at 77 is expected, and a `scripts.rs` test pins that no block is
+guarded by 77 until that block merges in. Any later renumber is the steward's call at land
+time. `init.rs` creates both indexes from the same specs as the block (the test database is
+not migrated). A dev database that ran an earlier numbering of this block must be reset
+(the revision-74 trap above).
 
 ---
 
@@ -1990,7 +2011,8 @@ group_salt:{64 lowercase hex = 32 random bytes}
   `pre_history:kept`. Until S4 ships a non-empty `history_boundary` is refused on every
   path, protect included, and `pre_history:wiped` is refused until S4's `history_setting`
   flag is on (a signed "wiped" with no wipe behind it would be false); `wiped` is also
-  refused whenever the boundary is empty.
+  refused whenever the boundary is empty (the parser treats that body as malformed,
+  `FailedValidation`).
 - **Entered only while `formats_v2` is on** (7.1, #218). An S1 build parses a v2 body as
   malformed (`v:1` only, #172), which is why the flag exists. The flag governs only a NEW v2
   genesis and a v1-to-v2 upgrade: a channel already on v2 keeps v2 (every later list, its
@@ -2135,10 +2157,10 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
   `version` never lower and never empty after non-empty; a v1 body over a stored v2 list
   refused. Each is `FailedValidation`.
 - **Step 4d (removal reason, S2-D20).** A PUT whose planner releases anyone needs a
-  non-empty `X-Audit-Log-Reason` header (it is not part of the signed body), else
-  `RemovalReasonRequired` (400) and nothing is written. It is checked against the planner's
-  released set inside the write transaction, after step 4, so a retry without the header of
-  a list that already landed still succeeds.
+  non-empty `X-Audit-Log-Reason` header (it is not part of the signed body; a reason of
+  only whitespace is empty), else `RemovalReasonRequired` (400) and nothing is written. It
+  is checked against the planner's released set inside the write transaction, after step
+  4, so a retry without the header of a list that already landed still succeeds.
 - **Step 4b** (no silent re-seat) is unchanged. S2-D16 adds the client half: the owner's
   list builder drops users with a non-owner `release_cause` by default, and native counts
   re-seating a forced-removed user as growth (4.9).
@@ -2158,8 +2180,9 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
   that does NOT carry such an authority is refused with
   `ProtectedChannelResecuring { reason: "owner_device_lost" }` (409) and nothing is written
   (#222): landing it would leave `signer_lost` set under a live signer, and sends would stay
-  frozen. Seats this list releases get `release_cause = OwnerUnseat` (or
-  `DeviceNeverJoined`, 2.3).
+  frozen. A list signed by the lost device itself is refused the same way (the revoked
+  device cannot sign through the route; refusing it here fails closed if one gets through).
+  Seats this list releases get `release_cause = OwnerUnseat` (or `DeviceNeverJoined`, 2.3).
 - **AD size.** The planner refuses a new row whose commit AD (3.12.1) would exceed 16383
   bytes, `FailedValidation`, before any write.
 - **After the claim commits (S2-D12).** The route runs `reconcile_channel` with fresh reads
@@ -3336,9 +3359,10 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
   that successor (4.9). A successor create when the channel already has a Text group is
   recovery-gated (S2-D32), so it works with the growth flag off and in Grace; a first create
   needs the growth flag and `allows_text_traffic()` (#220). **Rate limit:** at most
-  `successor_rate_per_day` (default 10) successors per channel per 24 h, else `InSlowmode`;
-  the owner is told which committer's commit forced each successor (9.2). A successor create
-  empties both pending lists and COPIES `signer_lost` (#213).
+  `successor_rate_per_day` (default 10; `0` is no limit) successors per channel per 24 h,
+  else `InSlowmode`; the owner is told which committer's commit forced each successor (9.2;
+  the S2a backend does not report it yet, S2-W2). A successor create empties both pending
+  lists and COPIES `signer_lost` (#213).
 - **Join intent (S2-D6, S2-D28, S2-D32).** A Text intent signs the Text join payload (3.13)
   on a channel whose list is v2 (#218), and stays outstanding for
   `TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS` = `text_rejoin_window_secs` (86400; the driver's
@@ -3349,7 +3373,9 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
 - **KeyPackage claim (S2-D32).** A claim for the re-Add of a device in `rejoin_readd`, or
   for the signer user's replacement device while `signer_lost` is set or the stored list's
   signer device has no registered identity (#213), is recovery-gated; other claims need the
-  growth flag and `allows_text_traffic()` (#220).
+  growth flag and `allows_text_traffic()` (#220). The gate is checked after the seated
+  check, so an unseated claimer gets `NotSeated` with the growth flag off too and cannot
+  probe `signer_lost`.
 - **Commit with `added` (S2-D29, S2-D32).** The commit row stores the Welcome
   (`MlsCommit.welcome`) and `removed_reasons`. The re-Add of a device in `rejoin_readd` is
   recovery-gated and consumes the entry; the Add of a new device of a seated member needs
@@ -3445,6 +3471,14 @@ below). Member clients learn of it
 from `ProtectedChannelResecuring { reason: "pending_removal" }` on send or from the text-group
 state refresh, and any member device commits the Remove (leaf-index stagger, 2 s; permitted
 because the user is in `pending_removals`, 6.1 Remove rule).
+**S2 (W2 wave audit MAJOR-1).** Every server-forced release (`Member::create`, both
+releases of `Member::remove_with_outcome`, both of `User::delete`, and the ban's own
+release) sends `ProtectedChannelChanged { scope: ["seats", "text_group"] }` on the channel
+topic of each channel it returned, right after that release succeeds and never after a
+failed one (7.5). Both scopes, because the release returns one list for its seat releases
+and its Text group writes (pending removals, `signer_lost`). These paths record no
+`ProtectedSeatRelease` entry: a kick or a ban records only its `MemberKick` or
+`MemberBanAdd` entry, and a leave or an account deletion records none.
 
 **Removal order, fail closed (DECISION (W2), #141).** The release
 (`release_channel_seats_for_user(user, Some(server), now)`) runs BEFORE the membership
@@ -3688,7 +3722,9 @@ intent.
 `crates/core/database/src/util/protected_access.rs`): true for a non-member, a missing user,
 a bot, a privileged (staff) account, or no ViewChannel. Suspended or disabled accounts are
 NOT in it (R17). `GET .../seats` computes `seated_without_access` from it, so the owner UI
-and the reconciler never disagree.
+and the reconciler agree on every holder except the list signer user, whom the reconciler
+keeps (below, #222). Because the predicate counts bots and staff, a bot or staff holder is
+flagged too, which S1's ViewChannel-only flag never did (6.4).
 - `reconcile_channel(channel)` releases every active seat whose holder lacks access through
   the per-channel CAS release
   `release_channel_seat(channel_id, user_id, expected_seated_at, cause, now) -> Result<bool>`
@@ -3702,17 +3738,21 @@ and the reconciler never disagree.
   `reconcile_member_in_server` iterate it.
 - **Hooks (S2-D11)** run unconditionally (so retrying the same edit repairs a failed
   reconcile), after the write and its audit entry and BEFORE the existing voice sync. The
-  reconcile result is KEPT, the voice sync always runs, then the result is returned (500 on
-  failure; the permission write is never undone): the `Member::remove` kept-second-release
-  shape. Routes: `servers/member_edit.rs` (roles change; that member);
-  `servers/permissions_set.rs`, `servers/permissions_set_default.rs`, `roles_delete.rs`,
-  `roles_edit_positions.rs` (the server); `channels/permissions_set.rs`,
-  `channels/permissions_set_default.rs`, and `channel_edit.rs` with
-  `remove: DefaultPermissions` (that channel). The upstream source-text pins in
-  `roles_edit_positions.rs`, `permissions_set_default.rs` and `permissions_set.rs` are
-  edited with stated reasons, each with a mutation proving it still bites. A timeout never
-  loses ViewChannel (`ALLOW_IN_TIMEOUT` includes it), so there is no timeout hook; a test
-  pins that.
+  reconcile result is KEPT (a failure is logged at once) and the voice sync always runs;
+  then the route answers the reconcile's error, unchanged, after the voice sync (in practice
+  500). A failing voice sync answers first, and the reconcile error stays in the log. A
+  channel or server row the reconcile cannot find (deleted under the pass, or a legacy row)
+  is nothing to reconcile, logged at `warn`, so a successful permission edit never answers
+  404 for it (W2 wave audit MINOR-1). The permission write is never undone: the
+  `Member::remove` kept-second-release shape. Routes:
+  `servers/member_edit.rs` (roles change; that member); `servers/permissions_set.rs`,
+  `servers/permissions_set_default.rs`, `roles_delete.rs`, `roles_edit_positions.rs` (the
+  server); `channels/permissions_set.rs`, `channels/permissions_set_default.rs`, and
+  `channel_edit.rs` with `remove: DefaultPermissions` (that channel). The upstream
+  source-text pins in `roles_edit_positions.rs`, `permissions_set_default.rs` and
+  `permissions_set.rs` are edited with stated reasons, each with a mutation proving it still
+  bites. A timeout never loses ViewChannel (`ALLOW_IN_TIMEOUT` includes it), so there is no
+  timeout hook; a test pins that.
 - **Race closure (S2-D12).** `seats_put.rs` and `channel_protect.rs` run `reconcile_channel`
   with fresh reads AFTER their claim commits (write W then hook H; claim C then recheck R;
   every order ends reconciled). Permissions are not evaluated inside the transaction, which
@@ -3720,21 +3760,31 @@ and the reconciler never disagree.
 - **Sweep (S2-D14).** NEW crond task `tasks/protected_access_sweep.rs` (registered like
   `afk_sweep.rs`, with the `include_str!("../main.rs")` pin) pages
   `fetch_channels_with_active_seats(after: Option<String>, limit: i64) -> Result<Vec<String>>`
-  and runs `reconcile_channel` every `reconcile_sweep_secs` (300). It runs regardless of
-  both feature flags and of the entitlement state (removal always works; S5's growth
-  predicates never gate it) and is idempotent across replicas (the CAS, and "already
-  pending"). While `formats_v2` is on (#219), it also queues a pending device removal for
-  every Text member device whose identity row is absent, whose bound session no longer
-  exists, or which a newer identity on the same session superseded: the repair path of
-  "Device revocation" below (RR#S2-9).
+  and runs `reconcile_channel` every `reconcile_sweep_secs` (300; `0` disables the sweep,
+  the hooks still run). It runs regardless of both feature flags and of the entitlement
+  state (removal always works; S5's growth predicates never gate it) and is idempotent
+  across replicas (the CAS, and "already pending"). While `formats_v2` is on (#219), it
+  also queues a pending device removal for every Text member device whose identity row is
+  absent, whose bound session no longer exists, or which a newer identity on the same
+  session superseded: the repair path of "Device revocation" below (RR#S2-9). The repair
+  reaches the open Text group of each channel the sweep pages, i.e. each channel with an
+  active seat. That covers every live channel: the list signer is always seated and the
+  reconciler never releases them (#222; W2 wave audit ruling 5).
 - **The reconciler never releases the current list signer user (fix round, #222).** A
   privileged owner (the staff flag set after protect) would match the predicate, and
   releasing the signer would wedge the channel; the reconciler skips that seat and logs and
-  reports it (ids only).
+  reports it (ids only, on every pass that finds it, the sweep included). `GET .../seats`
+  still shows that seat to the owner as `seated_without_access` (owner only); the owner UI
+  must not offer to unseat the signer (W2 wave audit ruling 10).
 - **Regaining access never re-seats (S2-D16).** The user stays released; re-seating is an
   owner growth add (4.9).
 - Every release with a non-empty result emits `ProtectedChannelChanged` (7.5) and records
-  `ProtectedSeatRelease { channel, user, cause }`.
+  `ProtectedSeatRelease { channel, user, cause }`. Both live inside `reconcile_*`, so every
+  caller emits the same: one entry per release that landed, and ONE event per channel with
+  `scope: ["seats"]`, also when the release queued a pending removal on the open Text group
+  (as the seat PUT's event does, 4.3). The entry's `cause` is the reason the seat was
+  released for, `access_lost`, never `device_never_joined`, even when the row stored that
+  (2.3: the stored value only says the slot freed at once) (W2 wave audit ruling 12).
 - Role editors get copy only (the spec rule "a role that opens a protected channel uses a
   slot" is superseded by explicit seating): "makes them eligible; the owner seats them", and
   a generic warning before role or permission edits in a server with protected channels
@@ -3753,7 +3803,17 @@ AGAIN (idempotent; it catches a Text commit that added the device between the fi
 the delete); then the `E2EEDeviceDelete` broadcast and `ProtectedChannelChanged` for each
 returned channel. A failed pending pass fails the revocation closed for the route.
 `Session::delete` and `delete_all_sessions` delete the session BEFORE revoking, so a failure
-there leaves an identity bound to a dead session: the sweep above repairs it. The commit
+there leaves an identity bound to a dead session: the sweep above repairs it.
+**Disable and suspend order (W2 wave audit MAJOR-2).** `Account::disable` stores
+`disabled` FIRST, then `delete_all_sessions` deletes every session and revokes EVERY device
+(each one is attempted even after another fails, and each failure is logged), sends
+`DeleteAllSessions`, and returns the first error. A device whose pending pass failed stays
+intact (identity and leaf), bound to a dead session, and the sweep's repair queues it while
+`formats_v2` is on. `User::suspend` stores the suspension (`SuspendedUntil`) BEFORE it
+disables the account, so a failed revocation answers its error with the user already
+suspended and disabled, never logged out and free to sign straight back in.
+`Account::schedule_deletion` goes through `disable` too, so a failed revocation there answers
+its error with the deletion already scheduled. The commit
 transaction refuses an Add whose identity is absent and claims the identity of every added
 device (6.1), so every ordering of a revocation and an Add ends with no member or a pending
 entry. On `E2EEDeviceDelete` for one of its OWN devices, each of the user's other active
@@ -3807,7 +3867,8 @@ listed devices simply signs from another one (no successor needed while members 
 **Async Text join (S2-D28; #203).** `GET .../text_group` gains
 `join_requests: [{ user_id, device_id, generation, key_package_ref, signature, issued_at, created_at, rejoin }]`:
 the stored intents of seated users that are newer than that device's `member_added.at`,
-returned to SEATED callers only (an unseated viewer gets `[]`). Members admit on channel
+returned to SEATED callers only (absent for an unseated viewer, as it is when there are
+none; `generation` and `issued_at` are absent on a v1 intent). Members admit on channel
 open, on the 60 s refresh and on reconnect (leaf-index stagger), as well as on the live
 event. A Text intent stays outstanding 24 h (`text_rejoin_window_secs`, route and driver;
 Call stays 30 s); the native Text intent lifetime (W3 D22) goes from 1 h to 24 h. The joiner
@@ -3848,17 +3909,28 @@ fix round, #226): the join intent, the KeyPackage claim and the Add of a device 
 leaf in the PREDECESSOR generation (the server finds it as the channel's closed Text group
 at the open group's generation - 1, which the create's `supersedes` named, and checks its
 member list), for recovery successors, poisoned-epoch successors and the v1-to-v2
-supersession of #223 alike; and, while `signer_lost` is set or the stored list's signer
-device has no registered identity (#213), the signer user's replacement device's join intent
-and KeyPackage claim (RR#S2-1). **Gating tiers (aligned with S5 plan section 7; fix round,
-#220):** a NEW SEAT (the seat claims of a seat PUT and of protect) needs the growth flag and
-`allows_new_seats()` (Active only); a NEW DEVICE of a seated member (its join intent, its
+supersession of #223 alike (OWED: not built in S2a; such a device is treated as a new one,
+so it fails closed with the growth flag off; W2 wave audit MINOR-3); and, while
+`signer_lost` is set or the stored list's signer device has no registered identity (#213),
+the signer user's replacement device's join intent and KeyPackage claim (RR#S2-1).
+**Gating tiers (aligned with S5 plan section 7; fix round, #220):** a NEW SEAT (the seat
+claims of a seat PUT and of protect) needs the growth flag and `allows_new_seats()` (Active
+only); a NEW DEVICE of a seated member (its join intent, its
 KeyPackage claim and its Add) and a first Text group create need the growth flag and
 `allows_text_traffic()` (Active or Grace); RECOVERY needs the available gate and
 `allows_text_traffic()` and no growth flag. Before S5 lands both predicates are `Active`.
 **S2 replaces** 7.1's consequence that "with the flag off, every Add is refused, including
 the re-admission of a member device that desynced": recovery Adds pass with the growth flag
-off (O-16). The predicate names are coordinated with S5.
+off (O-16). The predicate names are coordinated with S5. A MISSING entitlement row refuses
+every KeyPackage claim and every Add, recovery included; at the S5b merge S5b's
+pass-on-missing in `key_packages_claim` is dropped and its test rewritten (W2 wave audit
+ruling 11).
+**`rejoin_readd` lifetime (W2 wave audit MINOR-2).** Entries are never pruned today. The
+list is bounded (one entry per device, and a successor create empties it), but an evicted
+device that stays seated, viewing and registered keeps its recovery re-Add, a bypass of the
+growth flag, indefinitely (the commit transaction still re-checks everything else). Pruning
+on identity revocation or seat release, with a TTL of the Text rejoin window, is owed before
+the `formats_v2` flip.
 
 **Generations (S2-D33; #204).** The cap is 65535 on both sides (3.1, 3.1.1); `GET .../seats`
 gains `as_of_generation`, and W3 D14 checks a stated generation by recomputing its id, never
@@ -3874,19 +3946,33 @@ timer. After 10 minutes the owner UI shows "Removal waiting" with "Finish now"; 
 poisoned group it points to "Re-create the protected group" (9.2).
 
 **Removal reasons (S2-D20; #205).** New error `RemovalReasonRequired` (400) from the seam
-`removal_requires_reason(db, server_id, target)`. The S2 rule: EVERY kick and ban in a
-server with at least one protected channel, and every seat PUT that releases someone (4.3
-step 4d). It is not keyed on "the target holds a seat", which would tell a KickMembers
-moderator who cannot view the channel whether the target is seated (O-2). Kick: after the
-rank check, before `remove`. Ban: after the rank check, BEFORE `ServerBan::create`
-(coordinated with B42's source-text tests). New audit actions
+`refuse_removal_without_reason(db, server_id, reason)` (`member_remove.rs`, shared with
+`ban_create.rs`). The S2 rule: EVERY kick and ban in a server with at least one protected
+channel (a channel of the server's entitlements that carries the `protected` flag), and
+every seat PUT that releases someone (4.3 step 4d). A reason that is empty after
+sanitizing, or only whitespace, counts as none. The seam takes no target: keying it on
+"the target holds a seat" would tell a KickMembers moderator who cannot view the channel
+whether the target is seated (O-2). Kick: after the rank check, before `remove`; the reason
+is the `X-Audit-Log-Reason` header. Ban: after the rank check, BEFORE `ServerBan::create`
+(coordinated with B42's source-text tests), and only for a ban this request creates (an
+"already banned" retry writes nothing and needs no reason); the reason checked is the
+request BODY reason, sanitized as a header reason is, which is the reason the
+`MemberBanAdd` entry records (plan audit M4: a ban reason may run to 1024 characters, past
+the header's 512). New audit actions
 `ProtectedSeatsUpdate { channel, released, seated, reason }` and
 `ProtectedSeatRelease { channel, user, cause }` (`#[serde(other)] Unknown` keeps a rollback
 safe). **Audit visibility (fix round, #221):** both actions name a protected channel and its
 seat holders, so `servers/audit_log_fetch.rs` returns a `ProtectedSeatsUpdate` or
-`ProtectedSeatRelease` entry only to a reader who has ViewChannel on that entry's channel (a
-filter on the fetched page; a reader with ViewAuditLog but without ViewChannel never sees
-it). Copy never reveals contribution data. Role-edit releases bypass the rule (R26).
+`ProtectedSeatRelease` entry only to a reader who has ViewChannel on that entry's channel;
+a reader with ViewAuditLog but without ViewChannel never sees it. **(S2-W2)** The route
+filters inside its fetch loop, BEFORE it collects the page's `users`, so a hidden entry
+contributes neither its actor nor its target. An entry with no channel, a channel that no
+longer exists or a channel of another server is hidden from every reader, the owner
+included (fail closed). Hidden entries are replaced from older ones: the route reads up to
+10 further batches of 100 entries to fill the page. Accepted residuals: a run of more than
+about 1000 hidden entries ends the page early; the response time leaks a rough count of
+hidden entries; an `Unknown` entry (written by a newer build) is not filtered. Copy never
+reveals contribution data. Role-edit releases bypass the rule (R26).
 
 **Account deletion and leave (S2-D43).** Server behavior is unchanged in S2a: deleting the
 owner's account deletes their servers (above), and the client warns first (9.2). [S2b]
@@ -3999,7 +4085,7 @@ Gates (**kind-aware**; the media gate body is unchanged and stays pinned by `fla
 | (S2, #218) `formats_v2` off, a new v2 genesis or a v1-to-v2 upgrade list | Refused (`FailedValidation`); protect takes a v1 genesis |
 | (S2, #219) `formats_v2` off, a device revocation | The S2 revocation hook writes nothing (no pending device entry, no `signer_lost`; R23 open) |
 | (S2, #220) growth flag off, a recovery operation (rejoin, `rejoin_readd` re-Add, successor of an existing group, `signer_lost` replacement) | Allowed (available gate and `allows_text_traffic()`) |
-| (S2, #226) growth flag off, a device that held a leaf in the predecessor generation joins the successor (intent, KeyPackage claim, Add) | Allowed as recovery; a device new to the channel is still refused |
+| (S2, #226) growth flag off, a device that held a leaf in the predecessor generation joins the successor (intent, KeyPackage claim, Add) | OWED, not built in S2a (W2 wave audit MINOR-3): refused like a new device (fails closed). Specified: allowed as recovery; a device new to the channel is still refused |
 
 **Flag off (DECISION (W2), #135).** The flag stops growth only. It refuses seat claims,
 Adds, Text group create, join intents and KeyPackage claims (and the grant and protect,
@@ -4024,9 +4110,9 @@ member device's rejoin and re-Add pass with the growth flag off.
 ```toml
 [features.protected_channels]
 formats_v2 = false              # entry into v2 (genesis, upgrade) and the revocation hook; flip once every protected device runs S2
-reconcile_sweep_secs = 300      # S2-D14 sweep period
-text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver)
-successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h
+reconcile_sweep_secs = 300      # S2-D14 sweep period; 0 disables the sweep (the hooks still run)
+text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver); never below 30 (the Call window)
+successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h; 0 is no limit
 # idle_device_days              # [S2b] S2-D34; default commit_retention_days
 ```
 
@@ -4042,8 +4128,10 @@ successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h
   carries it (7.2).
 - `successor_rate_per_day` is S2a: S2-D33 moved to S2a (plan audit PA-7) after plan section
   6 had tagged this key [b] (#204).
-- **Recovery gate (S2-D32, 6.3).** A third Text gate beside Available and Growth (its name
-  is S2-W2's): available AND the entitlement's `allows_text_traffic()` (the three gating
+- **Recovery gate (S2-D32, 6.3).** A third Text gate beside Available and Growth
+  (`TextGate::Recovery`, `require_text_gate_for` in `routes/mls/mod.rs`; no route calls it
+  yet: the S2-W2 routes check the available gate and the entitlement inline, `Active` only
+  until S5 lands): available AND the entitlement's `allows_text_traffic()` (the three gating
   tiers are in 6.3 "Recovery gates", #220). The route chooses Recovery or Growth from the
   operation (a rejoin, a `rejoin_readd` re-Add and its claim, the successor of an existing
   group, a `signer_lost` replacement), never from a client flag.
@@ -4184,8 +4272,9 @@ sufficient. `device_cap` here is the enforced cap (2.5); `entitlement_device_cap
 ceiling a newly signed list may use (4.1, W0-fix4).
 
 `list` is `null` only for a channel that is not protected. `seated_without_access` is computed
-(ViewChannel for that user) and present **only when the caller is the server owner**; omitted
-otherwise (**DECISION (W0)**: other members' permission state is not disclosed).
+(ViewChannel for that user; S2: the 6.3 predicate) and present **only when the caller is the
+server owner**; omitted otherwise (**DECISION (W0)**: other members' permission state is not
+disclosed).
 **Nullable caps (DECISION (W2), #152).** `entitlement_device_cap` and `slot_cap` serialize
 as `null` when the channel has no entitlement, and `device_cap` as `null` when it has no
 seat list. A client MUST treat `null` as "unknown", never as `0` (which means unlimited).
@@ -4250,26 +4339,33 @@ has one). A stored Text group without a `generation` is corrupt and answers
 **Existing MLS routes**, behavior by the stored group's kind: join intent, KeyPackage claim,
 commit submit and commit fetch per 6.1; the ctl pipe refuses Text.
 
-**S2 route changes (S2-W0, #203, #205, #206; plan section 6).** S2a unless marked.
+**S2 route changes (S2-W0, #203, #205, #206; plan section 6).** S2a unless marked. Every
+field S2 adds to a response is OMITTED when it is `None` or empty, never sent as `null` or
+`[]` (the S2-W1 wire choice); a client reads an absent S2 field as `null` or empty. The S1
+fields keep their S1 shapes (`list`, `as_of_epoch`, `as_of_group_id` and the caps above
+still serialize `null`).
 
 | Surface | Change |
 |---|---|
 | `PUT /channels/:id/seats` | v2 bodies (4.1.1); `DataSeatList.authority: Option<SignedAuthority>` (2.4, 4.3 step 3b); `X-Audit-Log-Reason` (4.3 step 4d); post-claim reconcile, `ProtectedChannelChanged`, `ProtectedSeatsUpdate` (4.3 "S2 additions") |
-| `GET /channels/:id/seats` | `list.authority` (`{ body, signature }`, absent when none); `revoked_owner_devices` (owner caller only: the device ids of the stored authority's `owner_devices` that have no registered identity, or whose listed key differs from the directory key, computed at read time; R27, #216, #231); `as_of_generation` (the open group's generation, `null` without one, read in the same snapshot; S2-D33); `cooling[].cause` (`release_cause`, owner caller only, like `seated_without_access`); `seated_without_access` from the shared predicate (6.4) |
+| `GET /channels/:id/seats` | `list.authority` (`{ body, signature }`, absent when none); `revoked_owner_devices` (owner caller only, absent when empty: the device ids of the stored authority's `owner_devices` that have no registered identity, or whose listed key differs from the directory key, computed at read time; R27, #216, #231); `as_of_generation` (the open group's generation, absent without one, read in the same snapshot; S2-D33); `cooling[].cause` (`release_cause`, owner caller only, like `seated_without_access`); `seated_without_access` from the shared predicate (6.3, 6.4) |
 | `PUT /channels/:id/protect` | a v2 genesis while `formats_v2` is on, a v1 genesis while it is off (#218); post-claim reconcile |
-| server audit log (`servers/audit_log_fetch.rs`) | `ProtectedSeatsUpdate` and `ProtectedSeatRelease` entries only for readers with ViewChannel on their channel (#221) |
-| `GET /mls/channels/:id/text_group` | `join_requests` (6.3), `pending_device_removals: [{ user_id, device_id, created_at }]` and `signer_lost: { user_id, device_id, cause, at }` or `null` (`cause` is `account_unavailable` when the signer user's account is suspended, deleted or banned, derived at read time, else the stored `device_revoked`; #222; for a caller who is the signer USER it is also reported, derived at read time, when the newest list's signer device has no registered identity even though no flag is stored, which covers the authority-less solo owner and a revocation with `formats_v2` off, #228), all three to SEATED callers only: an unseated viewer gets `[]`, `[]` and `null` (R24, #222); [S2b] `member_refreshed` |
+| server audit log (`servers/audit_log_fetch.rs`) | `ProtectedSeatsUpdate` and `ProtectedSeatRelease` entries only for readers with ViewChannel on their channel (#221), filtered inside the fetch loop before user collection, with up to 10 refill batches (6.3 "Removal reasons") |
+| reconciler hooks: `servers/{member_edit, permissions_set, permissions_set_default, roles_delete, roles_edit_positions}.rs`, `channels/{permissions_set, permissions_set_default, channel_edit}.rs` (`channel_edit` on `remove: DefaultPermissions` only) | `reconcile_*` after the write and its audit entry, before the voice sync; a failed reconcile's error is answered after the sync (6.3 "Hooks") |
+| `GET /mls/channels/:id/text_group` | `join_requests` (6.3), `pending_device_removals: [{ user_id, device_id, created_at }]` and `signer_lost: { user_id, device_id, cause, at }`, absent when none (`cause` is `account_unavailable` when the signer user's account is suspended, deleted or banned, derived at read time, else the stored `device_revoked`; #222; for a caller who is the signer USER it is also reported, derived at read time, when the newest list's signer device has no registered identity even though no flag is stored, which covers the authority-less solo owner and a revocation with `formats_v2` off, #228), all three to SEATED callers only: for an unseated viewer all three are absent (R24, #222); [S2b] `member_refreshed` |
 | `GET /mls/groups/:id/welcome?device_id=` | NEW (below) |
 | commit fetch (`commits_fetch.rs`) | `removed_reasons` with the S2 values; optional `oldest_epoch`; never the stored Welcome |
 | commit submit (`commits_submit.rs`) | rule 3a, Add-clears-pending, the added-identity claim, `signer_lost`, stores the Welcome and the reasons (6.1); [S2b] rule 7 |
 | join intent (`join_intent.rs`) | `DataMlsJoinIntent` gains `generation` and `issued_at` (3.13); the 24 h Text window; the recovery gate |
 | Text group create (`groups_create.rs`) | the signer-or-recovery creator rule, the recovery gate, `generation <= 65535`, the successor rate limit (6.1) |
 | KeyPackage claim (`key_packages_claim.rs`) | the recovery gate for a `rejoin_readd` re-Add and a `signer_lost` replacement |
-| kick (`member_remove.rs`), ban (`ban_create.rs`) | `RemovalReasonRequired` (6.3) |
+| kick (`member_remove.rs`), ban (`ban_create.rs`) | `RemovalReasonRequired` (6.3; the kick reads the `X-Audit-Log-Reason` header, the ban its body reason) |
 | `DELETE /servers/:id` | [S2b] the owner's "Leave and hand over" (S2-D23) |
 | `POST /servers/:id/ownership_transfer` | [S2b] NEW (S2-D25) |
-| own E2EE device listing (`routes/e2ee/fetch_devices.rs`) | for the caller's OWN devices only, each entry gains `session_id` and the session name (S2-D38) |
+| own E2EE device listing (`routes/e2ee/fetch_devices.rs`) | for the caller's OWN devices only, each entry gains `session_id` and `session_name` (S2-D38); both absent on any other user's devices and on a device bound to no session |
+| protected send (`channels/message_send.rs`) | `pending_removal` while `pending_device_removals` is non-empty, `owner_device_lost` while `signer_lost` is set (7.3) |
 | root advert (`routes/root.rs`) | `protected_channels.formats_v2` (below) |
+| crond (`tasks/protected_access_sweep.rs`) | NEW: the sweep and its revocation repair (6.3 "Sweep") |
 | events | `ProtectedChannelChanged` (7.5) |
 
 **Welcome fetch (S2-D29; DECISION (S2-W0) for the response shape).**
@@ -4285,10 +4381,13 @@ or re-added since) the unknown-group answer. Driver:
 `fetch_mls_text_welcome(group_id, user_id, device_id) -> Result<Option<MlsCommit>>`, both
 drivers, Text-marked rows only.
 
-**Root advert (DECISION (S2-W0), #206).** `protected_channels` gains `formats_v2` (the
-effective flag). Native cannot read the server's configuration, so the bridge passes the
-format to `_seat_list_sign` for a genesis or an upgrade list (8.3). This is not in the plan;
-S2-D1's "builders emit v2 while the flag is on" needs it (#210 OPEN item (h)).
+**Root advert (DECISION (S2-W0), #206).** `protected_channels` gains `formats_v2`: the
+configured value the server enforces (protect and the seat PUT read the same key),
+advertised as is; unlike `enabled`, it is not combined with `e2ee_enabled` (W2 wave audit
+ruling 8). Native cannot read the server's
+configuration, so the bridge passes the format to `_seat_list_sign` for a genesis or an
+upgrade list (8.3). This is not in the plan; S2-D1's "builders emit v2 while the flag is on"
+needs it (#210 OPEN item (h)).
 
 ### 7.3 Protected-channel send (`POST /channels/:id/messages`)
 
@@ -4567,17 +4666,39 @@ unknown-group answer (6.1 invariant).
 - **S2 replaces "no new events" (S2-W0, #205; S2-D18).**
   `EventV1::ProtectedChannelChanged { id: String, scope: Vec<String> }`, `scope` items
   `seats` or `text_group`, published on the CHANNEL topic `.p(channel_id)` (viewers only; no
-  user ids in the event). Emitted after: a seat PUT that changed the list; every release
-  that returns a non-empty result (both `Member::remove` releases, `User::delete`,
-  `Member::create`, the ban, the reconciler, a device revocation); a won Text commit that
-  cleared pending entries; `signer_lost` being set or cleared. Clients refetch (debounced)
-  and run the removal duty (6.3). No push notification in S2. stoat.js types it in
-  `events/v1.ts` and routes it to `client.e2ee.onEvent` (S2-D44). The polling above stays as
-  the backstop.
+  user ids in the event). Emitters, with their scopes (as built in S2-W2 and the W2 wave
+  audit fixes, MAJOR-1):
+  - a seat PUT or protect that changed the list (this also covers `signer_lost` being
+    cleared, 4.3 step 7): `seats`;
+  - the reconciler: ONE `seats` event per channel that released someone (6.3), even when
+    the release also queued a pending removal on the open Text group;
+  - every server-forced release (`Member::create`, both releases of
+    `Member::remove_with_outcome`, both of `User::delete`, the ban's own release):
+    `["seats", "text_group"]` for each channel the release returned, right after each
+    release that succeeded and never after a failed one (6.3 "Server-forced removal");
+  - a device revocation (including `signer_lost` being set) and the sweep's repair:
+    `text_group`;
+  - a won Text commit whose pending lists shrank: `text_group`. The route decides from its
+    own group read; a read that raced another commit counts any commit with Removes as
+    clearing, so the event may be needless. It can be missing in one narrow race: a pending
+    entry added after the route's read and cleared by this commit is not seen, and the
+    members keep a stale "pending" view until their polling refresh (fails closed; a
+    followup returns the cleared lists from the transaction).
+
+  Clients refetch (debounced) and run the removal duty (6.3) on the event, whatever its
+  scope. No
+  push notification in S2. stoat.js types it in `events/v1.ts` and routes it to
+  `client.e2ee.onEvent` (S2-D44). The polling above stays as the backstop.
 - **Audit (S2-W0, #205, #221).**
   `ProtectedSeatsUpdate { channel, released, seated, reason }` and
   `ProtectedSeatRelease { channel, user, cause }` (6.3), served by the audit-log fetch only
-  to readers with ViewChannel on the entry's channel.
+  to readers with ViewChannel on the entry's channel, filtered inside the fetch loop before
+  the page's users are collected (6.3 "Removal reasons" names the refill and its residuals).
+  Entries of a deleted channel are hidden from every reader, the owner included (W2 wave
+  audit ruling 9). Only the reconciler records `ProtectedSeatRelease`; its `cause` is the
+  reason released for (`access_lost`), never `device_never_joined` (ruling 12). Kick, ban,
+  leave and account deletion record no `ProtectedSeatRelease`; a kick or a ban records only
+  its `MemberKick` or `MemberBanAdd` entry.
 - **Reveal carries `protected` (DECISION (W2), #149).** bonfire caches hidden server
   channels, and on a hidden-to-visible `ChannelUpdate` it emits the CACHED copy as a
   `ChannelCreate`. A socket that missed the protect `ChannelUpdate` (an N3 landed-but-5xx
@@ -5418,7 +5539,8 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
     D1-signed authority unchanged and the server accepts it (control: require
     `signer_device_id` = the PUT signer for an unchanged authority, #225); with the growth
     flag off, a member of the predecessor generation joins a recovery, a poisoned-epoch and
-    a v1-to-v2 successor while a device new to the channel is refused (#226); an owner
+    a v1-to-v2 successor while a device new to the channel is refused (#226; owed with the
+    feature, W2 wave audit MINOR-3); an owner
     device sees a notice when another owner device's list seats someone (#227); a
     signer-user caller gets a derived `signer_lost` when the stored signer device has no
     identity and no flag is stored (#228); the staging-only `issued_at` rule compares two
@@ -5448,11 +5570,11 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
     deserializes as `Unknown` on the server and natively, and records memory (#219); a
     ViewAuditLog holder without ViewChannel never receives `ProtectedSeatsUpdate` or
     `ProtectedSeatRelease` entries for that channel (control: no filter, #221); an unseated
-    viewer gets empty `join_requests`, `pending_device_removals` and `signer_lost` from
-    `GET .../text_group` (#222); `removed_reasons` are stamped inside the commit transaction
-    (a pending removal cleared between the route's read and the transaction gives the
-    transaction's label, #222); a first v2 list over v1 accepts any salt (#222); native
-    refuses `format: 1` while holding a v2 list (#222).
+    viewer gets no `join_requests`, `pending_device_removals` or `signer_lost` (all three
+    absent) from `GET .../text_group` (#222); `removed_reasons` are stamped inside the
+    commit transaction (a pending removal cleared between the route's read and the
+    transaction gives the transaction's label, #222); a first v2 list over v1 accepts any
+    salt (#222); native refuses `format: 1` while holding a v2 list (#222).
   - **Join payload:** the v2 fields round-trip through every carrier (3.13); a Call intent
     replayed as a Text rejoin is refused.
   - **Native (S2-W3):** a single-device rule-6 rejoin is merged by every member (older and
@@ -6506,8 +6628,8 @@ where the plan, the contract and the code disagree are #210.
 206. DECISION (S2-W0), plan sections 5 and 6: the S2 data model (`ChannelSeat.release_cause`
      and `keys_received_at`, `SeatList.authority`, `MlsGroup.pending_device_removals`,
      `signer_lost` and `rejoin_readd`, `MlsCommit.welcome`, `MlsJoinIntent.generation` and
-     `issued_at`); the indexes-only migration block (expected `<= 77` / 78, confirmed with
-     the steward at land time; index names chosen here); the config keys `formats_v2`,
+     `issued_at`); the indexes-only migration block (`<= 78` / 79 in the steward's chain of
+     2026-11-02, 2.7; index names chosen here); the config keys `formats_v2`,
      `reconcile_sweep_secs`, `text_rejoin_window_secs` and `successor_rate_per_day`; the
      route table; `formats_v2` in the root advert (not in the plan, #210 (h)); the Welcome
      route's response shape; the errors `RemovalReasonRequired` and [S2b]

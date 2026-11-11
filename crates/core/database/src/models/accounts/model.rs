@@ -756,6 +756,11 @@ impl Account {
     }
 
     /// Delete all sessions for an account
+    ///
+    /// Every device is tried even after one fails to revoke (a failed
+    /// pending pass leaves that device intact, 6.3 "Device revocation"):
+    /// one failure must not keep the others alive. The sessions are gone
+    /// either way, so the event is sent; then the first error is returned.
     pub async fn delete_all_sessions(
         &self,
         db: &Database,
@@ -766,9 +771,30 @@ impl Account {
 
         // E2EE devices die with their sessions: revoke every device except
         // those bound to the surviving session
-        for identity in db.fetch_e2ee_identities(&self.id).await? {
-            if exclude_session_id.as_deref() != Some(identity.last_session_id.as_str()) {
-                crate::E2EEIdentity::revoke_device(db, &self.id, &identity.device_id).await?;
+        let mut first_error = None;
+        match db.fetch_e2ee_identities(&self.id).await {
+            Ok(identities) => {
+                for identity in identities {
+                    if exclude_session_id.as_deref() == Some(identity.last_session_id.as_str()) {
+                        continue;
+                    }
+                    if let Err(error) =
+                        crate::E2EEIdentity::revoke_device(db, &self.id, &identity.device_id).await
+                    {
+                        error!(
+                            "device revocation failed: user={} device={}: {error:?}",
+                            self.id, identity.device_id
+                        );
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            Err(error) => {
+                error!(
+                    "device revocation failed: user={}: listing: {error:?}",
+                    self.id
+                );
+                first_error = Some(error);
             }
         }
 
@@ -780,14 +806,21 @@ impl Account {
         .private(self.id.clone())
         .await;
 
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Disable an account
+    ///
+    /// `disabled` is stored BEFORE the sessions and devices go: a failed
+    /// revocation then answers its error with the account already disabled,
+    /// never a user logged out who can sign straight back in
     pub async fn disable(&mut self, db: &Database) -> Result<()> {
         self.disabled = true;
-        self.delete_all_sessions(db, None).await?;
-        self.save(db).await
+        self.save(db).await?;
+        self.delete_all_sessions(db, None).await
     }
 
     /// Schedule an account for deletion

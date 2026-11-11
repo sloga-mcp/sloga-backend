@@ -27,17 +27,18 @@
 //! the entitlement state: removal always works (6.3 "Sweep").
 //!
 //! Errors: a failed read before any release returns at once (nothing was
-//! written). A failed release does not stop the others: every seat and
-//! every channel is still tried, events and entries go out for what landed,
-//! and the FIRST error is returned at the end. Callers keep it and return it
-//! after their own follow-ups (6.3 "Hooks": the voice sync still runs, then
-//! 500).
+//! written). A channel or server row that is not found is nothing to
+//! reconcile, not an error. A failed release does not stop the others:
+//! every seat and every channel is still tried, events and entries go out
+//! for what landed, and the FIRST error is returned at the end. Callers keep
+//! it and, once their own follow-ups ran, return it unchanged (6.3 "Hooks":
+//! after the voice sync; in practice 500).
 
 use std::collections::BTreeSet;
 
 use iso8601_timestamp::Timestamp;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
-use revolt_result::{Error, Result};
+use revolt_result::{Error, ErrorType, Result};
 
 use crate::{
     events::client::EventV1, seat_list_channel_server, util::permissions::perms, AuditLogAction,
@@ -268,9 +269,20 @@ fn finish<T>(value: T, first_error: Option<Error>) -> Result<T> {
     }
 }
 
+/// `Ok(None)` for a read that answered `NotFound`; every other error
+/// unchanged
+fn found<T>(read: Result<T>) -> Result<Option<T>> {
+    match read {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Fresh reads of one channel and the seats to release (`only_user`: that
-/// user's seat only). `None`: no seat list (not protected) or no active
-/// seat in scope.
+/// user's seat only). `None`: no seat list (not protected), no active seat
+/// in scope, or no channel or server row (deleted under the pass, or a
+/// legacy row): a permission edit never answers 404 for it.
 async fn plan_channel(
     db: &Database,
     channel_id: &str,
@@ -289,14 +301,20 @@ async fn plan_channel(
         return Ok(None);
     }
 
-    let channel = db.fetch_channel(channel_id).await?;
+    let Some(channel) = found(db.fetch_channel(channel_id).await)? else {
+        warn!("protected channel reconcile: no channel row, nothing to reconcile: channel={channel_id}");
+        return Ok(None);
+    };
     let Some(server_id) = seat_list_channel_server(&channel) else {
         // Protect only takes a server text channel (2.1): a seat list on
         // anything else is corrupt data, so this fails loud
         error!("protected channel reconcile: seat list on a non-server channel {channel_id}");
         return Err(create_error!(InternalError));
     };
-    let server = db.fetch_server(server_id).await?;
+    let Some(server) = found(db.fetch_server(server_id).await)? else {
+        warn!("protected channel reconcile: no server row, nothing to reconcile: server={server_id} channel={channel_id}");
+        return Ok(None);
+    };
 
     let holders: Vec<String> = seats.iter().map(|seat| seat.user_id.clone()).collect();
     let users = db.fetch_users(&holders).await?;
@@ -1106,6 +1124,111 @@ mod tests {
                 .unwrap()
                 .is_empty());
             assert!(changed.is_empty());
+        });
+    }
+
+    /// Remove a `channels` or `servers` row straight from the store, its
+    /// seat list, seats and entitlements left behind (a delete under the
+    /// pass, or a legacy row)
+    async fn drop_row(db: &Database, collection: &str, id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                let removed = match collection {
+                    "channels" => reference.channels.lock().await.remove(id).is_some(),
+                    "servers" => reference.servers.lock().await.remove(id).is_some(),
+                    _ => unreachable!("{collection}"),
+                };
+                assert!(removed, "the {collection} row {id}");
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => {
+                let result = mongo
+                    .col::<bson::Document>(collection)
+                    .delete_one(doc! { "_id": id })
+                    .await
+                    .unwrap();
+                assert_eq!(result.deleted_count, 1, "the {collection} row {id}");
+            }
+        }
+    }
+
+    /// MINOR-1: a protected channel whose channel row is gone is nothing to
+    /// reconcile, so the hooks answer 200, never 404: Ok, no release, no
+    /// entry, no event, and the server's other channel is still reconciled.
+    /// Control: pass the `NotFound` through.
+    #[tokio::test]
+    async fn a_missing_channel_row_is_nothing_to_reconcile() {
+        database_test!(|db| async move {
+            world(&db, &[USER_A, USER_B, USER_C, USER_D]).await;
+            drop_row(&db, "channels", CHANNEL).await;
+
+            let mut changed = Changed::new();
+            assert!(
+                reconcile_channel_at(&db, CHANNEL, None, at(1), &mut changed)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            // B's seats: CHANNEL (no row) and CHANNEL_2 (keeps View)
+            assert!(
+                reconcile_member_in_server_at(&db, SERVER, USER_B, at(1), &mut changed)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(changed.is_empty());
+
+            assert_eq!(
+                reconcile_server_at(&db, SERVER, at(2), &mut changed)
+                    .await
+                    .unwrap(),
+                vec![(CHANNEL_2.to_string(), vec![USER_D.to_string()])]
+            );
+            assert_eq!(events(&changed), vec![seats_changed(CHANNEL_2)]);
+            assert_eq!(
+                release_entries(&db).await,
+                vec![(USER_D.to_string(), CHANNEL_2.to_string())]
+            );
+            for holder in [USER_B, USER_D] {
+                assert!(seat_of(&db, CHANNEL, holder).await.is_active(), "{holder}");
+            }
+        });
+    }
+
+    /// MINOR-1: the same for a channel whose server row is gone. Controls:
+    /// pass the `NotFound` through; map it for the channel read only.
+    #[tokio::test]
+    async fn a_missing_server_row_is_nothing_to_reconcile() {
+        database_test!(|db| async move {
+            world(&db, &[USER_A, USER_B, USER_C, USER_D]).await;
+            drop_row(&db, "servers", SERVER).await;
+
+            let mut changed = Changed::new();
+            assert!(
+                reconcile_channel_at(&db, CHANNEL, None, at(1), &mut changed)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                reconcile_member_in_server_at(&db, SERVER, USER_D, at(1), &mut changed)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(reconcile_server_at(&db, SERVER, at(1), &mut changed)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(changed.is_empty());
+            for channel_id in [CHANNEL, CHANNEL_2] {
+                for holder in [USER_B, USER_D] {
+                    assert!(
+                        seat_of(&db, channel_id, holder).await.is_active(),
+                        "{channel_id} {holder}"
+                    );
+                }
+            }
         });
     }
 

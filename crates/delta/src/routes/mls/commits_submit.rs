@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, mls_text_enforced_device_cap,
-    mls_text_rejoin_window_seconds, Channel, ChannelEntitlement, Database, E2EEContentType,
-    E2EEEnvelope, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup, MlsJoinIntent,
-    MlsMemberDevice, SeatList, SeatListBody, Session, User, E2EE_PROTOCOL_VERSION,
-    MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, retain_member_pending_device_removals, Channel,
+    ChannelEntitlement, Database, E2EEContentType, E2EEEnvelope, MlsCommit, MlsCommitOutcome,
+    MlsEnvelopeRejoinIntent, MlsGroup, MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody,
+    Session, User, E2EE_PROTOCOL_VERSION, MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    PROTECTED_SCOPE_TEXT_GROUP,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -551,6 +552,19 @@ async fn submit_text_commit(
             }),
         }),
         MlsCommitOutcome::Won => {
+            // 7.5 (S2-D18, W2 audit MAJOR-1): a won commit that cleared a
+            // pending entry is announced on the channel topic (viewers
+            // only), first, so a failed read or fan-out below cannot lose
+            // it. A lost or an unchanged commit announces nothing.
+            if commit_clears_pending(&group, &commit) {
+                EventV1::ProtectedChannelChanged {
+                    id: group.channel_id.clone(),
+                    scope: vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()],
+                }
+                .p(group.channel_id.clone())
+                .await;
+            }
+
             // The declarations come from the STORED row: the transaction
             // filled its `rejoin_intents`. Receivers treat a Text commit
             // envelope without them as a mismatch, so nothing goes out
@@ -734,6 +748,38 @@ fn add_clears_pending(group: &MlsGroup, removed: &[MlsMemberDevice]) -> bool {
         !group.has_member(&pending.user_id, &pending.device_id)
             || removes(&pending.user_id, &pending.device_id)
     })
+}
+
+/// Whether the won `commit` cleared a pending entry (design 2.5 "Clearing",
+/// 7.5), by the commit transaction's own clearing rule on the route's group
+/// read: a pending-removal user left with no member device, or a pending
+/// device entry whose device holds no leaf after the commit. Only a read at
+/// `epoch - 1` is the pre-commit group (the fan-out's check). A read that
+/// raced another commit cannot tell, so a commit with Removes then counts
+/// as clearing: a needless refetch costs less than a channel left paused
+/// until someone opens it. No new read: the transaction's outcome carries
+/// no clearing.
+fn commit_clears_pending(group: &MlsGroup, commit: &MlsCommit) -> bool {
+    if group.current_epoch + 1 != commit.epoch {
+        return !commit.removed.is_empty();
+    }
+
+    let mut after = MlsGroup {
+        members: group
+            .members
+            .iter()
+            .filter(|member| !commit.removed.contains(member))
+            .chain(commit.added.iter())
+            .cloned()
+            .collect(),
+        ..group.clone()
+    };
+    let users_cleared = group
+        .pending_removals
+        .iter()
+        .any(|pending| after.member_devices_of(&pending.user_id).next().is_none());
+    retain_member_pending_device_removals(&mut after);
+    users_cleared || after.pending_device_removals.len() < group.pending_device_removals.len()
 }
 
 /// The Remove rule (design §3.12.2, §6.1 "S2 additions"), the route's
@@ -990,11 +1036,11 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
-        Account, BotInformation, ChannelEntitlementState, Database, E2EEContentType, E2EEEnvelope,
-        MemberCompositeKey, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
-        MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsMemberDevice, MlsRemovalReason,
-        MlsRemovedReason, PartialChannel, PartialMember, PartialUser, RelationshipStatus, SeatList,
-        Session, User,
+        events::client::EventV1, Account, BotInformation, ChannelEntitlementState, Database,
+        E2EEContentType, E2EEEnvelope, MemberCompositeKey, MlsCommit, MlsCommitOutcome,
+        MlsEnvelopeRejoinIntent, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent,
+        MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, PartialChannel, PartialMember,
+        PartialUser, RelationshipStatus, SeatList, Session, User, PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -3685,6 +3731,212 @@ mod tests {
             .expect("the group");
         assert!(group.has_member(&second_joiner.user.id, &second_joiner.device_id));
         assert!(group.pending_removals.is_empty());
+    }
+
+    /// The 7.5 event a won commit that cleared a pending entry publishes
+    fn text_group_changed(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+        move |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                if id == channel_id
+                    && *scope == vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()])
+        }
+    }
+
+    /// Buffer every event published so far: a marker on `user_id`'s private
+    /// topic is published and awaited. The harness reads every topic through
+    /// ONE subscription, FIFO, and the route (called directly) awaited its
+    /// publishes before it returned.
+    async fn flush_events(harness: &mut TestHarness, user_id: &str) {
+        let marker = Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: marker.clone(),
+            user: user_id.to_string(),
+            message_id: marker.clone(),
+        }
+        .private(user_id.to_string())
+        .await;
+        harness
+            .wait_for_event(&format!("{user_id}!"), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+    }
+
+    /// Which pending list the announcement test fills
+    #[derive(Clone, Copy)]
+    enum Pending {
+        /// `pending_device_removals` (rule 3a)
+        Device,
+        /// `pending_removals`, the owner unseating the user (rule 3)
+        User,
+    }
+
+    #[test]
+    fn a_remove_clearing_a_pending_device_announces_the_text_group() {
+        crate::util::test::rt().block_on(a_remove_clearing_pending_announces_case(Pending::Device))
+    }
+
+    #[test]
+    fn a_remove_clearing_a_pending_user_announces_the_text_group() {
+        crate::util::test::rt().block_on(a_remove_clearing_pending_announces_case(Pending::User))
+    }
+
+    /// 7.5 (S2-D18, W2 audit MAJOR-1): a won Remove commit that clears a
+    /// pending entry publishes `ProtectedChannelChanged { scope:
+    /// ["text_group"] }` on the channel topic. The entry is written through
+    /// the database, which announces nothing, and nothing is announced
+    /// before the Remove. Control: the won commit's publish dropped.
+    async fn a_remove_clearing_pending_announces_case(pending: Pending) {
+        let mut setup = setup(2).await;
+        let channel_id = setup.channel_id().to_string();
+        let owner_id = setup.owner.user.id.clone();
+        let committer = &setup.members[0];
+        let target = &setup.members[1];
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![committer.device(), target.device()],
+                vec![],
+            )
+            .await,
+            "two Adds",
+        );
+
+        match pending {
+            Pending::Device => {
+                let touched = setup
+                    .harness
+                    .db
+                    .add_pending_device_removal(
+                        &target.user.id,
+                        &target.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                    .expect("the pending pass");
+                assert_eq!(touched, vec![channel_id.clone()]);
+            }
+            Pending::User => {
+                setup
+                    .harness
+                    .put_seats_with_db(
+                        &setup.protected.channel,
+                        &setup.protected.owner_device.seat_list(
+                            &channel_id,
+                            2,
+                            FIXTURE_DEVICE_CAP,
+                            &[&setup.owner.user.id, &committer.user.id],
+                        ),
+                    )
+                    .await;
+                assert!(setup
+                    .harness
+                    .db
+                    .fetch_mls_group(&setup.group_id)
+                    .await
+                    .expect("the group")
+                    .has_pending_removal(&target.user.id));
+            }
+        }
+
+        flush_events(&mut setup.harness, &owner_id).await;
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, text_group_changed(&channel_id));
+
+        assert_won(
+            commit_next(&setup, committer, vec![], vec![target.device()]).await,
+            "a Remove clearing the pending entry",
+        );
+        let group = setup
+            .harness
+            .db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.pending_removals.is_empty(), "{group:?}");
+        assert!(group.pending_device_removals.is_empty(), "{group:?}");
+        setup
+            .harness
+            .wait_for_event(&channel_id, text_group_changed(&channel_id))
+            .await;
+    }
+
+    #[test]
+    fn commits_that_clear_nothing_announce_nothing() {
+        crate::util::test::rt().block_on(commits_that_clear_nothing_announce_nothing_case())
+    }
+
+    /// 7.5: a won commit that clears no pending entry announces nothing: the
+    /// Adds (no entry yet), then, with a pending device entry the commits
+    /// leave in place, an Update and a Remove of the committer's own other
+    /// device (rule 2). Control: the publish made unconditional on every won
+    /// commit.
+    async fn commits_that_clear_nothing_announce_nothing_case() {
+        let mut setup = setup(2).await;
+        let channel_id = setup.channel_id().to_string();
+        let owner_id = setup.owner.user.id.clone();
+        let committer = &setup.members[0];
+        let target = &setup.members[1];
+        let own_other = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x60)
+            .await;
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![
+                    committer.device(),
+                    device_of(&committer.user, &own_other.device_id),
+                    target.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "three Adds",
+        );
+        setup
+            .harness
+            .db
+            .add_pending_device_removal(&target.user.id, &target.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+
+        assert_won(
+            commit_next(&setup, committer, vec![], vec![]).await,
+            "an Update",
+        );
+        assert_won(
+            commit_next(
+                &setup,
+                committer,
+                vec![],
+                vec![device_of(&committer.user, &own_other.device_id)],
+            )
+            .await,
+            "a Remove clearing nothing",
+        );
+        let group = setup
+            .harness
+            .db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert_eq!(
+            group.pending_device_removals.len(),
+            1,
+            "the pending entry stays: {group:?}"
+        );
+
+        flush_events(&mut setup.harness, &owner_id).await;
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, |event| {
+                matches!(event, EventV1::ProtectedChannelChanged { .. })
+            });
     }
 
     /// `seconds` before now

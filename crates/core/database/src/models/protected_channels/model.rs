@@ -186,7 +186,9 @@ auto_derived!(
         /// S2: why the seat was last released (2.3)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub release_cause: Option<SeatReleaseCause>,
-        /// S2: when the user's first device was added to the Text group (2.3)
+        /// S2: when the user's first device was added to the Text group (2.3).
+        /// A re-seat while the seat is still cooling keeps it, or sets it to
+        /// `released_at` when it was `None` (`reactivate`, #233)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub keys_received_at: Option<Timestamp>,
     }

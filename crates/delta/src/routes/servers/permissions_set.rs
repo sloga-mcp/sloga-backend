@@ -635,14 +635,15 @@ mod test {
             .block_on(a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case())
     }
 
-    /// The reconcile fails (the protected channel's document is gone): the
-    /// permission write stands and is logged, the voice sync still runs
-    /// (with a call it cannot reach, its own `UnknownNode` is the answer),
-    /// and without such a call the reconcile's own error is the answer
-    /// (`NotFound`: the document it reads is gone). Retrying the
-    /// same edit, now a no-change one that logs nothing, releases the seat
-    /// once the document is back. Controls: the reconcile's error returned
-    /// before the sync; its error dropped; the hook run only on a change.
+    /// The reconcile fails (the protected channel's row is stored as a
+    /// SavedMessages channel): the permission write stands and is logged,
+    /// the voice sync still runs (with a call it cannot reach, its own
+    /// `UnknownNode` is the answer), and without such a call the
+    /// reconcile's own error is answered unchanged (`InternalError`).
+    /// Retrying the same edit, now a no-change one that logs nothing,
+    /// releases the seat once the row is back. Controls: the reconcile's
+    /// error returned before the sync; its error dropped; the hook run only
+    /// on a change.
     async fn a_failed_reconcile_still_syncs_then_answers_its_error_after_the_write_case() {
         let mut world = hook_world().await;
         let role = world.role(5, OverrideField { a: 0, d: 0 }).await;
@@ -678,8 +679,8 @@ mod test {
             None,
         )
         .await;
-        assert_eq!(status, Status::NotFound, "body: {}", body);
-        assert_eq!(body["type"], "NotFound", "body: {}", body);
+        assert_eq!(status, Status::InternalServerError, "body: {}", body);
+        assert_eq!(body["type"], "InternalError", "body: {}", body);
         assert_eq!(stored(&world.harness, &server, &role.id).await, blind);
         assert!(
             world.seat(&world.member.id).await.is_active(),

@@ -82,8 +82,10 @@ mod protected_tests {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
-        events::client::EventV1, Account, Channel, MFATicket, MlsCommit, MlsCommitOutcome,
-        MlsGroup, MlsMemberDevice, Session, User, PROTECTED_SCOPE_TEXT_GROUP,
+        events::client::EventV1,
+        mongodb::bson::{doc, Document},
+        Account, Channel, Database, MFATicket, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupKind,
+        MlsMemberDevice, Session, User, PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use rocket::http::{Header, Status};
@@ -393,5 +395,308 @@ mod protected_tests {
         w.harness.assert_no_buffered_event(w.channel.id(), |event| {
             matches!(event, EventV1::ProtectedChannelChanged { .. })
         });
+    }
+
+    const FAILING_GROUP: &str = "01DISFAILINGGROUP";
+    const PASSING_GROUP: &str = "01DISPASSINGGROUP";
+
+    /// A failing revocation (audit MAJOR-2), flag on: the member's two
+    /// devices each sit alone in an open Text group, and an `mls_groups`
+    /// validator refuses every write to the first, so that device's pending
+    /// pass fails and leaves it intact while the other's goes through. The
+    /// failing device gets the lower device id and is stored first, so the
+    /// listing returns it first in id and in insertion order: a loop that
+    /// stops at the first error never reaches the other. Lift the validator
+    /// with [`group_validator`] and `{}`.
+    struct Fault {
+        harness: TestHarness,
+        account: Account,
+        session: Session,
+        member: User,
+        failing: TestE2EEDevice,
+        passing: TestE2EEDevice,
+    }
+
+    /// [`Fault`], armed. `None` on the reference store, which cannot fail a
+    /// write.
+    async fn fault() -> Option<Fault> {
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(mongo) = &harness.db else {
+            return None;
+        };
+        let (account, session, member) = harness.new_user().await;
+        let phone = account
+            .create_session(&harness.db, "Phone".to_string())
+            .await
+            .expect("the member's second session");
+        let device_id_for = |seed: u8| -> String {
+            TestE2EEDevice::signing_key_for(seed)
+                .verifying_key()
+                .as_bytes()[..16]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let (failing_seed, passing_seed) =
+            if device_id_for(MEMBER_DEVICE_SEED) < device_id_for(SECOND_MEMBER_DEVICE_SEED) {
+                (MEMBER_DEVICE_SEED, SECOND_MEMBER_DEVICE_SEED)
+            } else {
+                (SECOND_MEMBER_DEVICE_SEED, MEMBER_DEVICE_SEED)
+            };
+        let failing = harness
+            .new_e2ee_device(&member, &session.id, failing_seed)
+            .await;
+        let passing = harness
+            .new_e2ee_device(&member, &phone.id, passing_seed)
+            .await;
+        assert!(failing.device_id < passing.device_id);
+
+        for (group_id, device) in [(FAILING_GROUP, &failing), (PASSING_GROUP, &passing)] {
+            let member_device = MlsMemberDevice {
+                user_id: device.user_id.clone(),
+                device_id: device.device_id.clone(),
+            };
+            let group = MlsGroup {
+                id: group_id.to_string(),
+                channel_id: format!("{group_id}CHANNEL"),
+                open: true,
+                created_by: member_device.clone(),
+                created_at: Timestamp::now_utc(),
+                current_epoch: 0,
+                members: vec![member_device],
+                closed_at: None,
+                superseded_by: None,
+                kind: MlsGroupKind::Text,
+                generation: Some(0),
+                seat_list_ad_sha256: None,
+                pending_removals: vec![],
+                member_added: vec![],
+                pending_device_removals: vec![],
+                signer_lost: None,
+                rejoin_readd: vec![],
+            };
+            mongo
+                .col::<MlsGroup>("mls_groups")
+                .insert_one(&group)
+                .await
+                .expect("raw text group");
+        }
+
+        group_validator(&harness, doc! { "_id": { "$ne": FAILING_GROUP } }).await;
+        assert!(
+            harness
+                .db
+                .add_pending_device_removal(&member.id, &failing.device_id, Timestamp::now_utc())
+                .await
+                .is_err(),
+            "precondition: the refused group write fails the pending pass"
+        );
+
+        Some(Fault {
+            harness,
+            account,
+            session,
+            member,
+            failing,
+            passing,
+        })
+    }
+
+    /// Set the `mls_groups` collection validator (`{}` lifts it)
+    async fn group_validator(harness: &TestHarness, validator: Document) {
+        let Database::MongoDb(mongo) = &harness.db else {
+            panic!("the group validator is MONGODB only");
+        };
+        mongo
+            .db()
+            .run_command(doc! {
+                "collMod": "mls_groups",
+                "validator": validator,
+                "validationLevel": "strict",
+                "validationAction": "error",
+            })
+            .await
+            .expect("collMod mls_groups");
+    }
+
+    /// The member's devices left in the directory
+    async fn devices_left(harness: &TestHarness, member: &User) -> BTreeSet<String> {
+        harness
+            .db
+            .fetch_e2ee_identities(&member.id)
+            .await
+            .expect("identities")
+            .into_iter()
+            .map(|identity| identity.device_id)
+            .collect()
+    }
+
+    /// [`Fault`] through the route: disable answers 500 with `disabled`
+    /// already stored, every session gone, the other device revoked and
+    /// `DeleteAllSessions` sent. MONGODB only. Controls: the loop's `?`
+    /// restored; the save moved back after the revocations; the first
+    /// error dropped.
+    #[test]
+    fn a_failed_device_revocation_still_disables_and_revokes_the_rest() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            formats_v2(true).await;
+            a_failed_device_revocation_still_disables_and_revokes_the_rest_case().await
+        }))
+    }
+
+    async fn a_failed_device_revocation_still_disables_and_revokes_the_rest_case() {
+        let Some(Fault {
+            mut harness,
+            account,
+            session,
+            member,
+            failing,
+            passing,
+        }) = fault().await
+        else {
+            return;
+        };
+
+        let ticket = MFATicket::new(account.id.to_string(), true);
+        ticket.save(&harness.db).await.unwrap();
+        let response = harness
+            .client
+            .post("/auth/account/disable")
+            .header(Header::new("X-Session-Token", session.token.clone()))
+            .header(Header::new("X-MFA-Ticket", ticket.token))
+            .dispatch()
+            .await;
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+
+        // Lifted before any assertion can fail
+        group_validator(&harness, doc! {}).await;
+
+        assert_eq!(
+            status,
+            Status::InternalServerError,
+            "the failed revocation is answered: {body}"
+        );
+        assert!(body.contains("DatabaseError"), "{}", body);
+        assert!(
+            harness
+                .db
+                .fetch_account(&account.id)
+                .await
+                .expect("the account")
+                .disabled,
+            "disabled is stored although a revocation failed"
+        );
+        assert!(
+            harness
+                .db
+                .fetch_sessions(&member.id)
+                .await
+                .expect("the sessions")
+                .is_empty(),
+            "every session is deleted"
+        );
+
+        let left = devices_left(&harness, &member).await;
+        assert!(
+            !left.contains(&passing.device_id),
+            "the device whose pass went through is revoked: {left:?}"
+        );
+        assert_eq!(
+            left,
+            BTreeSet::from([failing.device_id.clone()]),
+            "the failed pass leaves its device intact"
+        );
+        let queued = |group: &MlsGroup| {
+            group
+                .pending_device_removals
+                .iter()
+                .map(|pending| (pending.user_id.clone(), pending.device_id.clone()))
+                .collect::<Vec<_>>()
+        };
+        let passed = harness
+            .db
+            .fetch_mls_group(PASSING_GROUP)
+            .await
+            .expect("the passing group");
+        assert_eq!(
+            queued(&passed),
+            vec![(member.id.clone(), passing.device_id.clone())]
+        );
+        let failed = harness
+            .db
+            .fetch_mls_group(FAILING_GROUP)
+            .await
+            .expect("the failing group");
+        assert!(queued(&failed).is_empty(), "{:?}", queued(&failed));
+
+        let member_id = member.id.clone();
+        harness
+            .wait_for_event(&format!("{}!", member.id), |event| {
+                matches!(event, EventV1::DeleteAllSessions { user_id, .. } if user_id == &member_id)
+            })
+            .await;
+    }
+
+    /// [`Fault`] under a suspension: `User::suspend` (the model method the
+    /// staff suspend route calls) answers the revocation's error with the
+    /// suspension (`SuspendedUntil`, `suspended_until`) and `disabled`
+    /// already stored, and the other device revoked. MONGODB only.
+    /// Control: the suspension write moved back after
+    /// `account.disable(db).await?`.
+    #[test]
+    fn a_failed_device_revocation_still_stores_the_suspension() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            formats_v2(true).await;
+            a_failed_device_revocation_still_stores_the_suspension_case().await
+        }))
+    }
+
+    async fn a_failed_device_revocation_still_stores_the_suspension_case() {
+        let Some(Fault {
+            harness,
+            account,
+            member,
+            failing,
+            ..
+        }) = fault().await
+        else {
+            return;
+        };
+
+        let mut user = member.clone();
+        let result = user.suspend(&harness.db, Some(7), None).await;
+
+        // Lifted before any assertion can fail
+        group_validator(&harness, doc! {}).await;
+
+        assert!(
+            result.is_err(),
+            "the failed revocation fails the suspension: {result:?}"
+        );
+        let stored = harness.db.fetch_user(&member.id).await.expect("the user");
+        assert_eq!(
+            stored.flags,
+            Some(v0::UserFlags::SuspendedUntil as i32),
+            "the suspension flag is stored although a revocation failed"
+        );
+        assert!(
+            stored.suspended_until.is_some(),
+            "the suspension's end is stored although a revocation failed"
+        );
+        assert!(
+            harness
+                .db
+                .fetch_account(&account.id)
+                .await
+                .expect("the account")
+                .disabled,
+            "the suspended account is stored disabled"
+        );
+        assert_eq!(
+            devices_left(&harness, &member).await,
+            BTreeSet::from([failing.device_id.clone()]),
+            "only the device whose pass failed is left"
+        );
     }
 }

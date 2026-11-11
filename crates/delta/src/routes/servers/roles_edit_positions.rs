@@ -990,12 +990,12 @@ mod test {
         })
     }
 
-    /// The reconcile fails (the protected channel's document is gone): the
-    /// new order stands and is logged, the voice sync still runs (with a call
-    /// it cannot reach, its own `UnknownNode` is the answer), and without
-    /// such a call the reconcile's own error is the answer (`NotFound`: the
-    /// document it reads is gone). Resubmitting the same order,
-    /// which logs nothing, releases the seat once the document is back.
+    /// The reconcile fails (the protected channel's row is not a server
+    /// channel): the new order stands and is logged, the voice sync still
+    /// runs (with a call it cannot reach, its own `UnknownNode` is the
+    /// answer), and without such a call the reconcile's own error is the
+    /// answer (`InternalError`). Resubmitting the same order, which logs
+    /// nothing, releases the seat once the row is back.
     /// Controls: the reconcile's error returned before the sync; its error
     /// dropped; the hook run only on a change.
     #[test]
@@ -1035,8 +1035,8 @@ mod test {
                 None,
             )
             .await;
-            assert_eq!(status, Status::NotFound, "body: {}", body);
-            assert_eq!(body["type"], "NotFound", "body: {}", body);
+            assert_eq!(status, Status::InternalServerError, "body: {}", body);
+            assert_eq!(body["type"], "InternalError", "body: {}", body);
             assert_eq!(
                 ordered_ids(&world.server().await),
                 ranks,
@@ -1367,46 +1367,57 @@ pub(crate) mod protected_hook {
         }
 
         /// Make every reconcile of this server fail after the route's write:
-        /// the protected channel's document is removed straight from the
-        /// store (its seat list, seats and entitlement stay), so the pass
-        /// fails reading it. Returns the document for [`Self::repair`].
+        /// the protected channel's stored row becomes a non-server channel
+        /// (its seat list, seats and entitlement stay), so the pass answers
+        /// `InternalError` reading it (a seat list on anything but a server
+        /// TextChannel is corrupt data). A removed row would not do: it is
+        /// nothing to reconcile. Returns the row for [`Self::repair`].
         pub(crate) async fn break_reconcile(&self) -> Channel {
             let db = &self.harness.db;
             let channel = db.fetch_channel(&self.channel_id).await.expect("channel");
-            match db {
-                Database::Reference(reference) => {
-                    reference
-                        .channels
-                        .lock()
-                        .await
-                        .remove(&self.channel_id)
-                        .expect("the channel row");
-                }
-                Database::MongoDb(mongo) => {
-                    use revolt_database::mongodb::bson::{doc, Document};
-
-                    let result = mongo
-                        .col::<Document>("channels")
-                        .delete_one(doc! { "_id": &self.channel_id })
-                        .await
-                        .expect("the channel delete");
-                    assert_eq!(result.deleted_count, 1, "the channel row");
-                }
-            }
+            self.store_channel(&Channel::SavedMessages {
+                id: self.channel_id.clone(),
+                user: self.owner.id.clone(),
+            })
+            .await;
             assert!(
-                db.fetch_channel(&self.channel_id).await.is_err(),
-                "precondition: the channel read fails"
+                matches!(
+                    db.fetch_channel(&self.channel_id).await,
+                    Ok(Channel::SavedMessages { .. })
+                ),
+                "precondition: the stored row is not a server channel"
             );
             channel
         }
 
-        /// Put back the document [`Self::break_reconcile`] removed
+        /// Put back the row [`Self::break_reconcile`] replaced
         pub(crate) async fn repair(&self, channel: &Channel) {
-            self.harness
-                .db
-                .insert_channel(channel)
-                .await
-                .expect("the channel restored");
+            self.store_channel(channel).await;
+        }
+
+        /// Overwrite the stored row of `channel` straight in the store (no
+        /// guard, no event); the row must exist
+        async fn store_channel(&self, channel: &Channel) {
+            match &self.harness.db {
+                Database::Reference(reference) => {
+                    let replaced = reference
+                        .channels
+                        .lock()
+                        .await
+                        .insert(channel.id().to_string(), channel.clone());
+                    assert!(replaced.is_some(), "the channel row");
+                }
+                Database::MongoDb(mongo) => {
+                    use revolt_database::mongodb::bson::doc;
+
+                    let result = mongo
+                        .col::<Channel>("channels")
+                        .replace_one(doc! { "_id": channel.id() }, channel)
+                        .await
+                        .expect("the channel write");
+                    assert_eq!(result.matched_count, 1, "the channel row");
+                }
+            }
         }
 
         /// A voice channel of the server whose call is pinned to

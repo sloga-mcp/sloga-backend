@@ -6,7 +6,8 @@ use revolt_database::{
     },
     voice::{remove_user_from_server_voice, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, Message,
-    RemovalIntention, RemovalOutcome, ServerBan, User,
+    RemovalIntention, RemovalOutcome, ServerBan, User, PROTECTED_SCOPE_SEATS,
+    PROTECTED_SCOPE_TEXT_GROUP,
 };
 use revolt_models::v0;
 use std::time::{Duration, SystemTime};
@@ -70,7 +71,8 @@ pub async fn ban(
     //    request created is then recorded in the audit log, before the
     //    eviction, so an eviction error cannot lose the entry.
     // 4. The target's seats in the server's protected channels are released,
-    //    member or not (protected channels 6.3).
+    //    member or not (protected channels 6.3), and each channel the release
+    //    wrote is announced (7.5).
     // 5. The target is evicted from every call in the server, member or not.
     //    A failed removal or release (step 3 or 4) is answered only now, so
     //    it skips neither the record nor the eviction (audit C3).
@@ -194,6 +196,24 @@ pub async fn ban(
         .release_channel_seats_for_user(target.id, Some(&server.id), Timestamp::now_utc())
         .await;
 
+    // 7.5 (S2-D18, W2 audit MAJOR-1): each channel the release wrote is
+    // announced on its own topic (viewers only), right away, so neither the
+    // eviction nor the purge failing can lose it. The release returns one
+    // list for its seat releases, pending removals and `signer_lost` writes,
+    // so both scopes go out. A failed release (`Err`) announces nothing: its
+    // transaction wrote nothing, and the retry's release announces.
+    for channel_id in released.iter().flatten() {
+        EventV1::ProtectedChannelChanged {
+            id: channel_id.clone(),
+            scope: vec![
+                PROTECTED_SCOPE_SEATS.to_string(),
+                PROTECTED_SCOPE_TEXT_GROUP.to_string(),
+            ],
+        }
+        .p(channel_id.clone())
+        .await;
+    }
+
     // Outside the member check (S-3 F-4): a hit-and-run spammer who already
     // left can still hold a connection. Every call in the server is reached,
     // not only the one the per-server pointer names (S-3 F-3).
@@ -224,6 +244,7 @@ pub(crate) mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
+        events::client::EventV1,
         seat_cooldown_until,
         voice::{
             create_voice_state, delete_channel_node, delete_channel_voice_state,
@@ -233,7 +254,7 @@ pub(crate) mod test {
         },
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, ChannelSeat, Database,
         Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember,
-        SeatReleaseCause, Server,
+        SeatReleaseCause, Server, PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1464,6 +1485,123 @@ pub(crate) mod test {
         ban_entry(&entries, &owner.id, &target.id);
     }
 
+    /// The 7.5 event a ban's release publishes for `channel_id`
+    fn ban_release_event(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+        move |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+            if id == channel_id
+                && *scope
+                    == vec![
+                        PROTECTED_SCOPE_SEATS.to_string(),
+                        PROTECTED_SCOPE_TEXT_GROUP.to_string(),
+                    ])
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_announces_the_former_members_released_seat() {
+        crate::util::test::rt().block_on(a_ban_announces_the_former_members_released_seat_case())
+    }
+
+    /// 7.5 (S2-D18, W2 audit MAJOR-1): a ban that releases a former
+    /// member's seat publishes `ProtectedChannelChanged` on that channel's
+    /// topic. A former member, so no `Member::remove` runs: the event is the
+    /// ban's own. Control: the ban's publish dropped.
+    async fn a_ban_announces_the_former_members_released_seat_case() {
+        let mut harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let channel_id = protected.channel.id().to_string();
+        let member = harness
+            .db
+            .fetch_member(&protected.server.id, &target.id)
+            .await
+            .expect("the target joined");
+        harness
+            .db
+            .soft_delete_member(&member.id)
+            .await
+            .expect("the membership removed, the seat left behind");
+        assert!(
+            seat_of(&harness.db, &channel_id, &target.id)
+                .await
+                .is_active(),
+            "precondition: the former member is still seated"
+        );
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "left",
+        )
+        .await;
+        ban_answered(response, "banning a seated former member").await;
+
+        assert!(
+            !seat_of(&harness.db, &channel_id, &target.id)
+                .await
+                .is_active(),
+            "the ban released the seat"
+        );
+        harness
+            .wait_for_event(&channel_id, ban_release_event(&channel_id))
+            .await;
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_that_releases_nothing_announces_nothing() {
+        crate::util::test::rt().block_on(a_ban_that_releases_nothing_announces_nothing_case())
+    }
+
+    /// 7.5: a ban of a user who holds no seat in the protected server (never
+    /// a member) releases nothing, so no `ProtectedChannelChanged` reaches
+    /// the channel's topic. A marker on the owner's private topic is
+    /// published and awaited first: the harness reads every topic through
+    /// ONE subscription, FIFO, and the route awaited its publishes before it
+    /// answered, so anything it published is buffered by then.
+    async fn a_ban_that_releases_nothing_announces_nothing_case() {
+        let mut harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session_a, &[]).await;
+        let channel_id = protected.channel.id().to_string();
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "never seated",
+        )
+        .await;
+        ban_answered(response, "banning a user with no seat").await;
+
+        let marker = ulid::Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: marker.clone(),
+            user: owner.id.clone(),
+            message_id: marker.clone(),
+        }
+        .private(owner.id.clone())
+        .await;
+        harness
+            .wait_for_event(&format!("{}!", owner.id), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+        harness.assert_no_buffered_event(&channel_id, |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { .. })
+        });
+    }
+
     // Compile-only without RabbitMQ and Redis: see the section note above.
     #[test]
     fn an_already_banned_retry_releases_again() {
@@ -1791,6 +1929,14 @@ pub(crate) mod test {
             &[&owner.id, &target.id],
         )
         .await;
+        // Cools via the Text group naming the target: pre-S2 fallback `text_group_user_ids`, W1 (l)
+        assert_eq!(
+            seat_of(&harness.db, protected.channel.id(), &target.id)
+                .await
+                .keys_received_at,
+            None,
+            "precondition: the target never received the keys"
+        );
 
         let channel = voice_channel(&harness, &protected.server, "Ended").await;
         let uvc = UserVoiceChannel::from_channel(&channel);

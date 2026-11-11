@@ -1279,10 +1279,9 @@ impl User {
     ) -> Result<()> {
         let mut account = db.fetch_account(&self.id).await?;
 
-        account.disable(db).await?;
-
-        account.delete_all_sessions(db, None).await?;
-
+        // The suspension is persisted before any device is revoked: a failed
+        // revocation below then fails the call with the user already
+        // suspended, never plain-disabled without `suspended_until`
         self.update(
             db,
             PartialUser {
@@ -1295,6 +1294,10 @@ impl User {
             vec![],
         )
         .await?;
+
+        account.disable(db).await?;
+
+        account.delete_all_sessions(db, None).await?;
 
         if let Some(reason) = reason {
             let config = config().await;
@@ -1473,7 +1476,8 @@ impl User {
     ///   server memberships; a failed release aborts the deletion with the
     ///   memberships intact. A second release after the memberships are
     ///   cleared catches a seat granted in between; its failure aborts the
-    ///   deletion too
+    ///   deletion too. Each release that succeeded announces its channels
+    ///   (`ProtectedChannelChanged`, 7.5)
     /// - clears relationships
     pub async fn delete(&mut self, db: &Database) -> Result<()> {
         for bot in db.fetch_bots_by_user(&self.id).await? {
@@ -1491,9 +1495,12 @@ impl User {
         // and before the memberships go, so a failure never leaves a
         // non-member holding a seat. Servers this account owns, and their
         // protected channels, were deleted above. The released seat rows
-        // are kept.
-        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+        // are kept. Each release announces what it released at once (7.5),
+        // as a later step may still fail and a retry would announce nothing.
+        let released = db
+            .release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
             .await?;
+        crate::Member::publish_seat_release(&released).await;
         db.clear_memberships(&self.id).await?;
         // Second release, as `Member::remove` runs one (decision 11 (W2),
         // audit C6): a seat PUT that landed between the first release and
@@ -1502,8 +1509,10 @@ impl User {
         // is not marked deleted, and the retry (crond's next run) releases
         // first again. Unlike `Member::remove`'s, its error is not kept:
         // `clear_memberships` sends no leave event that has to go out first.
-        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+        let released = db
+            .release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
             .await?;
+        crate::Member::publish_seat_release(&released).await;
         // Calendar cascade (slice F): `clear_memberships` bypasses `Member::remove`,
         // so the per-server RSVP cascade never runs — drop every RSVP row the account
         // holds, or attendee lists would keep a ghost user id forever.
@@ -2452,6 +2461,42 @@ mod tests {
         });
     }
 
+    /// 7.5 / S2-D18 (W2 audit MAJOR-1): deleting a seated account announces
+    /// the channel once, on the CHANNEL topic (viewers only), naming both
+    /// scopes and no user. Control: the first release's announcement
+    /// dropped.
+    #[tokio::test]
+    async fn delete_announces_the_released_channel() {
+        use protected::{CHANNEL, SEATED};
+
+        database_test!(|db| async move {
+            let mut user = protected::seated_user(&db).await;
+
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            deleted.unwrap();
+
+            assert!(
+                db.fetch_channel_seats(CHANNEL)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|seat| seat.user_id == SEATED && !seat.is_active()),
+                "precondition: the deletion released the seat"
+            );
+            assert_eq!(
+                sent,
+                vec![(
+                    CHANNEL.to_string(),
+                    format!(
+                        r#"{{"type":"ProtectedChannelChanged","id":"{CHANNEL}","scope":["seats","text_group"]}}"#
+                    ),
+                )],
+                "a deletion that released a seat announces its channel once (7.5)"
+            );
+        });
+    }
+
     /// 2.3 (S2-D21): deleting an account whose seat never received the keys
     /// releases it with `DeviceNeverJoined` and no cooldown
     #[tokio::test]
@@ -2514,10 +2559,13 @@ mod tests {
                 .await
                 .expect("insert the undecodable seat row");
 
-            let err = user
-                .delete(&db)
-                .await
-                .expect_err("an undecodable seat row must fail the deletion");
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            let err = deleted.expect_err("an undecodable seat row must fail the deletion");
+            assert!(
+                sent.is_empty(),
+                "a failed release must announce nothing (7.5): {sent:?}"
+            );
             assert!(
                 matches!(
                     &err.error_type,
@@ -2613,10 +2661,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            let err = user
-                .delete(&db)
-                .await
-                .expect_err("a failed second release must fail the deletion");
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            let err = deleted.expect_err("a failed second release must fail the deletion");
+            assert_eq!(
+                sent,
+                vec![(
+                    CHANNEL.to_string(),
+                    format!(
+                        r#"{{"type":"ProtectedChannelChanged","id":"{CHANNEL}","scope":["seats","text_group"]}}"#
+                    ),
+                )],
+                "the first release is announced, the failed second one is not (7.5)"
+            );
             assert!(
                 matches!(
                     &err.error_type,
