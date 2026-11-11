@@ -202,6 +202,10 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::ProtIdempotencyConflict => Status::Conflict,
             ErrorType::ProtReplicaSetRequired => Status::ServiceUnavailable,
             ErrorType::ProtRegionUnavailable => Status::BadRequest,
+            ErrorType::ProtStoreClosed => Status::Forbidden,
+            ErrorType::ProtStoreProductUnknown => Status::BadRequest,
+            ErrorType::ProtStoreVerifyFailed => Status::BadRequest,
+            ErrorType::ProtStoreUnavailable => Status::ServiceUnavailable,
         };
 
         // The body no longer carries the location, so log it for server
@@ -359,6 +363,26 @@ mod tests {
             (create_error!(ProtIdempotencyConflict), 409),
             (create_error!(ProtReplicaSetRequired), 503),
             (create_error!(ProtRegionUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            let response = error.respond_to(request.inner()).unwrap();
+            assert_eq!(response.status().code, code, "{name}");
+        }
+    }
+
+    /// Pins the Prot store errors' statuses; `axum.rs` pins the same table
+    #[test]
+    fn prot_store_error_statuses() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+
+        let cases: [(Error, u16); 4] = [
+            (create_error!(ProtStoreClosed), 403),
+            (create_error!(ProtStoreProductUnknown), 400),
+            (create_error!(ProtStoreVerifyFailed), 400),
+            (create_error!(ProtStoreUnavailable), 503),
         ];
 
         for (error, code) in cases {

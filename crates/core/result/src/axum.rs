@@ -197,6 +197,10 @@ impl IntoResponse for Error {
             ErrorType::ProtIdempotencyConflict => StatusCode::CONFLICT,
             ErrorType::ProtReplicaSetRequired => StatusCode::SERVICE_UNAVAILABLE,
             ErrorType::ProtRegionUnavailable => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreClosed => StatusCode::FORBIDDEN,
+            ErrorType::ProtStoreProductUnknown => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreVerifyFailed => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
 
         // The body no longer carries the location, so log it for server
@@ -352,6 +356,22 @@ mod tests {
             (create_error!(ProtIdempotencyConflict), 409),
             (create_error!(ProtReplicaSetRequired), 503),
             (create_error!(ProtRegionUnavailable), 400),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            assert_eq!(error.into_response().status().as_u16(), code, "{name}");
+        }
+    }
+
+    /// Pins the Prot store errors' statuses; `rocket.rs` pins the same table
+    #[test]
+    fn prot_store_error_statuses() {
+        let cases: [(Error, u16); 4] = [
+            (create_error!(ProtStoreClosed), 403),
+            (create_error!(ProtStoreProductUnknown), 400),
+            (create_error!(ProtStoreVerifyFailed), 400),
+            (create_error!(ProtStoreUnavailable), 503),
         ];
 
         for (error, code) in cases {

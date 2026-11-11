@@ -40,6 +40,7 @@ use super::super::ops::reference::{
 };
 use super::super::ops::{duplicate_outcome, state_retries_exhausted, validate_prot_posting};
 use super::AbstractProtTanks;
+use crate::models::prot_store::held_store_unconsumed_locked;
 
 const DAY_MS: i64 = 86_400_000;
 
@@ -1038,6 +1039,7 @@ impl AbstractProtTanks for ReferenceDb {
         let mut accounts = self.prot_accounts.lock().await;
         let mut tanks = self.prot_tanks.lock().await;
         let runtime = self.prot_runtime.lock().await;
+        let store = self.prot_store_purchases.lock().await;
 
         let tank = tanks
             .get(&input.tank_id)
@@ -1102,6 +1104,11 @@ impl AbstractProtTanks for ReferenceDb {
         // D17 (BR8): Prot bought within the hold window stays in the wallet
         let wallet_balance = accounts.get(&wallet).map_or(0, |wallet| wallet.balance);
         let held = held_purchase_prot_locked(&ledger, &input.user_id, now - rules.hold_ms())
+            .saturating_add(held_store_unconsumed_locked(
+                &store,
+                &input.user_id,
+                now - rules.hold_ms(),
+            ))
             .min(wallet_balance)
             .max(0);
         contribution.debit_floor = held;
@@ -1206,6 +1213,7 @@ impl AbstractProtTanks for ReferenceDb {
         let mut accounts = self.prot_accounts.lock().await;
         let mut pledges = self.prot_pledges.lock().await;
         let mut goals = self.prot_goals.lock().await;
+        let store = self.prot_store_purchases.lock().await;
 
         let key = prot_key_pledge(&input.user_id, &input.goal_id, &input.nonce);
         let wallet = prot_user_account(&input.user_id);
@@ -1268,6 +1276,11 @@ impl AbstractProtTanks for ReferenceDb {
         // D17 (BR8), read under the same locks as the debit
         let wallet_balance = accounts.get(&wallet).map_or(0, |wallet| wallet.balance);
         let held = held_purchase_prot_locked(&ledger, &input.user_id, now - rules.hold_ms())
+            .saturating_add(held_store_unconsumed_locked(
+                &store,
+                &input.user_id,
+                now - rules.hold_ms(),
+            ))
             .min(wallet_balance)
             .max(0);
 

@@ -1,7 +1,7 @@
 pub mod mongodb;
 pub mod reference;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 
 use revolt_models::v0;
@@ -14,6 +14,11 @@ use crate::{
     CipherMembership, CipherProtSync, ProtAccount, ProtAmount, ProtApplyOutcome, ProtGoal,
     ProtLedgerEntry, ProtPledge, ProtPosting, ProtRef, PROT_ACTOR_CIPHER, PROT_ACTOR_DELETION,
     PROT_ACTOR_PAYMENTS, PROT_SYS_CLAWED, PROT_SYS_FORFEITED, PROT_SYS_ISSUED,
+};
+use crate::{
+    is_store_purchase_id, prot_store_key_clawback, prot_store_key_purchase,
+    prot_store_key_reinstate, prot_store_refund_base, prot_store_refund_gen_of, ProtStoreLedger,
+    ProtStoreMove, ProtStoreMoveOutcome, ProtStorePurchase,
 };
 
 /// Append-only Prot ledger: inserts and reads only. No method updates or
@@ -100,6 +105,8 @@ pub trait AbstractProtLedger: Sync + Send {
     /// D17 held figure, NET (carry-forward 2): sum of Purchase credits to user:{user_id} with
     /// created_at >= since_ms, minus the `amount` of every Clawback row whose ref.order_id is one of
     /// those purchases' orders; never below 0. NOT clamped to the balance (callers clamp). Read-only.
+    /// S6 (prot-s6-contracts 7.4): a clawback counts only from its order's first held purchase on, and the
+    /// figure adds the user's unconsumed Play credits from before `since_ms`.
     async fn held_purchase_prot(&self, user_id: &str, since_ms: i64) -> Result<i64>;
 
     /// Sum of `remaining` over the user's pledges in state Held (carry-forward 1). Read-only.
@@ -115,6 +122,11 @@ pub trait AbstractProtLedger: Sync + Send {
         user_id: &str,
         now: i64,
     ) -> Result<Vec<ProtLedgerEntry>>;
+
+    /// One store-row move and its ledger postings, ONE transaction (prot-s6-contracts section 7).
+    /// Ok(Applied) when written; Ok(Conflict) when the row or intent moved (the caller re-reads and re-plans,
+    /// at most PROT_STORE_MOVE_RETRIES times); Err(ProtIdempotencyConflict) for a key with another payload.
+    async fn apply_store_purchase_move(&self, m: &ProtStoreMove) -> Result<ProtStoreMoveOutcome>;
 }
 
 /// Bound on re-running a Cipher sync or clawback whose state moved under it,
@@ -513,6 +525,12 @@ where
 /// every Clawback row debiting that wallet whose `ref.order_id` is one of
 /// those purchases' orders, never below 0. Any other row is ignored, so a
 /// caller may pass more rows than it needs to.
+///
+/// S6 (audit N1): a Clawback row is subtracted only if its `created_at` is
+/// at or after the earliest of its order's Purchase rows in the window. A
+/// store `reinstate:{id}:{n}` row is a Purchase, held 72 h again; the
+/// generation's own earlier `clawback:` row must not cancel it. A Stripe
+/// order (one purchase, clawbacks after it) folds as before.
 fn held_purchase_net<'a>(
     rows: impl IntoIterator<Item = &'a ProtLedgerEntry>,
     user_id: &str,
@@ -520,8 +538,8 @@ fn held_purchase_net<'a>(
 ) -> i64 {
     let wallet = prot_user_account(user_id);
     let mut credited: i64 = 0;
-    let mut orders: HashSet<&'a str> = HashSet::new();
-    let mut clawed: HashMap<&'a str, i64> = HashMap::new();
+    let mut first_held: HashMap<&'a str, i64> = HashMap::new();
+    let mut clawbacks: Vec<(&'a str, i64, i64)> = Vec::new();
 
     for row in rows {
         let order_id = row.reference.order_id.as_deref();
@@ -530,20 +548,22 @@ fn held_purchase_net<'a>(
                 if row.credit == wallet && row.created_at >= since_ms =>
             {
                 credited = credited.saturating_add(row.amount);
-                orders.extend(order_id);
+                if let Some(order_id) = order_id {
+                    let first = first_held.entry(order_id).or_insert(row.created_at);
+                    *first = (*first).min(row.created_at);
+                }
             }
             (v0::ProtEntryKind::Clawback, Some(order_id)) if row.debit == wallet => {
-                let total = clawed.entry(order_id).or_insert(0);
-                *total = total.saturating_add(row.amount);
+                clawbacks.push((order_id, row.created_at, row.amount));
             }
             _ => {}
         }
     }
 
-    let clawed = orders
+    let clawed = clawbacks
         .iter()
-        .filter_map(|order_id| clawed.get(order_id))
-        .fold(0_i64, |total, amount| total.saturating_add(*amount));
+        .filter(|(order_id, at, _)| first_held.get(order_id).is_some_and(|first| at >= first))
+        .fold(0_i64, |total, (_, _, amount)| total.saturating_add(*amount));
     credited.saturating_sub(clawed).max(0)
 }
 
@@ -603,10 +623,18 @@ fn plan_pledge_drain(rest: i64, held: &[ProtPledge]) -> Vec<(&ProtPledge, i64)> 
 }
 
 /// The drain's posting for one pledge (key table: ClawbackHold, Exact,
-/// floor 0, sys:payments, never the membership refs)
-fn clawback_hold_posting(order_id: &str, pledge: &ProtPledge, x: i64, now: i64) -> ProtPosting {
+/// floor 0, sys:payments, never the membership refs). S6 (7.3): the key is
+/// `clawback-hold:{key_base}:{pledge}`; S5b's callers pass the order id as
+/// the key base, a store refund generation passes its own base.
+fn clawback_hold_posting(
+    key_base: &str,
+    order_id: &str,
+    pledge: &ProtPledge,
+    x: i64,
+    now: i64,
+) -> ProtPosting {
     ProtPosting {
-        key: prot_key_clawback_hold(order_id, &pledge.id),
+        key: prot_key_clawback_hold(key_base, &pledge.id),
         kind: v0::ProtEntryKind::ClawbackHold,
         debit: prot_hold_account(&pledge.goal_id),
         credit: PROT_SYS_CLAWED.to_string(),
@@ -711,6 +739,287 @@ fn hold_short(posting: &ProtPosting, error: revolt_result::Error) -> revolt_resu
 fn hold_state_broken(what: &str, id: &str) -> revolt_result::Error {
     log::error!("PROT_HOLD_STATE_BROKEN {what}={id}");
     create_error!(InternalError)
+}
+
+/// A store move the engine built wrong is a programming error, never a user
+/// error: logged, refused before anything is read or written
+fn store_move_invalid(id: &str, why: &str) -> revolt_result::Error {
+    log::error!("PROT_STORE_MOVE_INVALID id={id:?}: {why}");
+    create_error!(InternalError)
+}
+
+/// The checks `apply_store_purchase_move` runs first, identical in both
+/// drivers (S6 sections 7.1, 8.2): a store id, `use_intent` only on a row's
+/// first write and never for an unbound or no-buyer row, and postings that
+/// match the row they move. Returns the refund generation of a Clawback.
+pub(in crate::models::prot) fn validate_store_move(m: &ProtStoreMove) -> Result<Option<u32>> {
+    let row = &m.row;
+    let id = row.id.as_str();
+    if !is_store_purchase_id(id) {
+        return Err(store_move_invalid(id, "not a store purchase id"));
+    }
+    if m.use_intent.is_some() {
+        if m.expected_version.is_some() {
+            return Err(store_move_invalid(
+                id,
+                "only a row's first write uses an intent",
+            ));
+        }
+        if row.state == v0::ProtStoreState::Rejected
+            && matches!(
+                row.reject_reason,
+                Some(v0::ProtStoreRejectReason::Unbound | v0::ProtStoreRejectReason::NoBuyer)
+            )
+        {
+            return Err(store_move_invalid(
+                id,
+                "an unbound or no-buyer row uses no intent",
+            ));
+        }
+    }
+
+    match &m.ledger {
+        ProtStoreLedger::None => Ok(None),
+        ProtStoreLedger::Credit(posting) => {
+            validate_prot_posting(posting)?;
+            let Some(user_id) = row.user_id.as_deref() else {
+                return Err(store_move_invalid(id, "a credit needs the row's user"));
+            };
+            let (key, amount_ok) = match row.state {
+                v0::ProtStoreState::Credited => (
+                    prot_store_key_purchase(id),
+                    posting.amount == ProtAmount::Exact(row.prot),
+                ),
+                v0::ProtStoreState::Reinstated if row.refund_gen >= 1 => (
+                    prot_store_key_reinstate(id, row.refund_gen),
+                    matches!(posting.amount, ProtAmount::Exact(_)),
+                ),
+                _ => {
+                    return Err(store_move_invalid(
+                        id,
+                        "a credit moves the row to Credited or Reinstated",
+                    ))
+                }
+            };
+            if posting.key != key
+                || !amount_ok
+                || posting.kind != v0::ProtEntryKind::Purchase
+                || posting.debit != PROT_SYS_ISSUED
+                || posting.credit != prot_user_account(user_id)
+                || posting.reference.order_id.as_deref() != Some(id)
+            {
+                return Err(store_move_invalid(id, "the credit does not match the row"));
+            }
+            // W1 audit MINOR 4: the row records the instant of its credit
+            if row.state == v0::ProtStoreState::Credited
+                && row.credited_at != Some(posting.created_at)
+            {
+                return Err(store_move_invalid(
+                    id,
+                    "a purchase credit stamps credited_at",
+                ));
+            }
+            Ok(None)
+        }
+        ProtStoreLedger::Clawback {
+            user_id,
+            posting,
+            key_base,
+        } => {
+            validate_prot_posting(posting)?;
+            let gen = row.refund_gen;
+            if row.state != v0::ProtStoreState::Revoked || gen == 0 {
+                return Err(store_move_invalid(
+                    id,
+                    "a clawback moves the row to Revoked",
+                ));
+            }
+            if row.user_id.as_deref() != Some(user_id.as_str())
+                || posting.key != prot_store_key_clawback(id, gen)
+                || *key_base != prot_store_refund_base(id, gen)
+                || posting.kind != v0::ProtEntryKind::Clawback
+                || posting.debit != prot_user_account(user_id)
+                || posting.credit != PROT_SYS_CLAWED
+                || posting.amount != ProtAmount::UpTo(row.prot)
+                || posting.reference.order_id.as_deref() != Some(id)
+            {
+                return Err(store_move_invalid(
+                    id,
+                    "the clawback does not match the row",
+                ));
+            }
+            if !row.refunds.iter().any(|refund| refund.gen == gen) {
+                return Err(store_move_invalid(
+                    id,
+                    "the generation has no refunds entry",
+                ));
+            }
+            Ok(Some(gen))
+        }
+    }
+}
+
+/// A row reaches Credited only in the transaction that writes its
+/// `purchase:{id}` posting, so a Credited row always has the ledger key
+/// `already_credited` is answered from (sections 0, 6, 9.4 step 8). Checked
+/// against the stored row, in the move's transaction.
+pub(in crate::models::prot) fn check_store_credit(
+    stored: Option<v0::ProtStoreState>,
+    m: &ProtStoreMove,
+) -> Result<()> {
+    if m.row.state == v0::ProtStoreState::Credited
+        && stored != Some(v0::ProtStoreState::Credited)
+        && !matches!(m.ledger, ProtStoreLedger::Credit(_))
+    {
+        return Err(store_move_invalid(
+            &m.row.id,
+            "a row reaches Credited only with its purchase posting",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a store move re-credits a reversed generation (its bound needs
+/// the purchase's ledger rows)
+pub(in crate::models::prot) fn store_move_reinstates(m: &ProtStoreMove) -> bool {
+    matches!(&m.ledger, ProtStoreLedger::Credit(posting) if posting.key != prot_store_key_purchase(&m.row.id))
+}
+
+/// W1 audit R50: every posting is bounded by the STORED row, in the move's
+/// transaction, after its CAS precondition held (a stale move is Conflict,
+/// never refused). `order_rows` are the purchase's ledger rows
+/// (`ref.order_id` = its id), read in the same transaction; only a reinstate
+/// needs them. A CAS never changes what was bought; a `purchase:` credit
+/// lands only on an uncredited row (absent, Held, Rejected(Unbound)); a
+/// clawback takes the next generation of a Credited or Reinstated row; a
+/// reinstate re-credits exactly what its generation clawed, from the Revoked
+/// row of that generation.
+pub(in crate::models::prot) fn check_store_move_bounds(
+    stored: Option<&ProtStorePurchase>,
+    m: &ProtStoreMove,
+    order_rows: &[ProtLedgerEntry],
+) -> Result<()> {
+    let row = &m.row;
+    let id = row.id.as_str();
+    if let Some(stored) = stored {
+        if stored.prot != row.prot
+            || stored.store != row.store
+            || stored.environment != row.environment
+            || stored.product_id != row.product_id
+            || stored.quantity != row.quantity
+            || stored.created_at != row.created_at
+        {
+            return Err(store_move_invalid(
+                id,
+                "a move never changes what was bought",
+            ));
+        }
+    }
+
+    match &m.ledger {
+        ProtStoreLedger::None => Ok(()),
+        ProtStoreLedger::Credit(posting) if posting.key == prot_store_key_purchase(id) => {
+            let uncredited = stored.is_none_or(|stored| {
+                stored.state == v0::ProtStoreState::Held
+                    || (stored.state == v0::ProtStoreState::Rejected
+                        && stored.reject_reason == Some(v0::ProtStoreRejectReason::Unbound))
+            });
+            if !uncredited {
+                return Err(store_move_invalid(
+                    id,
+                    "a purchase credit needs an uncredited row",
+                ));
+            }
+            Ok(())
+        }
+        ProtStoreLedger::Credit(posting) => {
+            let same_generation = stored.is_some_and(|stored| {
+                stored.state == v0::ProtStoreState::Revoked && stored.refund_gen == row.refund_gen
+            });
+            if !same_generation {
+                return Err(store_move_invalid(
+                    id,
+                    "a reinstate needs the Revoked row of its generation",
+                ));
+            }
+            let clawed = order_rows
+                .iter()
+                .filter(|entry| {
+                    entry.reference.order_id.as_deref() == Some(id)
+                        && matches!(
+                            entry.kind,
+                            v0::ProtEntryKind::Clawback | v0::ProtEntryKind::ClawbackHold
+                        )
+                        && prot_store_refund_gen_of(&entry.key, id) == Some(row.refund_gen)
+                })
+                .fold(0_i64, |total, entry| total.saturating_add(entry.amount));
+            let ProtAmount::Exact(amount) = posting.amount else {
+                return Err(store_move_invalid(id, "a reinstate is Exact"));
+            };
+            if amount != clawed {
+                return Err(store_move_invalid(
+                    id,
+                    "a reinstate re-credits what its generation clawed",
+                ));
+            }
+            if amount <= 0 || amount > row.prot {
+                return Err(store_move_invalid(
+                    id,
+                    "a reinstate is more than 0 and at most the purchase",
+                ));
+            }
+            Ok(())
+        }
+        ProtStoreLedger::Clawback { .. } => {
+            let next_generation = stored.is_some_and(|stored| {
+                matches!(
+                    stored.state,
+                    v0::ProtStoreState::Credited | v0::ProtStoreState::Reinstated
+                ) && stored.refund_gen.checked_add(1) == Some(row.refund_gen)
+            });
+            if !next_generation {
+                return Err(store_move_invalid(
+                    id,
+                    "a clawback takes the next generation of a credited row",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A Clawback generation's refunds entry records what its rows took (7.1):
+/// `clawed` = Σ amount of the Clawback and ClawbackHold rows written,
+/// `shortfall` = the wallet row's final shortfall
+pub(in crate::models::prot) fn fill_store_refund(
+    row: &mut ProtStorePurchase,
+    gen: u32,
+    written: &[ProtLedgerEntry],
+    wallet: &ProtLedgerEntry,
+) -> Result<()> {
+    let id = row.id.clone();
+    let refund = row
+        .refunds
+        .iter_mut()
+        .find(|refund| refund.gen == gen)
+        .ok_or_else(|| store_move_invalid(&id, "the generation has no refunds entry"))?;
+    refund.clawed = written
+        .iter()
+        .fold(0_i64, |total, entry| total.saturating_add(entry.amount));
+    refund.shortfall = wallet.shortfall.unwrap_or(0);
+    Ok(())
+}
+
+/// A duplicate ledger key in a store move, read back outside the
+/// transaction: the same payload means a racing move committed it
+/// (Conflict: the caller re-reads); another payload is
+/// ProtIdempotencyConflict
+pub(in crate::models::prot) fn store_move_duplicate(
+    key: &str,
+    payload_hash: &str,
+    stored: Option<ProtLedgerEntry>,
+) -> Result<ProtStoreMoveOutcome> {
+    duplicate_outcome(key, payload_hash, stored).map(|_| ProtStoreMoveOutcome::Conflict)
 }
 
 #[cfg(test)]

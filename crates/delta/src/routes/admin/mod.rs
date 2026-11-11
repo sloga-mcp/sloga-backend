@@ -11,6 +11,7 @@ use rocket::Route;
 
 mod prot_adjust;
 mod prot_orders;
+mod prot_store;
 mod prot_terminate;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
@@ -18,6 +19,10 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         prot_orders::fetch_prot_order,
         prot_adjust::adjust_prot,
         prot_terminate::terminate_prot_tank,
+        prot_store::fetch_prot_store_purchase,
+        prot_store::list_prot_store_needs_action,
+        prot_store::assign_prot_store_purchase,
+        prot_store::resolve_prot_store_purchase,
     ]
 }
 

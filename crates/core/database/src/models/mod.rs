@@ -48,6 +48,7 @@ mod payment_orders;
 mod cipher_numbers;
 mod cipher_memberships;
 mod prot;
+mod prot_store;
 
 pub use admin_migrations::*;
 pub use application_commands::*;
@@ -102,6 +103,7 @@ pub use payment_orders::*;
 pub use cipher_numbers::*;
 pub use cipher_memberships::*;
 pub use prot::*;
+pub use prot_store::*;
 
 use crate::{Database, ReferenceDb};
 
@@ -162,6 +164,7 @@ pub trait AbstractDatabase:
     + cipher_memberships::AbstractCipherMemberships
     + prot::AbstractProtLedger
     + prot::AbstractProtTanks
+    + prot_store::AbstractProtStore
 {
 }
 

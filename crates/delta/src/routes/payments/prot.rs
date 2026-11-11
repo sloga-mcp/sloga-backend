@@ -1,10 +1,10 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use revolt_database::{now_ms, Database, User};
 use revolt_models::v0;
 use revolt_payments::catalog::ProtChoice;
 use revolt_payments::engine;
-use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings};
+use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings, ProtStoreSettings};
 use revolt_payments::stripe::StripeApi;
 use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
@@ -91,7 +91,8 @@ pub async fn prot_checkout(
 ///
 /// The session user's Prot balance, the part of it still under the purchase
 /// hold, their unfinished Prot checkout if any, and the 20 newest ledger
-/// rows of their wallet.
+/// rows of their wallet. `store_preview` is set (and present) only for an
+/// account that may buy in-app packs while a store is closed.
 #[openapi(tag = "Payments")]
 #[get("/prot/@me")]
 pub async fn prot_me(db: &State<Database>, user: User) -> Result<Json<v0::ProtMe>> {
@@ -104,9 +105,26 @@ pub async fn prot_me(db: &State<Database>, user: User) -> Result<Json<v0::ProtMe
     // still binds. Checkout keeps every gate. Only the session user's own
     // wallet is read; a config that fails validation still refuses.
     let ps = ProtSalesSettings::load().await?;
-    Ok(Json(
-        engine::prot::prot_me(db, &ps, &user.id, now_ms()).await?,
-    ))
+    let mut me = engine::prot::prot_me(db, &ps, &user.id, now_ms()).await?;
+
+    // In-app preview access (E3). A store config that fails validation
+    // reads as no preview; it never hides the wallet.
+    me.store_preview = engine::prot_store::store_preview(store_settings().await, &user.id);
+    Ok(Json(me))
+}
+
+/// The in-app store settings `/@me` reads: [`ProtStoreSettings::load_or_closed`]
+/// once per process, as `root.rs` memoizes its Prot advert. The config is
+/// frozen into the process at first load, so the answer cannot change, and
+/// an invalid store config is logged once rather than on every wallet poll
+/// (two first requests racing may each load it once).
+async fn store_settings() -> &'static ProtStoreSettings {
+    static STORE_SETTINGS: OnceLock<ProtStoreSettings> = OnceLock::new();
+    if let Some(st) = STORE_SETTINGS.get() {
+        return st;
+    }
+    let st = ProtStoreSettings::load_or_closed().await;
+    STORE_SETTINGS.get_or_init(|| st)
 }
 
 #[cfg(test)]
@@ -805,6 +823,31 @@ mod tests {
         let error = super::refuse_blocked_prot_region(&ps, Some("DE")).unwrap_err();
         let value = serde_json::to_value(&error).unwrap();
         assert_eq!(value, json!({ "type": "ProtRegionUnavailable" }));
+    }
+
+    /// `/@me` reads the store settings memoized (W2 audit MINOR 7): the same
+    /// instance on every call, and the route reads nothing else (controls:
+    /// load on every call, or call `load_or_closed` from the route, and this
+    /// fails)
+    #[test]
+    fn prot_me_reads_the_store_settings_once() {
+        crate::util::test::rt().block_on(prot_me_reads_the_store_settings_once_case())
+    }
+
+    async fn prot_me_reads_the_store_settings_once_case() {
+        let first = super::store_settings().await;
+        let second = super::store_settings().await;
+        assert!(std::ptr::eq(first, second));
+
+        let source = include_str!("prot.rs");
+        let from = source.find("pub async fn prot_me(").expect("the @me route");
+        let to = from
+            + source[from..]
+                .find("/// The in-app store settings `/@me` reads")
+                .expect("the memo after it");
+        let route = &source[from..to];
+        assert!(route.contains("store_settings().await"));
+        assert!(!route.contains("ProtStoreSettings::"));
     }
 
     /// The body maps to exactly one choice

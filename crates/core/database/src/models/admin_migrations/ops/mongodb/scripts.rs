@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 80; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 82; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -3083,6 +3083,24 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create Prot tank indexes.");
     }
 
+    // Prot in-app purchases (S6) follow the earlier Prot blocks as their own
+    // top-level guard; a database at 78..=81 runs only the blocks above it
+    // that it has not run.
+    if revision <= 81 {
+        info!("Running migration [revision 81 / 02-11-2026]: Create prot_store_intents / prot_store_purchases / prot_store_cursors collections (Prot in-app purchases)");
+
+        // Same contract as revision 76: panics on failure (the unique token
+        // index is what makes an intent token one-time), and every step is
+        // idempotent, so the next boot re-runs the whole block.
+        for collection in PROT_STORE_COLLECTIONS {
+            db.db().create_collection(collection).await.ok();
+        }
+
+        create_prot_store_indexes(&db.db())
+            .await
+            .expect("Failed to create Prot store indexes.");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -3108,6 +3126,13 @@ pub const PROT_TANK_COLLECTIONS: [&str; 6] = [
     "prot_notices",
     "prot_contributor_prefs",
     "prot_runtime",
+];
+
+/// The Prot in-app purchase collections (revision 81). Created by both the migration and `init.rs`.
+pub const PROT_STORE_COLLECTIONS: [&str; 3] = [
+    "prot_store_intents",
+    "prot_store_purchases",
+    "prot_store_cursors",
 ];
 
 /// Revision 76: the Prot indexes, shared by the migration and `init.rs` (same shape as
@@ -3370,6 +3395,117 @@ pub async fn create_prot_tank_indexes(
                 "unique": true,
                 "partialFilterExpression": {
                     "open_key": { "$type": "string" }
+                }
+            }
+        ]
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// Revision 81: the Prot in-app purchase indexes, shared by the migration and `init.rs` (same
+/// shape as create_prot_tank_indexes). Re-running is a no-op.
+///
+/// `prot_store_cursors` needs nothing beyond `_id`: each cursor is only ever read and written by
+/// id. There is no index on `apple.original_transaction_id`: for a consumable it equals the
+/// transaction id, which is already in `_id`, and it is stored for support only.
+pub async fn create_prot_store_indexes(
+    db: &crate::mongodb::Database,
+) -> Result<(), crate::mongodb::error::Error> {
+    db.run_command(doc! {
+        "createIndexes": "prot_store_intents",
+        "indexes": [
+            // ENFORCES one intent per token: a store purchase names its
+            // intent by this token, so two intents must never share one.
+            {
+                "key": {
+                    "token": 1_i32
+                },
+                "name": "prot_store_intents_token_unique",
+                "unique": true
+            },
+            // Serves a user's intents in a state (the open-intent cap,
+            // account deletion).
+            {
+                "key": {
+                    "user_id": 1_i32,
+                    "state": 1_i32
+                },
+                "name": "prot_store_intents_user_state"
+            },
+            // Serves the expiry pass: open intents past their expiry.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "expires_at": 1_i32
+                },
+                "name": "prot_store_intents_state_expires"
+            }
+        ]
+    })
+    .await?;
+
+    db.run_command(doc! {
+        "createIndexes": "prot_store_purchases",
+        "indexes": [
+            // Serves a user's purchases, newest first (history, account
+            // deletion).
+            {
+                "key": {
+                    "user_id": 1_i32,
+                    "created_at": -1_i32
+                },
+                "name": "prot_store_purchases_user_created"
+            },
+            // Serves the reconcile: one store's rows in a state, oldest
+            // first.
+            {
+                "key": {
+                    "state": 1_i32,
+                    "store": 1_i32,
+                    "created_at": 1_i32
+                },
+                "name": "prot_store_purchases_state_store"
+            },
+            // Serves the staff work items, newest first. Partial: most rows
+            // need no action.
+            {
+                "key": {
+                    "needs_action": 1_i32,
+                    "updated_at": -1_i32
+                },
+                "name": "prot_store_purchases_needs_action",
+                "partialFilterExpression": {
+                    "needs_action": { "$type": "string" }
+                }
+            },
+            // Serves the Play credits not yet consumed (the held figure, the
+            // consume retry). A partial filter cannot select a missing
+            // field, so a credited Play row carries `unconsumed: true` until
+            // the server consumes it, and the field is unset then.
+            {
+                "key": {
+                    "unconsumed": 1_i32,
+                    "user_id": 1_i32,
+                    "credited_at": 1_i32
+                },
+                "name": "prot_store_purchases_unconsumed",
+                "partialFilterExpression": {
+                    "unconsumed": { "$eq": true }
+                }
+            },
+            // Serves a tester's sandbox purchases (the sandbox cap).
+            // Partial: production rows never need it.
+            {
+                "key": {
+                    "user_id": 1_i32,
+                    "environment": 1_i32,
+                    "state": 1_i32
+                },
+                "name": "prot_store_purchases_sandbox_user",
+                "partialFilterExpression": {
+                    "environment": "Sandbox"
                 }
             }
         ]
@@ -3926,10 +4062,10 @@ mod afk_backfill_tests {
     }
 
     #[test]
-    fn latest_revision_is_80() {
+    fn latest_revision_is_82() {
         assert_eq!(
-            LATEST_REVISION, 80,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, the Prot tanks 79 (77 is e2ee add-device's, 78 protected-channels S2's)"
+            LATEST_REVISION, 82,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, the Prot tanks 79 (77 is e2ee add-device's, 78 protected-channels S2's), the Prot store 81"
         );
     }
 
@@ -5898,6 +6034,231 @@ mod tests {
         db.drop_database().await;
         guard.disarm();
     }
+
+    /// Revision 81 must create the Prot in-app purchase collections and every
+    /// S6 index with its exact name and spec, starting from a database at 80
+    /// (the Prot ledger and tanks already built), leave the earlier Prot
+    /// indexes as they were, and be a no-op when re-run. Control: drop
+    /// `prot_store_intents_token_unique` and the spec check fails; past it, a
+    /// second intent with one token would be accepted.
+    #[tokio::test]
+    async fn revision_81_creates_the_prot_store_indexes() {
+        // One index as listIndexes reports it: name, key fields in order,
+        // unique, partial filter.
+        type Spec = (String, Vec<(String, Bson)>, bool, Option<Document>);
+
+        // Every index of `collection`, sorted by name.
+        async fn specs(mongo: &crate::MongoDb, collection: &str) -> Vec<Spec> {
+            let reply = mongo
+                .db()
+                .run_command(doc! { "listIndexes": collection })
+                .await
+                .expect("listIndexes");
+            let mut specs: Vec<Spec> = reply
+                .get_document("cursor")
+                .and_then(|cursor| cursor.get_array("firstBatch"))
+                .expect("the first batch")
+                .iter()
+                .map(|index| {
+                    let index = index.as_document().expect("an index document");
+                    (
+                        index.get_str("name").expect("name").to_string(),
+                        index
+                            .get_document("key")
+                            .expect("key")
+                            .iter()
+                            .map(|(field, order)| (field.clone(), order.clone()))
+                            .collect(),
+                        index.get_bool("unique").unwrap_or(false),
+                        index.get_document("partialFilterExpression").ok().cloned(),
+                    )
+                })
+                .collect();
+            specs.sort_by(|a, b| a.0.cmp(&b.0));
+            specs
+        }
+
+        fn spec(name: &str, key: &[(&str, i32)], unique: bool, partial: Option<Document>) -> Spec {
+            (
+                name.to_string(),
+                key.iter()
+                    .map(|(field, order)| (field.to_string(), Bson::Int32(*order)))
+                    .collect(),
+                unique,
+                partial,
+            )
+        }
+
+        // Named by hand for the same 63-character reason as revision 70's.
+        let db = crate::DatabaseInfo::Test("migration_rev81_prot_store".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // A database at 80 already holds the revision 76 ledger and the
+            // revision 79 tanks.
+            let earlier_collections = super::PROT_COLLECTIONS
+                .into_iter()
+                .chain(super::PROT_TANK_COLLECTIONS);
+            for collection in earlier_collections.clone() {
+                mongo
+                    .db()
+                    .create_collection(collection)
+                    .await
+                    .expect("create a Prot collection");
+            }
+            super::create_prot_indexes(&mongo.db())
+                .await
+                .expect("the revision 76 indexes");
+            super::create_prot_tank_indexes(&mongo.db())
+                .await
+                .expect("the revision 79 indexes");
+            let mut earlier = Vec::new();
+            for collection in earlier_collections {
+                earlier.push((collection, specs(&mongo, collection).await));
+            }
+
+            assert_eq!(
+                super::run_migrations(&mongo, 80).await,
+                super::LATEST_REVISION
+            );
+
+            let collections = mongo
+                .db()
+                .list_collection_names()
+                .await
+                .expect("list collections");
+            for name in super::PROT_STORE_COLLECTIONS {
+                assert!(
+                    collections.iter().any(|collection| collection == name),
+                    "{name} missing from {collections:?}"
+                );
+            }
+
+            // S6 adds no index to an earlier Prot collection.
+            for (collection, before) in &earlier {
+                assert_eq!(
+                    &specs(&mongo, collection).await,
+                    before,
+                    "{collection} indexes are untouched"
+                );
+            }
+
+            let want_intents = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec(
+                    "prot_store_intents_state_expires",
+                    &[("state", 1), ("expires_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_store_intents_token_unique",
+                    &[("token", 1)],
+                    true,
+                    None,
+                ),
+                spec(
+                    "prot_store_intents_user_state",
+                    &[("user_id", 1), ("state", 1)],
+                    false,
+                    None,
+                ),
+            ];
+            let want_purchases = vec![
+                spec("_id_", &[("_id", 1)], false, None),
+                spec(
+                    "prot_store_purchases_needs_action",
+                    &[("needs_action", 1), ("updated_at", -1)],
+                    false,
+                    Some(doc! { "needs_action": { "$type": "string" } }),
+                ),
+                spec(
+                    "prot_store_purchases_sandbox_user",
+                    &[("user_id", 1), ("environment", 1), ("state", 1)],
+                    false,
+                    Some(doc! { "environment": "Sandbox" }),
+                ),
+                spec(
+                    "prot_store_purchases_state_store",
+                    &[("state", 1), ("store", 1), ("created_at", 1)],
+                    false,
+                    None,
+                ),
+                spec(
+                    "prot_store_purchases_unconsumed",
+                    &[("unconsumed", 1), ("user_id", 1), ("credited_at", 1)],
+                    false,
+                    Some(doc! { "unconsumed": { "$eq": true } }),
+                ),
+                spec(
+                    "prot_store_purchases_user_created",
+                    &[("user_id", 1), ("created_at", -1)],
+                    false,
+                    None,
+                ),
+            ];
+            let want_cursors = vec![spec("_id_", &[("_id", 1)], false, None)];
+            let wanted: Vec<(&str, Vec<Spec>)> = vec![
+                ("prot_store_intents", want_intents),
+                ("prot_store_purchases", want_purchases),
+                ("prot_store_cursors", want_cursors),
+            ];
+            for (collection, want) in &wanted {
+                assert_eq!(
+                    &specs(&mongo, collection).await,
+                    want,
+                    "{collection} indexes"
+                );
+            }
+
+            // The unique token is what makes an intent token one-time.
+            let intents = mongo.col::<Document>("prot_store_intents");
+            intents
+                .insert_many(vec![
+                    doc! { "_id": "I1", "token": "t-1", "state": "Open" },
+                    doc! { "_id": "I2", "token": "t-2", "state": "Open" },
+                ])
+                .await
+                .expect("two intents with distinct tokens");
+            assert!(
+                intents
+                    .insert_one(doc! { "_id": "I3", "token": "t-1", "state": "Open" })
+                    .await
+                    .is_err(),
+                "a second intent with one token"
+            );
+
+            // Re-running over populated collections changes nothing.
+            assert_eq!(
+                super::run_migrations(&mongo, 80).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            for (collection, want) in &wanted {
+                assert_eq!(
+                    &specs(&mongo, collection).await,
+                    want,
+                    "{collection} indexes after a re-run"
+                );
+            }
+            assert_eq!(intents.count_documents(doc! {}).await.expect("count"), 2);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
 }
 
 #[cfg(test)]
@@ -6261,6 +6622,72 @@ mod prot_migration_tests {
             "in PROT_TANK_COLLECTIONS",
             "create_prot_tank_indexes(&db)",
             ".expect(\"Failed to create Prot tank indexes.\")",
+        ] {
+            assert!(init.contains(needle), "init.rs must contain {needle}");
+        }
+    }
+
+    /// The revision 81 guard carries the same nesting trap: nested inside
+    /// the 79 block (or any earlier one), a database already at 80 or 81
+    /// would skip the Prot store collections and the unique token index
+    /// forever. It names 79 and 81 only, so S4's revision 80 block can land
+    /// between them without touching this test.
+    #[test]
+    fn revision_81_guard_is_a_top_level_sibling() {
+        let text = shipping(SOURCE);
+        let (at_79, open_79) = guard(79);
+        let (at_81, _) = guard(81);
+
+        let block_79 = braced(text, open_79);
+        assert!(
+            !block_79.contains("if revision <= 81"),
+            "the revision 81 guard must not be nested inside the 79 block"
+        );
+        assert!(
+            at_81 > open_79 + block_79.len(),
+            "the revision 81 guard must come after the 79 block closes"
+        );
+
+        let body = text
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + text[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_79), depth_at(at_81)),
+            (top_level, top_level),
+            "the 79 and 81 guards must both sit at the top level of run_migrations"
+        );
+    }
+
+    /// Same contract as revision 76: the block creates the store collections
+    /// and indexes through the shared helpers, and a failure panics so delta
+    /// never issues an intent without its unique token index.
+    #[test]
+    fn the_prot_store_block_runs_the_shared_helpers() {
+        let (_, open) = guard(81);
+        let block = braced(shipping(SOURCE), open);
+        for needle in [
+            "in PROT_STORE_COLLECTIONS",
+            "create_prot_store_indexes(&db.db())",
+            ".expect(\"Failed to create Prot store indexes.\")",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the revision 81 block must contain {needle}"
+            );
+        }
+    }
+
+    /// Fresh databases skip the migrations, so init.rs must build the same
+    /// Prot store schema through the same helpers.
+    #[test]
+    fn init_builds_the_prot_store_schema_through_the_shared_helpers() {
+        let init = shipping(INIT);
+        for needle in [
+            "in PROT_STORE_COLLECTIONS",
+            "create_prot_store_indexes(&db)",
+            ".expect(\"Failed to create Prot store indexes.\")",
         ] {
             assert!(init.contains(needle), "init.rs must contain {needle}");
         }

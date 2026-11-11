@@ -8,9 +8,12 @@
 //! - [`engine`]: the order state machine (checkout, fulfil, reverse, expire);
 //!   [`engine::prot`] holds the Prot side (wallet credit, clawback, Cipher grants)
 //! - [`dispatch`]: webhook event handling and the crond reconcile sweep
+//! - [`store`]: in-app purchases: the Apple JWS verifier and the App Store / Google Play
+//!   clients (with in-memory mocks for tests)
 
 pub mod catalog;
 pub mod dispatch;
 pub mod engine;
 pub mod settings;
+pub mod store;
 pub mod stripe;

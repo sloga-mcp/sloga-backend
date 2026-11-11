@@ -451,6 +451,15 @@ pub enum ErrorType {
     ProtReplicaSetRequired,
     /// Prot is not sold in the caller's country
     ProtRegionUnavailable,
+    // ? Prot store (in-app purchase) errors
+    /// In-app Prot purchases are not open for this store (or the caller is not on the preview list)
+    ProtStoreClosed,
+    /// The store product is not on sale
+    ProtStoreProductUnknown,
+    /// The store purchase could not be verified (signature, chain, bundle, environment)
+    ProtStoreVerifyFailed,
+    /// In-app purchases are not configured on this server
+    ProtStoreUnavailable,
 }
 
 #[macro_export]
@@ -682,5 +691,31 @@ mod tests {
             value,
             serde_json::json!({ "type": "ProtRegionUnavailable" })
         );
+    }
+
+    /// The types the client keys its store messages on; none carries a field
+    #[cfg(feature = "serde")]
+    #[test]
+    fn prot_store_errors_serialize_by_name() {
+        let cases = [
+            (create_error!(ProtStoreClosed), "ProtStoreClosed"),
+            (
+                create_error!(ProtStoreProductUnknown),
+                "ProtStoreProductUnknown",
+            ),
+            (
+                create_error!(ProtStoreVerifyFailed),
+                "ProtStoreVerifyFailed",
+            ),
+            (create_error!(ProtStoreUnavailable), "ProtStoreUnavailable"),
+        ];
+
+        for (error, name) in cases {
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value, serde_json::json!({ "type": name }));
+
+            let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+            assert_eq!(format!("{:?}", decoded.error_type), name);
+        }
     }
 }

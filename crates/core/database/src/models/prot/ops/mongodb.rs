@@ -22,12 +22,25 @@ use super::{
     run_forfeit_passes, state_retries_exhausted, validate_prot_posting, AbstractProtLedger,
     CipherSyncPlan, PROT_STATE_RETRIES,
 };
+use super::{
+    check_store_credit, check_store_move_bounds, fill_store_refund, store_move_duplicate,
+    store_move_reinstates, validate_store_move,
+};
+use crate::models::prot_store::{
+    prot_store_move_crashes, unconsumed_play_filter, unconsumed_play_prot,
+};
+use crate::{
+    AbstractProtStore, ProtStoreLedger, ProtStoreMove, ProtStoreMoveOutcome, ProtStorePurchase,
+};
 
 pub(in crate::models::prot) static LEDGER: &str = "prot_ledger";
 pub(in crate::models::prot) static ACCOUNTS: &str = "prot_accounts";
 static MEMBERSHIPS: &str = "cipher_memberships";
 static PLEDGES: &str = "prot_pledges";
 static GOALS: &str = "prot_goals";
+/// S6: a store move writes these in the ledger's transaction (section 7.2)
+static STORE_PURCHASES: &str = "prot_store_purchases";
+static STORE_INTENTS: &str = "prot_store_intents";
 
 /// Every retry of one transaction (body or commit) stops this long after the
 /// first attempt started
@@ -541,6 +554,26 @@ fn held_clawbacks_filter(user_id: &str, purchases: &[ProtLedgerEntry]) -> Option
     })
 }
 
+/// S6: store purchase rows matching `filter` inside `session`
+async fn store_rows_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    filter: Document,
+) -> std::result::Result<Vec<ProtStorePurchase>, TxnAbort> {
+    let mut cursor = db
+        .col::<ProtStorePurchase>(STORE_PURCHASES)
+        .find(filter)
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("find", STORE_PURCHASES))?;
+
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next(&mut *session).await {
+        rows.push(row.map_err(mongo_abort("find", STORE_PURCHASES))?);
+    }
+    Ok(rows)
+}
+
 /// Compare-and-swap one pledge from `read` to `next` (state, remaining,
 /// version): a pledge that moved since the snapshot re-runs the body
 async fn cas_pledge_in(
@@ -682,11 +715,13 @@ async fn hold_debit_in(
 /// The pledge drain (10.1 step c) inside `session`: up to `rest` from the
 /// buyer's Held pledges, newest first, each through `clawback-hold:`.
 /// Returns the rows written; what they moved is the drain's recovery.
+/// S6 (7.3): keys `clawback-hold:{key_base}:{pledge}` (S5b passes the order).
 async fn drain_held_pledges_in(
     db: &MongoDb,
     session: &mut ClientSession,
     user_id: &str,
     order_id: &str,
+    key_base: &str,
     rest: i64,
     now: i64,
 ) -> std::result::Result<Vec<ProtLedgerEntry>, TxnAbort> {
@@ -694,7 +729,7 @@ async fn drain_held_pledges_in(
 
     let mut rows = Vec::new();
     for (pledge, x) in plan_pledge_drain(rest, &held) {
-        let posting = clawback_hold_posting(order_id, pledge, x, now);
+        let posting = clawback_hold_posting(key_base, order_id, pledge, x, now);
         let written = hold_debit_in(
             db,
             session,
@@ -714,7 +749,8 @@ async fn drain_held_pledges_in(
 /// for; (b) the wallet gives `w = min(total, balance)`; (c) the held pledges
 /// give up to `total - w`; (d) the `clawback:` row records `amount = w`,
 /// `requested = total` and the FINAL shortfall `total - w - drained`.
-/// Never a tank.
+/// Never a tank. S6 (7.3): the drain's keys use `key_base`.
+#[allow(clippy::too_many_arguments)]
 async fn claw_back_in(
     db: &MongoDb,
     session: &mut ClientSession,
@@ -722,6 +758,7 @@ async fn claw_back_in(
     payload_hash: &str,
     user_id: &str,
     order_id: &str,
+    key_base: &str,
     now: i64,
 ) -> std::result::Result<ProtLedgerEntry, TxnAbort> {
     let total = clawback_total(posting).map_err(TxnAbort::Refused)?;
@@ -734,7 +771,16 @@ async fn claw_back_in(
     let from_wallet = total.min(wallet.map_or(0, |account| account.balance).max(0));
 
     let drained = if total > from_wallet {
-        drain_held_pledges_in(db, session, user_id, order_id, total - from_wallet, now).await?
+        drain_held_pledges_in(
+            db,
+            session,
+            user_id,
+            order_id,
+            key_base,
+            total - from_wallet,
+            now,
+        )
+        .await?
     } else {
         Vec::new()
     };
@@ -886,6 +932,7 @@ impl ProtTxnBody for CipherClawbackBody {
             &payload_hash,
             &self.user_id,
             &self.order_id,
+            &self.order_id,
             self.now,
         )
         .await?;
@@ -934,6 +981,7 @@ impl ProtTxnBody for PurchaseClawbackBody {
             &self.posting,
             &self.payload_hash,
             &self.user_id,
+            &self.order_id,
             &self.order_id,
             self.posting.created_at,
         )
@@ -1016,6 +1064,177 @@ impl ProtTxnBody for ForfeitPassBody {
     }
 }
 
+/// apply_store_purchase_move (S6 section 7.2): the row read, the intent CAS,
+/// the postings and the row write, in this order, in one transaction. `gen`
+/// is a Clawback's refund generation (from validate_store_move).
+struct StoreMoveBody {
+    m: ProtStoreMove,
+    gen: Option<u32>,
+}
+
+#[async_trait]
+impl ProtTxnBody for StoreMoveBody {
+    type Output = (ProtStorePurchase, Vec<ProtLedgerEntry>);
+
+    async fn run(
+        &self,
+        db: &MongoDb,
+        session: &mut ClientSession,
+    ) -> std::result::Result<(ProtStorePurchase, Vec<ProtLedgerEntry>), TxnAbort> {
+        let m = &self.m;
+        let mut row = m.row.clone();
+
+        // 1. Absent for an insert, at the expected version for a CAS (a stale
+        // move is Conflict); then every posting is bounded by that stored row
+        let stored = db
+            .col::<ProtStorePurchase>(STORE_PURCHASES)
+            .find_one(doc! { "_id": &row.id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_abort("find_one", STORE_PURCHASES))?;
+        let version = match (m.expected_version, stored.as_ref()) {
+            (None, None) => 0,
+            (Some(expected), Some(stored)) if stored.version == expected => {
+                expected.checked_add(1).ok_or_else(|| {
+                    log::error!("PROT_VERSION_OVERFLOW version={expected}");
+                    TxnAbort::Refused(create_error!(InternalError))
+                })?
+            }
+            _ => return Err(TxnAbort::StateMoved),
+        };
+        check_store_credit(stored.as_ref().map(|stored| stored.state), m)
+            .map_err(TxnAbort::Refused)?;
+        let order_rows = if store_move_reinstates(m) {
+            ledger_rows_in(db, session, doc! { "ref.order_id": &row.id }).await?
+        } else {
+            Vec::new()
+        };
+        check_store_move_bounds(stored.as_ref(), m, &order_rows).map_err(TxnAbort::Refused)?;
+
+        // 2. The intent, Open or Expired and still the row's user's
+        if let Some(intent_id) = &m.use_intent {
+            let mut filter = doc! {
+                "_id": intent_id,
+                "state": { "$in": ["Open", "Expired"] }
+            };
+            match &row.user_id {
+                Some(user_id) => {
+                    filter.insert("user_id", user_id.as_str());
+                }
+                None => {
+                    filter.insert("user_id", doc! { "$exists": false });
+                }
+            }
+            let result = db
+                .col::<Document>(STORE_INTENTS)
+                .update_one(
+                    filter,
+                    doc! { "$set": { "state": "Used", "purchase_id": &row.id } },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(mongo_abort("update_one", STORE_INTENTS))?;
+            if result.matched_count == 0 {
+                return Err(TxnAbort::StateMoved);
+            }
+        }
+
+        // 3. The postings
+        let entries = match &m.ledger {
+            ProtStoreLedger::None => Vec::new(),
+            ProtStoreLedger::Credit(posting) => {
+                vec![post_in_session(db, session, posting, &prot_payload_hash(posting)).await?]
+            }
+            ProtStoreLedger::Clawback {
+                user_id,
+                posting,
+                key_base,
+            } => {
+                let payload_hash = prot_payload_hash(posting);
+                let wallet = claw_back_in(
+                    db,
+                    session,
+                    posting,
+                    &payload_hash,
+                    user_id,
+                    &row.id,
+                    key_base,
+                    posting.created_at,
+                )
+                .await?;
+
+                // This generation's drain rows, as this transaction wrote them
+                let prefix = format!("clawback-hold:{key_base}:");
+                let mut written: Vec<ProtLedgerEntry> = ledger_rows_in(
+                    db,
+                    session,
+                    doc! {
+                        "ref.order_id": &row.id,
+                        "kind": v0::ProtEntryKind::ClawbackHold.as_str()
+                    },
+                )
+                .await?
+                .into_iter()
+                .filter(|entry| {
+                    entry
+                        .key
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|pledge_id| !pledge_id.contains(':'))
+                })
+                .collect();
+                written.push(wallet.clone());
+
+                let gen = self
+                    .gen
+                    .ok_or_else(|| TxnAbort::Refused(create_error!(InternalError)))?;
+                fill_store_refund(&mut row, gen, &written, &wallet).map_err(TxnAbort::Refused)?;
+                written
+            }
+        };
+
+        // Test hook (store_move_credit_is_one_transaction): a failure between
+        // the postings and the row write rolls both back
+        if prot_store_move_crashes(&row.id) {
+            log::error!("PROT_STORE_MOVE_CRASH_INJECTED id={}", row.id);
+            return Err(TxnAbort::Refused(create_error!(InternalError)));
+        }
+
+        // 4. The row: every write to it bumps `version` (audit N2), so a
+        // move planned on a stale copy misses here and the caller re-plans
+        row.version = version;
+        match m.expected_version {
+            None => {
+                if let Err(error) = db
+                    .col::<ProtStorePurchase>(STORE_PURCHASES)
+                    .insert_one(&row)
+                    .session(&mut *session)
+                    .await
+                {
+                    return Err(if is_duplicate_key(&error) {
+                        TxnAbort::StateMoved
+                    } else {
+                        mongo_abort("insert_one", STORE_PURCHASES)(error)
+                    });
+                }
+            }
+            Some(expected) => {
+                let expected = stored_version(expected)?;
+                let result = db
+                    .col::<ProtStorePurchase>(STORE_PURCHASES)
+                    .replace_one(doc! { "_id": &row.id, "version": expected }, &row)
+                    .session(&mut *session)
+                    .await
+                    .map_err(mongo_abort("replace_one", STORE_PURCHASES))?;
+                if result.matched_count == 0 {
+                    return Err(TxnAbort::StateMoved);
+                }
+            }
+        }
+
+        Ok((row, entries))
+    }
+}
+
 impl MongoDb {
     /// One forfeit pass in its own transaction
     async fn prot_forfeit_pass(&self, user_id: &str, now: i64) -> Result<ProtApplyOutcome> {
@@ -1054,11 +1273,14 @@ impl MongoDb {
             Some(filter) => ledger_rows_in(self, session, filter).await?,
             None => Vec::new(),
         };
-        Ok(held_purchase_net(
-            purchases.iter().chain(clawbacks.iter()),
-            user_id,
-            since_ms,
-        ))
+        // S6 (7.4): plus the unconsumed Play credits from before the window,
+        // read in the same snapshot
+        let unconsumed =
+            store_rows_in(self, session, unconsumed_play_filter(user_id, since_ms)).await?;
+        Ok(
+            held_purchase_net(purchases.iter().chain(clawbacks.iter()), user_id, since_ms)
+                .saturating_add(unconsumed_play_prot(&unconsumed, user_id, since_ms)),
+        )
     }
 
     /// Ledger rows matching `filter`, outside any transaction
@@ -1421,11 +1643,12 @@ impl AbstractProtLedger for MongoDb {
             Some(filter) => self.prot_ledger_rows(filter).await?,
             None => Vec::new(),
         };
-        Ok(held_purchase_net(
-            purchases.iter().chain(clawbacks.iter()),
-            user_id,
-            since_ms,
-        ))
+        // S6 (7.4): plus the unconsumed Play credits from before the window
+        let unconsumed = self.sum_unconsumed_play_prot(user_id, since_ms).await?;
+        Ok(
+            held_purchase_net(purchases.iter().chain(clawbacks.iter()), user_id, since_ms)
+                .saturating_add(unconsumed),
+        )
     }
 
     async fn sum_held_prot_pledges(&self, user_id: &str) -> Result<i64> {
@@ -1462,6 +1685,22 @@ impl AbstractProtLedger for MongoDb {
         }
         log::error!("PROT_FORFEIT_HOLD_UNSETTLED user={user_id} rounds={PROT_STATE_RETRIES}");
         Err(create_error!(InternalError))
+    }
+
+    async fn apply_store_purchase_move(&self, m: &ProtStoreMove) -> Result<ProtStoreMoveOutcome> {
+        let gen = validate_store_move(m)?;
+        ensure_replica_set(self).await?;
+
+        let body = StoreMoveBody { m: m.clone(), gen };
+        match run_prot_transaction(self, &body).await? {
+            TxnEnd::Committed((row, entries)) => Ok(ProtStoreMoveOutcome::Applied { row, entries }),
+            // The row or the intent moved: the caller re-reads and re-plans
+            TxnEnd::StateMoved => Ok(ProtStoreMoveOutcome::Conflict),
+            TxnEnd::DuplicateKey { key, payload_hash } => {
+                let stored = self.fetch_prot_entry_by_key(&key).await?;
+                store_move_duplicate(&key, &payload_hash, stored)
+            }
+        }
     }
 }
 

@@ -9,7 +9,8 @@ pub(crate) use init::{protected_nonce_index, PROTECTED_NONCE_INDEX_NAME};
 /// The Prot tests install the real migration indexes
 #[cfg(test)]
 pub(crate) use scripts::{
-    create_prot_indexes, create_prot_tank_indexes, PROT_COLLECTIONS, PROT_TANK_COLLECTIONS,
+    create_prot_indexes, create_prot_store_indexes, create_prot_tank_indexes, PROT_COLLECTIONS,
+    PROT_STORE_COLLECTIONS, PROT_TANK_COLLECTIONS,
 };
 
 #[async_trait]

@@ -1,6 +1,7 @@
 use revolt_config::{config, ProtectionFeatures, Settings};
 use revolt_database::{ProtTankRules, PROT_SLOT_TIERS};
 use revolt_models::v0;
+use revolt_payments::settings::ProtStoreSettings;
 use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings};
 use revolt_result::Result;
 use rocket::serde::json::Json;
@@ -75,6 +76,22 @@ pub struct ProtFeature {
     pub wallet_cap: i64,
     /// Tank rules the client previews prices with (the server computes every price)
     pub tank: ProtTankFeature,
+    /// In-app Prot packs (S6). Per-user preview access is NOT here (GET /payments/prot/@me store_preview)
+    pub store: ProtStoreFeature,
+}
+
+/// # In-App Prot Packs
+///
+/// `[features.payments] prot_store_*` as validated by `ProtStoreSettings`. A
+/// config the engine would refuse is advertised closed with no products.
+#[derive(Serialize, JsonSchema, Debug, Clone)]
+pub struct ProtStoreFeature {
+    /// prot_store_apple_open AND App Store credentials configured
+    pub apple_open: bool,
+    /// prot_store_play_open AND Play credentials configured
+    pub play_open: bool,
+    pub products: Vec<v0::ProtStoreProductView>,
+    pub us_web_link: bool,
 }
 
 /// # Prot Tank Rules
@@ -132,6 +149,50 @@ pub fn prot_tank_feature_from(protection: &ProtectionFeatures) -> ProtTankFeatur
         grace_days: rules.grace_days,
         freeze_days: rules.freeze_days,
         deletion_enabled: rules.deletion_enabled,
+    }
+}
+
+/// The in-app Prot packs to advertise, from the same
+/// `ProtStoreSettings::from_config` the engine validates with. A store is
+/// open only while payments and Prot are both enabled (R54; the intent
+/// route refuses otherwise), with its flag on AND its credentials in the
+/// config (Play also needs the Pub/Sub subscription its intents require):
+/// the advert can't see the managed store clients, and in production those
+/// are built from the same credentials. Every configured product is listed
+/// even while both stores are closed, since preview accounts buy them.
+pub fn prot_store_feature_from(config: &Settings) -> ProtStoreFeature {
+    let Ok(st) = ProtStoreSettings::from_config(config) else {
+        return ProtStoreFeature {
+            apple_open: false,
+            play_open: false,
+            products: Vec::new(),
+            us_web_link: false,
+        };
+    };
+
+    // The intent route's first gates, from the same validated settings: a
+    // config that fails either is a 500 there, so it is closed here too
+    let selling = PaymentsSettings::from_config(config).is_ok_and(|s| s.enabled)
+        && ProtSalesSettings::from_config(config).is_ok_and(|ps| ps.enabled);
+
+    ProtStoreFeature {
+        apple_open: selling && st.apple_open && st.apple.is_some(),
+        play_open: selling
+            && st.play_open
+            && st
+                .play
+                .as_ref()
+                .is_some_and(|play| !play.pubsub_subscription.is_empty()),
+        products: st
+            .products
+            .iter()
+            .map(|product| v0::ProtStoreProductView {
+                store: product.store,
+                product_id: product.product_id.clone(),
+                prot: product.prot,
+            })
+            .collect(),
+        us_web_link: st.us_web_link,
     }
 }
 
@@ -240,6 +301,8 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
     // Independent of the sale config: a broken pack list still advertises
     // the tank rules, and a broken tank config the sale
     let tank = prot_tank_feature_from(protection);
+    // Independent of both: the store packs validate on their own
+    let store = prot_store_feature_from(config);
     let Ok(prot) = ProtSalesSettings::from_config(config) else {
         return ProtFeature {
             enabled: protection.enabled,
@@ -251,6 +314,7 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
             exact_max_cents: config.features.payments.prot_exact_max_cents,
             wallet_cap: protection.wallet_cap,
             tank,
+            store,
         };
     };
 
@@ -275,6 +339,7 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
         exact_max_cents: prot.exact_max_cents,
         wallet_cap: prot.wallet_cap,
         tank,
+        store,
     }
 }
 
@@ -986,6 +1051,23 @@ mod test {
                     "freeze_days": 25,
                     "deletion_enabled": false,
                 },
+                "store": {
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": [
+                        { "store": "apple", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+                    ],
+                    "us_web_link": false,
+                },
             })
         );
 
@@ -1252,5 +1334,323 @@ mod test {
                 .map(serde_json::Map::len),
             Some(4)
         );
+    }
+
+    /// `prot_settings()` with both stores open, the US web link on, the
+    /// default product table, and App Store and Play credentials plus the
+    /// Pub/Sub subscription, all set explicitly so a local override file
+    /// can't change them. The keys are placeholders: the advert only checks
+    /// that they are present
+    fn prot_store_settings() -> revolt_config::Settings {
+        let mut config = prot_settings();
+        let defaults = revolt_config::FeaturePayments::default();
+        let payments = &mut config.features.payments;
+        payments.prot_store_apple_open = true;
+        payments.prot_store_play_open = true;
+        payments.prot_store_products = defaults.prot_store_products;
+        payments.prot_store_preview_user_ids = Vec::new();
+        payments.prot_store_test_user_ids = Vec::new();
+        payments.prot_store_test_max_prot = defaults.prot_store_test_max_prot;
+        payments.prot_store_us_web_link = true;
+        payments.ops_alert_email = String::new();
+        config.api.appstore = revolt_config::ApiAppStore {
+            issuer_id: "issuer".to_string(),
+            key_id: "KEYID".to_string(),
+            private_key: "placeholder".to_string(),
+            ..Default::default()
+        };
+        config.api.googleplay = revolt_config::ApiGooglePlay {
+            client_email: "rtdn@sloga-test.iam.gserviceaccount.com".to_string(),
+            private_key: "placeholder".to_string(),
+            pubsub_subscription: "projects/sloga-test/subscriptions/play-rtdn".to_string(),
+            ..Default::default()
+        };
+        config
+    }
+
+    fn store_product(
+        store: &str,
+        product_id: &str,
+        prot: i64,
+    ) -> revolt_config::ProtStoreProductConfig {
+        revolt_config::ProtStoreProductConfig {
+            store: store.to_string(),
+            product_id: product_id.to_string(),
+            prot,
+        }
+    }
+
+    /// The default product table (prot-s6-contracts section 4): 5 Apple
+    /// rows, then the same 5 on Play
+    fn default_store_products_json() -> serde_json::Value {
+        serde_json::json!([
+            { "store": "apple", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+            { "store": "play", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+            { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "play", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+            { "store": "play", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+            { "store": "play", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+        ])
+    }
+
+    /// A store is advertised open only with its flag on AND its credentials
+    /// in the config, and Play only with the Pub/Sub subscription as well
+    /// (its intents refuse without one). Closing one store leaves the other
+    /// and the product list alone
+    #[test]
+    fn store_advert_is_closed_without_credentials() {
+        assert_eq!(
+            prot_json(&prot_store_settings())["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": default_store_products_json(),
+                "us_web_link": true,
+            })
+        );
+
+        type Darken = fn(&mut revolt_config::Settings);
+        let apple: [(&str, Darken); 4] = [
+            ("no issuer id", |c| c.api.appstore.issuer_id.clear()),
+            ("no key id", |c| c.api.appstore.key_id.clear()),
+            ("no private key", |c| c.api.appstore.private_key.clear()),
+            ("apple closed", |c| {
+                c.features.payments.prot_store_apple_open = false
+            }),
+        ];
+        for (name, darken) in apple {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(json["store"]["apple_open"], false, "{name}");
+            assert_eq!(json["store"]["play_open"], true, "{name}");
+            assert_eq!(
+                json["store"]["products"],
+                default_store_products_json(),
+                "{name}"
+            );
+        }
+
+        let play: [(&str, Darken); 4] = [
+            ("no client email", |c| c.api.googleplay.client_email.clear()),
+            ("no private key", |c| c.api.googleplay.private_key.clear()),
+            ("no Pub/Sub subscription", |c| {
+                c.api.googleplay.pubsub_subscription.clear()
+            }),
+            ("play closed", |c| {
+                c.features.payments.prot_store_play_open = false
+            }),
+        ];
+        for (name, darken) in play {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(json["store"]["play_open"], false, "{name}");
+            assert_eq!(json["store"]["apple_open"], true, "{name}");
+            assert_eq!(
+                json["store"]["products"],
+                default_store_products_json(),
+                "{name}"
+            );
+        }
+
+        // Both flags on (as Revolt.test.toml has them) and no credentials
+        // at all: both closed, the products still listed
+        let mut config = prot_store_settings();
+        config.api.appstore = revolt_config::ApiAppStore::default();
+        config.api.googleplay = revolt_config::ApiGooglePlay::default();
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": false,
+                "play_open": false,
+                "products": default_store_products_json(),
+                "us_web_link": true,
+            })
+        );
+    }
+
+    /// The products are the configured rows in config order, listed whether
+    /// or not a store is open (preview accounts buy them), and the US web
+    /// link flag is carried as configured
+    #[test]
+    fn store_advert_lists_the_products() {
+        let mut config = prot_store_settings();
+        config.features.payments.prot_store_products = vec![
+            store_product("play", "gg.sloga.prot.p10", 1000),
+            store_product("apple", "gg.sloga.prot.x_1", 7),
+            store_product("play", "gg.sloga.prot.x_1", 9),
+        ];
+        let products = serde_json::json!([
+            { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "apple", "product_id": "gg.sloga.prot.x_1", "prot": 7 },
+            { "store": "play", "product_id": "gg.sloga.prot.x_1", "prot": 9 },
+        ]);
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": products,
+                "us_web_link": true,
+            })
+        );
+
+        let payments = &mut config.features.payments;
+        payments.prot_store_apple_open = false;
+        payments.prot_store_play_open = false;
+        payments.prot_store_us_web_link = false;
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": false,
+                "play_open": false,
+                "products": products,
+                "us_web_link": false,
+            })
+        );
+
+        // An empty table is valid: nothing listed, the stores as configured
+        let mut config = prot_store_settings();
+        config.features.payments.prot_store_products = Vec::new();
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": [],
+                "us_web_link": true,
+            })
+        );
+    }
+
+    /// A store config the engine would refuse is advertised closed with no
+    /// products and no web link, however the flags and credentials are set,
+    /// and leaves the rest of the Prot advert alone
+    #[test]
+    fn store_advert_is_closed_when_the_store_config_is_invalid() {
+        type Break = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Break); 9] = [
+            ("zero-Prot product", |c| {
+                c.features.payments.prot_store_products[0].prot = 0
+            }),
+            ("duplicate product", |c| {
+                c.features.payments.prot_store_products[1].product_id =
+                    "gg.sloga.prot.p5".to_string()
+            }),
+            ("unknown store", |c| {
+                c.features.payments.prot_store_products[0].store = "steam".to_string()
+            }),
+            ("product id with a dash", |c| {
+                c.features.payments.prot_store_products[0].product_id =
+                    "gg-sloga-prot-p5".to_string()
+            }),
+            ("preview id that is not a user id", |c| {
+                c.features.payments.prot_store_preview_user_ids = vec!["01ABC-".to_string()]
+            }),
+            ("negative tester cap", |c| {
+                c.features.payments.prot_store_test_max_prot = -1
+            }),
+            ("alert mailbox without an @", |c| {
+                c.features.payments.ops_alert_email = "ops".to_string()
+            }),
+            ("unknown App Store environment", |c| {
+                c.api.appstore.environment = "Xcode".to_string()
+            }),
+            ("root pin that is not a SHA-256", |c| {
+                c.api.appstore.root_ca_g3_sha256 = "abc".to_string()
+            }),
+        ];
+        let valid = prot_json(&prot_store_settings());
+        for (name, break_config) in cases {
+            let mut config = prot_store_settings();
+            break_config(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(
+                json["store"],
+                serde_json::json!({
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": [],
+                    "us_web_link": false,
+                }),
+                "{name}"
+            );
+            assert_eq!(json["sales_open"], true, "{name}");
+            assert_eq!(json["packs"], valid["packs"], "{name}");
+            assert_eq!(json["tank"], valid["tank"], "{name}");
+        }
+    }
+
+    /// Both stores are advertised closed unless payments and Prot are both
+    /// enabled and their configs validate, the intent route's first gates
+    /// (R54); the products and the web link stay as configured, in both of
+    /// the builder's literals
+    #[test]
+    fn store_advert_is_closed_while_payments_or_prot_are_off() {
+        type Darken = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Darken); 4] = [
+            ("payments off", |c| c.features.payments.enabled = false),
+            ("Prot off", |c| c.features.boosts.protection.enabled = false),
+            ("payments config invalid", |c| {
+                c.features.payments.cipher_cap = 0
+            }),
+            ("Prot sale config invalid", |c| {
+                c.features.payments.prot_exact_min_cents = 10
+            }),
+        ];
+        for (name, darken) in cases {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            assert_eq!(
+                prot_json(&config)["store"],
+                serde_json::json!({
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": default_store_products_json(),
+                    "us_web_link": true,
+                }),
+                "{name}"
+            );
+        }
+
+        // Prot's own sale switch is not a store gate: both stay open
+        let mut config = prot_store_settings();
+        config.features.payments.prot_sales_open = false;
+        let store = &prot_json(&config)["store"];
+        assert_eq!(store["apple_open"], true);
+        assert_eq!(store["play_open"], true);
+    }
+
+    /// `GET /` carries the store advert of the node's config. The test node
+    /// turns both store flags on but has no store credentials, so both
+    /// stores are advertised closed with the default products listed
+    #[test]
+    fn root_serves_the_store_advert() {
+        crate::util::test::rt().block_on(root_serves_the_store_advert_case())
+    }
+
+    async fn root_serves_the_store_advert_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let config = revolt_config::config().await;
+        let store = &body["features"]["prot"]["store"];
+        assert_eq!(
+            *store,
+            serde_json::to_value(super::prot_store_feature_from(&config)).unwrap()
+        );
+        assert!(config.features.payments.prot_store_apple_open);
+        assert!(config.features.payments.prot_store_play_open);
+        assert_eq!(store["apple_open"], false, "{}", store);
+        assert_eq!(store["play_open"], false, "{}", store);
+        assert_eq!(store["products"].as_array().map(Vec::len), Some(10));
+        assert_eq!(store["us_web_link"], false);
     }
 }

@@ -38,6 +38,8 @@ use_tls = false
 enabled = true
 cipher_sales_open = true
 prot_sales_open = true
+prot_store_apple_open = true
+prot_store_play_open = true
 
 # Prot on for the wallet and pack tests. cipher_grants_enabled stays off, so
 # the Cipher tests never post Prot; grant tests pass their own settings.

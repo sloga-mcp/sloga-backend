@@ -8,7 +8,8 @@
 //!  mls_commits -> mls_join_intents -> e2ee_identities -> e2ee_queue ->
 //!  cipher_memberships -> prot_ledger -> prot_accounts -> prot_pledges ->
 //!  prot_goals -> prot_tanks -> prot_runtime -> prot_notices ->
-//!  prot_contributor_prefs`
+//!  prot_contributor_prefs -> prot_store_intents -> prot_store_purchases ->
+//!  prot_store_cursors`
 //!
 //! S1's documented order (`protected_channels/ops/reference.rs`) comes
 //! first, then S5a's (`cipher_memberships -> prot_ledger -> prot_accounts`,
@@ -19,6 +20,9 @@
 //! holding one (the mutex is not re-entrant), and every check runs before
 //! its first mutation. `tests::reference_lock_order_never_deadlocks` races
 //! the paths that share these maps on one channel.
+//!
+//! S6's store maps come last; a store move takes the ledger maps first
+//! (section 7.3 of prot-s6-contracts).
 
 mod entitlement;
 mod lifecycle;

@@ -18,6 +18,12 @@ use super::{
     resolve_prot_amount, run_forfeit_passes, state_retries_exhausted, validate_prot_posting,
     AbstractProtLedger, CipherSyncPlan,
 };
+use super::{
+    check_store_credit, check_store_move_bounds, fill_store_refund, store_move_duplicate,
+    store_move_reinstates, validate_store_move,
+};
+use crate::models::prot_store::{held_store_unconsumed_locked, prot_store_move_crashes};
+use crate::{ProtStoreLedger, ProtStoreMove, ProtStoreMoveOutcome};
 
 // Lock order (every method): cipher_memberships -> prot_ledger -> prot_accounts
 // -> prot_pledges -> prot_goals (the complete order is in models/prot/mod.rs).
@@ -25,6 +31,10 @@ use super::{
 // the end, and never calls another trait method while holding one (the mutex
 // is not re-entrant). Every check runs before the first mutation, so a refused
 // call changes nothing: that is this driver's transaction.
+//
+// S6: the store move takes prot_ledger -> prot_accounts -> prot_pledges ->
+// prot_goals -> prot_store_intents -> prot_store_purchases, and
+// held_purchase_prot takes prot_ledger -> prot_store_purchases.
 
 /// A posting whose checks all passed, ready to write
 pub(in crate::models::prot) struct PreparedPosting {
@@ -301,12 +311,14 @@ fn hold_debit_locked(
 /// The pledge drain (10.1 step c, `drain_held_pledges_in` in MongoDB): up
 /// to `rest` from the buyer's Held pledges, newest first, each through
 /// `clawback-hold:`. Returns the rows recorded; what they moved is the
-/// drain's recovery.
+/// drain's recovery. S6 (7.3): keys `clawback-hold:{key_base}:{pledge}`
+/// (S5b passes the order).
 fn drain_held_pledges_locked(
     maps: &HoldMaps,
     writes: &mut LockedWrites,
     user_id: &str,
     order_id: &str,
+    key_base: &str,
     rest: i64,
     now: i64,
 ) -> Result<Vec<ProtLedgerEntry>> {
@@ -319,7 +331,7 @@ fn drain_held_pledges_locked(
 
     let mut rows = Vec::new();
     for (pledge, x) in plan_pledge_drain(rest, &held) {
-        let posting = clawback_hold_posting(order_id, pledge, x, now);
+        let posting = clawback_hold_posting(key_base, order_id, pledge, x, now);
         rows.extend(hold_debit_locked(
             maps,
             writes,
@@ -336,20 +348,30 @@ fn drain_held_pledges_locked(
 /// what the `clawback:` posting asks for; (b) the wallet gives `w =
 /// min(total, balance)`; (c) the held pledges give up to `total - w`; (d) the
 /// `clawback:` row records `amount = w`, `requested = total` and the FINAL
-/// shortfall `total - w - drained`. Never a tank.
+/// shortfall `total - w - drained`. Never a tank. S6 (7.3): the drain's keys
+/// use `key_base`.
 fn claw_back_locked(
     maps: &HoldMaps,
     writes: &mut LockedWrites,
     posting: &ProtPosting,
     user_id: &str,
     order_id: &str,
+    key_base: &str,
     now: i64,
 ) -> Result<ProtLedgerEntry> {
     let total = clawback_total(posting)?;
     let from_wallet = total.min(balance_of(maps.accounts, &posting.debit).max(0));
 
     let drained = if total > from_wallet {
-        drain_held_pledges_locked(maps, writes, user_id, order_id, total - from_wallet, now)?
+        drain_held_pledges_locked(
+            maps,
+            writes,
+            user_id,
+            order_id,
+            key_base,
+            total - from_wallet,
+            now,
+        )?
     } else {
         Vec::new()
     };
@@ -582,6 +604,7 @@ impl AbstractProtLedger for ReferenceDb {
             &posting,
             user_id,
             order_id,
+            order_id,
             now,
         )?;
 
@@ -647,6 +670,7 @@ impl AbstractProtLedger for ReferenceDb {
             &posting,
             user_id,
             order_id,
+            order_id,
             now,
         )?;
 
@@ -656,7 +680,10 @@ impl AbstractProtLedger for ReferenceDb {
 
     async fn held_purchase_prot(&self, user_id: &str, since_ms: i64) -> Result<i64> {
         let ledger = self.prot_ledger.lock().await;
-        Ok(held_purchase_prot_locked(&ledger, user_id, since_ms))
+        // S6 (7.4): plus the unconsumed Play credits from before the window
+        let purchases = self.prot_store_purchases.lock().await;
+        Ok(held_purchase_prot_locked(&ledger, user_id, since_ms)
+            .saturating_add(held_store_unconsumed_locked(&purchases, user_id, since_ms)))
     }
 
     async fn sum_held_prot_pledges(&self, user_id: &str) -> Result<i64> {
@@ -712,5 +739,128 @@ impl AbstractProtLedger for ReferenceDb {
             writes.apply(&mut ledger, &mut accounts, &mut pledges, &mut goals);
             written.extend(entry);
         }
+    }
+
+    async fn apply_store_purchase_move(&self, m: &ProtStoreMove) -> Result<ProtStoreMoveOutcome> {
+        let gen = validate_store_move(m)?;
+
+        // The ledger maps first, then the store maps (models/prot/mod.rs)
+        let mut ledger = self.prot_ledger.lock().await;
+        let mut accounts = self.prot_accounts.lock().await;
+        let mut pledges = self.prot_pledges.lock().await;
+        let mut goals = self.prot_goals.lock().await;
+        let mut intents = self.prot_store_intents.lock().await;
+        let mut purchases = self.prot_store_purchases.lock().await;
+        let mut row = m.row.clone();
+
+        // 1. Absent for an insert, at the expected version for a CAS (a stale
+        // move is Conflict); then every posting is bounded by that stored row
+        let stored = purchases.get(&row.id);
+        let version = match (m.expected_version, stored) {
+            (None, None) => 0,
+            (Some(expected), Some(stored)) if stored.version == expected => {
+                expected.checked_add(1).ok_or_else(|| {
+                    log::error!("PROT_VERSION_OVERFLOW version={expected}");
+                    create_error!(InternalError)
+                })?
+            }
+            _ => return Ok(ProtStoreMoveOutcome::Conflict),
+        };
+        check_store_credit(stored.map(|stored| stored.state), m)?;
+        let order_rows: Vec<ProtLedgerEntry> = if store_move_reinstates(m) {
+            ledger
+                .values()
+                .filter(|entry| entry.reference.order_id.as_deref() == Some(row.id.as_str()))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        check_store_move_bounds(stored, m, &order_rows)?;
+
+        // 2. The intent, Open or Expired and still the row's user's
+        if let Some(intent_id) = &m.use_intent {
+            let usable = intents.get(intent_id).is_some_and(|intent| {
+                matches!(
+                    intent.state,
+                    v0::ProtStoreIntentState::Open | v0::ProtStoreIntentState::Expired
+                ) && intent.user_id == row.user_id
+            });
+            if !usable {
+                return Ok(ProtStoreMoveOutcome::Conflict);
+            }
+        }
+
+        // 3. The postings, checked in full against this section's view;
+        // nothing reaches the maps until every check has passed
+        let mut writes = LockedWrites::default();
+        match &m.ledger {
+            ProtStoreLedger::None => {}
+            ProtStoreLedger::Credit(posting) => {
+                let payload_hash = prot_payload_hash(posting);
+                if let Some(stored) = ledger.get(&posting.key) {
+                    return store_move_duplicate(&posting.key, &payload_hash, Some(stored.clone()));
+                }
+                writes.post(
+                    &HoldMaps {
+                        ledger: &ledger,
+                        accounts: &accounts,
+                        pledges: &pledges,
+                        goals: &goals,
+                    },
+                    posting,
+                    None,
+                )?;
+            }
+            ProtStoreLedger::Clawback {
+                user_id,
+                posting,
+                key_base,
+            } => {
+                let payload_hash = prot_payload_hash(posting);
+                if let Some(stored) = ledger.get(&posting.key) {
+                    return store_move_duplicate(&posting.key, &payload_hash, Some(stored.clone()));
+                }
+                let wallet = claw_back_locked(
+                    &HoldMaps {
+                        ledger: &ledger,
+                        accounts: &accounts,
+                        pledges: &pledges,
+                        goals: &goals,
+                    },
+                    &mut writes,
+                    posting,
+                    user_id,
+                    &row.id,
+                    key_base,
+                    posting.created_at,
+                )?;
+                let gen = gen.ok_or_else(|| create_error!(InternalError))?;
+                fill_store_refund(&mut row, gen, &writes.rows, &wallet)?;
+            }
+        }
+
+        // Test hook (store_move_credit_is_one_transaction): a failure between
+        // the postings and the row write leaves both maps untouched
+        if prot_store_move_crashes(&row.id) {
+            log::error!("PROT_STORE_MOVE_CRASH_INJECTED id={}", row.id);
+            return Err(create_error!(InternalError));
+        }
+
+        // 4. Every write, which cannot fail
+        let entries = writes.rows.clone();
+        writes.apply(&mut ledger, &mut accounts, &mut pledges, &mut goals);
+        if let Some(intent) = m
+            .use_intent
+            .as_ref()
+            .and_then(|intent_id| intents.get_mut(intent_id))
+        {
+            intent.state = v0::ProtStoreIntentState::Used;
+            intent.purchase_id = Some(row.id.clone());
+        }
+        row.version = version;
+        purchases.insert(row.id.clone(), row.clone());
+
+        Ok(ProtStoreMoveOutcome::Applied { row, entries })
     }
 }

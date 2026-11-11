@@ -24,6 +24,8 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 use revolt_database::voice::VoiceClient;
+use revolt_payments::settings::ProtStoreSettings;
+use revolt_payments::store::{AppleStoreApi, PlayStoreApi, ReqwestAppleStore, ReqwestPlayStore};
 use revolt_payments::stripe::{ReqwestStripe, StripeApi};
 use rocket::data::ToByteUnit;
 use std::sync::Arc;
@@ -39,9 +41,28 @@ pub async fn web() -> Rocket<Build> {
     web_with_stripe(stripe).await
 }
 
-/// [`web`] with the Stripe client supplied by the caller, so the test
-/// harness can manage a `MockStripe` in its place.
+/// [`web`] with the Stripe client supplied by the caller, and the App Store
+/// and Google Play clients for the in-app Prot routes built from the store
+/// config. Without credentials, or with a store config that does not
+/// validate (logged), a store client reports `configured()` false and every
+/// call fails closed without touching the network, so that store is not
+/// sold through. The keys stay inside the clients, whose Debug output
+/// redacts them.
 pub async fn web_with_stripe(stripe: Arc<dyn StripeApi>) -> Rocket<Build> {
+    let st = ProtStoreSettings::load_or_closed().await;
+    let apple: Arc<dyn AppleStoreApi> = Arc::new(ReqwestAppleStore::new(st.apple));
+    let play: Arc<dyn PlayStoreApi> = Arc::new(ReqwestPlayStore::new(st.play));
+
+    web_with_clients(stripe, apple, play).await
+}
+
+/// [`web`] with every payment client supplied by the caller, so the test
+/// harness can manage `MockStripe`, `MockAppleStore` and `MockPlayStore`.
+pub async fn web_with_clients(
+    stripe: Arc<dyn StripeApi>,
+    apple: Arc<dyn AppleStoreApi>,
+    play: Arc<dyn PlayStoreApi>,
+) -> Rocket<Build> {
     // Get settings
     let config = config().await;
 
@@ -111,6 +132,8 @@ pub async fn web_with_stripe(stripe: Arc<dyn StripeApi>) -> Rocket<Build> {
         .manage(cors.clone())
         .manage(voice_client)
         .manage(stripe)
+        .manage(apple)
+        .manage(play)
         .manage(ratelimits)
         .attach(ratelimiter::RatelimitFairing)
         .attach(cors)

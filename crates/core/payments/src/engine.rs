@@ -101,6 +101,11 @@ pub mod prot;
 /// clock, the goal sweep and the tank notices.
 pub mod tank;
 
+/// In-app Prot (S6): App Store and Google Play purchases, verified with the
+/// stores and moved through the purchase-row state machine, one database
+/// transaction per move (intents, verify, notifications, reconcile, admin).
+pub mod prot_store;
+
 /// How long a worker holds an order; longer than the worst-case chain of
 /// Stripe calls (each has a 10 s timeout)
 pub const LEASE_MS: i64 = 120_000;
@@ -3255,11 +3260,14 @@ pub async fn on_account_deleted(
 
 /// The part of the account-deletion cascade that must succeed before the
 /// account is deleted: unlink every order from the user, then delete the
-/// Cipher membership. No Stripe call, so it also runs when no payments
-/// config is usable. Both steps are idempotent, so a retry is safe.
+/// Cipher membership, then unlink the user's in-app purchase rows and
+/// intents (a later store refund of one finds no buyer). No Stripe call, so
+/// it also runs when no payments config is usable. Every step is
+/// idempotent, so a retry is safe.
 pub async fn unlink_account_payments(db: &Database, user_id: &str) -> Result<()> {
     db.unlink_payment_orders_by_user(user_id).await?;
     db.delete_cipher_membership(user_id).await?;
+    db.unlink_prot_store_user(user_id).await?;
     Ok(())
 }
 

@@ -21,6 +21,7 @@ use revolt_database::{
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
 use revolt_models::v0;
+use revolt_payments::store::{MockAppleStore, MockPlayStore};
 use revolt_payments::stripe::MockStripe;
 use revolt_permissions::OverrideField;
 use rocket::http::Header;
@@ -79,6 +80,14 @@ pub struct TestHarness {
     /// responses and failures here and read back the calls a route made; the
     /// harness never reaches the network.
     pub stripe: Arc<MockStripe>,
+    /// The App Store client the rocket manages (as `Arc<dyn AppleStoreApi>`).
+    /// Script lookups and failures here and read back the calls a route made.
+    /// `configured()` unless the test calls `unconfigured()`; the test config
+    /// itself carries no store credentials.
+    pub apple: Arc<MockAppleStore>,
+    /// The Google Play client the rocket manages (as `Arc<dyn PlayStoreApi>`),
+    /// as `apple`; `no_pubsub()` takes RTDN away.
+    pub play: Arc<MockPlayStore>,
     /// Connection string this harness resolved to, kept so `Drop` can
     /// reconnect and delete the throwaway database. `None` on the reference
     /// driver, which leaves nothing behind. Captured at construction because
@@ -278,9 +287,13 @@ impl TestHarness {
         );
 
         let stripe = Arc::new(MockStripe::new());
-        let client = Client::tracked(crate::web_with_stripe(stripe.clone()).await)
-            .await
-            .expect("valid rocket instance");
+        let apple = Arc::new(MockAppleStore::new());
+        let play = Arc::new(MockPlayStore::new());
+        let client = Client::tracked(
+            crate::web_with_clients(stripe.clone(), apple.clone(), play.clone()).await,
+        )
+        .await
+        .expect("valid rocket instance");
 
         // Pump the subscription from construction time. The previous
         // per-`wait_for_event`-call `on_message()` stream lost events that
@@ -334,6 +347,8 @@ impl TestHarness {
             db,
             amqp,
             stripe,
+            apple,
+            play,
             mongo_uri,
             events,
             event_buffer: vec![],

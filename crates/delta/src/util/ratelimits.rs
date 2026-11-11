@@ -445,6 +445,19 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // shares the payments_me counter; checkout falls through to
                 // "payments" below.
                 ("payments", Some("prot"), _) if extra == Some("@me") => ("payments_me", None),
+                // In-app purchase verify (POST /payments/prot/store/verify): the app replays every
+                // unfinished store transaction at launch, so it gets its own counter. The 4th segment
+                // tells it from the intent (POST …/store/intent), which stays on the tight "payments" budget.
+                ("payments", Some("prot"), _)
+                    if extra == Some("store")
+                        && request.routed_segment(if versioned { 4 } else { 3 })
+                            == Some("verify") =>
+                {
+                    ("payments_store", None)
+                }
+                // App Store Server Notifications carry no session: keyed by the sender's address, like the
+                // Stripe webhook, so neither buyers nor "any" can spend it.
+                ("payments", Some("apple"), _) => ("payments_apple_webhook", None),
                 // Checkout, keyed per session. It creates a Stripe session,
                 // so the budget is tight; the engine's one live Pending
                 // order per user bounds a user with many sessions
@@ -626,6 +639,13 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // in the fixed 10 s window; 3 per window (the checkout precedent)
             // caps a script at 18 per minute.
             "prot_write" => 3,
+            // In-app purchase verify: the app replays each unfinished store
+            // transaction at launch and on every transaction update, so a
+            // buyer with a small backlog needs more than checkout's 3
+            "payments_store" => 10,
+            // One delivery per App Store notification plus Apple's retries
+            // after a failed one, as the Stripe webhook
+            "payments_apple_webhook" => 60,
             _ => 20,
         }
     }
@@ -1322,6 +1342,214 @@ mod tests {
         let terminate = client.post("/admin/prot/tanks/01TNK/terminate").dispatch();
         assert_eq!(terminate.status(), Status::Ok);
         assert_eq!(bucket(&terminate), bucket(&any));
+    }
+
+    #[rocket::post("/prot/store/intent")]
+    fn prot_store_intent() {}
+
+    #[rocket::post("/prot/store/intent/<_intent_id>/cancel")]
+    fn prot_store_intent_cancel(_intent_id: &str) {}
+
+    #[rocket::post("/prot/store/verify")]
+    fn prot_store_verify() {}
+
+    #[rocket::post("/apple/notifications")]
+    fn apple_notifications() {}
+
+    /// The in-app Prot routes and the App Store notification receiver, on
+    /// the same database-free Rocket as `client()`
+    fn prot_store_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount(
+                "/payments",
+                rocket::routes![
+                    prot_store_intent,
+                    prot_store_intent_cancel,
+                    prot_store_verify,
+                    apple_notifications,
+                    prot_me,
+                    stripe_webhook
+                ],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Verify (POST /payments/prot/store/verify) resolves to `payments_store`
+    /// (limit 10) by its 4th segment, so the intent and its cancel stay on
+    /// the tight `payments` budget; the App Store notifications resolve to
+    /// `payments_apple_webhook` (limit 60), a counter apart from Stripe's
+    #[test]
+    fn prot_store_routes_split_into_their_own_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = prot_store_client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/payments/prot/store/verify", "payments_store"),
+            ("POST", "/0.8/payments/prot/store/verify", "payments_store"),
+            ("POST", "/payments/prot/store/intent", "payments"),
+            ("POST", "/0.8/payments/prot/store/intent", "payments"),
+            (
+                "POST",
+                "/payments/prot/store/intent/01INTENT/cancel",
+                "payments",
+            ),
+            (
+                "POST",
+                "/0.8/payments/prot/store/intent/01INTENT/cancel",
+                "payments",
+            ),
+            (
+                "POST",
+                "/payments/apple/notifications",
+                "payments_apple_webhook",
+            ),
+            (
+                "POST",
+                "/0.8/payments/apple/notifications",
+                "payments_apple_webhook",
+            ),
+            ("GET", "/payments/prot/@me", "payments_me"),
+            ("GET", "/0.8/payments/prot/@me", "payments_me"),
+            ("POST", "/payments/prot/checkout", "payments"),
+            ("POST", "/payments/stripe/webhook", "payments_webhook"),
+            // Must NOT match: "verify" anywhere but the segment after
+            // payments/prot/store, or under another resource
+            ("POST", "/payments/prot/store", "payments"),
+            ("POST", "/payments/prot/verify", "payments"),
+            ("POST", "/payments/prot/checkout/verify", "payments"),
+            ("POST", "/payments/prot/store/intent/verify", "payments"),
+            ("POST", "/payments/prot/store/01INTENT/verify", "payments"),
+            (
+                "POST",
+                "/0.8/payments/prot/store/01INTENT/verify",
+                "payments",
+            ),
+            ("POST", "/payments/cipher/store/verify", "payments"),
+            ("POST", "/payments/applestore/notifications", "payments"),
+            ("POST", "/apple/notifications", "any"),
+            // S5b's /prot write arm keeps its paths and never sees /payments
+            ("POST", "/prot/store/verify", "prot_write"),
+            ("POST", "/0.8/prot/store/verify", "prot_write"),
+            ("GET", "/prot/store/verify", "any"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("payments_store"), 10);
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket_limit("payments_apple_webhook"),
+            60
+        );
+
+        // Through the fairing: verify 10 per window, the intent 3, Apple's
+        // notifications 60, each its own counter
+        let verify = client.post("/payments/prot/store/verify").dispatch();
+        assert_eq!(verify.status(), Status::Ok);
+        assert_eq!(limit(&verify), 10);
+        let intent = client.post("/payments/prot/store/intent").dispatch();
+        assert_eq!(intent.status(), Status::Ok);
+        assert_eq!(limit(&intent), 3);
+        let cancel = client
+            .post("/payments/prot/store/intent/01INTENT/cancel")
+            .dispatch();
+        assert_eq!(cancel.status(), Status::Ok);
+        assert_eq!(
+            bucket(&cancel),
+            bucket(&intent),
+            "a cancel spends the intent's counter"
+        );
+        let apple = client.post("/payments/apple/notifications").dispatch();
+        assert_eq!(apple.status(), Status::Ok);
+        assert_eq!(limit(&apple), 60);
+        let stripe = client.post("/payments/stripe/webhook").dispatch();
+        assert_eq!(stripe.status(), Status::Ok);
+        let me = client.get("/payments/prot/@me").dispatch();
+        assert_eq!(me.status(), Status::Ok);
+        let any = client.get("/sync/settings").dispatch();
+        let buckets = [
+            bucket(&verify),
+            bucket(&intent),
+            bucket(&apple),
+            bucket(&stripe),
+            bucket(&me),
+            bucket(&any),
+        ];
+        for (i, a) in buckets.iter().enumerate() {
+            for b in &buckets[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "verify, intent, both webhooks, the wallet and any must be distinct counters"
+                );
+            }
+        }
+
+        // The versioned prefix (which 404s here after the fairing has
+        // counted it) spends the same verify counter
+        let versioned = client.post("/0.8/payments/prot/store/verify").dispatch();
+        assert_eq!(limit(&versioned), 10);
+        assert_eq!(bucket(&versioned), bucket(&verify));
+
+        // Two verifies so far: 8 more fill the window of 10, the 11th is
+        // refused
+        for _ in 0..8 {
+            assert_eq!(
+                client
+                    .post("/payments/prot/store/verify")
+                    .dispatch()
+                    .status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client
+                .post("/payments/prot/store/verify")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // The intent still answers: an intent and a cancel so far, one more
+        // fills the window of 3 and the next is refused
+        assert_eq!(
+            client
+                .post("/payments/prot/store/intent")
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client
+                .post("/payments/prot/store/intent/01INTENT/cancel")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // Apple's and Stripe's deliveries are spent by neither
+        assert_eq!(
+            client
+                .post("/payments/apple/notifications")
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.post("/payments/stripe/webhook").dispatch().status(),
+            Status::Ok
+        );
     }
 
     #[test]

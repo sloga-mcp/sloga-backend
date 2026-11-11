@@ -48,6 +48,21 @@ log = { workspace = true }
 # Order ids
 ulid = { workspace = true }
 
+# In-app purchases (S6): the Apple JWS verifier (store/apple_jws.rs) and the App Store / Google
+# Play clients (store/). Pinned to the versions already in Cargo.lock; x509-cert without its
+# default features (they pull tls_codec into the lock)
+base64 = { workspace = true }
+const-oid = "=0.9.6"
+der = { version = "=0.7.10", features = ["alloc", "oid"] }
+ecdsa = { version = "=0.16.9", features = ["der", "verifying"] }
+jsonwebtoken = { workspace = true }
+p256 = { version = "=0.13.2", features = ["ecdsa"] }
+p384 = { version = "=0.13.1", features = ["ecdsa"] }
+x509-cert = { version = "=0.2.5", default-features = false }
+# Store intent tokens (Apple appAccountToken UUID v4, Play random account id)
+uuid = { workspace = true, features = ["v4"] }
+rand = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 # Drops the throwaway Mongo test databases even when a test panics

@@ -331,14 +331,21 @@ pub async fn prot_me(
         .map_or((0, 0), |account| (account.balance, account.version));
 
     // A refunded recent purchase is no longer held: its clawback took that
-    // Prot back already (carry-forward 2)
+    // Prot back already (carry-forward 2). An in-app Play credit the server
+    // has not consumed yet stays held whatever the hold is, 0 included
+    // (prot-s6-contracts 7.4): `held_purchase_prot` adds it past the window,
+    // `sum_unconsumed_play_prot` alone when there is no window
     let hold_ms = ps.hold_ms();
-    let held = if hold_ms > 0 && balance > 0 {
+    let held = if balance <= 0 {
+        0
+    } else if hold_ms > 0 {
         db.held_purchase_prot(user_id, now_ms.saturating_sub(hold_ms))
             .await?
             .clamp(0, balance)
     } else {
-        0
+        db.sum_unconsumed_play_prot(user_id, i64::MAX)
+            .await?
+            .clamp(0, balance)
     };
 
     let pending_order = db
@@ -369,6 +376,8 @@ pub async fn prot_me(
         version,
         pending_order,
         recent,
+        // The route fills it from the store settings (15.2)
+        store_preview: false,
     })
 }
 
@@ -382,6 +391,43 @@ pub(super) async fn purchase_applied(db: &Database, order_id: &str) -> Result<bo
         .fetch_prot_entry_by_key(&prot_key_purchase(order_id))
         .await?
         .is_some())
+}
+
+/// The credit of a purchase: `Exact(prot)` under `purchase:{order_id}`,
+/// `sys:issued` → the buyer's wallet, by `actor`. A Stripe order is credited
+/// by `sys:payments` (its payload hash is unchanged by this helper); an
+/// in-app purchase's credit is built by `build_store_move` with `sys:store`
+/// and posted in its row's transaction (prot-s6-contracts 9.7, R49).
+pub(super) fn purchase_posting(
+    order_id: &str,
+    prot: i64,
+    user_id: &str,
+    actor: &str,
+    now_ms: i64,
+) -> ProtPosting {
+    ProtPosting {
+        key: prot_key_purchase(order_id),
+        kind: ProtEntryKind::Purchase,
+        debit: PROT_SYS_ISSUED.to_string(),
+        credit: prot_user_account(user_id),
+        amount: ProtAmount::Exact(prot),
+        debit_floor: 0,
+        actor: actor.to_string(),
+        reference: ProtRef {
+            order_id: Some(order_id.to_string()),
+            ..Default::default()
+        },
+        reason: None,
+        created_at: now_ms,
+    }
+}
+
+/// After a store move that wrote a ledger row for `user_id` committed: the
+/// balance is published to its owner and the second pass forfeits a credit
+/// that reached a deleted account (prot-s6-contracts 9.7)
+pub(super) async fn after_store_posting(db: &Database, user_id: &str, now_ms: i64) -> Result<()> {
+    Box::pin(publish_balance(db, user_id)).await;
+    forfeit_if_deleted(db, user_id, now_ms).await
 }
 
 /// Credit a paid Prot order: `Exact(sku prot)` under `purchase:{order_id}`,
@@ -404,21 +450,7 @@ pub(super) async fn apply_purchase(
         return Err(create_error!(InternalError));
     };
 
-    let posting = ProtPosting {
-        key: prot_key_purchase(&order.id),
-        kind: ProtEntryKind::Purchase,
-        debit: PROT_SYS_ISSUED.to_string(),
-        credit: prot_user_account(user_id),
-        amount: ProtAmount::Exact(prot),
-        debit_floor: 0,
-        actor: PROT_ACTOR_PAYMENTS.to_string(),
-        reference: ProtRef {
-            order_id: Some(order.id.clone()),
-            ..Default::default()
-        },
-        reason: None,
-        created_at: now_ms,
-    };
+    let posting = purchase_posting(&order.id, prot, user_id, PROT_ACTOR_PAYMENTS, now_ms);
 
     if let ProtApplyOutcome::Applied(entry) = db.apply_prot_posting(&posting).await? {
         log::info!(
@@ -2552,6 +2584,7 @@ mod tests {
                 version: 0,
                 pending_order: None,
                 recent: vec![],
+                store_preview: false,
             }
         );
 

@@ -21,6 +21,7 @@ use crate::{
     CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtContributorPref,
     ProtGoal, ProtLedgerEntry, ProtNotice, ProtPledge, ProtRuntime, ProtTank,
 };
+use crate::{ProtStoreCursor, ProtStoreIntent, ProtStorePurchase};
 
 database_derived!(
     /// Reference implementation
@@ -106,5 +107,12 @@ database_derived!(
         pub prot_notices: Arc<Mutex<HashMap<String, ProtNotice>>>,
         /// Keyed by "{server_id}:{user_id}"
         pub prot_contributor_prefs: Arc<Mutex<HashMap<String, ProtContributorPref>>>,
+        // S6 in-app purchases; lock order: models/prot/mod.rs
+        /// Keyed by `_id` (intent ULID)
+        pub prot_store_intents: Arc<Mutex<HashMap<String, ProtStoreIntent>>>,
+        /// Keyed by `_id` (`apple:{prod|sandbox}:{transactionId}` / `play:{sha256hex}`)
+        pub prot_store_purchases: Arc<Mutex<HashMap<String, ProtStorePurchase>>>,
+        /// Keyed by `_id` (`apple-history` / `play-voided`)
+        pub prot_store_cursors: Arc<Mutex<HashMap<String, ProtStoreCursor>>>,
     }
 );

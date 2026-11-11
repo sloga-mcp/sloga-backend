@@ -231,6 +231,34 @@ tolerance_secs = 300
 # refuses every checkout until Stripe Tax is active in the account, so turn on only after that
 automatic_tax = false
 
+[api.appstore]
+# App Store Connect API issuer id; empty = App Store purchases not configured
+issuer_id = ""
+# In-App Purchase key id; empty = App Store purchases not configured
+key_id = ""
+# In-App Purchase key, PEM (PKCS#8 EC P-256) (secret, set only in deployment overrides)
+private_key = ""
+# Bundle id every signed transaction must carry
+bundle_id = "gg.sloga.app"
+# The app's Apple id (appAppleId) every Production transaction must carry
+app_apple_id = 6809989506
+# This deployment's own App Store environment: "Production" or "Sandbox"
+environment = "Production"
+# SHA-256 hex of the DER of Apple Root CA - G3, the root every signed payload must chain to
+root_ca_g3_sha256 = "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179"
+
+[api.googleplay]
+# Android package name every Play purchase must belong to
+package_name = "gg.sloga.app"
+# Service-account email; empty = Play purchases not configured
+client_email = ""
+# Service-account key, PEM (PKCS#8 RSA) (secret, set only in deployment overrides)
+private_key = ""
+# OAuth token endpoint of the service account
+token_uri = "https://oauth2.googleapis.com/token"
+# Real-time developer notifications, "projects/{p}/subscriptions/{s}"; empty = RTDN not pulled
+pubsub_subscription = ""
+
 [pushd]
 # this changes the names of the queues to not overlap 
 # prod/beta if they happen to be on the same exchange/instance.
@@ -560,6 +588,36 @@ prot_blocked_countries = [
 prot_success_url = "https://app.sloga.gg/settings?prot=success"
 prot_cancel_url = "https://app.sloga.gg/settings?prot=cancel"
 prot_shell_return_url = "https://sloga.gg/prot/thanks/"
+# In-app Prot (App Store / Google Play). Each open flag gates NEW intents for its store only;
+# verifying a purchase and handling a refund never read it
+prot_store_apple_open = false
+prot_store_play_open = false
+# Emergency switch: verified purchases are recorded Held, and crond credits them once it is off
+prot_store_credit_paused = false
+# Store product id -> Prot per unit. Prices live in the store consoles; a Prot change is a NEW
+# product id. Setting the key in Revolt.overrides.toml replaces the whole list.
+prot_store_products = [
+    { store = "apple", product_id = "gg.sloga.prot.p5", prot = 500 },
+    { store = "apple", product_id = "gg.sloga.prot.p10", prot = 1000 },
+    { store = "apple", product_id = "gg.sloga.prot.p25", prot = 2600 },
+    { store = "apple", product_id = "gg.sloga.prot.p50", prot = 5300 },
+    { store = "apple", product_id = "gg.sloga.prot.p100", prot = 11000 },
+    { store = "play", product_id = "gg.sloga.prot.p5", prot = 500 },
+    { store = "play", product_id = "gg.sloga.prot.p10", prot = 1000 },
+    { store = "play", product_id = "gg.sloga.prot.p25", prot = 2600 },
+    { store = "play", product_id = "gg.sloga.prot.p50", prot = 5300 },
+    { store = "play", product_id = "gg.sloga.prot.p100", prot = 11000 },
+]
+# Accounts that see the store packs, and are credited, while a store is closed
+prot_store_preview_user_ids = []
+# Accounts whose sandbox / test purchases are credited on this server
+prot_store_test_user_ids = []
+# Most Prot one tester may be credited from sandbox / test purchases
+prot_store_test_max_prot = 25000
+# The US iPhone app may link to web checkout (server switch and advert field only; no app code)
+prot_store_us_web_link = false
+# Staff mailbox for store work items; empty = log only
+ops_alert_email = ""
 
 # --- Protected channels (protected-channels design §7.1) ---
 # The feature ships DARK: all keys below default in code to the values shown,

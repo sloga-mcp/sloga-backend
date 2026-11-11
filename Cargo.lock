@@ -7366,9 +7366,17 @@ name = "revolt-payments"
 version = "0.13.7"
 dependencies = [
  "async-trait",
+ "base64 0.21.7",
  "chrono",
+ "const-oid 0.9.6",
+ "der 0.7.10",
+ "ecdsa",
  "hmac 0.12.1",
+ "jsonwebtoken",
  "log",
+ "p256",
+ "p384",
+ "rand 0.8.6",
  "reqwest 0.13.4",
  "revolt-config",
  "revolt-database",
@@ -7381,6 +7389,8 @@ dependencies = [
  "subtle",
  "tokio",
  "ulid",
+ "uuid",
+ "x509-cert",
 ]
 
 [[package]]

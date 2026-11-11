@@ -50,6 +50,7 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
         "admin/prot_terminate.rs",
         "foreign_ticket_admin_prot_terminate",
     ),
+    ("admin/prot_store.rs", "foreign_ticket_admin_prot_store"),
     ("e2ee/delete_backup.rs", "foreign_ticket_delete_backup"),
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
@@ -920,6 +921,184 @@ async fn foreign_ticket_admin_prot_terminate_case() {
     assert_eq!(status, Status::Forbidden, "admin_prot_terminate");
     pair.assert_unchanged("admin_prot_terminate", &before).await;
     pair.assert_ticket_kept("admin_prot_terminate").await;
+}
+
+#[test]
+fn foreign_ticket_admin_prot_store() {
+    rt().block_on(foreign_ticket_admin_prot_store_case())
+}
+
+/// POST /admin/prot/store/:id/assign would credit an unbound store purchase
+/// to the attacker's wallet as the victim, and GET /admin/prot/store/:id
+/// would read it. The victim is promoted to staff, the purchase is
+/// assignable and Play shows it paid, so the refusal can only come from the
+/// binding.
+async fn foreign_ticket_admin_prot_store_case() {
+    use revolt_database::{
+        build_store_move, now_ms, plan_store_move, prot_store_key_purchase, ProtStoreEvent,
+        ProtStorePlay, ProtStorePurchase, ProtStoreVerdict,
+    };
+    use revolt_payments::store::{
+        PlayLineItem, PlayOfferDetails, PlayPurchase, PlayStateContext,
+        PLAY_PURCHASE_STATE_PURCHASED,
+    };
+    use sha2::{Digest, Sha256};
+
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+    let before = victim_state(&pair).await;
+
+    // An unbound Play purchase, written as the engine writes one
+    let token = format!("binding-token.{}", ulid::Ulid::new());
+    let hash: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let now = now_ms();
+    let seed = ProtStorePurchase {
+        id: format!("play:{hash}"),
+        store: v0::ProtStore::Play,
+        user_id: None,
+        intent_id: None,
+        product_id: "gg.sloga.prot.p5".to_string(),
+        prot: 500,
+        quantity: 1,
+        environment: v0::ProtStoreEnvironment::Production,
+        storefront: None,
+        country: None,
+        state: v0::ProtStoreState::Rejected,
+        reject_reason: None,
+        refund_gen: 0,
+        refunds: vec![],
+        unreinstated_reversals: 0,
+        apple: None,
+        play: Some(ProtStorePlay {
+            purchase_token: token.clone(),
+            order_id: None,
+            obfuscated_account_id: None,
+            consumed_at: None,
+            test: false,
+            region_code: None,
+        }),
+        credited_at: None,
+        unconsumed: None,
+        revoked_at: None,
+        revocation_reason: None,
+        assigned_by: None,
+        needs_action: None,
+        alerted: vec![],
+        created_at: now,
+        updated_at: now,
+        version: 0,
+    };
+    let event = ProtStoreEvent::Seen(ProtStoreVerdict::Reject {
+        reason: v0::ProtStoreRejectReason::Unbound,
+        user_id: None,
+        intent_id: None,
+    });
+    let plan = plan_store_move(None, &event, 0);
+    let m = build_store_move(None, &seed, &event, &plan, 0, now).expect("a move");
+    pair.harness
+        .db
+        .apply_store_purchase_move(&m)
+        .await
+        .expect("store move");
+    let row = pair
+        .harness
+        .db
+        .fetch_prot_store_purchase(&seed.id)
+        .await
+        .expect("row read")
+        .expect("the row");
+    pair.harness.play.set_purchase(
+        &token,
+        Ok(PlayPurchase {
+            product_line_item: vec![PlayLineItem {
+                product_id: "gg.sloga.prot.p5".to_string(),
+                product_offer_details: PlayOfferDetails::default(),
+            }],
+            purchase_state_context: PlayStateContext {
+                purchase_state: PLAY_PURCHASE_STATE_PURCHASED.to_string(),
+            },
+            test_purchase_context: None,
+            order_id: None,
+            obfuscated_external_account_id: None,
+            region_code: None,
+            purchase_completion_time: None,
+            acknowledgement_state: None,
+        }),
+    );
+
+    let body = json!({ "user_id": pair.attacker_user.id });
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .post(format!("/admin/prot/store/{}/assign", row.id))
+                .header(ContentType::JSON)
+                .header(Header::new("X-Audit-Log-Reason", "goodwill"))
+                .body(body.to_string()),
+        )
+        .dispatch()
+        .await
+        .status();
+    assert_eq!(status, Status::Forbidden, "admin_prot_store assign");
+
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .get(format!("/admin/prot/store/{}", row.id))
+                .header(Header::new("X-Audit-Log-Reason", "check")),
+        )
+        .dispatch()
+        .await
+        .status();
+    assert_eq!(status, Status::Forbidden, "admin_prot_store read");
+
+    assert!(
+        pair.harness
+            .db
+            .fetch_prot_entry_by_key(&prot_store_key_purchase(&row.id))
+            .await
+            .expect("ledger read")
+            .is_none(),
+        "admin_prot_store: the purchase was credited"
+    );
+    assert!(
+        pair.harness
+            .db
+            .fetch_prot_account(&prot_user_account(&pair.attacker_user.id))
+            .await
+            .expect("account read")
+            .is_none(),
+        "admin_prot_store: the attacker's wallet was credited"
+    );
+    assert_eq!(
+        pair.harness
+            .db
+            .fetch_prot_store_purchase(&row.id)
+            .await
+            .expect("row read"),
+        Some(row),
+        "admin_prot_store: the purchase moved"
+    );
+    assert!(
+        pair.harness.play.calls().is_empty(),
+        "admin_prot_store: the store was asked"
+    );
+    pair.assert_unchanged("admin_prot_store", &before).await;
+    pair.assert_ticket_kept("admin_prot_store").await;
 }
 
 // ------------------------------------------------------------------------

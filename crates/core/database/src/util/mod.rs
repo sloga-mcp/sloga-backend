@@ -15,6 +15,7 @@ pub mod name_filter;
 pub mod password;
 pub mod permissions;
 pub mod prot_email;
+pub mod prot_store_alert;
 pub mod reference;
 pub mod shield;
 pub mod test_fixtures;

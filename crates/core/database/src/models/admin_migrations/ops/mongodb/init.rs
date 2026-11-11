@@ -1,7 +1,7 @@
 use super::scripts::{
-    create_payment_indexes, create_prot_indexes, create_prot_tank_indexes,
-    seed_cipher_numbers_table, LATEST_REVISION, PAYMENT_COLLECTIONS, PROT_COLLECTIONS,
-    PROT_TANK_COLLECTIONS,
+    create_payment_indexes, create_prot_indexes, create_prot_store_indexes,
+    create_prot_tank_indexes, seed_cipher_numbers_table, LATEST_REVISION, PAYMENT_COLLECTIONS,
+    PROT_COLLECTIONS, PROT_STORE_COLLECTIONS, PROT_TANK_COLLECTIONS,
 };
 
 use crate::mongodb::bson::doc;
@@ -289,6 +289,12 @@ pub async fn create_database(db: &MongoDb) {
     }
     // Prot fuel tanks (revision 79).
     for collection in PROT_TANK_COLLECTIONS {
+        db.create_collection(collection)
+            .await
+            .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
+    }
+    // Prot in-app purchases (revision 81).
+    for collection in PROT_STORE_COLLECTIONS {
         db.create_collection(collection)
             .await
             .unwrap_or_else(|error| panic!("Failed to create {collection} collection: {error}"));
@@ -1424,6 +1430,11 @@ pub async fn create_database(db: &MongoDb) {
     create_prot_tank_indexes(&db)
         .await
         .expect("Failed to create Prot tank indexes.");
+
+    // Prot in-app purchases. The same helper revision 81 runs.
+    create_prot_store_indexes(&db)
+        .await
+        .expect("Failed to create Prot store indexes.");
 
     info!("Created database.");
 }
