@@ -24,6 +24,21 @@ is stated. It covers the S3-N0 envelope v2 decoder (3.6.1), the native command a
 changes (8.2 to 8.4), the 4.4.1 rules as built, the #223 supersession, and a release note
 (rolling back past S2 is unsafe, 8.2).
 
+**S4 additions (S4-W0, 2026-11-11, #240).** Slice 4 (history sharing, protecting a channel
+that already has messages, the opt-in wipe of the pre-protect history, text tables in key
+backup) is added to this contract from the approved plan `protected-s4-history-plan.md`
+(decisions S4-D1 to S4-D23 and S4-D2b; approved 2026-10-25 with every recommended default,
+O-1 to O-18; its plan-audit items are cited here as S4-PA-1 to S4-PA-21 and its re-review items
+as S4-RR-1 to S4-RR-7). S4 stacks on S2: it consumes S2's v2 seat list and its `history:`,
+`history_boundary:` and `pre_history:` lines (4.1.1), S2's catch-up pager (6.3) and S2's
+events. New text is marked **DECISION (S4-W0)**; text that S4 changes is kept and marked "S4
+replaces" or "S4 extends". S4b items are marked "[S4b]" (own-device history in hidden mode
+over Olm, O-4; the native confirmation before an honest new device of a seated user walks
+history, O-17); everything else is S4a. What the plan did not settle was put to the S4-W0
+crypto-lens audit; its rulings are recorded in #283 and its fixes in #285 to #299. The S4
+index entries are #240 to #309 (section 12; #300 is the planner's 40 KiB cap ruling,
+#301 to #309 the second fix round).
+
 How to read it:
 
 - **MUST / MUST NOT / SHOULD** are normative.
@@ -92,6 +107,9 @@ Every signed text payload in this document follows the house pattern of
 | `sloga-text-commit-ad-v2` | commit `authenticated_data` v2 (S2) | 3.12.1 |
 | `sloga-text-join-v1` | Text join intent payload (S2) | 3.13 |
 | `sloga-owner-succession-v1` | owner succession statement ([S2b], format only) | 4.11 |
+| `sloga/text/history/v1` | MLS exporter label for the history key (S4) | 3.14.1 |
+| `sloga-text-history-link-v1` | history link AD context field (S4) | 3.14.5 |
+| `sloga-text-history-link-sig-v1` | history link signature payload (S4) | 3.14.5 |
 
 The first three are fixed by the plan. The last three are **DECISION (W0)**. Like the
 existing `acutest:e2ee:*` literals, each is a protocol constant: changing one is a protocol
@@ -101,6 +119,11 @@ carry their own copy and the section 5 vectors pin them byte-for-byte.
 **DECISION (S2-W0), #188.** The last six rows are S2's (plan S2-D1 to S2-D6). No S1 literal
 is renamed: every v1 builder and parser stays, for flag-off and dev data (7.1 `formats_v2`).
 Section 5.8 pins the six new literals byte for byte.
+
+**DECISION (S4-W0), #241.** The last three rows are S4's; their names are the plan's (S4-D1
+and its pinned cross-file contracts). No S1 or S2 literal is renamed. The seal label of the
+native history-key table, `sloga-text-history-key` (3.14.2), is a local store constant like
+W3's `sloga-text-epoch-key`, not a wire literal; 5.9 pins it with the three above.
 
 ---
 
@@ -132,6 +155,16 @@ the reconciler and closes R24 with the viewer-bound group id (3.1.1); the R24 fi
 channels on a v2 list, and a channel enters v2 only while `formats_v2` is on (7.1, #218), so
 flipping that flag is part of lifting the HOLD.
 
+**S4 (S4-W0, #240).** S4a takes three items out of "Out": history for new members and for a
+member's new device, under the owner's per-channel setting, default visible (3.14); protecting
+a channel that already has messages, with a permanent "protected from here" divider and an
+opt-in, owner-signed deletion of the earlier unencrypted history (4.1.1, 7.2, 9.5); and text
+tables in key backup (8.5; O-7 taken as S4a). Still out: own-device history in hidden mode
+([S4b], O-4), a plaintext cache for kicked members (O-5), content search over the pre-protect
+plaintext (O-12) and threads in a protected channel (O-11). **Rollout:** S4 adds the flag
+`history_setting` (7.1) beside S2's `formats_v2`; both stay off in production and flip only
+when every protected device runs S4. The HOLDs above are unchanged.
+
 ### 1.2 Trust model
 
 The server is a **Delivery Service plus directory**: it stores ciphertext, arbitrates one
@@ -159,6 +192,19 @@ A hostile or compromised server (or an operator with database access):
 | Relay a Welcome for a different channel's group | Make the joiner accept it: the text group id is derived from the channel id (3.1) and checked before any key derivation |
 | Register an extra device for a seated user (directory control) | Do so invisibly: a "new device joined" marker is shown; see residual R1 |
 
+**S4 (S4-W0, #242).** On a channel protected with history (a non-empty boundary B, 4.1.1)
+the row "Inject plaintext messages" is qualified, and two rows are added:
+
+| Can | Cannot |
+|---|---|
+| Inject a plaintext row whose id is at or below the signed boundary B (it mints the ids) | Make it render below the divider or as protected: it shows above the permanent "Messages above weren't protected" divider with the trust of an unprotected channel (residual R29); after a wipe, for any id above B, and for any ULID time after the earliest held list's `issued_at`, it is the red marker (9.5) |
+| Store, withhold or drop history links (3.14) | Read one: a link is AEAD ciphertext under an MLS exporter output the server never holds, and a device removed from the group cannot open the link of its removal epoch or any later one (3.14.1) |
+| Serve a moved boundary, an un-wiped list or a list that marks injected plaintext as old | Make a client accept it: B, `pre_history` and `history` live in the owner-signed, anti-rollback seat list; B is immutable and never later than the list's `issued_at` (4.1.1, 4.4.1) |
+
+The Delivery Service rule is unchanged: no group secret, exporter output or key is ever
+server-side. History links are ciphertext (3.14) and the key-backup text section rides inside
+the existing passphrase-sealed backup (8.5). Visible history WIDENS R1 and R3 (S4-D2b; 1.3).
+
 ### 1.3 Documented residuals (accepted for S1)
 
 - **R1. Injected extra device of a seated user.** The server controls the device directory. A
@@ -166,6 +212,17 @@ A hostile or compromised server (or an operator with database access):
   the signed list and within `device_cap`), and can then read the channel. This is the same
   risk as E2EE DMs. Mitigation: a visible "new device joined" marker (9.3) and slice-5 safety
   numbers. Not closed in S1.
+  **S4 (S4-W0, S4-D2b, #243): widened by visible history.** Before S4 an injected device
+  read from its join epoch on. On a channel whose history is visible it walks the history-link
+  chain (3.14) back to the most recent point history became visible and reads everything
+  visible from there. An MLS exporter cannot exclude a member, so an injected device running
+  attacker code derives `hist_key(j)` from its own leaf like any member. Mitigations: the "new
+  device joined" marker says the device can read the channel's history (9.5); the owner's
+  visible-mode copy says so (9.5); and [S4b] (O-17) an HONEST client on a new device of an
+  already-seated user walks history only after a native confirmation on one of that user's
+  existing devices, when one exists. That is a speed bump against account takeover through
+  the real app, NOT a fix for R1, whose mitigation stays device verification and safety
+  numbers.
 - **R2. Non-repudiation.** Messages are signed with the long-term vodozemac identity key, so
   authorship is provable to third parties (unlike deniable Olm). This is deliberate (it is
   what S9 franking and reporter-side reports build on) and must be stated in the consent copy.
@@ -173,8 +230,23 @@ A hostile or compromised server (or an operator with database access):
   (`mls_text_epoch_keys`) so history stays readable. Compromise of a device's store reveals
   all history that device could read; there is no forward secrecy at rest. MLS forward
   secrecy still covers the in-transit handshake.
+  **S4 (S4-W0, S4-D2b, S4-RR-7, #243): widened.** With visible history, compromising ANY
+  current member device's store opens all visible history of the channel through the
+  server-stored links, which are kept for the group's lifetime (O-6), not only what that device
+  derived itself. A compromised key backup whose text section carries history keys (8.5) opens
+  the same. Removal still bounds it: a device removed at epoch r cannot open the link held at
+  epoch r + 1 or any later one (3.14.1). Native keeps history keys like epoch keys (S4-D4).
 - **R4. History lost on logout or a new device until S4.** Text tables are excluded from key
   backup in S1. A new device of a seated user reads only messages from its join epoch on.
+  **S4 (S4-W0, S4-D10, #244): closed once the key-backup text section ships (8.5, S4a).** A
+  restore brings back the channel's epoch and history keys (re-sealed under the fresh master,
+  `source = 'backup'`), its lists, chains, authorities and pins; groups restore as `left`, the
+  device rejoins through the normal join path, and it fills the gap between the restored
+  epochs and its new join epoch through the link chain when history was visible (6.3 "S4").
+  What remains: a section dropped for size (`text_truncated`), epochs truncated oldest first,
+  a gap in hidden mode (own-device forwarding is [S4b], O-4), and kicked or banned users who
+  log out without a backup (no plaintext cache, O-5). A NEW device of a seated user without a
+  backup reads pre-join history only through the chain, so only while history is visible.
 - **R5. Welcome stranded by the queue budget until S2.** A Welcome dropped by the per-device
   E2EE queue depth cap leaves the joiner without group state. The joiner's join-intent retry
   (3 retries, media plan 1.4 step 5) then ends in the loud failure state; catch-up is S2.
@@ -195,6 +267,15 @@ A hostile or compromised server (or an operator with database access):
   epochs it was a member of and can sign valid messages at those epochs. A colluding server
   can insert them into history at any position. Live injection is caught (3.9 step 9); a
   forged backdated history entry is not, beyond the timestamp-skew marker (3.9 step 11).
+  **S4 (S4-W0, S4-D5, S4-PA-16, #245; amended by fix F4, #288).** The 3.9 step 9 time
+  clause reads the `first_seen_at` of the first held epoch without the sender's leaf. For a
+  `backup` row that is the device's own stored value (kept by the restore), and the verdict
+  stays `RemovedSender` (red). For a `history_link` row the value is the MINIMUM signed
+  `observed_at` across the candidates that carried the accepted keys (3.14.7), and a verdict
+  resting on it is INFORMATIONAL only: the grey marker "Timing of this message can't be
+  verified", never red. The tradeoff, stated: a removed sender colluding with the server can
+  backdate into history anyway (above), so a red verdict on imported timing protected little,
+  while one lying writer could otherwise paint honest history red with a small `observed_at`.
 - **R8. Server-forced removal is availability-trust.** Kick, ban, leave and account deletion
   remove the user from the group only if the server reports them (6.3). The security-bearing
   removal is the owner's signed unseat, itself subject to R11.
@@ -224,6 +305,12 @@ A hostile or compromised server (or an operator with database access):
   server tip whose only cause is an unpinned or revoked identity is
   `CatchUpLeafUnresolvable` (left, then rejoin), never poisoned (8.4). History for a pruned
   gap stays lost until S4.
+  **S4 (S4-W0, S4-D9, #246).** A device that rejoined after its commits were pruned fills
+  the gap through the history-link chain when history was visible for those transitions (6.3
+  "S4"); in hidden mode the gap stays lost ([S4b], O-4). Links are never pruned with commits
+  (2.8), but a link held at epoch e' >= 1 can only be WRITTEN while commit e' is stored (the
+  route reads its `history_visible`, 6.1 "S4"), so a transition whose commit was pruned before
+  anyone wrote its link has none.
 - **R10. Send-time check races.** The server's epoch and membership checks on send (7.3) are
   not atomic with commit arbitration; a send can land at epoch `e` while a commit to `e+1`
   wins. Receivers handle this (3.9 step 9).
@@ -340,6 +427,11 @@ A hostile or compromised server (or an operator with database access):
   history read that starts just before protect lands and fetches just after it can serve a
   stray once, within a window of microseconds. Accepted: a second flag read on the hot
   history path is not worth closing it, and the stray is never rendered as protected (9.4).
+  **S4 (S4-W0, S4-D12, #247).** On a channel protected with a boundary B, a crash-left stray
+  with `_id <= B` is truthful pre-protect plaintext: it is SERVED above the divider like every
+  pre-boundary row (7.5 "S4"), not dropped. A stray with `_id > B` (a send that lost its race
+  with protect and whose compensating delete failed) is dropped and reported as before, and
+  renders red if any path serves it (9.5). On a channel protected while empty R15 is unchanged.
 - **R16. Server ownership transfer racing protect (DECISION (W2), #144).** `server_edit`
   refuses a changed `owner` while any channel of the server is protected (7.4), but that
   refusal is a read and the transfer's write is unconditional. Both orders:
@@ -380,6 +472,13 @@ A hostile or compromised server (or an operator with database access):
   client paging backward reaches that page last and loses nothing by treating it as the
   start of history. A client paging FORWARD from the start of the channel gets it first, so
   W4 must not end forward paging on a short page alone.
+  **S4 replaces the reasoning above (S4-W0, S4-D15, S4-D17, S4-PA-15, #248).** With
+  pre-boundary rows served, strays sit just after B, in the MIDDLE of a channel's history, so
+  a short page is no longer only the oldest one. The fix is server-side: both drivers' history
+  and search queries carry the servable predicate (7.5 "S4"), so a page is full unless the
+  history is exhausted, and the post-filter is only a backstop that no longer reports
+  wipe-pending drops to Sentry. Clients also end backward and forward paging ONLY on an empty
+  page or a server `has_more: false`, never on a short page (9.5).
 - **R20. Server delete cleans only listed channels (DECISION (W2), #155).** `Server::delete`
   runs the protected cascade over the ids in `server.channels` (#142, 7.5), but the Mongo
   bulk delete removes channel rows by their `server` field. A protected channel missing
@@ -549,6 +648,66 @@ A hostile or compromised server (or an operator with database access):
   account flags, #222) until the owner is reinstated and recovers from a device, or the
   server is deleted. In S2a a staff ban of an owner goes through server deletion. S2b
   succession resolves it.
+- **R29. The server mints message ids, so it can inject plaintext at or below the boundary
+  (S4-W0, plan S4-R1, #249).** On a channel protected with history, a hostile server can
+  insert a plaintext row whose id is at or below the signed boundary B and whose ULID time is
+  not after the earliest held list's `issued_at`. It renders above the permanent divider as an
+  ordinary unprotected message, which is the trust that part of the channel always had; it
+  never renders below the divider unflagged, and after a wipe every plaintext row is red
+  (9.5). The 2-minute sign-time clock tolerance (4.1.1, S4-RR-3) lets B lie up to 2 minutes
+  after the owner's clock, inside this residual. A hostile server can also collect several
+  valid owner-only version-1 geneses during the protect retry loop (4.9 "S4"); the one it
+  applies is still a real owner-signed boundary, and a replayed older one only has a smaller,
+  stricter B.
+- **R30. R11 extends to the history setting (S4-W0, plan S4-R2, #249).** A hostile DS can
+  keep sequencing commits that embed an older list saying `history:visible` after the owner
+  signed `hidden`, so writers keep building links; only the owner can detect it (R11). Native
+  narrows it: a transition counts as visible only when BOTH the list embedded in its commit AND
+  the newest list the device holds when it processes that commit say visible (3.14.3), so a
+  member that adopted the `hidden` list never writes another link. Links already written cannot
+  be recalled, and any member can leak what it reads anyway (the owner copy says so, 9.5).
+- **R31. A member and the server can forge the roster of a history epoch (S4-W0 fix F11,
+  #295).** A joiner derives `roster(G, e)` from a link's `added` and `removed` (3.14.7 step
+  4) and checks them against the commit's declarations, which the server records unsigned. A
+  hostile server together with any member of epoch e + 1 (who holds the keys to write the
+  link) can therefore make a joiner accept a false `roster(e)`, and beyond commit retention a
+  lying writer alone can. Identity keys must still match the joiner's pins (step 3), so the
+  forgery can add or hide the leaf of a real device, never put words in another user's mouth:
+  messages are signed by leaf-bound identity keys, and a hidden leaf's messages show as
+  unverifiable. The contest (3.14.6) lets an honest member of e + 1 object.
+  **Amended in S4-W0 fix round 2 (#302).** One first writer can no longer cut history by
+  forging the roster: candidates carrying the same keys are merged (3.14.7), and a disagreement
+  only widens vouching below to the union of their rosters and greys that epoch's senders.
+  What remains: when the forger's candidate is the only one carrying those keys (no honest
+  candidate stored for that holder), a hostile server together with that member can still show
+  a joiner a false `roster(e)` within commit retention, or the member alone beyond it; the pins
+  still bind every entry to a real device.
+- **R32. Five colluding seated users can fill every candidate slot (S4-W0 fix F14,
+  #298).** Slots are one per writer user, five per holder epoch (3.14.6). Five colluding
+  members of epoch e' that each write first can take every slot, so no honest candidate is
+  stored; the search (3.14.7 "Evidence") accepts none of theirs without evidence, and
+  history before that epoch is unavailable to joiners: a loss of availability, never a forged
+  import. The server refuses a writer added after the holder epoch (6.1 "S4"), so the
+  colluders must have been members then.
+  **Amended in S4-W0 fix round 2 (#301, #302).** A planted probe counts only when its
+  author did not write a candidate carrying the same keys, but five colluders can split those
+  roles (R34). A joiner then imports the colluders' keys for that span and reads the messages
+  they planted, attributed to them by their pinned keys, instead of the real history of that
+  span; never another user's words. If an honest candidate for the same holder also has
+  evidence, the walk stops `conflict` (loud) instead.
+- **R33. A restore resets replay dedupe (S4-W0 fix F13, #297).** `mls_text_seen` is not
+  restored (8.5), so a restored device does not know the `cid` bindings it made before, and
+  against a hostile server a message replayed across the restore is not caught natively
+  (3.10). An honest server's durable `cid` index (2.7 step 4) still refuses a duplicate.
+- **R34. Two colluders can forge evidence (S4-W0 fix round 2, HIGH 1, #301).** A probe
+  counts as evidence only when its author is not a writer of any candidate carrying the same
+  keys, but two colluding members of an epoch can split the roles: one writes a link carrying
+  forged keys, the other stores a message encrypted under the forged text key (the server
+  stores any ciphertext) to serve as the probe. If no honest candidate for that holder has
+  evidence, a joiner accepts the forged keys for that epoch and reads the planted message,
+  attributed to its real author by the pinned key; if an honest candidate also has evidence,
+  the walk stops `conflict` (loud). The forged keys never decrypt the real messages of that
+  epoch, which show as undecryptable to that joiner.
 
 ---
 
@@ -565,6 +724,33 @@ A hostile or compromised server (or an operator with database access):
   with `protected: Some(false)` on a protected channel (`ChannelProtected`); setting it true is
   only done by the protect route. No migration ever writes false.
 - Only server `TextChannel`s can be protected (not DMs, groups, voice-only or forum channels).
+
+**S4 additions (S4-W0, S4-D14, #250).** `Channel::TextChannel` gains
+`protected_history: Option<ProtectedHistory>` (serde default, omitted when `None`; additive,
+no migration) on the database model, on `PartialChannel`, on the v0 `Channel::TextChannel` and
+in `util/bridge/v0.rs` both directions:
+
+```
+ProtectedHistory { boundary: String, wipe: HistoryWipe }
+HistoryWipe = None | Requested { at: Timestamp, by: String } | Done { at: Timestamp, count: u64 }
+```
+
+- **DECISION (S4-W0):** `HistoryWipe` serializes internally tagged, `#[serde(tag = "state",
+  rename_all = "snake_case")]`: `{ "state": "none" }`, `{ "state": "requested", "at", "by" }`,
+  `{ "state": "done", "at", "count" }`.
+- Written only by protect with a non-empty boundary (B and the wipe state derived from the
+  SIGNED genesis: `pre_history:kept` gives `None`, `wiped` gives `Requested`, 7.2 "S4"), by the
+  wipe route (`Requested`) and by the `history_wipes` job (`Done`, 7.5 "S4"). Not in
+  `FieldsChannel`, `DataEditChannel` or `DataCreateServerChannel`; `guard_protected_partial`
+  refuses a partial that carries it from any other writer (`ChannelProtected`). A channel
+  protected while empty never carries it.
+- `boundary` never changes once written; `wipe` only moves `None -> Requested -> Done`
+  (requesting again is idempotent; nothing moves back).
+- Carried by the protect `ChannelUpdate` (7.2) and by `ChannelUpdate { protected_history }`
+  when the wipe is requested and when it is done (7.5 "S4").
+- Informational for clients: they take the boundary and the wipe state from the VERIFIED seat
+  list (native `TextChannelState.history_boundary` and `pre_history`, 8.3 "S4"), never from
+  this field. The server reads it for `is_servable` (7.5 "S4").
 
 ### 2.2 `channel_entitlements` (new collection, both drivers)
 
@@ -1044,6 +1230,19 @@ byte-identical (the field-level rule of (b) above):
   path's Reference set. Pinning the identity documents' place in the Mongo claim order when
   S2-D17c lands is a recorded plan nit.
 
+**S4 additions to `MlsCommit` and `MlsGroup` (S4-W0, S4-D1, S4-D2, S4-PA-4, S4-PA-5, #251).**
+Additive, Text-only, `#[serde(default, skip_serializing_if = "Option::is_none")]`, no data
+migration; a Call commit leaves them untouched (the field-level rule of (b)):
+
+| Field | Type | Notes |
+|---|---|---|
+| `MlsCommit.history_visible` | `Option<bool>` | Written with the row inside the Text commit transaction, from the AD the route already parses (3.12.2): `Some(true)` when the embedded list is v2 with `history:visible`; `Some(false)` when it is v2 with `history:hidden`, or a v1 list (O-2); `None` on rows written before S4. It is the visibility of the transition INTO the row's epoch (the row at `{G}:{e'}` is the commit `e' - 1 -> e'`). The history-link PUT reads it (6.1 "S4"): an absent row, `None` or `false` refuses. **DECISION (S4-W0):** never serialized into `MlsCommitInfo` or the envelope (members read visibility from the AD they verify) |
+| `MlsGroup.history_visible_at_create` | `Option<bool>` | The visibility of the group's epoch 0 (for a successor, of its BRIDGE transition): set by the Text create transaction from the seat list it binds (`prepare_text_group`), same rule as above, for EVERY Text create (fix F3, #287: a first group too, because the link held at epoch 1 also needs epoch 0 visible); `None` only on groups created before S4. Read by the link PUT for e' = 1 and by the bridge-link PUT. Field name **DECISION (S4-W0)** |
+
+- B43's commit pruning deletes `history_visible` with its row, which is why a link for a
+  pruned transition can no longer be written (R9 "S4"); links already written stay (2.8).
+- `delete_protected_channel_data` also deletes the channel's history links (2.8, 7.5 "S4").
+
 ### 2.6 `Message.encrypted`
 
 `encrypted: Option<EncryptedPayload>` on the database `Message` and the v0 `Message`
@@ -1150,6 +1349,98 @@ guarded by 77 until that block merges in. Any later renumber is the steward's ca
 time. `init.rs` creates both indexes from the same specs as the block (the test database is
 not migrated). A dev database that ran an earlier numbering of this block must be reset
 (the revision-74 trap above).
+
+**S4 migration block (S4-W0, plan section 5, #252).** Assigned by the merge steward on
+2026-11-11: `if revision <= 80`, then `LATEST_REVISION = 81` (land order S2 `<= 78` / 79, S5b
+`<= 79` / 80, S4 `<= 80` / 81, S6 `<= 81` / 82). It creates the `mls_history_links`
+collection (2.8) and its one index:
+
+`{ key: { group_id: 1, epoch: -1 }, name: "history_links_by_holder" }` (the index name is
+**DECISION (S4-W0)**).
+
+The same block creates the `server_legal_holds` collection (2.9; fix F8, #292), which needs
+no index beyond `_id`.
+
+Every other S4 field is an additive serde default (`Channel.protected_history`,
+`MlsCommit.history_visible`, `MlsGroup.history_visible_at_create`) and needs no migration.
+`init.rs` creates the index from the same spec as the block (the test database is not
+migrated; the `protected_nonce_index()` pattern of step 4). The Reference driver registers the
+collection. Pins: `scripts.rs` gains `latest_revision_is_81` (replacing the LATEST assert of
+the block before it at land time), and a MONGO test shows a database stored at revision 80
+gains `history_links_by_holder` from the block. Any renumber is the steward's call at land
+time. (The plan's section 5 expected `<= 78` / 79; the steward's chain supersedes it.)
+
+### 2.8 `mls_history_links` (S4-D6; new collection, both drivers)
+
+**DECISION (S4-W0), #252** for the field details; the `_id`, the driver signatures and the
+retention are the plan's. Type name `MlsHistoryLink`; one row per (holder group, holder epoch,
+writer USER), 3.14.4:
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | String | `{group_id}:{epoch}:{writer_user_id}` |
+| `group_id` | String | the holder group G' (64 hex) |
+| `epoch` | i64 | the holder epoch e', `0 ..= current_epoch(G')` |
+| `prev_group_id` | String | G; equal to `group_id` when `epoch >= 1` |
+| `prev_epoch` | i64 | e; equal to `epoch - 1` when `epoch >= 1` |
+| `nonce` | String | b64 of 24 bytes |
+| `ciphertext` | String | b64; decoded `17 ..= 40960` bytes (40 KiB; planner ruling, #300) |
+| `writer_user_id` | String | |
+| `writer_device_id` | String | |
+| `signature` | String | b64 of 64 bytes (3.14.5) |
+| `size` | i64 | the decoded ciphertext length, for the byte caps (7.1 "S4") |
+| `created_at` | Timestamp | the candidate order (3.14.7) |
+
+Driver methods, both drivers (the plan's pinned contract):
+
+- `insert_mls_history_link(link) -> Result<InsertOutcome>`: first write wins PER WRITER USER
+  (S4-RR-1). A byte-identical re-insert (every field but `created_at` and `size` equal) is a
+  success with no write; different bytes from the same writer user, and a sixth distinct writer
+  user for one holder epoch, are `HistoryLinkExists` (409). The five-candidate count and the
+  byte caps (7.1 "S4") are checked in the same atomic unit as the insert: Mongo, a transaction
+  that claims the holder group document with `$inc txn_serial` (the #143 pattern), so two
+  racing inserts cannot both pass a cap or the count; Reference, under the locks below. Over a
+  byte cap is `FailedValidation`.
+- `fetch_mls_history_links(group_id, before: Option<i64>, limit: i64) ->
+  Result<Vec<MlsHistoryLink>>`: the rows of holder group `group_id` with `epoch < before`
+  (every epoch when `None`), sorted by `epoch` descending, then `created_at` ascending, then
+  `writer_user_id`. `limit` (`5 ..= 200`) caps ROWS, and the driver never splits a holder
+  epoch: it drops a trailing epoch that does not fit whole (every candidate of one epoch
+  arrives together).
+- `delete_mls_history_links_for_group(group_id)`. `delete_protected_channel_data` calls it for
+  every Text group of the channel it deletes, open or closed, on both drivers.
+- **Retention:** the group's lifetime (O-6). B43's commit pruning never touches this
+  collection. A link that changes no leaf stores about 0.85 KB (the 5.9 `link_wire_json`,
+  which adds one leaf, is 1073 bytes), so a busy channel (about 5000 epochs a year) stores
+  about 4.3 MB a year at one candidate per epoch (the plan's S4-PA-17 estimate was 700 B per
+  link and 3.5 MB a year). One candidate is at most about 55 KB stored (a 40 KiB ciphertext as
+  b64 plus its ids and signature); only a mass seat change comes near that.
+- **Reference lock order (2.5 (d)):** `mls_history_links` comes right after `mls_commits`
+  (`... mls_groups -> mls_commits -> mls_history_links -> mls_join_intents -> ...`). The PUT
+  path holds `channels`, `mls_groups`, `mls_commits` and `mls_history_links`; the delete
+  cascade adds it after `mls_commits`. No other path holds it.
+
+### 2.9 `server_legal_holds` (S4-PA-9, O-15; the legal-hold stub until S9)
+
+**DECISION (S4-W0 fix F8), #292** (ruling (g) revised: the hold lives in the database, not in
+configuration). A tiny collection, both drivers, `_id` only:
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | String | the server id |
+| `set_at` | Timestamp | |
+| `set_by` | String | the privileged user id that set it |
+| `note` | `Option<String>` | free text for the operator, never shown to users |
+
+- A hold is SET while a row exists. Writes are admin-only: `set_server_legal_hold` and
+  `clear_server_legal_hold` (both drivers) have no client route in S4 and are called by a
+  privileged admin path (S9's) or by an operator; `fetch_server_legal_hold(server_id)` reads it.
+- Read by the wipe route and by protect with a wiped genesis (refused `InvalidOperation` while
+  set, 4.3 "S4", 7.2 "S4"), and by the `history_wipes` job before EACH batch (7.5 "S4"). A hold
+  set between the route's read and its write is caught by the job's per-batch read, which never
+  marks a wipe `Done` while a hold exists.
+- Server deletion deletes the row (both drivers). Reference: its own lock, never held together
+  with another (every reader reads it before taking the 2.5 (d) locks).
 
 ---
 
@@ -1318,6 +1609,12 @@ epoch_key = MlsGroup::export_secret(crypto,
   list at that epoch: `(user_id, device_id, identity_ed25519_b64)` per leaf, from the leaf
   credentials. Never returned over IPC, never in an error.
 - **Retention (R3):** epoch keys are kept for the lifetime of the local channel state.
+
+**S4 (S4-W0, S4-D1, #253).** Wherever native derives an epoch key (Welcome join, every
+merged commit, the creator's epoch 0) it also derives that epoch's HISTORY key, with the label
+`sloga/text/history/v1` and the same 40-byte context, and stores it with the epoch's
+visibility record in `mls_text_history_keys`, in the same SQLite transaction as the epoch key
+(3.14.1 to 3.14.3). Neither key is ever deleted (S4-D4).
 
 ### 3.4 AEAD
 
@@ -1517,6 +1814,34 @@ would show them as removed). Once the successor is held, the superseded group is
 the channel's current group, so a live message in it is `RemovedSender` (step 9; the L6
 rule for any older generation), and history still decrypts from held keys. Only `_encrypt`
 refuses a superseded group (3.1.1 "As built").
+
+**S4 (S4-W0, S4-D4, S4-D5, #254).** Imported keys (3.14) touch three steps:
+
+- **Step 3.** A predecessor group reached through a bridge link gets a `mls_text_groups` row
+  (`state = 'left'`) only after the 3.14.4 derivation check (3.14.8), so the lookup maps it to
+  its channel like any other group.
+- **Step 4 (fix F6, F7; #290, #291).** `oldest_held` is the first epoch of this device's
+  CURRENT membership run of the group: the `joined_epoch` of `mls_text_membership` (the epoch of
+  its latest Welcome join or of its create; 8.2 "S4"), or, for a group with no such row (joined
+  before S4), the lowest epoch of the trailing run of derived epochs that ends at `current`.
+  Imported epochs (`history_link`, `backup`) decrypt like derived ones. `UnknownEpoch` gains
+  `removed_self: bool`: true only while the group is `left`, holds a `removed_self_epoch` r (the epoch
+  that the commit removing this device establishes; fix round 2, LOW 8) and the message's
+  `epoch >= r`; a Welcome
+  that re-admits this device into the group clears the record. The bridge routes an
+  `UnknownEpoch`: `removed_self` to the gray "Sent after you were removed" marker (9.3 "S4");
+  `epoch < current` (below `oldest_held` or not), or any epoch of a closed (superseded) or
+  `left` group above the last epoch held there, to the history walk (3.14.8); `epoch > current`
+  in an active group to catch-up and one retry (S1). A bare `left` state never sets
+  `removed_self`.
+- **Step 9 (fix F4, #288).** The local observation time of the sender's removal stays the
+  `first_seen_at` of the first held epoch without the sender's leaf. For a `derived` or
+  `backup` row (the original device's stored value, 8.5) the verdict is `RemovedSender` as
+  before. When that row is a `history_link` row (its value is the MINIMUM signed
+  `observed_at`, 3.14.7), the time clause is INFORMATIONAL: `_decrypt` succeeds with
+  `timing_unverified: true` (8.3 "S4") instead of `RemovedSender`, and the bridge shows the grey
+  "Timing of this message can't be verified" marker (9.3 "S4"). The live-arrival half of step 9
+  is unchanged.
 
 ### 3.10 Replay dedupe
 
@@ -2067,6 +2392,442 @@ issued_at:{decimal ms, 0 ..= 2^53 - 1}
   3a, whose entries exist only while the flag is on), and the server catch-all lands with
   S2-W1.
 
+### 3.14 History keys and history links (S4-D1, S4-D2, S4-D2b, S4-D5)
+
+**DECISION (S4-W0), #253 and #255 to #261; amended by the S4-W0 fix round (#285 to
+#299).** Before S4 a joiner held keys only from its join epoch on (R4). S4 lets a device that
+joins at epoch j read earlier epochs of the channel, back to the most recent point at which
+history became visible, through a BACKWARD chain of links stored by the server: the link
+`W(G, e)` carries the text key and the history key of epoch e of group G, encrypted under the
+history key of the next epoch. A joiner derives `hist_key(j)` from its own leaf and walks
+`W(j - 1)`, `W(j - 2)`, and so on. (O-1: chosen over member-to-joiner forwarding over MLS
+application messages, Olm or per-joiner blobs, over a long-lived channel history key, and over
+a Welcome extension; plan S4-D1.) This is an application-layer use of the MLS exporter of the
+same class as 3.3; S4-W0 carried a dedicated crypto-lens audit of it and it is on the
+independent-audit list (O-1).
+
+#### 3.14.1 History key
+
+```
+hist_key(G, e) = MlsGroup::export_secret(crypto,
+                                         label   = "sloga/text/history/v1",
+                                         context = raw_group_id (32 bytes) || u64_be(e) (8 bytes),
+                                         length  = 32)
+```
+
+- The context is the 3.3 epoch-key context; the label differs, so the two outputs are
+  independent. Derived on the merged group at the same points as the epoch key (Welcome join,
+  the `_process` and `_commit_won` merges, the creator's epoch 0 in `_group_create`); OpenMLS
+  0.8.1 `export_secret` on the merged group is what native already calls for 3.3. Vector: 5.9
+  (`history_exporter_label_hex`, `history_exporter_context_hex`).
+- Never returned over IPC, never in an error or a log (as 3.3). It leaves the device only
+  inside a history link (3.14.5) or a key backup (8.5).
+- **Removal is MLS's.** A device removed by the commit r -> r + 1 holds `hist_key(r)` but
+  never `hist_key(r + 1)`, so it can open neither `W(r)` (held at r + 1) nor any later link.
+  The server holds link ciphertext only (1.2).
+- Only epochs derived by an S4 build have a history key. Transitions before the S4 rollout
+  have no link and never will: a walk that reaches one stops there (`missing`).
+
+#### 3.14.2 Storage: `mls_text_history_keys` (S4-PA-20)
+
+A NEW native table, created by an `ensure` step outside the schema ladder like the other text
+tables (8.2), NOT a column pair on `mls_text_epoch_keys` (`ALTER TABLE` has no `IF NOT EXISTS`
+and races a second opener; `put_epoch_key`'s fork check compares only the key and the roster):
+
+`mls_text_history_keys (group_id, epoch, key_nonce, key_sealed, history_visible, source, PRIMARY KEY(group_id, epoch))`
+
+- `history_visible`: `1`, `0` or NULL; the per-epoch visibility record of 3.14.3 for this
+  epoch (the transition INTO it). NULL on every imported row and on every provenance-only row.
+- `source`: `derived`, `history_link`, `history_link_disputed` (fix round 2: imported from a
+  merged roster, 3.14.7) or `backup` (S4-D5; a CHECK on the four values). It is
+  the provenance of the epoch's TEXT key as well: an import writes the epoch-key row and the
+  history-key row of an epoch in ONE SQLite transaction, and so does a derivation.
+  `held_epoch_range` and the membership run (3.9 "S4") read provenance from this table.
+  (Ruled in the S4-W0 fix round, #283 (a): `source` lives here, not on
+  `mls_text_epoch_keys`, as the plan's S4-PA-20 fold moved the history key here to avoid an
+  `ALTER` there.)
+- **Provenance-only rows (S4-W0 fix F10, #294).** `key_nonce` and `key_sealed` are NULL on a
+  provenance-only row. S4's `ensure` step BACKFILLS one (`source = 'derived'`, key NULL,
+  `history_visible` NULL) for every existing `mls_text_epoch_keys` row that has none, inside its
+  `BEGIN IMMEDIATE` (`INSERT ... SELECT ... WHERE NOT EXISTS`, so a second opener inserts
+  nothing); a restore writes a `backup` provenance row for an epoch the backup carries without
+  a history key (8.5). After the backfill an epoch-key row with NO history-key row is
+  `StoreCorrupt` (fail closed), never "derived by default".
+- **Seal (DECISION (S4-W0)).** The store's existing secret sealing, under its own AAD:
+
+  ```
+  "sloga-text-history-key" 0x00 group_id 0x00 u64_be(epoch) 0x00 source 0x00 v
+  ```
+
+  where `group_id` is the 64-char hex as ASCII, `source` its ASCII value, and `v` one byte:
+  `0x01` visible, `0x00` hidden, `0x02` absent (NULL). The AAD binds the key to its row AND to
+  its visibility and provenance, so a store edit that flips `history_visible` (to make the
+  device build links for a hidden transition) or relabels an imported row `derived` makes the
+  row fail to open (`StoreCorrupt`, fail closed), as 3.3's seal binds the roster. A
+  provenance-only row seals nothing and is never used to build or open a link. Vector: 5.9
+  (`history_key_seal_aad_hex`, 106 bytes for a 64-char id).
+- **Writes.** A plain INSERT, as `put_epoch_key`: on a primary-key conflict the stored row is
+  opened and compared; the identical key, visibility and source are a no-op, anything else is
+  a fork, refused with `StoreCorrupt`, nothing written. An import never overwrites a held row
+  (3.14.7 "Anchor").
+
+#### 3.14.3 Per-epoch visibility record (S4-D1, S4-D2; S4-PA-4, S4-RR-6)
+
+The `history_visible` of epoch e + 1 is written ONCE, when the device derives epoch e + 1:
+
+- `_process` and `_commit_won` of the commit e -> e + 1: visible (`1`) iff the list embedded
+  in that commit's AD (3.12.1) says `history:visible` AND the newest list this device holds
+  after 3.12.3 step 3 says `history:visible`; else hidden (`0`). A v1 list, embedded or held,
+  counts as hidden (O-2);
+- a Welcome join at epoch j: from the newest list the joiner verified before it signed its
+  join intent (6.3), the same rule (it is its only list);
+- the creator's epoch 0 (`_group_create`, a first group or a successor): from the list the
+  create binds, which is the device's newest verified list (the server's
+  `history_visible_at_create`, 2.5 "S4", comes from the same list; S4-RR-6).
+
+**Both ends visible (S4-W0 fix F3, #287).** A link `W(G, e)` (held at e + 1) is built ONLY
+when the records of BOTH e AND e + 1 are `1`; a bridge (held at (G', 0)) only when the
+creator's record of (G, e) AND of (G', 0) are `1`. Messages of an epoch are sent under the list
+in force during that epoch, which is the list embedded in the commit INTO it; so the epoch that
+was current when the owner switched hidden -> visible (its commit into it said hidden) is never
+linked, and "messages sent from now on" (9.5) is exact. `e2ee_text_history_link_build` and the
+`_commit_won` link (8.3 "S4") check both records; native NEVER consults the currently held list
+for this: after a hidden -> visible flip, a fallback builder could otherwise build links for old
+hidden transitions and hand them to a hostile server (S4-PA-4). The records are the native
+half of the enforcement whose server half is the PUT's check on BOTH commits (6.1 "S4"); a link
+for a hidden epoch needs an honest member AND the server to fail, and any member can leak what
+it reads anyway (S4-D2; the owner copy says so, 9.5).
+
+**The switch commits at once (S4-W0 fix round 2, NIT; #309).** A list that changes `history`
+is followed at once by a self-Update commit from the switching device (as an unseat is followed
+by its Remove, 6.3), so the first epoch under the new setting begins when that commit lands.
+"Messages sent from now on" (9.5) counts from that commit; a message sent between the list
+landing and that commit belongs to the old setting.
+
+#### 3.14.4 Addressing: the holder (G', e') (S4-PA-5)
+
+A link is addressed by its HOLDER, the group and epoch whose history key encrypts it:
+
+- **e' >= 1 (an ordinary link):** G = G' and e = e' - 1; its visibility is that of commits e'
+  and e' - 1 (for e' = 1, of commit 1 and of G's epoch 0, `history_visible_at_create`).
+- **e' = 0 (a bridge link):** written by the creator device of successor G' at creation. G is
+  the group G' supersedes (the channel's Text group at generation g - 1), and e is the NEWEST
+  epoch of G for which the creator holds a DERIVED key (a poisoned commit is never merged, so
+  it never yields one; S4-RR-6). The server takes the bridge's visibility from the list bound
+  at the successor create (`history_visible_at_create`) AND from G's visibility of e (commit e,
+  or G's `history_visible_at_create` when e = 0); the creator's native records come from the
+  same lists (3.14.3).
+- **Derivation check.** Before importing anything from a bridge, a joiner checks
+  `G' == text_group_id_v2(channel, g, salt)` and `G == text_group_id_v2(channel, g - 1, salt)`
+  with the salt of its held list (3.1.1, S2-D1b); a mismatch is
+  `HistoryLinkInvalid { reason: malformed }`. A bridge never reaches a v1-id group: the first
+  v2 list over v1 is `history:hidden` (4.1.1), so the bridge of the v1-to-v2 successor (#223)
+  is hidden and has no link.
+- The server id is `{G'}:{e'}:{writer_user_id}` (2.8). The PUT checks `e' <=
+  current_epoch(G')`; a closed (superseded) G' still accepts late links (6.1 "S4").
+- **Dormant channel (S4-W0 fix round 2, NIT; #309).** The bridge PUT needs G's visibility at
+  `prev_epoch`, read from G's commit at that epoch (6.1 "S4"). A recovery successor of a
+  channel dormant longer than commit retention finds that commit pruned and gets NO bridge
+  link: history before the successor then stays only on the devices that hold it (and in their
+  key backups, 8.5).
+
+#### 3.14.5 Link format
+
+**Plaintext.** Compact JSON, UTF-8, these keys in this order, no insignificant whitespace;
+parsed strictly (the 3.6 rule: an unknown, duplicate or missing key or a wrong type is
+`malformed`):
+
+| Key | Type | Rule |
+|---|---|---|
+| `v` | number | exactly `1` |
+| `group_id` | string | G, 64 lowercase hex; MUST equal the expected G (3.14.7 step 1; S4-PA-21) |
+| `epoch` | number | e; MUST equal the expected e |
+| `text_key` | string | b64 of the 32-byte epoch key of (G, e) (3.3) |
+| `history_key` | string | b64 of the 32-byte `hist_key(G, e)` |
+| `added` | array | **(fix F12, #296)** the leaves of the HOLDER roster `roster(G', e')` that are not in `roster(G, e)`, as full entries `{ leaf_index, user_id, device_id, identity_ed25519 }` (that key order), sorted ascending by `leaf_index` |
+| `removed` | array | the leaves of `roster(G, e)` that are not in `roster(G', e')`, full entries, the same shape and order |
+| `seat_list_version` | number | **DECISION (S4-W0):** the version of the list embedded in the commit that created (G, e) (for e = 0, the list bound at that group's create); informational (3.14.7; ruled in the fix round, #283 (f)) |
+| `observed_at` | number | the writer's own `first_seen_at` of (G, e), ms (3.14.7; used only for the informational timing check of 3.9 "S4") |
+
+- **Roster by difference (F12).** "Not in" compares FULL entries (all four fields). The joiner
+  derives `roster(G, e) = (roster(G', e') - added) + removed` exactly (3.14.7 step 4), so no
+  full roster travels and a writer cannot slip a changed identity key into an unchanged
+  member's entry. For an ordinary link `added` and `removed` are the leaves the commit
+  e -> e + 1 added and removed (an Update changes neither); for a bridge they are the
+  difference between G's roster at e and the successor's single-leaf epoch 0.
+- **Size (planner ruling, #300).** The plaintext of a link that changes nothing is under
+  300 bytes. The largest change one commit can make (99 leaves removed and 99 added under the
+  100-leaf cap) at the widest values gives 35379 bytes with the tag, within the 40 KiB cap
+  (40960 bytes, 2.8), and 229 changed entries at the widest values would still fit (vectors 5.9
+  `worst_link_raw_len`, `worst_link_within_cap`, `link_entries_within_cap`): every link an
+  honest commit or bridge can produce is storable, so a legitimate mass seat change never cuts
+  history. **A link over the cap is still not built** (`refused: "too_large"`, 8.3 "S4"), which
+  honest traffic cannot reach: the bridge logs it loud and the OWNER's devices, which hold the
+  same epochs and reach the same refusal on their own duty run, show "History from before
+  {time} can't be shared with new members: too many people joined or left at once." (9.5). The
+  walk then stops there (`missing`).
+
+**AEAD.** XChaCha20-Poly1305 (3.4) with the key `hist_key(G', e')`, a fresh 24-byte nonce from
+the OS CSPRNG per link (never derived, never reused), and the AD:
+
+```
+link_ad = field( ASCII "sloga-text-history-link-v1" )   26 bytes
+       || field( ASCII G' (64 hex) )                    64 bytes
+       || u64_be( e' )                                    8 bytes
+       || field( ASCII G (64 hex) )                     64 bytes
+       || u64_be( e )                                     8 bytes
+```
+
+`field(x) = u16_be(len(x)) || x` (3.5); the two epochs are raw `u64_be`, as in 3.1.1. The AD is
+always 176 bytes. A link replayed at another holder, or relabeled with another (G, e), fails
+its AD, because a receiver rebuilds it from the EXPECTED values, never from wire fields (3.14.7
+step 1).
+
+**Signature.** Ed25519 by the WRITER device's vodozemac identity key (the key bound in its
+leaf credential), over the UTF-8 bytes of:
+
+```
+sloga-text-history-link-sig-v1
+group:{G'}
+epoch:{decimal e'}
+prev_group:{G}
+prev_epoch:{decimal e}
+writer_user:{writer user id}
+writer_device:{writer device id}
+nonce:{b64(nonce)}
+ciphertext:{b64(ciphertext with tag)}
+```
+
+Exactly 9 lines (0.3), no trailing LF; the signature is b64. The writer ids are inside the
+signature (S4-PA-21).
+
+**Wire.** `HistoryLinkWire { group_id (G'), epoch (e'), prev_group_id (G), prev_epoch (e),
+nonce, ciphertext, writer_user_id, writer_device_id, signature }`, snake_case JSON, in that
+order (the plan's pinned contract): the PUT body, each GET row, and the native argument and
+result (8.3 "S4"). `contest` is NOT a field (fix F9: it is a query parameter of the PUT).
+Vectors: 5.9 (`link_*`: `W(G0, 7)` held at (G0, 8), whose commit added the member's device;
+`bridge_*`: a bridge into generation 1 that leaves the member's device behind).
+
+#### 3.14.6 Writer duty and contest (S4-PA-2; S4-RR-1)
+
+Only a device holding `text_key(G, e)`, `hist_key(G, e)` and `hist_key(G', e')`, each from a
+DERIVED row with a sealed key, with both visibility records of 3.14.3 visible, builds a link.
+(**DECISION (S4-W0):** derived rows only, so a device never re-signs keys it merely imported
+and cannot launder a forged candidate under its own signature.)
+
+1. **The committer** of e -> e + 1 gets `history_link: Some(...)` from `_commit_won` when both
+   records are visible (8.3 "S4"), and the bridge PUTs it. The creator of a successor calls
+   `_history_link_build(G', 0, [])` right after the create succeeds and PUTs the bridge link.
+2. **Every other member** holding e and e + 1 (derived), after a stagger of
+   `leaf_index x 2 s` (the 6.3 removal-duty stagger; **DECISION (S4-W0)**), fetches the
+   stored candidates of (G', e') and calls `_history_link_build(G', e', candidates)`. Native
+   opens each candidate with its own `hist_key(G', e')` and compares the carried keys and the
+   carried `added`/`removed` with its own: if any candidate carries all of them, with an `observed_at` no more
+   than 5 minutes after its own `first_seen_at` of (G, e) (fix round 2, LOW 5), it returns no
+   link; otherwise it returns its own link, flagged `contest: true` when candidates existed,
+   and the bridge PUTs it with `?contest=true`.
+3. **Contest (fix F9, #293; ruling (b) revised).** `contest` is a QUERY PARAMETER of the PUT,
+   client-claimed and never security-bearing. The server writes
+   `AUDIT mls_history_link_contest group=<id> epoch=<n> writer=<user id>` (ids only) and emits
+   `ProtectedChannelChanged { scope: ["history"] }` (7.5 "S4") at most once per group per 5
+   minutes. The contesting bridge logs it loud (a console error and a Sentry breadcrumb, ids
+   only). The OWNER notice fires ONLY after the owner's own native, on that event, opens the
+   stored candidates of the holder under its own keys and confirms a SIGNED mismatch (a
+   candidate whose signature verifies under its writer's leaf, 3.14.7 step 2, and whose keys
+   or entries differ from the owner's): it names the writer of the mismatching candidate, not
+   the contester ("{writer} shared history keys for #channel that don't match. New members may
+   not be able to read some earlier messages.", 9.5). An owner device that does not hold the
+   epochs cannot confirm and shows nothing.
+4. **Slots.** Up to N = 5 candidates per holder epoch, at most ONE per writer USER, counted
+   per distinct user (S4-RR-1: per-device slots would let one user with five devices fill
+   every slot and block the honest contest), each user's first write winning (2.8). A forged
+   candidate cannot be accepted without evidence (3.14.7 "Evidence"), so one malicious member
+   only adds noise; five colluding seated users can fill every slot, and two colluders can
+   forge evidence (residuals R32, R34).
+
+#### 3.14.7 Joiner verification: a level-by-level search over states (S4-PA-2, S4-RR-2; fix rounds 1 and 2)
+
+**Rewritten in S4-W0 fix round 2 (#301, #302)**, replacing both the first-in-stored-order
+acceptance of round 1 and the depth-first backtracking of fix round 1 (#285): no candidate
+wins by being stored first, the search never revisits an earlier level, and nothing
+relies on AEAD key commitment (XChaCha20-Poly1305 is NOT key-committing: one crafted ciphertext
+can open under two keys to two plaintexts, so "it opened under this key" proves nothing about
+any other key).
+
+**States.** The walk goes down one holder at a time (3.14.8). A STATE is a pair (holder, carried
+history key): the history key that opens that holder's links, plus what the candidates carrying
+it said about the epoch it describes. The first state is the device's own: its lowest held
+epoch of the run being extended, with its own history key, text key and roster. A state at
+holder (G', e') is EXPANDED by fetching every stored candidate of (G', e') and checking each
+against that state (steps 1 to 4); every candidate that passes carries a pair of keys for
+(G, e) and derives a roster for it. The passing candidates, over all states of (G', e'), are
+grouped by the HISTORY KEY they carry: each group is one state at the next holder down, (G, e).
+
+- **Merged roster (fix round 2, HIGH 2).** A state's roster is the MERGE of the rosters derived
+  by the candidates in its group. When they disagree, the state vouches the next level with the
+  UNION of those rosters, its epoch is imported with source `history_link_disputed` (3.14.2), so
+  `_decrypt` reports every sender of that epoch `sender_verified: false` and the bridge shows
+  "Sender couldn't be verified (history)", never green, and the disagreement is logged loud.
+  One writer's forged `added`/`removed` therefore cannot cut history: it only widens vouching
+  below and greys that epoch's senders (residual R31, amended).
+- **Text key.** Candidates of one state normally carry one text key. When they carry more than
+  one, the state's text key is the one that opens a qualifying probe (below); if none or more
+  than one does, the epoch is imported WITHOUT a text key (its messages show "Sent before this
+  device joined"), the history key still continues the walk, and the disagreement is logged
+  loud. (**DECISION (S4-W0)**: a history-key row with no epoch-key row means exactly this.)
+- **Hard cap (fix round 2).** At most FIVE states per holder. A holder that yields a sixth
+  distinct history key stops the walk there with `stopped: "conflict"` (loud, 9.2 "S4"):
+  honest traffic yields one, and a crafted ciphertext opening under several parent keys must
+  not multiply the work.
+- **Work bound.** Each holder costs at most 5 states x 5 candidates = 25 AEAD opens and 25
+  signature checks, plus at most 3 probe opens per state; the search is LINEAR in the depth of
+  the walk (no backtracking over earlier levels).
+
+**Checks.** Every check below refuses ONE CANDIDATE for that state, never the holder (#286):
+each refusal is logged loud (console error and Sentry breadcrumb, ids and the reason only).
+A candidate PASSES for a state S = (holder (G', e'), k) with roster R when:
+
+1. **AEAD and shape (fix F15).** The expected values are fixed BEFORE any wire field is read:
+   G' and e' from the walk; G = G' and e = e' - 1 for e' >= 1, or, for e' = 0, G = the derived
+   predecessor id (3.14.4) and e = the wire `prev_epoch` (the one value not known in advance,
+   bound by the AD and by the plaintext). The wire `group_id`, `epoch` and `prev_group_id` must
+   equal the expected ones (`malformed`). The AD is rebuilt from the EXPECTED values and must
+   open the ciphertext under `k` (`aead`); the plaintext parses strictly and its `group_id` and
+   `epoch` equal the expected G and e (`malformed`).
+2. **Vouching.** `(writer_user_id, writer_device_id)` holds a leaf in R (`writer_not_member`),
+   and the signature (3.14.5) verifies under that leaf's identity key (`bad_writer_sig`).
+3. **Identity pins.** Every identity key in `added` and `removed` is cross-checked against this
+   device's slice-5 pins: an unpinned device is pinned from the signed device listing and the
+   check retried once (`IdentityPinRequired`, the W3 D5 flow); a key that differs from its pin
+   is `roster_identity_mismatch`. A device missing from the directory does NOT refuse the
+   candidate: its messages at (G, e) get the "Sender couldn't be verified (history)" marker,
+   never green (9.3 "S4").
+4. **Exact roster derivation (S4-RR-2; fix F11, F12).** Every `added` entry is a full entry of
+   R; no `removed` entry equals a full entry of R; no entry repeats; `(R - added) + removed`
+   has unique `leaf_index` and unique `(user_id, device_id)`; survivors are identical FULL
+   entries in both rosters (`roster_diff_mismatch`). Within commit retention, for e' >= 1 the
+   bridge supplies the stored commit e' (the commit e -> e + 1): as multisets over
+   `(user_id, device_id)`, `added` equals its declared `added` and `removed` its declared
+   `removed` (`roster_diff_mismatch`); and the users ADDED by the commit e - 1 -> e (supplied
+   too) must be seated on the list embedded in THAT commit's AD (`roster_diff_mismatch`).
+   Checking `roster(e)` against the list embedded in e -> e + 1 instead would refuse every
+   honest link at an unseat. The declarations are unsigned server data (residual R31).
+
+**Evidence (fix round 2, HIGH 1; LOW 6).** A state X at holder (G, e) has EVIDENCE when:
+
+- **Probe.** A QUALIFYING probe of (G, e) AEAD-opens under X's text key. A probe is a stored
+  message of group G at epoch e; it QUALIFIES only when its author user is not the writer user
+  of ANY candidate carrying X's keys. The bridge supplies up to N = 3 probes of (G, e) from
+  DISTINCT authors whenever its paged history holds them (3.14.8). A probe that fails to open is
+  "no evidence", NEVER a refusal of anything (an honest probe can fail to open for reasons
+  unrelated to the link, and a planted one must not be able to veto the truth).
+- **Anchor.** (G, e) is an epoch this device already holds and both carried keys equal the
+  held ones; for a held provenance-only row (its history key is NULL, 3.14.2), the held text key
+  equals X's and the held roster equals X's.
+- **Descent.** Some state at the next holder down, reached by opening (G, e)'s candidates with
+  X's history key, has evidence.
+
+The walk's clean ends (`hidden`, `genesis`) and every other stop are STOP conditions only,
+NEVER evidence (fix round 2, LOW 6): a state with no probe, no anchor and no evidenced
+descendant is never imported, however the walk below it ends.
+
+**Decision per holder, top down.** At each holder the states with evidence are counted by their
+history key:
+
+- exactly one: that state is ACCEPTED (its text key as decided above), the walk continues below
+  it, and its whole path from the top is committed (3.14.8 "Staged import");
+- two or more with DIFFERENT history keys: no first-wins. The walk stops there with
+  `stopped: "conflict"`, loud (9.2 "S4"); nothing at or below that holder is imported. Two
+  stored candidates carrying different keys are a stored mismatch, which every honest member of
+  that epoch contests (3.14.6), so the owner's notice follows from the contest path;
+- none: the states stay STAGED and the walk keeps fetching pages below (3.14.8) until a level
+  yields evidence, a stop is reached (the walk then ends with that stop, and the states above
+  it that never found evidence are discarded, not imported), or the session caps are hit
+  (`unanchored`).
+
+**Hidden transition (fix F3).** When the commit e -> e + 1 OR the commit e - 1 -> e that the
+bridge supplies embeds a list saying `history:hidden` (for e = 0, the group's bound list), the
+walk stops there (`stopped: hidden`) and imports nothing for that holder, whatever the server
+stored. It is a stop, not evidence.
+
+- **`seat_list_version`.** When the bridge supplied the commit that created (G, e), native
+  requires the field to equal the version of the list in that commit's AD (`malformed`);
+  otherwise it is ignored. It never takes part in the contest (3.14.6).
+- **`observed_at` (S4-PA-16; fix F4, #288; fix round 2, LOW 5).** Each candidate's
+  `observed_at` is first CAPPED at the `created_at` of the stored commit e' (the commit
+  e -> e + 1) when the bridge supplied it (an epoch cannot be first seen after it ended; the cap
+  is safe because the value only ever feeds the grey check). The imported epoch-key row's
+  `first_seen_at` is the MINIMUM capped `observed_at` over the accepted state's candidates. It
+  feeds ONLY the informational timing check of 3.9 "S4", never a red verdict.
+- **Anchor mismatch.** At an epoch this device already holds, a candidate whose carried keys
+  differ from the held ones is refused (`anchor_mismatch`, loud, per candidate as every reason).
+  A held row is never overwritten.
+- **Stop notices.** When the walk stops on `conflict`, `unanchored`, or a holder at which every
+  candidate was refused (`invalid`) or mismatched an anchor (`anchor_mismatch`), the bridge
+  shows the loud notice of 9.2 "S4"; the other stops show the plain markers.
+
+#### 3.14.8 The walk and the import (`e2ee_text_history_import`)
+
+**Trigger (fix F6, #290; fix round 2, MEDIUM 3).** The bridge's node-testable
+`protectedHistoryWalk.ts` (S4-D8) runs the walk whenever backward paging meets a message whose
+key this device lacks and that is not covered by `removed_self` (3.9 "S4"): `UnknownEpoch` with
+`epoch < current` (not only `epoch < oldest_held`), `MlsGroupNotFound` for a predecessor
+group, and, in a closed (superseded) or `left` group, any epoch above the last epoch held there
+(such a message is reached through the successor's bridge, never "ahead of us, catch up").
+**Where it starts and stops:** for a missing epoch m, the walk starts from the BOTTOM of the
+held run just ABOVE m (the lowest held epoch above m whose history key this device holds with a
+sealed key) and goes down; it stops at the first held epoch BELOW m, which acts as the anchor
+(3.14.7 "Anchor"). Example: an epoch range held as 0 to 50 and 100 upward, a message at epoch
+70: the walk starts at holder 100, imports 99 down to 51, and epoch 50 anchors it. A
+provenance-only row cannot be a starting point.
+
+**Paging and probes (fix F1; fix round 2, HIGH 1).** The bridge pages links with
+`GET .../history_links?before&limit` (7.2 "S4"), fetches the commits the checks need
+(`GET .../commits`), and pages the channel's message history far enough to know, for every
+epoch it walks, which stored messages of that group and epoch exist (`encrypted.group_id` and
+`encrypted.epoch` are visible without decrypting); it passes up to 3 of them from DISTINCT
+authors as that step's probes (3.14.7 "Evidence").
+
+**Walk session (fix round 2, MEDIUM 4).** One walk is one SESSION of `_history_import` calls
+(8.3 "S4"). Native keeps the session's staged states in memory and answers `need_more: true`
+while no level below the last committed one has evidence and no stop was reached; the bridge
+then sends the next page (at most 200 link rows per page). The session ends on evidence (the
+evidenced path is committed), on a stop, or on its caps: at most 2000 holders or 64 MiB of
+candidate bytes per session. A session that hits a cap without evidence ends with the loud
+`stopped: "unanchored"`: its staged states are discarded and the walk is retried later (on the
+next backward paging that needs it), never imported on trust. The stop values are `hidden`,
+`missing` (no stored link: never written, its commit pruned before anyone wrote it, a
+transition before S4, or a link over the cap), `invalid`, `anchor_mismatch`, `conflict`,
+`unanchored` and `genesis` (epoch 0 of the channel's first group). After a bridge the walk
+continues in G from the bridge's `prev_epoch` downward.
+
+- **Staged import (fix F1; DECISION (S4-W0)).** States are STAGED in memory while the levels
+  below are searched. Only a path from the top down to an evidenced state is COMMITTED, in ONE
+  SQLite transaction per committed level range: for each (G, e) on it, the epoch-key row
+  (`put_epoch_key` with the state's text key when it has one, its roster, and `first_seen_at` =
+  the MINIMUM capped `observed_at`) and the history-key row (`source = 'history_link'`, or
+  `history_link_disputed` for a merged roster; `history_visible` NULL). A group G with no
+  `mls_text_groups` row (a predecessor reached by a bridge) gets one with `state = 'left'`,
+  `generation = g - 1`, `superseded_by = G'` and `last_epoch` NULL, after the 3.14.4
+  derivation check. An import never touches OpenMLS state.
+- **Floor.** `TextChannelState.history_floor` (8.3 "S4") reports the lowest epoch held for
+  the channel from any source and why the walk stopped there.
+- [S4b] O-17: an honest client on a NEW device of an already-seated user walks only after a
+  native confirmation on one of that user's existing devices, when one exists (S4-D2b).
+
+#### 3.14.9 What history covers (S4-D3, S4-D9)
+
+- A change of the `history` line acts on LATER epochs only (3.14.3 "Both ends visible"):
+  nothing already held or linked can be un-shared, and the epoch current at a hidden -> visible
+  switch is never shared. Joiners see back to the most recent point history became visible.
+- No encrypted history exists before protect (the plaintext up to B is served as plaintext,
+  9.5), nothing exists below epoch 0 of the channel's first group (`genesis`), and nothing
+  before the S4 rollout (3.14.1).
+- Attachments (S3) ride in the message envelope, so epoch keys suffice. S3's envelope `v`
+  bump lands with the S3-N0 decoder in S2 native, before S4 native decrypts history that
+  contains it (S4-D9; S3 plan 2.3 and 2.8); a v2 envelope reached through history gets the
+  same grey S3-N0 marker on a client without the decoder.
+
 ---
 
 ## 4. Seat list, owner pin and handover
@@ -2164,6 +2925,39 @@ group_salt:{64 lowercase hex = 32 random bytes}
   list over a v1 list** (never the genesis default), so an upgrade never turns sharing on
   without the dialog. A v1 list after a v2 list is refused (4.3 step 4c, 4.4.1).
 - Vector: 5.8 (`seat_list_v2_*`).
+
+**S4 semantics of the three lines (S4-W0, S4-D3, S4-D11, S4-D20, O-2, O-3, O-9, #262).** S4
+gives the lines effect. S2's rules above (parsing, the immutable boundary, one-way
+`pre_history`, the v1 predecessor, `history:hidden` on the first v2 list) are unchanged; S4
+only extends them:
+
+- **`history:`** The owner's per-channel setting. `visible` lets later joiners walk links
+  (3.14); `hidden` stops new links for later transitions. Genesis is `visible` (the default
+  above and the product default); an S1 `v:1` list counts as `hidden` (nothing was promised and
+  no links exist for those epochs), and so does the first v2 list over v1 (S2's
+  `history:hidden`). hidden -> visible is growth: `_seat_list_sign` shows the native growth
+  dialog (4.9, O-3); visible -> hidden needs none. A change acts on later transitions only
+  (3.14.9).
+- **`history_boundary:`** The id B of the newest pre-protect message (inclusive), set ONLY on
+  a genesis list (version 1, protect), immutable afterwards (S2's rule), empty on a channel
+  protected while empty. **No future boundary (S4-PA-1, S4-RR-3; fix F5, #289):** a genesis
+  builder refuses `ulid_time(B) > local_now + 2 min`, and EVERY builder of a list on a channel
+  with a boundary (the genesis and every later list) sets
+  `issued_at := max(local_now, ulid_time(B), held.issued_at)` (no held list at genesis), so
+  `ulid_time(B) <= issued_at` holds on every honest list, even one signed on a slow clock;
+  every parser (server 4.3, native 4.4.1) refuses `ulid_time(B) > issued_at` as malformed.
+  **`ulid_time` (fix F15, #299)** is the 48-bit millisecond time in the first 10 characters
+  of an UPPERCASE canonical Crockford ULID whose first character is `0` to `7`; server and
+  native refuse any other spelling (lowercase, `I`, `L`, `O`, `U`, a first character above
+  `7`) as malformed (vector 5.9 `boundary_ulid_time`).
+- **`pre_history:`** `kept` or `wiped`, the opt-in deletion of every message at or below B
+  (S4-D20, O-14). `kept -> wiped` only through the wipe route (7.2 "S4") or on a genesis that
+  is `wiped` from the start; `wiped` needs a boundary and never goes back (S2's rules). The wipe
+  list and a wiped genesis are signed only after the native wipe dialog (4.9 "S4").
+- **Flag (7.1 "S4").** While `history_setting` is off, a non-empty boundary and `wiped` stay
+  refused on every path (S2's "until S4" rules, now keyed on that flag) and the server stores
+  no link; `history:` is still parsed and enforced as S2 says. **DECISION (S4-W0):** that
+  refusal is `FailedValidation`, the answer #218 gives a v2 genesis while `formats_v2` is off.
 
 ### 4.2 Seat list signature
 
@@ -2327,6 +3121,46 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
   (6.3 "Reconciler"), then, if the list changed, emits
   `ProtectedChannelChanged { scope: ["seats"] }` and writes the `ProtectedSeatsUpdate` audit
   entry (7.5). Protect does the same after its transaction.
+
+**S4 additions (S4-W0, S4-D11 to S4-D13, S4-D20; S4-PA-6, S4-PA-7, S4-PA-9; #263).** In the
+step order above:
+
+- **Step 1.** The future-boundary rule of 4.1.1 (`ulid_time(B) > issued_at`), and a boundary
+  that is not an uppercase canonical ULID with a first character `0` to `7` (fix F15), are
+  `FailedValidation`, like any malformed body.
+- **Step 4c on the seat PUT** is unchanged: `history_boundary` equal to the stored one,
+  `kept -> wiped` refused (only `SeatListWriteKind::Wipe` and a protect genesis set it),
+  `wiped -> kept` refused.
+- **A protect genesis with a boundary** needs `history_setting` on (else `FailedValidation`,
+  4.1.1 "S4"). Inside the protect transaction (7.2 "S4"): no message row of the channel with
+  `_id > B`, else `ProtectHistoryMoved` (409, nothing written); and `ulid_time(B) <= now + 2
+  min` by the server's clock, else `FailedValidation` (ruled in the S4-W0 fix round, #283
+  (e): the plan says "not in the future"; B is server-minted, but delta instances' clocks
+  differ, so this document allows the same 2 minutes as the signer). A genesis with an EMPTY
+  boundary on a channel holding any message stays `InvalidOperation` (S1), and so does a v1
+  genesis on a non-empty channel (a v1 list has no boundary line).
+- **Owner-only genesis (S4-D13, S4-PA-10).** **DECISION (S4-W0)**, enforced by the server: a
+  genesis with a non-empty boundary seats ONLY its signer (`seats` is exactly
+  `signer_user_id`), else `FailedValidation`. Members are seated by ordinary seat PUTs
+  afterwards, so protect shows no growth dialog and an automatic retry has nothing to
+  re-confirm (4.9 "S4").
+- **A wiped genesis** is refused while a legal hold is set (S4-PA-9; `InvalidOperation`;
+  `server_legal_holds`, 2.9) and sets `protected_history.wipe = Requested` inside the protect transaction,
+  derived from the SIGNED `pre_history` line alone (S4-PA-7). A request whose
+  `wipe_history` flag (7.2 "S4") disagrees with the signed line is `FailedValidation`.
+- **The wipe write (S4-PA-6).** `POST /channels/:id/history_wipe` (7.2 "S4") runs as
+  `SeatListWriteKind::Wipe` inside `seat_list_write_attempt` (both drivers). Every step of
+  this section applies to its list (parse, owner and bound session, signature, version + 1,
+  the N3 byte-identical retry first, 5b: the signer holds a leaf), with step 4c turned around:
+  `pre_history` MUST go `kept -> wiped`, and every line other than `version`, `issued_at` and
+  the two signer lines MUST equal the stored list's (seats, `device_cap`, `authority`,
+  `history`, the boundary, the salt), else `FailedValidation`. The transaction is the seat-list write's: the same group claim, the
+  update of the open group's `seat_list_ad_sha256` (without it every later commit embedding
+  the new list fails 3.12.2 and the channel wedges), the clearing rule (2.5), plus
+  `protected_history.wipe = Requested { at: now, by: signer_user_id }`. No growth gate, no
+  seat claims, allowed in every entitlement state. After it commits: S2's
+  `ProtectedChannelChanged { scope: ["seats"] }`, the `ChannelUpdate { protected_history }`
+  and the audit entry (7.5 "S4").
 
 ### 4.4 Client verification and anti-rollback (`e2ee_text_seat_list_verify`)
 
@@ -2509,6 +3343,24 @@ rules above leave open:
   path, before decryption, so a refused decryption cannot lose it) and read back as
   `TextChannelState.owner_alert`; an adoption that leaves this device the pinned owner
   device, or an entry of the authority now held, clears it.
+
+**S4 additions (S4-W0, S4-D11, S4-D16, S4-PA-1, #264).** Within steps 1 to 6:
+
+1. **Future boundary.** A list whose non-empty `history_boundary` has a `ulid_time` later than
+   the list's own `issued_at` is `SeatListInvalid { reason: malformed }`, on the GET path and
+   on the AD path alike (poisoned on the AD path).
+2. **`kept -> wiped` now has effect** (S2's rule 3): adopting it moves the channel's local
+   `pre_history` to `wiped`, one-way; the row policy reads it (9.5).
+3. **Earliest `issued_at`.** Native records per channel the `issued_at` of the EARLIEST list it
+   ever verified for that channel (never raised; kept on wipe-and-rejoin;
+   `mls_text_history_state`, 8.2 "S4") and reports it as `TextChannelState.history_time_limit`
+   (8.3 "S4"): a plaintext row timed after it is red whatever B says (9.5). For the owner's
+   device and every member that saw the genesis it is the genesis `issued_at`; a later member's
+   first list is later and still at or after `ulid_time(B)`, so no legitimate pre-boundary row
+   turns red. (The server keeps the newest list only, 2.4, so a late joiner never sees the
+   genesis; this is the plan's "or the earliest held list's".)
+4. **hidden -> visible** stays a SIGNER check (the growth dialog, 4.9); members adopt either
+   direction without a dialog, and the change acts through the per-epoch record (3.14.3).
 
 ### 4.5 Owner pinning
 
@@ -2742,6 +3594,44 @@ with step 1.
   - **`RemovalReasonRequired`** is a 4xx that does NOT use up the bytes: the reason is a
     header, not part of the signed body, so the bridge asks the owner for a reason and
     re-sends the SAME bytes with it.
+
+**S4 additions (S4-W0, S4-D11, S4-D13, S4-D20; S4-PA-10, S4-PA-18, S4-RR-3 to S4-RR-5;
+#265).**
+
+- **Genesis with a boundary.** `_seat_list_sign` gains `history_boundary: Option<String>` and
+  `pre_history: Option<"kept" | "wiped">`, accepted for a genesis only (refused on a later
+  list, which copies both from the held list). It refuses `ulid_time(B) > local_now + 2 min`
+  (`SeatListInvalid { reason: future_boundary }`, fix F15, 8.4 "S4") and sets
+  `issued_at := max(local_now, ulid_time(B))`; every later list on such a channel sets
+  `issued_at := max(local_now, ulid_time(B), held.issued_at)` (fix F5, 4.1.1 "S4"). With a
+  boundary the
+  genesis seats ONLY the signer (4.3 "S4"), so it has no growth dialog.
+- **`ProtectHistoryMoved` retry (S4-D13, O-10).** On `ProtectHistoryMoved` (409, returned only
+  after the N3 check inside the transaction; nothing landed) the bridge reads back as this
+  section says (channel not protected, no list), fetches the newest message id again
+  (`GET /channels/:id/messages?limit=1&sort=Latest`) and signs a NEW owner-only genesis with
+  a strictly larger B, at most 5 automatic attempts in all, with no new growth dialog
+  (nobody is added). After the fifth the owner sees "This channel is too busy to protect right
+  now. Try again in a quiet moment." (9.5). A 5xx, a 429 or a lost response keeps the N3 rule:
+  re-send the SAME bytes.
+- **Keep every genesis (S4-RR-5).** In this retry loop the bridge keeps EVERY genesis it
+  signed and treats a read-back that equals ANY of them byte for byte as "landed" (a delayed
+  earlier genesis can land after a later one was signed), and only then verifies it (the
+  self-pin, 4.5). This amends the read-back rule above ("byte-identical to its genesis bytes")
+  for this loop only. A replayed older genesis has a smaller, stricter B; an equal-version
+  list that matches none is `SeatListEquivocation` as before. R29 records that a hostile
+  server can collect several valid owner-only geneses.
+- **Wipe dialog and consent (S4-PA-18, S4-RR-4).** `_seat_list_sign` shows a NATIVE dialog
+  before it signs any list that moves `pre_history` from `kept` to `wiped`, and before a
+  genesis that is `wiped` from the start: "Delete {N} earlier unencrypted messages from
+  Sloga's servers? This can't be undone." ({N} comes from the bridge and is informational;
+  9.5). A compromised webview must not be able to sign a wipe. For a WIPED genesis the
+  confirmed dialog grants a short-lived per-channel wipe consent held natively (at most 5
+  signatures or 60 s, whichever ends first), valid ONLY for signing version-1 geneses of that
+  channel (fix F15), which the `ProtectHistoryMoved` retries use; a later `kept -> wiped` list
+  always shows its own dialog, and there is never a webview-supplied "skip the dialog" flag. A
+  `kept` genesis needs no consent.
+- **hidden -> visible** is growth (S2 above); the copy is in 9.5.
 
 ### 4.10 Channel authority (S2-D2, `sloga-channel-authority-v1`)
 
@@ -3307,6 +4197,213 @@ owner and the keys are those of 5.1 and 5.2):
 745d6adff648976eb588bab96cb005001819f66858b6556bba5f59bf3dcd68c1
 ```
 
+### 5.9 S4 vectors (S4-W0, #266; `tv4:` blocks)
+
+**Reading rule.** As 5.8, under their own marker `tv4:NAME` (the S1 checker freezes every
+`tv:` block and refuses unknown `tv:` names; the S2 blocks keep `tv2:`). A text block's bytes
+are its lines joined by LF with no trailing LF; a `*_hex` block's bytes are its rows
+concatenated. Seeds, ids and keys come from `tv:inputs` and 5.2; the salt from `tv2:inputs`, so
+G0 is `tv2:group_id_v2_g0` and G1 is `tv2:group_id_v2_g1`. The MLS exporter needs live group
+state, so 5.9 pins the exporter's INPUTS (label and context bytes) and everything downstream of
+FIXED 32-byte exporter outputs (the `*_key_hex` inputs), as 5.6 does for the epoch key. The
+S4-only inputs:
+
+<!-- tv4:inputs -->
+```text
+link_epoch = 7
+link_holder_epoch = 8
+link_text_key_hex = 404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f
+link_history_key_hex = 707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f
+link_holder_history_key_hex = 909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf
+link_nonce_hex = c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf
+link_seat_list_version = 4
+link_observed_at = 1790812900000
+bridge_prev_epoch = 12
+bridge_holder_generation = 1
+bridge_text_key_hex = 303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f
+bridge_history_key_hex = 505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f
+bridge_holder_history_key_hex = 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20
+bridge_nonce_hex = 6162636465666768696a6b6c6d6e6f707172737475767778
+bridge_seat_list_version = 5
+bridge_observed_at = 1790812950000
+seal_epoch = 7
+seal_source = derived
+seal_visible = 1
+boundary_message_id = 01J9Z3K4M5N6P7Q8R9S0T1V2W0
+```
+
+`link_*` is `W(G0, 7)`: held at (G0, 8), carrying the keys of (G0, 7). The commit 7 -> 8 added
+the member's device at leaf 1 (`roster(G0, 7)` is the owner's device at leaf 0, `roster(G0, 8)`
+both devices, with their 5.2 keys), so `added` holds the member's entry and `removed` is empty;
+written and signed by the member's device. `bridge_*` is a bridge link held at (G1, 0), whose
+roster is the owner's device at leaf 0, carrying the keys of (G0, 12), whose roster is both
+devices, so `added` is empty and `removed` holds the member's entry; written and signed by the
+owner's device (the creator of G1). `seal_*` feeds the history-key seal AAD. `boundary_message_id` is the 5.1 reply id used
+as a boundary B.
+
+**History exporter (3.14.1):** the label (21 bytes) and the context for (G0, 7) (40 bytes: the
+raw G0, then `u64_be(7)`):
+
+<!-- tv4:history_exporter_label_hex -->
+```text
+736c6f67612f746578742f686973746f72792f7631
+```
+
+<!-- tv4:history_exporter_context_hex -->
+```text
+6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+0000000000000007
+```
+
+**History-key seal AAD (3.14.2),** one row per element (label, `0x00`, G0 as ASCII, `0x00`,
+`u64_be(7)`, `0x00`, `derived`, `0x00`, visible `0x01`), 106 bytes:
+
+<!-- tv4:history_key_seal_aad_hex -->
+```text
+736c6f67612d746578742d686973746f72792d6b6579
+00
+36303336303232383733653930383864373633323931333333666433616164346565643265666134616439376564633734333439343934643066613234616333
+00
+0000000000000007
+00
+64657269766564
+00
+01
+```
+
+**Boundary time (4.1.1):** `ulid_time(boundary_message_id)` in ms. It is before the 5.1
+`issued_at`, so a genesis with this B and that `issued_at` passes the future-boundary rule.
+
+<!-- tv4:boundary_ulid_time -->
+```text
+1728694555269
+```
+
+**Link `W(G0, 7)` (3.14.5).** Plaintext, 453 bytes:
+
+<!-- tv4:link_plaintext_json -->
+```text
+{"v":1,"group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","epoch":7,"text_key":"QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl8","history_key":"cHFyc3R1dnd4eXp7fH1+f4CBgoOEhYaHiImKi4yNjo8","added":[{"leaf_index":1,"user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","device_id":"ffeeddccbbaa99887766554433221100","identity_ed25519":"Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc"}],"removed":[],"seat_list_version":4,"observed_at":1790812900000}
+```
+
+AD, one row per element (context field, G' field, `u64_be(e')`, G field, `u64_be(e)`), 176
+bytes:
+
+<!-- tv4:link_ad_hex -->
+```text
+001a736c6f67612d746578742d686973746f72792d6c696e6b2d7631
+004036303336303232383733653930383864373633323931333333666433616164346565643265666134616439376564633734333439343934643066613234616333
+0000000000000008
+004036303336303232383733653930383864373633323931333333666433616164346565643265666134616439376564633734333439343934643066613234616333
+0000000000000007
+```
+
+XChaCha20-Poly1305(key = `link_holder_history_key_hex`, nonce = `link_nonce_hex`, plaintext,
+AD), the 16-byte tag appended (469 bytes), b64:
+
+<!-- tv4:link_ciphertext_b64 -->
+```text
+zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg
+```
+
+Signature payload (3.14.5), exact bytes, and its signature (member seed):
+
+<!-- tv4:link_sig_input -->
+```text
+sloga-text-history-link-sig-v1
+group:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+epoch:8
+prev_group:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+prev_epoch:7
+writer_user:01HZXBBBBBBBBBBBBBBBBBBBBB
+writer_device:ffeeddccbbaa99887766554433221100
+nonce:yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f
+ciphertext:zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg
+```
+
+<!-- tv4:link_signature -->
+```text
+axkfh3Uwi6uZMXT6C47i3SBEUCTvDwiqCcWGob94L3B8AmBtYWeyayKENT4QwPPuBy1QzP7aAg92tblg+E73BQ
+```
+
+The `HistoryLinkWire` (compact JSON, 1073 bytes):
+
+<!-- tv4:link_wire_json -->
+```text
+{"group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","epoch":8,"prev_group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","prev_epoch":7,"nonce":"yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f","ciphertext":"zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg","writer_user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","writer_device_id":"ffeeddccbbaa99887766554433221100","signature":"axkfh3Uwi6uZMXT6C47i3SBEUCTvDwiqCcWGob94L3B8AmBtYWeyayKENT4QwPPuBy1QzP7aAg92tblg+E73BQ"}
+```
+
+**Bridge link (3.14.4, 3.14.5).** Plaintext (454 bytes), AD (176 bytes), ciphertext (470
+bytes) under `bridge_holder_history_key_hex` with `bridge_nonce_hex`, signature payload,
+signature (owner seed) and wire JSON (1075 bytes):
+
+<!-- tv4:bridge_plaintext_json -->
+```text
+{"v":1,"group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","epoch":12,"text_key":"MDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk8","history_key":"UFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm8","added":[],"removed":[{"leaf_index":1,"user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","device_id":"ffeeddccbbaa99887766554433221100","identity_ed25519":"Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc"}],"seat_list_version":5,"observed_at":1790812950000}
+```
+
+<!-- tv4:bridge_ad_hex -->
+```text
+001a736c6f67612d746578742d686973746f72792d6c696e6b2d7631
+004066356436376630646631653136623336326334366564653861393237613863623633623935646463613633383232646136643639313437356235366665383166
+0000000000000000
+004036303336303232383733653930383864373633323931333333666433616164346565643265666134616439376564633734333439343934643066613234616333
+000000000000000c
+```
+
+<!-- tv4:bridge_ciphertext_b64 -->
+```text
+NS+dYd1ABXnEMJWPBe1aVlFcfklyUndpJ7IPYY5KK+IDXEavpv63lbi/q4CYT9jfoe9SUK9B2ShzbcIpWI+QfwQ2Cohr1KCtfTaI+noUbemx+cJTAoxCxcE+Im1SJZPuMa0bfAGUKlQvybwQXqtArixxbR1EOPMVwNF5ysgmB4JkFb70ZI6buEbh/iVBKZleJyszC0+UzM19vZmBem9oWd4LzhqZc0TmXpWgVK5p6lAm6/Rh4S0qO4iKqU4AHwgKScoCxcLxmcZxAn7LOxaduGXYZ8d3vKfKPUYI7f+N+uDb6bG4YqLGHlU7a9ILHAKVSCFYL1RUX8rbjAwYx/vHwzYjV4u7sgUaTRgU/bYv8OgYTx2ROl2ctwAnMqgu0IAywMGbw8BzSdm6Bk/KxrHHnA2/C75R29kXXzGcPLBDSCzghxtowb/DwV4H1bIvCiBTk7moWvMBcbIUdm70GqwhCM28N4zCpk/2MnVjIXg5Hd2SjQ9XGmNoGibvg4oTm4gBMNkaXfZnR4HYOzjTiuwYJKHEmDH0uBM6sViuOFCBC54hnqG/njDM6Mha51CfVxNOzVqGLOPOiIRQZEGX0TuiF4aAGtXKiNBeB+IeQ1a0UO+sn/wTnDU
+```
+
+<!-- tv4:bridge_sig_input -->
+```text
+sloga-text-history-link-sig-v1
+group:f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f
+epoch:0
+prev_group:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+prev_epoch:12
+writer_user:01HZXAAAAAAAAAAAAAAAAAAAAA
+writer_device:00112233445566778899aabbccddeeff
+nonce:YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4
+ciphertext:NS+dYd1ABXnEMJWPBe1aVlFcfklyUndpJ7IPYY5KK+IDXEavpv63lbi/q4CYT9jfoe9SUK9B2ShzbcIpWI+QfwQ2Cohr1KCtfTaI+noUbemx+cJTAoxCxcE+Im1SJZPuMa0bfAGUKlQvybwQXqtArixxbR1EOPMVwNF5ysgmB4JkFb70ZI6buEbh/iVBKZleJyszC0+UzM19vZmBem9oWd4LzhqZc0TmXpWgVK5p6lAm6/Rh4S0qO4iKqU4AHwgKScoCxcLxmcZxAn7LOxaduGXYZ8d3vKfKPUYI7f+N+uDb6bG4YqLGHlU7a9ILHAKVSCFYL1RUX8rbjAwYx/vHwzYjV4u7sgUaTRgU/bYv8OgYTx2ROl2ctwAnMqgu0IAywMGbw8BzSdm6Bk/KxrHHnA2/C75R29kXXzGcPLBDSCzghxtowb/DwV4H1bIvCiBTk7moWvMBcbIUdm70GqwhCM28N4zCpk/2MnVjIXg5Hd2SjQ9XGmNoGibvg4oTm4gBMNkaXfZnR4HYOzjTiuwYJKHEmDH0uBM6sViuOFCBC54hnqG/njDM6Mha51CfVxNOzVqGLOPOiIRQZEGX0TuiF4aAGtXKiNBeB+IeQ1a0UO+sn/wTnDU
+```
+
+<!-- tv4:bridge_signature -->
+```text
+1haHQEC4icTkVB4a/gnceVc2XX+ce2RxtlBiOqkaiBd5gc529ZFrs/CdyeLHDWeiVWt4EQSIRwGl2RhfOMhcBA
+```
+
+<!-- tv4:bridge_wire_json -->
+```text
+{"group_id":"f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f","epoch":0,"prev_group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","prev_epoch":12,"nonce":"YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4","ciphertext":"NS+dYd1ABXnEMJWPBe1aVlFcfklyUndpJ7IPYY5KK+IDXEavpv63lbi/q4CYT9jfoe9SUK9B2ShzbcIpWI+QfwQ2Cohr1KCtfTaI+noUbemx+cJTAoxCxcE+Im1SJZPuMa0bfAGUKlQvybwQXqtArixxbR1EOPMVwNF5ysgmB4JkFb70ZI6buEbh/iVBKZleJyszC0+UzM19vZmBem9oWd4LzhqZc0TmXpWgVK5p6lAm6/Rh4S0qO4iKqU4AHwgKScoCxcLxmcZxAn7LOxaduGXYZ8d3vKfKPUYI7f+N+uDb6bG4YqLGHlU7a9ILHAKVSCFYL1RUX8rbjAwYx/vHwzYjV4u7sgUaTRgU/bYv8OgYTx2ROl2ctwAnMqgu0IAywMGbw8BzSdm6Bk/KxrHHnA2/C75R29kXXzGcPLBDSCzghxtowb/DwV4H1bIvCiBTk7moWvMBcbIUdm70GqwhCM28N4zCpk/2MnVjIXg5Hd2SjQ9XGmNoGibvg4oTm4gBMNkaXfZnR4HYOzjTiuwYJKHEmDH0uBM6sViuOFCBC54hnqG/njDM6Mha51CfVxNOzVqGLOPOiIRQZEGX0TuiF4aAGtXKiNBeB+IeQ1a0UO+sn/wTnDU","writer_user_id":"01HZXAAAAAAAAAAAAAAAAAAAAA","writer_device_id":"00112233445566778899aabbccddeeff","signature":"1haHQEC4icTkVB4a/gnceVc2XX+ce2RxtlBiOqkaiBd5gc529ZFrs/CdyeLHDWeiVWt4EQSIRwGl2RhfOMhcBA"}
+```
+
+**Largest link (3.14.5):** the length of plaintext plus tag for the largest change one commit
+can carry, 99 entries removed and 99 added, at the widest values: entry k has leaf index
+`4294967000 + k`, user id `01HZXS` + k as 20 digits, device id k as 32 hex and the member key,
+with k = 0 to 98 removed and k = 100 to 198 added; group id 64 x `f`; `epoch`,
+`seat_list_version` and `observed_at` at `2^53 - 1`; all-zero keys. It fits the 40960-byte
+cap (3.14.5 "Size"; both programs assert the comparison):
+
+<!-- tv4:worst_link_raw_len -->
+```text
+35379
+```
+
+<!-- tv4:worst_link_within_cap -->
+```text
+35379 <= 40960
+```
+
+The most changed entries (k = 0 to n - 1, all in `removed`, the same widest values) whose link
+still fits the cap; it is above 198, the most entries one commit can change:
+
+<!-- tv4:link_entries_within_cap -->
+```text
+229
+```
+
 ---
 
 ## 6. Admission and removal rules
@@ -3598,6 +4695,19 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
   oldest stored Text commit); the stored Welcome is never part of it.
 - **Welcome fetch (S2-D29).** A new route (7.2).
 
+**S4 additions to the Delivery Service rules (S4-W0, S4-D2, S4-D6, S4-PA-4, S4-PA-5, S4-RR-1,
+#267).**
+
+| Operation (Text group) | Rule |
+|---|---|
+| History link write (`PUT /mls/groups/:id/history_links/:epoch`) | The 6.1 order: kind dispatch (an unknown id AND a Call group get `as_unknown_group`: the route has no Call path, like the Welcome route), the channel, ViewChannel, `require_mls_caller`, request validation (shapes, the body's `group_id` and `epoch` equal the path, the decoded ciphertext at most 40960 bytes (40 KiB, #300) with the encoded length checked first), the available gate AND `history_setting` (else `FeatureDisabled { feature: "protected_history" }`), seated. Then: the session is bound to `writer_device_id` and `writer_user_id` is the caller (`NotAuthenticated`); the writer device is a current member of G' (else `ProtectedChannelResecuring { reason: "not_member" }`) and, for e' >= 1, its `member_added` epoch is BELOW e' (`member_added < e'`; fix F14, #298, tightened by fix round 2 LOW 7, #307: the writer must have held epoch e = e' - 1; a bridge's writer is the creator, added at epoch 0); else `InvalidOperation`; `e' <= current_epoch(G')` (`FailedValidation`). For e' >= 1: `prev_group_id == G'`, `prev_epoch == e' - 1`, and the Text-marked commit rows at `{G'}:{e'}` AND `{G'}:{e' - 1}` exist with `history_visible == Some(true)` (fix F3, #287; for e' = 1 the second is G''s `history_visible_at_create`; an absent or pruned row, `None` or `false`: `InvalidOperation`). For e' = 0: `prev_group_id` is the channel's Text group at generation g - 1, `prev_epoch <= current_epoch(G)`, the writer device is G''s creator (its `member_added` entry at epoch 0), `history_visible_at_create == Some(true)`, and G's visibility of `prev_epoch` is `Some(true)` (its commit row at that epoch, or G's `history_visible_at_create` when it is 0; fix F3) (else `InvalidOperation`). **DECISION (S4-W0):** the signature (3.14.5) must verify under the writer device's DIRECTORY identity key (`verify_payload`, a garbage filter like 4.3 step 3; members verify against the leaf-bound key, 3.14.7). Then `insert_mls_history_link` (2.8: an identical re-PUT succeeds, `HistoryLinkExists`, the caps). The optional query parameter `?contest=true` (fix F9) only adds the contest AUDIT line and the rate-limited event (3.14.6, 7.5 "S4"); it changes no rule. A closed (superseded) G' still accepts late links |
+| History link fetch (`GET /mls/groups/:id/history_links`) | The access of the commit fetch (seated AND ViewChannel, the 6.1 order, the unknown-group answer for a Call group too), the available gate only (a read never needs `history_setting`, so links stored before a flag flip-back stay readable); `before` and `limit` as 2.8. A closed group answers too (the walk crosses bridges into predecessors) |
+| Commit submit | Stores `MlsCommit.history_visible` (2.5 "S4") from the AD it already parses; no new refusal |
+| Text group create | Stores `history_visible_at_create` from the bound list for every create (2.5 "S4", fix F3) |
+
+Both new routes join the b1 oracle matrix (member, bot, unbound session x flags x {valid,
+malformed} body, full JSON compared; 6.1 above).
+
 ### 6.2 Client side (native; W3). The real trust decisions.
 
 | Operation | Rule |
@@ -3644,6 +4754,17 @@ not apply. The comparison is strict: an `issued_at` EQUAL to the record is allow
 older one is refused. `_admit` and `_remove` refuse it as `ReplayedRejoinIntent`, nothing
 staged (for `_remove`, before any target is looked at). A group wipe deletes the group's
 records.
+
+**S4 changes to the native rules (S4-W0, S4-D1, S4-D4, S4-D5, #268).**
+
+| Operation | S4 rule |
+|---|---|
+| Derive (Welcome, `_process`, `_commit_won`, `_group_create`) | also derive and store the history key and the visibility record, in the same SQLite transaction as the epoch key (3.14.1 to 3.14.3) |
+| Build a link (`_commit_won`, `_history_link_build`) | DERIVED rows with sealed keys only, the records of BOTH epochs visible (fix F3), never the currently held list; a link over the cap is refused `too_large` (3.14.3, 3.14.5, 3.14.6) |
+| Import (`_history_import`) | 3.14.7 and 3.14.8: the level-by-level search over states with probe, anchor and descent evidence, staged then committed, a refusal per candidate (fix rounds 1 and 2); never overwrites a held row |
+| Membership run and removed self (fix F6, F7) | a Welcome join and a create record `joined_epoch` and CLEAR `removed_self_epoch` in `mls_text_membership` (8.2 "S4"); `_process` of a commit that removes this device records `removed_self_epoch` in the transaction that moves the group to `left`; 3.9 step 4 reads both (S4-D4, S4-PA-21). Never inferred from `left` alone |
+| Keys are never deleted | removal, `left`, wipe-and-rejoin and successor creation keep `mls_text_epoch_keys` AND `mls_text_history_keys` (S4-D4; 2.5 "Wipe-and-rejoin" already keeps epoch keys) |
+| Seat-list sign / verify | 4.9 "S4" / 4.4.1 "S4" |
 
 ### 6.3 Flows
 
@@ -4216,6 +5337,52 @@ owner's account deletes their servers (above), and the client warns first (9.2).
 succession and "Leave and hand over" (S2-D23), cross-user handover (S2-D4) and ownership
 transfer (S2-D25) are specified by the plan, not here.
 
+**S4 flows (S4-W0, #269).** S4a unless marked.
+
+**Protect an existing channel (S4-D11 to S4-D13, S4-D18, S4-D19; S4-PA-19).** Who: the server
+OWNER (the hard check of 7.2; a privileged owner is refused as in S1) with an `Active`
+entitlement (S5 `allows_new_seats()`). The owner's device:
+
+1. **Preflight (DECISION (S4-W0): client-side, over existing reads).** It lists the threads
+   ("Delete N threads first", O-11; the server still refuses a channel with threads), the
+   webhooks (shown as becoming inactive), the server's system-message channel when it is this
+   channel ("Choose another system-message channel first": joins would otherwise stop posting
+   silently, `server_members/model.rs` swallows the error), pending scheduled messages (will
+   be cancelled), open polls and softres sheets (will be closed), and offers the wipe.
+2. `GET .../seats` (`list: null`) and `GET /channels/:id/messages?limit=1&sort=Latest` (B; an
+   empty channel has no B and takes the S1 flow above).
+3. If the owner chose to delete the earlier messages: the native wipe dialog in step 4 grants
+   the short-lived consent (4.9 "S4").
+4. `_seat_list_sign`: genesis, `history_boundary: B`, `pre_history`, seats = the owner only.
+5. `PUT /channels/:id/protect` with `wipe_history` matching the signed line. On
+   `ProtectHistoryMoved`, back to step 2 (at most 5 attempts in all; every signed genesis kept,
+   4.9 "S4").
+6. Read back, `_seat_list_verify` (the self-pin, 4.5), `_group_create` (generation 0),
+   `POST /mls/groups`.
+7. Seat members with ordinary seat PUTs (the growth dialog, 4.9).
+
+The server, after the protect transaction commits: the S1/S2 post-commit steps, the
+carried-over actions of 7.4 "S4" (cancel scheduled messages, close polls and softres sheets),
+the `ChannelUpdate` carrying `protected` and `protected_history`, the `ChannelProtect` audit
+entry (7.5 "S4") and, for a wiped genesis, the `history_wipes` job.
+
+**History walk (S4-D1, S4-D8, S4-D9).** 3.14.8. The same walk fills the gap of a device that
+rejoined after its commits were pruned (R9) or restored from a backup (R4, 8.5), anchored at
+both ends (3.14.7 "Anchor").
+
+**Writer duty (S4-D1).** 3.14.6. It also runs on the event-driven path of "Removal events and
+duty" above: a device holding an active leaf runs it even when the channel is not open.
+
+**Opt-in wipe later (S4-D20 to S4-D23).** The owner's device signs the next version, identical
+except `pre_history:wiped` (the native wipe dialog, 4.9 "S4"; nothing else may change in that
+list, 4.3 "S4"); `POST /channels/:id/history_wipe` with it, re-sent with the same bytes per
+4.9; read back and verify. Every client purges its cached plaintext rows at or below B on the
+`ChannelUpdate` (7.5 "S4"), never encrypted rows.
+
+**History setting.** The owner flips `history` in the channel settings page with an ordinary
+seat-list PUT (hidden -> visible behind the growth dialog, 4.9), then commits a self-Update at
+once (3.14.3, #309).
+
 ### 6.4 Permission loss (not handled in S1)
 
 A seated member who loses ViewChannel keeps their seat and their leaves and still receives
@@ -4323,6 +5490,10 @@ Gates (**kind-aware**; the media gate body is unchanged and stays pinned by `fla
 | (S2, #219) `formats_v2` off, a device revocation | The S2 revocation hook writes nothing (no pending device entry, no `signer_lost`; R23 open) |
 | (S2, #220) growth flag off, a recovery operation (rejoin, `rejoin_readd` re-Add, successor of an existing group, `signer_lost` replacement) | Allowed (available gate and `allows_text_traffic()`) |
 | (S2, #226) growth flag off, a device that held a leaf in the predecessor generation joins the successor (intent, KeyPackage claim, Add) | OWED, not built in S2a (W2 wave audit MINOR-3): refused like a new device (fails closed). Specified: allowed as recovery; a device new to the channel is still refused |
+| (S4, #270) `history_setting` off, a history-link PUT | Refused `FeatureDisabled { feature: "protected_history" }`; history-link GETs still answer |
+| (S4) `history_setting` off, a genesis with a non-empty boundary or any list with `pre_history:wiped` (protect, the wipe route) | Refused `FailedValidation` (4.1.1 "S4") |
+| (S4) `history_setting` off, the `history_wipes` job | **DECISION (S4-W0):** keeps running for wipes already `Requested`, so a signed wipe never stays half-done; the legal hold is the stop (7.5 "S4") |
+| (S4) any flag, a legal hold on the channel's server | The wipe route and a wiped genesis refused (`InvalidOperation`); the job pauses before its next batch |
 
 **Flag off (DECISION (W2), #135).** The flag stops growth only. It refuses seat claims,
 Adds, Text group create, join intents and KeyPackage claims (and the grant and protect,
@@ -4375,6 +5546,36 @@ successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h;
 - Flag-off table, S2 rows: recovery operations are allowed with the growth flag off; the
   reconciler, its sweep, the revocation passes and every removal run with any flag in any
   state, like pruning.
+
+**S4 configuration and gates (S4-W0, S4-D6, S4-D22, S4-PA-9, S4-PA-17, S4-RR-1, O-15, O-18,
+#270).**
+
+```toml
+[features.protected_channels]
+history_setting = false                  # S4: link writes, a non-empty boundary at protect, `wiped`; flip once every protected device runs S4
+history_link_group_cap_bytes = 67108864  # S4-D6: per holder group, decoded ciphertext bytes (64 MiB)
+history_link_user_cap_bytes = 13421772   # S4-RR-1: per writer user per holder group (64 MiB / 5)
+history_wipe_batch = 1000                # S4-D22: rows per wipe batch
+```
+
+- **Per-user split (ruled in the S4-W0 fix round, #283 (d)).** The plan says "split into a
+  per-writer-user budget" without the split. This document takes the group cap divided by the
+  five candidate slots, so one user can use at most a fifth of a group's budget; the
+  alternative (dividing by `slot_cap`) would starve the member who commits most of a busy
+  channel's Adds and Removes, and with it the history of those transitions. At the 40 KiB
+  link cap (#300) a user's default budget still holds at least 327 maximum-size links;
+  realistic links are about 0.85 KB.
+- **Legal hold (fix F8, #292; ruling (g) revised).** Stored in the database, the
+  `server_legal_holds` collection (2.9), not in configuration; read by the wipe route, by
+  protect with `wiped`, and before EVERY batch of the job. While a hold is set the wipe route
+  and a wiped genesis answer `InvalidOperation` (**DECISION (S4-W0)**).
+- **Gates.** History-link PUT: the available gate AND `history_setting`. History-link GET: the
+  available gate. The wipe route: the available gate AND `history_setting` AND no legal hold;
+  never the growth gate (S4-D20: every entitlement state). Protect keeps its S1/S2 gates and
+  needs `history_setting` for a non-empty boundary or `wiped`.
+- **Root advert (DECISION (S4-W0)).** `protected_channels` gains `history_setting` (the
+  configured value, as `formats_v2`, 7.2), so the bridge offers the boundary, the wipe and the
+  history toggle only when the server accepts them.
 
 ### 7.2 Routes
 
@@ -4626,6 +5827,70 @@ configuration, so the bridge passes the format to `_seat_list_sign` for a genesi
 upgrade list (8.3). This is not in the plan; S2-D1's "builders emit v2 while the flag is on"
 needs it (#210 OPEN item (h)).
 
+**S4 route changes (S4-W0, #271).** Every field S4 adds to a response is omitted when `None`
+(the S2 wire choice).
+
+| Surface | Change |
+|---|---|
+| `PUT /channels/:id/protect` | `DataProtectChannel` gains `wipe_history: Option<bool>` (absent: take the signed line; present: must agree with it, 4.3 "S4"); a genesis with a boundary on a channel with messages; the in-transaction boundary probe and `ProtectHistoryMoved`; owner-only seating with a boundary; `protected_history` written with the flag; the carried-over actions (7.4 "S4"); the `ChannelProtect` audit entry; the response `Channel` carries `protected_history` |
+| `POST /channels/:id/history_wipe` | NEW (below) |
+| `PUT /mls/groups/:group_id/history_links/:epoch` | NEW (below, 6.1 "S4", 2.8) |
+| `GET /mls/groups/:group_id/history_links?before&limit` | NEW (below, 6.1 "S4", 2.8) |
+| history, search, pinned listing, single fetch, safety snapshots | `is_servable(&ProtectedReadView)` and the query-level filter (7.5 "S4") |
+| `poll_vote`, `poll_end`, `softres_reserve`, `softres_manage` | `ChannelProtected` on a protected channel (7.4 "S4") |
+| `poll_fetch`, `poll_voters`, `softres_fetch`, `softres_export` | `NotFound` for a wipe-pending row (7.4 "S4") |
+| `commits_submit`, `groups_create` | store `history_visible` and `history_visible_at_create` (2.5 "S4") |
+| root advert | `protected_channels.history_setting` (7.1 "S4") |
+| crond `tasks/history_wipes.rs` | NEW (7.5 "S4") |
+| events | `ChannelUpdate { protected_history }` (7.5 "S4") |
+
+**Protect with a boundary (S4-D12, both drivers). S4 replaces** "channel has no messages,
+`last_message_id == None`" above: with an EMPTY boundary, no message row at all (S1,
+unchanged); with a boundary B, no message row of the channel with `_id > B`
+(`find_one({ channel, _id: { $gt: B } })` inside the protect transaction on Mongo; under the
+`messages` lock on Reference; else `ProtectHistoryMoved`), and `ulid_time(B) <= now + 2 min`
+(4.3 "S4"). The four places that refuse a non-empty channel today change TOGETHER (plan
+finding 3): `check_channel_protectable` (`last_message_id: None`), the Mongo in-transaction
+message probe, the Mongo flag write's `last_message_id: null` filter (DROPPED: the
+in-transaction probe is the authority; keeping the filter would turn a busy-channel protect
+into `Retry` until the budget, then a 5xx and an endless same-bytes resend, 4.9), and the
+Reference check. The existing send hold makes the probe exact: a racing plaintext send's hold
+write-conflicts protect, and when protect commits first the hold deletes the send (R15 "S4").
+The protect transaction also writes `protected_history { boundary: B, wipe }` with the flag
+(2.1 "S4"). `ProtectHistoryMoved` is returned only AFTER the N3 byte-identical check inside the
+transaction, and nothing is written. Threads still refuse (O-11). A genesis with a boundary
+seats only the signer (4.3 "S4").
+
+**Who can protect (S4-D19).** Unchanged: the server owner, non-privileged, an `Active`
+entitlement; the members of a busy channel become ELIGIBLE and are seated afterwards; the
+genesis is capped at `slot_cap` as before. Unseated members and web clients keep reading
+pre-boundary history (history reads check `ReadMessageHistory`, `message_query.rs`); web shows
+the divider and "Not available on this device" for the composer (O-13).
+
+**History wipe (S4-D20; NEW `routes/channels/history_wipe.rs`, registered in
+`routes/channels/mod.rs` and the OpenAPI schema).** `POST /channels/:channel_id/history_wipe`,
+body `DataSeatList` (the owner's NEXT v2 list, identical to the stored one except
+`pre_history:wiped`). Order: the channel and ViewChannel (refusal placement, 7.4: an
+unauthorized caller gets the pre-S4 answer); the hard owner check (the caller is the server
+owner; a privileged caller is `InvalidOperation`, as protect); the available gate and
+`history_setting`; the channel is protected with a non-empty boundary (else
+`InvalidOperation`); no legal hold in `server_legal_holds` (2.9; else `InvalidOperation`);
+then the seat-list write as
+`SeatListWriteKind::Wipe` (4.3 "S4"). Answer: `ResponseChannelSeats`, as the seat PUT.
+Idempotent: a byte-identical re-POST returns the stored success (N3), and once `Requested` or
+`Done` nothing more is written. A non-owner, a ManageMessages member and a privileged caller
+are refused. `seats_put` refuses `kept -> wiped` (S2's rule).
+
+**History links (S4-D6).** `PUT /mls/groups/:group_id/history_links/:epoch`, body
+`HistoryLinkWire` (3.14.5); the path's `:epoch` is the holder e'; the answer is 204, an
+identical re-PUT included. The decoded ciphertext is at most 40960 bytes (2.8, #300). An
+optional `?contest=true` query parameter (fix F9) marks a contest (3.14.6); it is not part of
+the body. `GET /mls/groups/:group_id/history_links?before=<i64>&limit=<5..=200>`
+answers `{ links: [HistoryLinkWire], next_before: Option<i64> }` (**DECISION (S4-W0)**:
+`next_before` is the lowest holder epoch on the page while more may exist, absent at the end).
+NEW `routes/mls/history_links.rs`, registered in `routes/mls/mod.rs` and the OpenAPI schema
+(one lane). Access and order: 6.1 "S4".
+
 ### 7.3 Protected-channel send (`POST /channels/:id/messages`)
 
 **Allowlist: only `nonce`, `encrypted` and `flags` (silent only).**
@@ -4840,6 +6105,25 @@ and #156 the MLS routes enforce that too: for any caller (member, bot, unbound s
 Text group whose channel is missing or that the caller cannot view gets exactly the
 unknown-group answer (6.1 invariant).
 
+**S4: state carried over when an EXISTING channel is protected (S4-W0, S4-D18, S4-PA-14,
+S4-PA-19, #272).** Every refusal below runs after the route's first authorization (the
+refusal placement above):
+
+| State | S4 |
+|---|---|
+| Threads | keep refusing protect; the preflight lists them ("Delete N threads first") (O-11) |
+| Pins | kept; the pinned listing serves pre-boundary rows (7.5 "S4") |
+| Webhooks | kept; execute and edit already refused (above); the preflight shows them inactive |
+| Follows (as target) | kept (crosspost already skips a protected follower, above) |
+| Scheduled messages pending | after the protect commit, `ScheduledMessage::cancel_all_for_channel`, best effort (the B30 delivery refusal above is the backstop) |
+| Polls | after the commit, open polls are closed (`Poll::close`); `resolve_open_poll` in `poll_vote.rs` refuses `ChannelProtected`, and so does `poll_end.rs` |
+| Softres | confirmed unchecked at `8c263217` (S4-PA-14): `softres_reserve.rs` and `softres_manage.rs` refuse `ChannelProtected`; open sheets are closed after the commit, like polls |
+| Reads during a pending wipe | `poll_fetch.rs`, `poll_voters.rs`, `softres_fetch.rs` and `softres_export.rs` answer `NotFound` for a wipe-pending row (S4-PA-14) |
+| Server system-message channel | the preflight lists it; the owner unsets it first (S4-PA-19; 6.3 "S4") |
+| Reactions, unread and ack state, embeds | kept |
+| Attachments | kept and served pre-boundary; `Draft.ts` refuses plaintext uploads, and encrypted channel files follow S3 (S3 plan 2.8 asks S4 to say so) |
+| Voice, announcement | still refused |
+
 ### 7.5 Other server behavior
 
 - **pushd**: a protected message produces a generic notification (body "New message", no
@@ -4950,6 +6234,62 @@ unknown-group answer (6.1 invariant).
   The client MUST NOT wipe protected group state (native text tables, owner pin, the 9.4
   pin) on it: permission loss keeps the seat in S1 (6.4), and the channel may be revealed
   again.
+- **S4 additions (S4-W0, #273).**
+  - **Read rule (S4-D15). S4 replaces `is_servable(channel_protected)`** of "History reads
+    drop strays" above with `ProtectedReadView { protected: bool, boundary: Option<String>,
+    wiped: bool }` and `Message::is_servable(&ProtectedReadView) -> bool` (pinned names): an
+    `encrypted` row always passes; a plaintext row passes only when `!protected`, or when
+    `boundary == Some(B)`, its id is at or below B, and `!wiped`. `wiped` is true from the
+    moment the wipe is `Requested` (S4-D21), not only once it is `Done`. A thread is judged by
+    its parent (#182): its view is the parent's. Every call site changes in ONE atomic lane
+    (S4-PA-13): `fetch_with_users` and its callers `message_query.rs` and
+    `message_search.rs`, `message_fetch.rs` (single fetch, `NotFound`),
+    `safety_snapshots/model.rs` (both sites and the source-text needle its W2 test pins),
+    `report_content.rs`, and the test callers (`message_search.rs`, `util/test.rs`).
+  - **Filter in the query (S4-PA-15).** Both drivers' history and search queries add the
+    servable predicate on a protected channel: `encrypted` present OR (`_id <= B` AND not
+    wiped); on Mongo `{ encrypted: { $ne: null } }` OR `{ _id: { $lte: B } }` (the latter
+    only while not wiped), the exact complement of the job's `encrypted: null`. Pages are full
+    and no empty page appears mid-history. The post-filter stays as a backstop and reports to
+    Sentry only a TRUE stray (a plaintext row above B, or on a channel without a boundary),
+    never a wipe-pending drop. Content search on a protected channel still returns nothing
+    (O-12).
+  - **`history_wipes` crond job (S4-D22, S4-PA-9, S4-PA-21).** NEW
+    `crates/daemons/crond/src/tasks/history_wipes.rs`, registered in `tasks/mod.rs` and
+    `main.rs` (one atomic lane). Each run finds channels whose `protected_history.wipe` is
+    `Requested` and, per channel: (1) claims an atomic per-channel lease (the
+    `scheduled_messages.rs` precedent; an expired lease lets another replica resume); (2)
+    re-reads the legal hold (`server_legal_holds`, 2.9) before EACH batch and, while one is set, releases the lease and
+    stops (the wipe stays `Requested`, never `Done`); (3) reads up to `history_wipe_batch`
+    ids from `{ channel, _id: { $lte: B }, encrypted: null }` (matches the Rust `is_some()`
+    view: an encrypted row is NEVER touched, whatever its id); (4) per batch, collects the
+    file ids of `attachments` AND `forwarded.attachments` and marks those files deleted (the
+    Reference driver marks them too; its `reference.rs` TODO is closed here), closes and
+    deletes the polls and softres sheets of those rows with their votes and reservations, then
+    `delete_many` by those ids (pins and reactions go with the rows, O-14); (5) when a batch is
+    empty, sets `wipe = Done { at, count }` (`count`: rows deleted over every run;
+    **DECISION (S4-W0)**: the lease document carries the running count), writes the audit
+    entry, recomputes `last_message_id` from the newest remaining row (or `None`), clears
+    `channel_unreads.mentions` entries that name deleted ids, and emits the
+    `ChannelUpdate`. Idempotent and resumable after a crash at any point; both drivers. Scope
+    (O-14): everything in the channel at or below B (threads are already refused).
+  - **Wipe reads and purge (S4-D21).** Pre-boundary plaintext is unservable from the moment
+    the wipe is `Requested`. The server emits `ChannelUpdate { protected_history }` on the
+    SERVER topic (as protect, #149) when the wipe is requested and when it is done; stoat.js
+    purges cached PLAINTEXT rows with an id at or below B on it (the `UserPlatformWipe`
+    precedent), never encrypted rows.
+  - **Audit (S4-D19, S4-D22).** New `AuditLogAction::ChannelProtect { channel, boundary:
+    Option<String>, wiped: bool }` (protect today only writes `log::info!`) and
+    `ChannelHistoryWipe { channel, count: Option<u64> }`. **DECISION (S4-W0):** the wipe route
+    writes `count: None` (requested; the plan's "the audit entry" of the route) and the job
+    writes `Some(count)` at `Done`. Both name a protected channel, so the #221 ViewChannel
+    filter of the audit-log fetch covers them; the `#[serde(other)] Unknown` catch-all stays.
+  - **Delete cascades.** `delete_protected_channel_data` also deletes the channel's history
+    links (2.8), both drivers.
+  - **Events (fix F9, #293).** `ProtectedChannelChanged` gains the scope `history`, emitted
+    on a PUT with `?contest=true` at most once per group per 5 minutes (a per-group timestamp;
+    a suppressed contest still writes its AUDIT line). Clients treat it as a hint: the owner's
+    notice needs its own native signed-mismatch check (3.14.6).
 
 ### 7.6 New errors (`revolt_result`, all status-mapping files)
 
@@ -4964,6 +6304,8 @@ unknown-group answer (6.1 invariant).
 | `SeatListNamesRemovedUsers` (W2 audit C1, #179) | `users: Vec<String>` (sorted user ids) | 400 |
 | `RemovalReasonRequired` (S2, #205) | none | 400 |
 | `ProtectedHandoverRequired` ([S2b], S2-D25) | `channel_ids: Vec<String>` | 400 |
+| `ProtectHistoryMoved` (S4, #274) | none | 409 |
+| `HistoryLinkExists` (S4, #274) | none | 409 |
 
 `DuplicateNonce` (409, existing, `util/idempotency.rs`) is reused for a protected `cid`
 replay (3.10, #153). `MlsCallFull { max }` (existing) is reused for the Text 100-leaf cap
@@ -4977,6 +6319,16 @@ rate limit reuses `InSlowmode` (seconds in `retry_after`, 4.9). Native gains
 
 **DECISION (W0):** the `reason` and `field` / `max` fields. The frontend needs the usual cast
 for new `ErrorType`s (the `stoat-api` types are upstream).
+
+**S4 (S4-W0, #274).** `ProtectHistoryMoved` (409): a protect genesis whose boundary is
+older than a stored message (7.2 "S4"); returned only after the N3 check, nothing written; the
+bridge re-signs with a newer boundary (4.9 "S4"). `HistoryLinkExists` (409): the same writer
+user already stored different bytes for that holder epoch, or five distinct writer users
+already did (2.8). Both join stoat.js's error lists and need the frontend `ErrorType` cast.
+`HistoryLinkInvalid` is native only (8.4), never a server error. No other new server variant:
+the history-link and wipe refusals reuse `FeatureDisabled { feature: "protected_history" }`,
+`FailedValidation`, `InvalidOperation` and `ProtectedChannelResecuring { reason: "not_member" }`
+(6.1 "S4", 7.2 "S4").
 
 ---
 
@@ -5089,6 +6441,28 @@ renamed by W3 with a note in its report.
   cannot derive its id (`InvalidArgument { field: "generation" }`), and S1 never reads the
   S2 tables. So no shell (desktop, Android, Electron) may ship an S1 core over a store an
   S2 core has opened; a rollback past S2 is not a plain binary downgrade.
+
+**S4 (S4-W0, S4-D1, S4-D4, S4-D5, #275).**
+- NEW `mls_text_history_keys` (3.14.2; `key_nonce` and `key_sealed` nullable for the
+  provenance-only rows of fix F10).
+- NEW `mls_text_membership` (`group_id` PK, `joined_epoch`, `removed_self_epoch` NULL,
+  `updated_at`; fix F6, F7, #290, #291): `joined_epoch` is written at a Welcome join or the
+  create (the start of the device's current membership run, 3.9 "S4"); `removed_self_epoch` is
+  r, the epoch the removing commit establishes (fix round 2, LOW 8), written in the transaction of the processed commit that removed this device (S4-D4,
+  S4-PA-21) and CLEARED by a Welcome that re-admits it; kept on wipe-and-rejoin.
+- NEW `mls_text_history_state` (`channel_id` PK, `earliest_issued_at`, `floor_group_id`,
+  `floor_epoch`, `stopped`): `earliest_issued_at` is the `issued_at` of the earliest list ever
+  verified for the channel (4.4.1 "S4"; never raised); the floor fields back
+  `TextChannelState.history_floor` (3.14.8); kept on wipe-and-rejoin.
+- The three names are **DECISION (S4-W0)** and may be renamed by W3 with a note (the rule
+  above). Each is created by the text `ensure` step (`IF NOT EXISTS`, outside the ladder); none
+  is an `ALTER` of an existing table. With S2's `mls_text_authorities` there are 16 text
+  tables; `TEXT_TABLES` and `has_text_tables` list all three new ones (fix F13), and the
+  `ensure` step also runs the provenance backfill of 3.14.2 (fix F10).
+- `mls_text_epoch_keys` is unchanged; an imported row's `first_seen_at` holds the MINIMUM
+  `observed_at` (history link) or the backed-up value (backup).
+- **S4 replaces "excluded from key backup"** for the rows 8.5 carries; the other text rows
+  stay excluded.
 
 ### 8.3 Commands
 
@@ -5208,6 +6582,25 @@ the native dialog.
   integer or an integral float (napi passes millisecond times as `f64`); a string is
   refused. Electron's napi path is not exercised by a built `.node` yet (a landing blocker).
 
+**S4 command changes (S4-W0, S4-D7, #276).** S4a unless marked:
+
+| Command | Change |
+|---|---|
+| `e2ee_text_process` | derives and stores the history key and the visibility record (3.14.3); records `removed_self_epoch`, and on a Welcome `joined_epoch` (clearing `removed_self_epoch`) (8.2 "S4"); `TextProcessOutcome.history_link` is always `None` here (members write through `_history_link_build` after the stagger, 3.14.6) |
+| `e2ee_text_commit_won` | `TextProcessOutcome.history_link: Option<HistoryLinkWire>`: the committer's link for the won transition when its record is visible (3.14.6) |
+| `e2ee_text_group_create` | derives the history key of epoch 0 and records its visibility from the bound list (3.14.3) |
+| `e2ee_text_history_link_build` | NEW `(group_id, epoch, candidates: Vec<HistoryLinkWire>)` -> `HistoryLinkBuilt { link: Option<HistoryLinkWire>, contest: bool, mismatched_writers: Vec<{ user_id, device_id }>, refused: Option<"hidden" \| "not_derived" \| "too_large"> }`; `epoch` is the holder e'. **DECISION (S4-W0):** the plan's `(group_id, epoch)` gains `candidates`, because the contest comparison (3.14.6) must open the stored candidates natively. `refused` is set, and no link built, when a needed record is absent or hidden (both epochs, fix F3), a needed row is not derived with a sealed key, or the link exceeds the cap (fix F12). `mismatched_writers` lists the writers of candidates whose signature verifies and whose content differs from this device's: the owner notice of fix F9 |
+| `e2ee_text_history_import` | NEW `(group_id, session: Option<String>, steps: Vec<HistoryImportStep>)` -> `HistoryImported { session: String, need_more: bool, imported: Vec<{ group_id, epoch }>, floor: Option<{ group_id, epoch }>, stopped: Option<"hidden" \| "missing" \| "invalid" \| "anchor_mismatch" \| "conflict" \| "unanchored" \| "genesis">, refused: Vec<HistoryLinkInvalid> }`, with `HistoryImportStep { holder_group_id, holder_epoch, candidates: Vec<HistoryLinkWire>, commit: Option<MlsCommitInfo>, prev_commit: Option<MlsCommitInfo>, probes: Vec<{ message_id, author_user_id, nonce, encrypted }> }` (up to 3 probes from distinct authors), highest holder first. **DECISION (S4-W0):** the plan's `(group_id, links)` gains the session, the commit rows and the probes that 3.14.7 needs. A session (fix round 2, MEDIUM 4) is one walk: the first call passes `session: None`; native answers `need_more: true` while no level has evidence and no stop was reached, and the bridge calls again with the returned session id and the next page (at most 200 link rows); at most 2000 holders or 64 MiB of candidate bytes per session, else `stopped: "unanchored"` with the staged states discarded. It runs the level-by-level search of 3.14.7 and commits only evidenced paths; `refused` lists every candidate refusal (each also logged loud); nothing unanchored is written; sessions live in memory only and die with the process |
+| `e2ee_text_seat_list_sign` | `history_boundary` and `pre_history` for a genesis; the wipe dialog and consent (4.9 "S4") |
+| `e2ee_text_state` | `TextChannelState` gains `history_floor: Option<{ group_id, epoch, stopped }>`, `history_setting: Option<"visible" \| "hidden">` (the held list's line; `hidden` for a v1 list), `history_boundary: Option<String>`, `pre_history: Option<"kept" \| "wiped">` (S4-D14) and `history_time_limit: Option<i64>` (4.4.1 "S4") |
+| `e2ee_text_decrypt` | `UnknownEpoch.removed_self` (3.9 "S4"); `TextDecrypted.timing_unverified: bool` (fix F4, 3.9 step 9) |
+| key backup commands | the text section (8.5) |
+| [S4b] | the new-device history confirmation (O-17) and own-device Olm history in hidden mode (O-4) |
+
+Both new commands follow the full registration list (#167): the permission TOML, the
+`capabilities/default.json` allow, `APP_COMMANDS`, `generate_handler!` and the dev grants;
+neither is confirm-gated (the wipe dialog lives in `_seat_list_sign`, which already is).
+
 ### 8.4 Typed errors (added to `e2ee-core` `Error`, serde tag `type`, snake_case)
 
 No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `BadSig`,
@@ -5241,6 +6634,7 @@ No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `Bad
 | `MalformedTextPayload` | `reason` (closed: `structure`, `envelope`, `cid_mismatch`, `too_large`) | encrypt and decrypt |
 | `WrongGroupKind` | `group_id` | call commands given a text id and vice versa |
 | `CatchUpLeafUnresolvable` (S2, #203) | `group_id, epoch: i64` | a leaf failure on a commit BEHIND the server tip whose only cause is an unpinned or revoked identity (S2-D31); the bridge marks the group `left` (`catch_up_failed`) and rejoins; never poisoned. As built (#238): only when `_process` got a `catch_up_tip` above the commit's epoch, and for added leaves only, never for the signer of an embedded list (6.3 "As built") |
+| `HistoryLinkInvalid` (S4, #277, #286) | `group_id, epoch: i64, reason` (closed: `aead`, `malformed`, `writer_not_member`, `bad_writer_sig`, `roster_identity_mismatch`, `roster_diff_mismatch` (new in S4, native only), `anchor_mismatch`) | `_history_import` (3.14.7): one per refused CANDIDATE, never a refusal of the holder; `group_id` and `epoch` name the HOLDER; every one logged loud (9.2 "S4") |
 | `UnsupportedEnvelopeVersion` (S3-N0 in S2, #234) | `v: u8` | decrypt: an outer `encrypted.v` of `2` to `255`, or an envelope `v` of `3` to `255` (3.6.1); nothing is shown. The grey "update" marker (9.2), never red |
 
 Existing `MlsGroupNotFound`, `MlsUnsolicitedWelcome`, `MlsLeafRejected`, `MlsEpochGap`,
@@ -5261,6 +6655,85 @@ NEW authority whose `signer_device_id` is not the list's signer device at the he
 version + 1, and a wrong `prev` at the held authority version + 1 (4.4.1 "As built").
 `ReplayedRejoinIntent` is also the staging-only `issued_at` refusal of `_admit` and
 `_remove` (6.2 "As built").
+
+**S4 (S4-W0, #277).** `UnknownEpoch` gains `removed_self: bool` (3.9 "S4").
+`HistoryLinkInvalid` never carries key material (invariant 6). The walk's pin step reuses
+`IdentityPinRequired` (W3 D5; 3.14.7 step 3). `SeatListRejection` gains `future_boundary` (fix
+F15): `_seat_list_sign` refuses a boundary more than 2 minutes after the local clock (4.9
+"S4"); a parser still answers `malformed` for `ulid_time(B) > issued_at`.
+
+### 8.5 Key backup text section (S4-D10, S4a; closes R4)
+
+**DECISION (S4-W0), #278** for the field names; the shape, the never-restored set, the
+budget rule and the tests are the plan's.
+
+- **Payload.** `BackupPayload` (`backup.rs`) gains `#[serde(default)] text:
+  Option<serde_json::Value>`; `BACKUP_PAYLOAD_VERSION` stays 1 (the v8 `pinned_via`
+  precedent: `BackupPayload` has no `deny_unknown_fields` and `payload_v` is strict, so an old
+  reader drops the section, which is today's R4 and fails safe). A typed field would fail the
+  WHOLE `BackupPayload` deserialization on a later type change (`RosterEntry` already uses
+  `deny_unknown_fields`), hence the `Value` (S4-PA-11). A new reader checks `text_v` first and
+  parses `BackupText { text_v: 1, ... }` inside a fallible block that maps ANY error (an
+  unknown `text_v`, a type change, a malformed row) to `text_skipped`, never a failed restore.
+- **Contents (`text_v: 1`).** `truncated` (`"none"`, `"oldest"` or `"all"`); `groups`
+  (`group_id`, `channel_id`, `generation`, `superseded_by`); `rosters` (`{ sha256, roster }`,
+  each distinct canonical roster JSON once); `epoch_keys` (`group_id`, `epoch`, `text_key`,
+  `history_key` (absent for a pre-S4 epoch), `roster_sha256`, `first_seen_at`; keys b64);
+  `seat_lists` (each stored row with its handover chain) and `authorities` (S2): the
+  anti-rollback floor; `owner_pins` (without the pending signer); `forced_removals`;
+  `consumed_rejoin_intents`; `own_device_pins` (status preserved, O-8); `history_state`
+  (`channel_id`, `earliest_issued_at`).
+- **Never restored** (re-derived against the CURRENT table list, S2's `mls_text_authorities`
+  and S4's tables included): OpenMLS state (`mls_state`, `mls_groups`), the MLS signature key
+  (`mls_signature_key`), KeyPackages (`mls_key_packages`), `mls_text_pending_commits`,
+  `mls_text_join_intents` (it would let a stale Welcome pass the unsolicited check),
+  `mls_text_self`, `mls_text_pin_attempts`, `mls_text_seen` (skipped in S4),
+  `mls_text_membership`, and S2-W3's text-schema version marker, whatever table holds it
+  (`ensure` re-derives it) (fix F13). Carried: `mls_text_groups` (the fields above), `mls_text_epoch_keys`,
+  `mls_text_history_keys` (the key only), `mls_text_seat_lists`, `mls_text_authorities`,
+  `mls_text_owner_pins` (no pending signer), `mls_text_forced_removals`,
+  `mls_text_consumed_rejoin_intents`, `mls_text_own_device_pins` and
+  `mls_text_history_state` (its `earliest_issued_at` only: the floor columns restore NULL and
+  the next walk re-derives them). Every text table is in exactly one of the two lists.
+- **Restore.** Every group restores as `left` (a `poisoned` one stays `poisoned`), `last_epoch`
+  NULL; keys are re-sealed under the FRESH master with `source = 'backup'`, `history_visible`
+  NULL and `first_seen_at` the backed-up value (R7 "S4"); a carried epoch without a history
+  key restores a `backup` provenance-only row (3.14.2, fix F10); the device rejoins (rule 6, 6.3) and
+  walks the gap anchored at both ends (3.14.7 "Anchor"). Copy: "Restoring replaces your old
+  device." (Restoring onto a second live machine clones the device; for text groups each
+  clone could evict the other through rule 6.)
+- **Size (S4-PA-12; fix F13).** The section's budget is
+  `min(2 MiB, MAX_BACKUP_CIPHERTEXT - BACKUP_SIZE_HEADROOM - fixed)`, `fixed` being the
+  invariant sections that `build_payload` measures, inside the same 8 MiB cap
+  (`MAX_BACKUP_CIPHERTEXT`), so the backup keeps up to 2 MiB fewer direct messages (the copy
+  says so, 9.5). It is NOT a fixed section. The never-truncated part (groups, lists, chains,
+  authorities, pins, forced removals, consumed intents, own-device pins; about 11 KiB per
+  channel with a full chain) is measured first; if it ALONE exceeds the budget, the section is
+  replaced by `{ "text_v": 1, "truncated": "all" }` and the backup stays valid: it never
+  spills into the fixed budget of `build_payload`. Otherwise epoch-key entries are added
+  newest first until the budget, the oldest are dropped, rosters no longer referenced are
+  dropped with them, and `truncated` is `"oldest"`. Pins and lists are never truncated.
+- **Zeroize (fix F13).** The section is a `serde_json::Value`, whose strings are not
+  zeroized on drop, so `zeroize_payload_secrets` WALKS the `Value` tree and zeroizes every
+  string in it (every `text_key` and `history_key` among them), and the typed `BackupText`
+  zeroizes its key fields on drop.
+- **Replay dedupe** resets on restore (`mls_text_seen` is not carried; residual R33).
+- **Refresh.** The bridge asks for a backup refresh after at least 20 new epoch-key rows
+  (derived or imported) since the last backup (the `e2ee.ts` seam, W4 F16).
+- **`RestoreReport`** gains `text_epochs: usize`, `text_truncated` (the section's
+  `truncated`) and `text_skipped: bool` (the fallible parse failed; **DECISION (S4-W0)**: a
+  separate field, since the plan names `text_skipped` as that outcome).
+- **The two `store.rs` tests are REPLACED, not deleted (S4-PA-14; one lane with
+  `backup.rs`).** `every_store_table_is_classified_for_backup` becomes a THREE-way tripwire
+  (`BACKED_UP`, `TEXT_SECTION`, `EXCLUDED`): every store table in exactly one list, and every
+  text table in `TEXT_SECTION` or `EXCLUDED`, never `BACKED_UP`, with `TEXT_TABLES` listing
+  S4's three tables (fix F13). Reason: the section now
+  carries selected rows of some text tables, so "no text table is backed up" stopped being
+  true, and the tripwire must still force a decision for every new table. And
+  `text_tables_are_not_carried_by_a_backup` becomes `text_section_carries_exactly_its_tables`:
+  a populated source restores the carried rows and leaves every never-restored text table
+  EMPTY. Reason: the old assertion is false by design now, and the never-restored set is the
+  property that matters.
 
 ---
 
@@ -5443,6 +6916,19 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Native | `TextDecrypted.files[]` entry with `state: "failed"`, `fail_reason: "unsupported"` (envelope v2, 3.6.1) | the message renders; each file shows as unavailable (name, type, size), never as another file | "Update Sloga to open this file." |
 | Server | `ProtectedClientOutdated { min }` (S4 server half of the protocol floor, 8.3 "As built") | unchanged; notice, never a generic failure | "Update Sloga to use this protected channel." |
 | Client | a role or permission edit in a server with protected channels (S2-D16) | role editor | "Roles make members eligible; the owner seats them." plus a generic warning before the edit |
+| Server | `ProtectHistoryMoved` (S4) | owner protect UI | none while the bridge retries (at most 5, 4.9 "S4"); after the fifth: "This channel is too busy to protect right now. Try again in a quiet moment." |
+| Server | `HistoryLinkExists` (S4) | unchanged | none; logged; never retried (this user's candidate already stands, or the five slots are taken) |
+| Native | any `HistoryLinkInvalid` (S4; fix F2) | unchanged shield | per CANDIDATE: logged loud (console error and Sentry breadcrumb, ids and the reason only) and the next candidate is tried; only when no candidate of a holder is accepted does the walk stop, with a loud notice at the history floor: "Earlier history couldn't be verified and wasn't loaded." |
+| Native | `TextDecrypted.timing_unverified` (S4, fix F4) | message marker (grey, informational) | "Timing of this message can't be verified." |
+| Native | the history walk stopped `conflict` (S4, fix round 2) | unchanged shield; a loud notice at the history floor | "Two different versions of this channel's earlier history were offered, so earlier history wasn't loaded." Sentry breadcrumb, ids only; the owner learns through the contest path (3.14.6) |
+| Native | the history walk stopped `unanchored` (S4, fix round 2) | a loud notice at the history floor | "Earlier history couldn't be confirmed yet. Sloga will try again later." |
+| Native | a message of an epoch imported from a merged roster (`history_link_disputed`, S4, fix round 2) | message marker (informational), `sender_verified: false` | "Sender couldn't be verified (history)." |
+| Native | `SeatListInvalid { reason: future_boundary }` from `_seat_list_sign` (S4, fix F15) | owner protect UI | "This device's clock is behind the newest message. Check the date and time settings and try again." |
+| Native | `_history_link_build` refused `too_large` on an owner-user device (S4, fix F12; unreachable by honest traffic since the 40 KiB cap, #300) | owner notice | "History from before {time} can't be shared with new members: too many people joined or left at once." |
+| Native | a signed mismatch confirmed by `_history_link_build` on an owner-user device (S4, fix F9) | owner notice | "{writer} shared history keys for #channel that don't match. New members may not be able to read some earlier messages." |
+| Native | `UnknownEpoch` with `removed_self` (S4) | message marker (gray) | "Sent after you were removed." |
+| Client | the history walk stopped `hidden` (S4) | timeline marker (gray) at the floor | "History from before you joined isn't shared here." |
+| Client | the history walk stopped `missing` (S4) | message marker (gray) | "Sent before this device joined." (the S1 copy) |
 
 **S2 client surfaces (S2-W0, #208; S2-D38 to S2-D44).** Owner seat UI (S2-D39): a "Released"
 section from `cooling[]` with the cause; a banner "N people on your signed list no longer
@@ -5468,6 +6954,21 @@ Markers render in place of the message body (`Messages.tsx`) and are never mista
 normal message. Red markers are loud; gray and informational markers are not alarms. Every
 string goes through lingui.
 
+**S4 markers (S4-W0, S4-D4, S4-D8, S4-D16, #279).** New, all through lingui:
+
+- gray "History from before you joined isn't shared here." (the walk stopped on a hidden
+  transition, 3.14.8);
+- gray "Sent after you were removed." (`UnknownEpoch.removed_self`: keyed on native's explicit
+  `removed_self` record for that group, never on a bare `left` state; S4-PA-21);
+- informational "Sender couldn't be verified (history)." (an imported epoch whose roster names
+  a device missing from the directory, 3.14.7 step 3; never green);
+- grey informational "Timing of this message can't be verified." (`timing_unverified`, fix F4:
+  a removed-sender time verdict that rests on imported history timing is never red);
+- the permanent divider "Messages above weren't protected" and the informational marker on an
+  encrypted row listed at or below B (9.5);
+- the grey S3-N0 "Update Sloga to see this message" marker is unchanged, and also applies to
+  a v2 envelope reached through history.
+
 ### 9.4 Never-plaintext client rules
 
 - **SDK** (`Channel.ts`): a protected `TextChannel` send goes to `handleProtectedSend`; it
@@ -5489,6 +6990,69 @@ string goes through lingui.
 - **Bridge:** a text-group manager separate from the call session with a multi-group sink;
   routing by `e2ee_mls_group_kind`; decrypt on live receive (`live: true`) and history fetch
   (`live: false`); inject via `#inject`.
+
+**S4 (S4-W0, #280).** "Rows without `encrypted`" above gains the pre-boundary exception of
+9.5, decided by the row policy alone, never ad hoc in `Messages.tsx`. The local protected pin
+(one-way) also stores `{ boundary, wiped }` (`wiped` one-way; S4-D16).
+
+### 9.5 Pre-protect history: row policy, divider, paging and copy (S4-D16, S4-D17, S4-D21, S4-D23)
+
+**Row policy (NEW pure `protectedRowPolicy.ts`, node-testable; W4 L4g and L4j).** Inputs: the
+row (`encrypted` present or not, its id), the local pin, and native `TextChannelState`
+(`history_boundary`, `pre_history`, `history_time_limit`, `verdict`); the boundary and the wipe
+state come ONLY from the VERIFIED list, never from the server's `protected_history`. For a row
+in a protected or pinned channel, first match wins:
+
+1. An encrypted row: the decrypt result (9.2, 9.3); when its id is at or below B, also the
+   informational marker "Listed among the earlier, unprotected messages." (S4-D16).
+2. A plaintext row while the native state is not loaded or not verified: a "Checking..."
+   placeholder, never a red flash and never a normal message.
+3. A plaintext row with a verified B, an id at or below B, `pre_history` `kept` (and the pin
+   not `wiped`), and a ULID time at or before `history_time_limit`: an ordinary unencrypted
+   message ABOVE the permanent divider, with no shield.
+4. Every other plaintext row (an id above B, wiped, no boundary, or a ULID time after
+   `history_time_limit` whatever B says, S4-PA-1): the red "Unencrypted message in a protected
+   channel" marker (9.2).
+
+The spec asserts every arm and its precedence with the production options bag, and
+`const exhaustive: never` over the result.
+
+**Divider.** Permanent and not dismissable, directly below the newest row at or below B:
+"Messages above weren't protected". After a wipe, at the top of the channel: "Earlier
+unprotected messages were deleted."
+
+**Paging (S4-D17).** stoat.js and `Messages.tsx` (W4 C7) end backward and forward paging ONLY
+on an empty page or a server `has_more: false`, never on a short page (R19 "S4").
+
+**Wipe purge (S4-D21).** On `ChannelUpdate { protected_history }` with a wipe `requested` or
+`done`, stoat.js removes the cached plaintext rows at or below B of that channel; encrypted
+rows stay.
+
+**Copy (lingui, US spelling; the final strings are W4's):**
+
+- Protecting a channel with messages: "Messages already in #channel stay as they are, above a
+  line that says they weren't protected. New messages are end-to-end encrypted." Option:
+  "Also delete the earlier messages".
+- Wipe (S4-D23): "Earlier messages and their files will be deleted from Sloga's servers. This
+  can't be undone. Copies on people's devices, forwards, crossposts and reports may remain."
+  Native dialog: "Delete {N} earlier unencrypted messages from Sloga's servers? This can't be
+  undone."
+- History setting (S4-D2b, S4-D8): toggle "New members can read earlier messages"; on: "People
+  who join later can read messages sent while this is on, and so can a new device of anyone in
+  the channel. Anyone in the channel can still share what they read."; off: "New members only
+  see messages sent after they join."
+- hidden -> visible native growth dialog: "Let people who join #channel later read messages
+  sent from now on?"
+- New device (S4-D2b): "{name} added a new device. It can read this channel's history." (while
+  history is visible; the S1 copy otherwise).
+- Removal (O-5): "If you're removed from this channel, you keep what you've already read on
+  this device. Signing out without a key backup loses it."
+- Backup (8.5): "Restoring replaces your old device." and "History from protected channels
+  uses up to 2 MB of your backup, so fewer direct messages may fit."
+- Protect retry exhausted (4.9 "S4"): "This channel is too busy to protect right now. Try
+  again in a quiet moment."
+- A wipe the server refuses (a legal hold or any other 4xx): "Earlier messages couldn't be
+  deleted right now."
 
 ---
 
@@ -5532,6 +7096,15 @@ string goes through lingui.
 - **S3:** attachments (persistent ciphertext blobs, storage allowance, large files).
 - **S4:** history sharing (owner setting), the "protected from here" divider, opt-in wipe,
   protecting an existing channel, text tables in key backup.
+- **S4 after S4-W0 (#281).** Specified for S4a in this document, so no longer deferred:
+  history sharing with the owner setting (3.14, 4.1.1), the "protected from here" divider and
+  the row policy (9.5), protecting an existing channel (6.3, 7.2), the opt-in wipe (7.2, 7.5)
+  and text tables in key backup (8.5; O-7 taken as S4a). **Still S4b:** own-device history in
+  hidden mode over Olm (O-4); the native confirmation on an existing device before an honest
+  new device of a seated user walks history (O-17). **Out of S4:** a native plaintext cache
+  for kicked members (O-5); content search over old plaintext (O-12); archive-and-lock threads
+  (O-11); the "protect pending" send freeze, unless the live leg shows retries still losing
+  (O-10).
 - **S5:** Prot coin, ledger, Stripe, fuel tank, expiry stages; entitlement states `Grace`,
   `Frozen`, `Deleted` and the matching shield states.
 - **S6:** in-app purchase.
@@ -5920,6 +7493,117 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
   - **Live leg (dev stack only):** as plan section 8 (role removal, a member's logout, the
     owner's logout and recovery, offline catch-up, a dropped Welcome refetched, the capacity
     screen, a Grace rejoin).
+- **S4-W0 obligations, from plan section 6 (S4a; #282).** Every control is pinned to a
+  literal SHA, never `HEAD`; backend tests run on REFERENCE and MONGODB with `TEST_DB` set.
+  - **Vectors:** every 5.9 block through the native builders (exporter label and context, the
+    seal AAD, link plaintext, AD, XChaCha20-Poly1305 with the fixed nonce, signature payload
+    and signature, the wire JSON, the bridge, `ulid_time`) and the server's link-wire parser
+    and `ulid_time`; a control that swaps the two epochs in the AD fails on both sides.
+  - **Native, adversarial (S4-W3):** a removed member cannot open the link of its removal epoch
+    or any later one; a joiner decrypts and verifies a pre-join message; a link built under a
+    hidden embedded list yields nothing (control: invert the visibility check); a hidden epoch
+    after a hidden -> visible flip yields no link (control: build from the currently held
+    list); a roster identity that differs from its pin is refused (control: drop the
+    cross-check); an anchor mismatch is loud; a link replayed at another epoch fails its AD;
+    a writer outside the holder roster is refused; imported rows never feed the
+    removed-sender clause with their import time (control: write `now` as `first_seen_at`);
+    the `UnknownEpoch` floor is right with imported keys; bridge links across generations,
+    and a bridge whose G is not the predecessor refused; the hidden -> visible growth dialog
+    (control: drop the check); a seal-AAD edit of `history_visible` fails to open; a builder
+    refuses imported rows.
+  - **Contest (S4-PA-2, S4-RR-1, S4-RR-2):** a forged FIRST link by one member, an honest
+    member's contest and the joiner's fallback to the honest candidate (control: one
+    first-write-wins slot, history lost); one user with five devices takes ONE slot; the exact
+    roster diff accepts an honest unseat and refuses an added colluder (control: compare
+    `roster(e)` with the list embedded in e -> e + 1, which refuses the honest unseat);
+    `observed_at` is the MIN over matching candidates.
+  - **Backup:** the text section round-trips; groups restore as `left` (control: keep the
+    original state); the never-restored set is empty after restore; an oversized section
+    truncates oldest first and keeps pins; a never-truncated part over budget drops the
+    section and the backup stays valid; an old payload still restores; an unknown or
+    type-changing `text_v` is skipped, not fatal; zeroize covers the new keys; the two
+    replaced `store.rs` tests state their reason.
+  - **Backend, history links:** the route auth matrix incl. malformed-body oracle parity
+    (both routes, a Call group included); first write wins per writer user, an identical re-PUT
+    is idempotent, different bytes are `HistoryLinkExists`, a sixth user is refused; the byte
+    caps (per group, per user); a hidden or pruned commit's link refused (S4-PA-4); `e' >
+    current` refused; the bridge rules; delete cascade on both drivers; commit pruning leaves
+    links untouched; a link PUT refused while `history_setting` is off.
+  - **Backend, protect:** B = newest succeeds; a row newer than B gives `ProtectHistoryMoved`
+    with nothing written; a future B is refused at sign, at server parse and at native verify
+    (S4-PA-1); a v1 genesis or an empty boundary on a non-empty channel refused; a boundary
+    genesis seating anyone but the owner refused; a MONGO plaintext send racing protect never
+    leaves a servable plaintext row above B (control: remove the hold); the owner-only
+    genesis retry on a busy channel lands within 5 attempts at 1 message per second (MONGO);
+    a delayed earlier genesis counts as landed (S4-RR-5); `is_servable` truth table (controls:
+    `<=` to `<`, the wipe arm dropped); history, pins, single fetch and snapshots serve
+    pre-boundary rows and drop a stray above B; the query filter yields full pages around a
+    stray; a seat PUT changing the boundary or `wiped -> kept` refused; poll votes and softres
+    reservations refused after protect.
+  - **Backend, wipe:** a non-owner, a ManageMessages member and a privileged caller refused;
+    `seats_put` with `kept -> wiped` refused; the wipe route updates the group's
+    `seat_list_ad_sha256` (control: write the list row only, and the next commit wedges);
+    idempotent; the job never deletes an encrypted row (a hostile fixture: an encrypted row
+    with id <= B; control: drop the `encrypted` filter); attachments incl. forwarded copies
+    marked; polls and softres cascaded; resumes after an injected mid-batch failure; a legal
+    hold set after `Requested` stops the next batch; `last_message_id` and mentions fixed.
+  - **Frontend (`node --test`, production options bag):** the row-policy matrix with the
+    `never` check, including "a plaintext row timed after `history_time_limit` is red whatever
+    B says" (control: drop the time check); the pin store is one-way; paging ends only on an
+    empty page (control: today's `< FETCH_LIMIT`); the stoat.js wipe purge keeps encrypted
+    rows; the history walk (several pages, a stop on a missing link, the hidden marker, a
+    bridge).
+  - **Live leg (dev stack):** protect a channel with 500 messages while a bot posts (retry,
+    then the divider); a new member sees the pre-protect plaintext above the divider and the
+    encrypted history below (visible); the owner flips to hidden and a later joiner sees the
+    "not shared" marker; a wipe removes the old rows on every client and marks their files
+    deleted; logout and restore from backup, then history readable after the rejoin; a
+    manager-free observer confirms Mongo holds only ciphertext after B.
+  - **Fix-round obligations (#285 to #299).** (F1) a forged FIRST link two levels deep
+    above an EMPTY epoch e, next to an honest candidate: the search (now level by level,
+    #302) accepts the honest chain (control: take the first passing candidate, and history is
+    lost); a forged candidate whose subtree reaches no evidence is never committed; the bridge
+    test fails when an epoch with messages gets no probe. (F2) every reason refuses one
+    candidate and the next is tried; a declaration mismatch is `roster_diff_mismatch`. (F3)
+    messages of the epoch current at a hidden -> visible switch are never linked: native
+    builder, server PUT (both commits) and joiner step 6 (control: check e + 1 only). (F4) a
+    time clause resting on a `history_link` row gives `timing_unverified`, never
+    `RemovedSender` (control: red). (F5) a second list signed on a slow clock is accepted.
+    (F6) a missing epoch between `oldest_held` and `current` triggers the walk; a message above
+    the last held epoch of a superseded group walks, never catches up. (F7) kick, re-add, then
+    a message ahead of this device is NOT "sent after you were removed". (F8) a hold row in
+    `server_legal_holds` stops the next batch, both drivers. (F9) a contest PUT emits at most one
+    event per group per 5 minutes; the owner notice needs a signed mismatch under the owner's
+    keys and names the mismatching writer. (F10) the backfill gives every pre-S4 epoch-key row a
+    provenance row, a second opener inserts nothing, a missing provenance row is
+    `StoreCorrupt`. (F12) `roster(e)` derived from `added`/`removed` equals the writer's; the
+    99-removed and 99-added worst case (35379 bytes) is stored by the server and imported by a
+    joiner (#300); a test-only link over 40960 bytes is refused `too_large` on every member
+    and the owner is told. (F13) the
+    three-way classification with S4's tables; zeroize walks the `Value`. (F14) a writer added
+    after e' is refused. (F15) a link whose wire fields name another holder fails even with a
+    valid AEAD under the wire values; a lowercase or `8`-led ULID boundary is refused on both
+    sides; the wipe consent does not cover a later `kept -> wiped` list.
+  - **Fix-round-2 obligations (#301 to #309).** A probe that fails to open is no
+    evidence and refuses nothing; a probe whose author wrote a candidate carrying those keys
+    does not count (control: let it count); up to 3 probes from distinct authors are passed;
+    a writer plus a planted probe by a second colluder is imported only when no honest
+    candidate has evidence, and with one the walk stops `conflict`; two evidenced states with
+    different keys stop `conflict` (control: first-wins); candidates carrying one key with
+    different rosters merge to the union and grey that epoch's senders (control: the first
+    roster wins and history below is cut); a sixth distinct history key at one holder stops
+    `conflict`; a crafted ciphertext opening under two parent keys never yields more than five
+    states, and a holder costs at most 25 opens; a middle gap (held 0 to 50 and 100 upward)
+    walks 99 to 51 and anchors at 50; a session that reaches 2000 holders without evidence stops
+    `unanchored` and imports nothing; `observed_at` is capped at the commit's `created_at`, and
+    an honest member contests a matching candidate whose `observed_at` is more than 5 minutes
+    after its own; `hidden` or `genesis` alone never imports an unprobed epoch; the server
+    refuses a writer with `member_added >= e'`; a message at exactly epoch r after a removal
+    establishing r is "sent after you were removed"; a history switch is followed at once by
+    the switching device's Update commit.
+  - **Crypto lens (O-1):** S4-W0's dedicated `media-e2ee-reviewer` re-checks the chain first
+    (candidates, roster diff, bridge), then the exporter use and the seal AAD; S4-D1 is on the
+    independent-audit list.
 
 ---
 
@@ -7226,6 +8910,295 @@ Added in the S2-W3 native doc pass (desktop `feat/protected-s2-native` `876c034`
      an `owner_device` pin and a held v2 list as `StoreCorrupt` and cannot derive a group
      id past generation 63, so rolling back past S2 is unsafe (8.2).
 
+Added in S4-W0 (the S4 document and vectors lane; contract `protected-s4-W0-addendum.md`, base
+S2 `977472e5` plus S2's W2 doc round 2, plan `protected-s4-history-plan.md`, approved
+2026-10-25). Written as `S4-n` placeholders and renumbered after S2's last entry at the splice.
+
+240. DECISION (S4-W0): S4 is added as marked text ("DECISION (S4-W0)", "S4 replaces", "S4
+     extends", "[S4b]"); S4a moves history sharing, protecting an existing channel, the opt-in
+     wipe and text tables in key backup out of "Out"; the flag `history_setting` joins
+     `formats_v2` for rollout (header, 1.1).
+241. DECISION (S4-W0), S4-D1: three new literals, `sloga/text/history/v1`,
+     `sloga-text-history-link-v1` and `sloga-text-history-link-sig-v1`; none renamed; the
+     store seal label `sloga-text-history-key` is a local constant (0.4).
+242. DECISION (S4-W0): the trust model gains the injected-plaintext-at-or-below-B row, the
+     link row and the signed-boundary row (1.2).
+243. S4-D2b (S4-PA-3, S4-RR-7): R1 and R3 are widened by visible history (an injected or
+     compromised current device, or a compromised backup with history keys, reads all visible
+     history); mitigations are the marker, the owner copy and [S4b] O-17 (1.3).
+244. S4-D10: R4 closed once the backup text section ships, with its remains (1.3).
+245. S4-D5 (S4-PA-16): R7 amended; imported rows feed step 9 through the MIN signed
+     `observed_at` or the backed-up `first_seen_at` (1.3, 3.9). Amended by #288.
+246. S4-D9: R9 amended; a pruned gap fills through the chain when it was visible; a link
+     cannot be written once its commit is pruned (1.3).
+247. S4-D12: R15 amended; a stray at or below B is truthful pre-protect plaintext and is
+     served; a stray above B is dropped as before (1.3).
+248. S4-D15, S4-D17 (S4-PA-15): R19's reasoning replaced; the query-level filter and
+     empty-page-only paging (1.3, 7.5, 9.5).
+249. S4-R1 and S4-R2 written as R29 (ids minted by the server; the 2-minute window; several
+     owner-only geneses) and R30 (R11 extends to the history setting, narrowed by the
+     two-list visibility rule) (1.3). The fix round adds R31 to R33 (#295, #298,
+     #297).
+250. DECISION (S4-W0), S4-D14: `Channel.protected_history { boundary, wipe }` with the
+     internally tagged `HistoryWipe`; written only by protect, the wipe route and the job;
+     informational for clients (2.1).
+251. DECISION (S4-W0), S4-D2 (S4-PA-4, S4-PA-5): `MlsCommit.history_visible` from the commit
+     AD (v1 counts hidden), never on the wire; `MlsGroup.history_visible_at_create` for the
+     bridge (2.5). Amended by #287 (set on every create).
+252. DECISION (S4-W0), S4-D6, plan section 5: migration block `<= 80` / `LATEST_REVISION` 81
+     (assigned by the steward 2026-11-11) creating `mls_history_links` and the index
+     `history_links_by_holder`; the collection's fields, the three driver functions, the
+     per-user first-write rule (S4-RR-1), five candidates, the in-transaction caps, the
+     never-split paging, retention for the group's lifetime (O-6), the Reference lock place
+     (2.7, 2.8). The block also creates `server_legal_holds` (2.9, #292).
+253. DECISION (S4-W0), S4-D1 (O-1): the exporter-keyed backward link chain;
+     `hist_key(G, e)` with the 3.3 context and its own label, derived at every point an epoch
+     key is; removal is MLS's (3.3, 3.14, 3.14.1).
+254. DECISION (S4-W0), S4-D4, S4-D5: decrypt with imported keys: the predecessor group row,
+     `oldest_held` derived-only, `UnknownEpoch.removed_self`, step 9 unchanged in form (3.9).
+     Amended by #288 (timing informational), #290 (membership run) and #291.
+255. DECISION (S4-W0) (S4-PA-20): `mls_text_history_keys` with `history_visible` and
+     `source`; the seal AAD binding visibility and provenance; fork-checked inserts; `source`
+     kept here, not on `mls_text_epoch_keys` (ruled (a); backfill #294) (3.14.2).
+256. S4-D1, S4-D2 (S4-PA-4, S4-RR-6): the per-epoch visibility record, visible only when
+     the embedded list AND the newest held list say visible, written once at derivation;
+     builders never consult the held list (3.14.3). Amended by #287 (both epochs).
+257. S4-PA-5, S4-RR-6: holder (G', e') addressing; the bridge at e' = 0 carries the
+     creator's newest derived epoch of G; the joiner's v2 derivation check; no bridge into a
+     v1-id group (3.14.4).
+258. DECISION (S4-W0), S4-D1 (S4-PA-21): the link plaintext JSON (key order; round 1
+     carried a `roster`, replaced by `added` and `removed` in #296), the 176-byte AD,
+     XChaCha20-Poly1305 with a random nonce, the 9-line signature payload with the writer ids,
+     `HistoryLinkWire`; the link size cap (3.14.5; 40 KiB since #300; over-cap links
+     refused, #296).
+259. DECISION (S4-W0), S4-D1 (S4-PA-2, S4-RR-1): writer duty (the committer through
+     `_commit_won`, the successor creator's bridge, every other member after a
+     `leaf_index x 2 s` stagger with a native comparison); derived rows only; at most five
+     candidates, one per writer user; the contest is loud (carrier revised by #293) (3.14.6).
+260. DECISION (S4-W0), S4-D1 (S4-PA-2, S4-PA-16, S4-RR-2): joiner verification in order
+     (AEAD and shape, vouching under the holder roster, identity pins with the directory
+     retry, the exact roster diff from the commit declarations, key evidence with a probe,
+     the hidden stop); MIN `observed_at` over matching candidates; the anchor rule
+     (per-candidate refusal, loud stop when none matches) (3.14.7). Amended by #285
+     (backtracking), #286 (`roster_diff_mismatch`) and #296 (roster by difference).
+261. DECISION (S4-W0), S4-D3, S4-D8, S4-D9: the lazy walk, its stop reasons, the
+     one-transaction import (with a `left` row for a bridged predecessor), the floor; what
+     history covers; S3 interplay; [S4b] O-17 (3.14.8, 3.14.9). Amended by #285 (staged
+     import) and #290 (trigger and resume point).
+262. DECISION (S4-W0), S4-D3, S4-D11, S4-D20 (S4-PA-1, S4-RR-3, O-2, O-3, O-9): the
+     semantics of `history:`, `history_boundary:` (no future B: the 2-minute sign tolerance,
+     `issued_at := max(now, time(B))`, parsers refuse `time(B) > issued_at`) and
+     `pre_history:`; the flag-off refusal is `FailedValidation` (4.1.1). Amended by #289
+     (`issued_at` with the held value) and #299 (canonical ULIDs).
+263. DECISION (S4-W0), S4-D11 to S4-D13, S4-D20 (S4-PA-6, S4-PA-7, S4-PA-9, S4-PA-10): server
+     validation: the future-boundary parse rule; the protect probe and `ProtectHistoryMoved`;
+     the server's 2-minute clock rule (ruled (e)); the owner-only boundary genesis enforced by
+     the server; the wiped genesis from the signed line with `wipe_history` cross-checked and
+     the legal hold; the wipe write as `SeatListWriteKind::Wipe` with every other line equal
+     (4.3).
+264. DECISION (S4-W0), S4-D11, S4-D16 (S4-PA-1): native verify refuses a future boundary on
+     both paths; `kept -> wiped` takes effect; the earliest verified `issued_at` per channel
+     as `history_time_limit` (4.4.1).
+265. DECISION (S4-W0), S4-D13, S4-D20 (S4-PA-10, S4-PA-18, S4-RR-3 to S4-RR-5, O-10): the
+     boundary arguments of `_seat_list_sign`; the automatic `ProtectHistoryMoved` retry (at
+     most 5, a strictly larger B, no dialog); every signed genesis kept, any match on
+     read-back landed; the native wipe dialog and the short-lived wipe consent (4.9).
+     Amended by #289 and #299 (consent for version-1 geneses only).
+266. DECISION (S4-W0): the 5.9 vectors under the `tv4:` marker, computed by two independent
+     programs, byte-identical (5.9, 13).
+267. DECISION (S4-W0), S4-D2, S4-D6: the Delivery Service rules of the two history-link
+     routes (order, gates, membership, visibility, bridge rules, directory-key signature
+     filter), `history_visible` at commit submit and create; both routes in the oracle matrix
+     (6.1). Amended by #287 (both commits), #293 (`?contest=true`) and #298.
+268. S4-D1, S4-D4, S4-D5: the native rules (derive, build, import, `removed_self`, keys
+     never deleted) (6.2). Amended by #285 to #287 and #291.
+269. DECISION (S4-W0), S4-D11 to S4-D13, S4-D18 to S4-D21 (S4-PA-19): the flows: protecting
+     an existing channel with a client-side preflight, the walk, the writer duty, the later
+     wipe, the history setting (6.3).
+270. DECISION (S4-W0), S4-D6, S4-D22 (S4-PA-9, S4-PA-17, S4-RR-1, O-15, O-18): the config
+     keys, the per-user split (ruled (d)), the legal-hold stub (revised by #292), the
+     gates, the root advert, the flag-off rows (7.1).
+271. DECISION (S4-W0), S4-D12, S4-D19, S4-D20: the route table; protect with a boundary
+     (the four places change together, the flag-write filter dropped); who can protect; the
+     wipe route; the history-link routes and the GET shape (7.2).
+272. S4-D18 (S4-PA-14, S4-PA-19): the carried-over state table, with S3's attachment
+     wording (7.4).
+273. DECISION (S4-W0), S4-D15, S4-D19, S4-D21, S4-D22 (S4-PA-9, S4-PA-13, S4-PA-15,
+     S4-PA-21): `ProtectedReadView` and `is_servable` in one atomic lane, the query filter,
+     the `history_wipes` job, the purge, the audit actions `ChannelProtect` and
+     `ChannelHistoryWipe` (requested and done), the cascade (7.5). Amended by #292 and
+     #293.
+274. S4-D13, S4-D6: errors `ProtectHistoryMoved` and `HistoryLinkExists` (409); no other new
+     server variant (7.6).
+275. DECISION (S4-W0), S4-D1, S4-D4: the native tables `mls_text_history_keys`,
+     `mls_text_membership` (named `mls_text_removed_self` in round 1, widened by #290 and
+     #291) and `mls_text_history_state`; no ALTER (8.2). Amended by #294 and #297.
+276. DECISION (S4-W0), S4-D7: the command changes, the two new commands with their extended
+     arguments (`candidates`; the import steps with commits and a probe), `TextChannelState`
+     fields, registration (8.3). Amended by #285, #288, #293 and #296.
+277. S4-D7: `HistoryLinkInvalid { group_id, epoch, reason }` with the plan's six reasons;
+     `UnknownEpoch.removed_self` (8.4). Amended by #286 (seventh reason, per-candidate) and
+     #299 (`future_boundary`).
+278. DECISION (S4-W0), S4-D10 (S4-PA-11, S4-PA-12, S4-PA-14, O-7, O-8): the key-backup
+     text section: `Option<Value>` with a fallible typed parse, its contents, the
+     never-restored set re-derived with S2's and S4's tables, restore as `left`, the 2 MiB
+     budget with the drop-whole-section rule, zeroize, the refresh trigger, `RestoreReport`,
+     the two replaced `store.rs` tests (8.5). Amended by #294 and #297.
+279. S4-D4, S4-D8, S4-D16: the markers and the 9.2 rows (9.2, 9.3).
+280. DECISION (S4-W0), S4-D16, S4-D17, S4-D21, S4-D23, S4-D2b: the row policy (the time arm,
+     the "Checking..." state, `never`), the divider, paging, the purge, the copy (9.4, 9.5).
+281. S4 section 10: S4a specified; S4b kept (O-4, O-17); out of S4 (O-5, O-10, O-11, O-12)
+     (10).
+282. S4 verification obligations from plan section 6 and the audit-driven list (11).
+283. Raised OPEN for the S4-W0 audit and ruled by it (rulings at the end). (a) `source`
+     lives on
+     `mls_text_history_keys` (an epoch-key row without a history-key row counts as derived),
+     although the plan's S4-D5 and section 5 name `mls_text_epoch_keys`; its S4-PA-20 fold
+     moved the history key off that table to avoid an ALTER, so this document does the same
+     for `source` (3.14.2). (b) The contest event has no carrier in the plan; recommended: a
+     client-claimed `contest: true` on the PUT, an `AUDIT` line, a
+     `ProtectedChannelChanged { scope: ["history"] }` and an owner notice (3.14.6, 7.5). (c)
+     A failed roster diff maps to `roster_identity_mismatch`, because the plan's reason list
+     is closed; a `roster_diff_mismatch` value would be clearer (3.14.7). (d) The
+     per-writer-user byte budget is the group cap divided by the five slots (13421772 bytes
+     by default); the plan states no split (7.1). (e) The server accepts `ulid_time(B)` up to
+     2 minutes after its own clock (delta instances' clocks differ); the plan says "not in the
+     future" (4.3). (f) `seat_list_version` is defined as the version of the list in the
+     commit that created (G, e), informational; the plan gives no semantics (3.14.5,
+     3.14.7). (g) The legal-hold stub is a config list of server ids; the plan names no
+     storage (7.1). Recorded, not open: the plan's migration expectation `<= 78` / 79 is
+     superseded by the steward's `<= 80` / 81; O-7 is taken as S4a because the contract's
+     S4b list names only O-4 and O-17. **Rulings (crypto-lens audit, PASS WITH FIXES):** (a)
+     kept, with the backfill of #294; (b) REVISED by #293; (c) REJECTED, see #286; (d),
+     (e) and (f) kept; (g) REVISED by #292.
+284. S4-W0 index maintenance: S2 entries S4 extends, left as written: #189 (the v2 lines;
+     S4 gives them effect, 4.1.1), #139 and #155 (stray drop; extended by the read rule,
+     7.5), #128 and #134 (N3; amended for the retry loop, 4.9), and the S1 decision that
+     protect needs an empty channel (7.2), replaced for a boundary genesis.
+
+Added in the S4-W0 fix round (crypto-lens audit PASS WITH FIXES, 2026-11-11; HIGH F1 to F3,
+MEDIUM F4 to F9, LOW F10 to F15).
+
+285. DECISION (S4-W0 fix F1, HIGH): acceptance is recursive with backtracking. A candidate is
+     accepted only when its subtree reaches evidence (a probe opens at that or a lower epoch,
+     an anchor matches both keys, or the walk ends at `genesis` or `hidden`), depth-first over
+     at most five candidates per holder, memoized by (holder, history key); a probe is
+     required whenever the bridge's paged history holds a message of that epoch; imports are
+     staged and committed only once anchored. The round-1 sentence that an unprobed bottom
+     candidate "decrypts nothing that another candidate could" is withdrawn: a forged first
+     link two levels above an empty epoch could decide the whole chain (3.14.7, 3.14.8, 8.3,
+     11). Superseded by #301 and #302 (the level-by-level search with qualifying probes).
+286. DECISION (S4-W0 fix F2, HIGH): every `HistoryLinkInvalid` reason refuses only that
+     candidate, each refusal logged loud; the walk stops, with the loud notice, only when no
+     candidate of the holder is accepted. Ruling (c) rejected: new native-only reason
+     `roster_diff_mismatch` (3.14.7, 8.4, 9.2).
+287. DECISION (S4-W0 fix F3, HIGH): a link `W(e)` is built, stored and accepted only when
+     BOTH epochs e and e + 1 are visible: native checks both per-epoch records (a bridge, the
+     creator's records of (G, e) and (G', 0)); the server PUT checks `history_visible` on
+     commits e' and e' - 1 (for e' = 1, `history_visible_at_create`, now set on every create);
+     the joiner stops at a hidden commit on either side. The epoch current at a hidden ->
+     visible switch is never shared, so "messages sent from now on" is exact (2.5, 3.14.3,
+     3.14.4, 3.14.7, 6.1, 11).
+288. DECISION (S4-W0 fix F4, planner ruling): a removed-sender time verdict that rests on a
+     `history_link` row is informational (`timing_unverified`, the grey "Timing of this message
+     can't be verified"), never red; the MIN `observed_at` feeds only that check; derived and
+     backup rows keep the red verdict. The tradeoff is stated in R7 (1.3, 3.9, 3.14.7, 8.3,
+     9.2, 9.3).
+289. DECISION (S4-W0 fix F5): "`issued_at` never decreases" (not an S2 rule) is withdrawn;
+     every builder on a channel with a boundary sets `issued_at := max(local_now,
+     ulid_time(B), held.issued_at)`; a second list signed on a slow clock is accepted (4.1.1,
+     4.9, 11).
+290. DECISION (S4-W0 fix F6): the walk runs for ANY missing epoch below `current` not covered
+     by `removed_self`, and for epochs of a closed or `left` group above its last held epoch;
+     `oldest_held` is the first epoch of the device's current membership run (`joined_epoch`);
+     the walk resumes from the lowest held sealed history key, any source (3.9, 3.14.8, 8.2).
+291. DECISION (S4-W0 fix F7): `removed_self_epoch` (in `mls_text_membership`) is cleared by
+     a Welcome that re-admits the device, and otherwise applies only to epochs above it while
+     the group is `left` (3.9, 6.2, 8.2, 11).
+292. DECISION (S4-W0 fix F8; ruling (g) revised): the legal-hold stub is the database
+     collection `server_legal_holds { _id: server_id, set_at, set_by, note }` (both drivers,
+     admin-only writes, `_id` only), created in the S4 migration block and read by the wipe
+     route, by protect with `wiped` and before each wipe batch; the config list is dropped
+     (2.7, 2.9, 4.3, 7.1, 7.2, 7.5).
+293. DECISION (S4-W0 fix F9; ruling (b) revised): `contest` is a query parameter of the PUT,
+     not a `HistoryLinkWire` field; the `history` event is limited to one per group per 5
+     minutes; the owner notice fires only after the owner's native confirms a signed mismatch
+     under its own keys, and names the writer of the mismatching candidate (3.14.6, 6.1, 7.2,
+     7.5, 8.3, 9.2).
+294. DECISION (S4-W0 fix F10): the `ensure` step backfills a provenance-only
+     `mls_text_history_keys` row (`derived`, key NULL) for every existing epoch-key row; a
+     restore writes a `backup` provenance row; a missing provenance row is `StoreCorrupt`
+     (3.14.2, 8.2, 8.5).
+295. S4-W0 fix F11: new residual R31 (a hostile server plus a member of epoch e + 1 can
+     forge `roster(e)` through the unsigned declarations; beyond retention a lying writer
+     alone); survivors compare as full entries (1.3, 3.14.7).
+296. DECISION (S4-W0 fix F12): a link carries `added` and `removed` full entries instead of a
+     full roster, so `roster(G, e) = (roster(G', e') - added) + removed` exactly; both programs
+     recomputed the 5.9 vectors; the largest commit change is 35379 bytes, and #300 raises the
+     cap to 40 KiB so it fits; a link over the cap is refused `too_large` and the owner is told
+     (3.14.5, 3.14.7, 5.9, 9.2).
+297. DECISION (S4-W0 fix F13): the 8.5 classification: `mls_text_history_state` carried
+     (`earliest_issued_at` only), `mls_text_membership` and S2-W3's schema marker never
+     restored; `TEXT_TABLES` and `has_text_tables` list S4's three tables; zeroize walks the
+     `Value` tree; the budget is `min(2 MiB, cap - headroom - fixed)`; new residual R33 (replay
+     dedupe resets on restore) (1.3, 8.2, 8.5).
+298. DECISION (S4-W0 fix F14): the server refuses a writer whose `member_added` epoch is
+     above e'; new residual R32 (five colluding seated users can fill every slot) (1.3,
+     6.1).
+299. DECISION (S4-W0 fix F15): the AD is rebuilt from the EXPECTED holder and (G, e), never
+     from wire fields; `ulid_time` accepts only uppercase canonical ULIDs whose first character
+     is `0` to `7` (server and native); the wipe consent covers version-1 geneses only; the
+     anchor at a held pre-S4 row compares the text key and roster only, and no transition
+     before S4 has a link; `SeatListRejection.future_boundary` with its 9.2 row (3.14.1,
+     3.14.5, 3.14.7, 4.1.1, 4.3, 4.9, 8.4, 9.2).
+300. DECISION (planner ruling after the S4-W0 fix round): the history-link size cap is 40 KiB
+     (40960 bytes of decoded ciphertext), up from 24 KiB, so the largest link one commit can
+     produce (99 leaves removed and 99 added at 100 leaves, 35379 bytes) is storable and a
+     legitimate mass seat change never cuts history; the `too_large` refusal and the owner
+     notice stay for anything above, which honest traffic cannot reach. 5.9 gains
+     `worst_link_within_cap` (35379 <= 40960, asserted by both programs), and
+     `link_entries_within_cap` becomes 229 (2.8, 3.14.5, 5.9, 6.1, 7.1, 7.2, 9.2, 11).
+
+Added in the S4-W0 fix round 2 (targeted re-review NEEDS CHANGE, 2026-11-11; HIGH 1 and 2,
+MEDIUM 3 and 4, LOW 5 to 8, NIT).
+
+301. DECISION (S4-W0 fix round 2, HIGH 1): evidence by probe. A probe that fails to open is
+     no evidence, never a refusal; a probe counts only when its author is not the writer user
+     of any candidate carrying the same keys; the bridge supplies up to 3 probes from distinct
+     authors; two states with different keys that both have evidence stop the walk
+     `conflict` (loud; the owner learns through the contest path); new residual R34 (two
+     colluders split writer and probe) (1.3, 3.14.7, 3.14.8, 8.3, 9.2, 11).
+302. DECISION (S4-W0 fix round 2, HIGH 2): the joiner's search goes level by level over
+     states (holder, carried history key), replacing first-in-stored-order acceptance and the
+     (holder, key) memo of #285; a state's roster is the merge of its candidates', the union
+     when they disagree (that epoch imported as `history_link_disputed`, its senders
+     unverifiable, logged loud); at most five states per holder, a sixth stops `conflict`;
+     the work is at most 25 AEAD opens and 25 signature checks per holder (plus at most 3
+     probe opens per state), linear in the depth; nothing relies on key commitment, which
+     XChaCha20-Poly1305 lacks. R31 and R32 amended (1.3, 3.14.2, 3.14.7, 6.2, 9.2).
+303. DECISION (S4-W0 fix round 2, MEDIUM 3): a middle gap is walked from the bottom of the
+     held run just above the missing epoch down to the first held epoch below it, which anchors
+     it (held 0 to 50 and 100 upward: walk 99 to 51, anchor 50). Amends #290 (3.14.8).
+304. DECISION (S4-W0 fix round 2, MEDIUM 4): a walk is one session of import calls that keeps
+     asking for pages (at most 200 link rows each) until a level has evidence or a stop is
+     reached; at most 2000 holders or 64 MiB of candidate bytes per session, else the loud
+     `stopped: "unanchored"`, staged states discarded and retried later (3.14.8, 8.3, 9.2).
+305. DECISION (S4-W0 fix round 2, LOW 5): a candidate's `observed_at` is capped at the stored
+     commit's `created_at` (it feeds only the grey check); an honest member contests a matching
+     candidate whose `observed_at` is more than 5 minutes after its own `first_seen_at`
+     (3.14.6, 3.14.7).
+306. S4-W0 fix round 2, LOW 6: `hidden` and `genesis` are stop conditions only, never
+     evidence (3.14.7).
+307. DECISION (S4-W0 fix round 2, LOW 7): the server requires `member_added < e'` for the
+     writer of a link held at e' >= 1. Amends #298 (6.1).
+308. DECISION (S4-W0 fix round 2, LOW 8): `removed_self_epoch` is r, the epoch the removing
+     commit establishes, and the marker applies to `epoch >= r`. Amends #291 (3.9, 8.2).
+309. S4-W0 fix round 2, NIT: a change of `history` is followed at once by the switching
+     device's self-Update commit, so "messages sent from now on" counts from that commit; a
+     recovery successor of a channel dormant past commit retention finds G's `prev_epoch`
+     commit pruned and gets no bridge link, and history before it stays only on the devices
+     that hold it (3.14.3, 3.14.4, 6.3).
+
 ---
 
 ## 13. How the vectors in section 5 were checked
@@ -7250,3 +9223,20 @@ checker was shown to fail on a copy of this document with one altered `tv2:` byt
 was run on the real file. The S1 document checker freezes every `tv:` block against the S1
 baseline and refuses unknown `tv:` names, which is why S2 uses its own marker; W1 and W3
 reproduce the S2 vectors in Rust, and those tests are the parity test.
+
+**S4 vectors (5.9, S4-W0, #266).** The `tv4:` values were computed by two programs written
+independently for this purpose: a Python one (`hashlib`, the `cryptography` package's Ed25519
+and IETF ChaCha20-Poly1305 under its own HChaCha20, f-string builders and `struct` packing),
+which first checks its HChaCha20 against draft-irtf-cfrg-xchacha-03 section 2.2.1 and
+reproduces the 5.6 ciphertext, the 5.2 owner key and the 5.8 v2 group ids before it emits
+anything; and a node one (`node:crypto`, its own HChaCha20, Buffer builders over label and
+value tables, `JSON.stringify`) that takes every input by PARSING this document
+(`tv:inputs`, `tv2:inputs`, `tv4:inputs`, and the 5.6 blocks for its own self-test) and checks
+every `tv4:` block against its recompute. Their outputs were byte-identical. In S4-W0 both
+checkers ran on a trial splice of this chapter into the S2 document, and each was shown to
+fail on a copy of that trial with one altered byte (a `tv4:` byte for the node checker); the
+splice re-runs both on the real file. After the S4-W0 fix round (the `added`/`removed` link
+format, F12, and the stricter `ulid_time`, F15) both programs recomputed every `tv4:` value and
+again agreed byte for byte. The S1 checker freezes every `tv:` block and refuses unknown `tv:` names, which
+is why S4 uses its own marker; W1 and W3 reproduce the S4 vectors in Rust, and those tests are
+the parity test.
