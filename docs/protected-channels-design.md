@@ -13,8 +13,16 @@ contract against branch `feat/protected-s2` at `be915a8d`, from the approved pla
 `protected-s2-membership-plan.md` (decisions S2-D1 to S2-D44; S2a is what the beta needs,
 S2b the follow-ups). New text is marked **DECISION (S2-W0)**; S1 text that an S2 decision
 replaces is kept and marked "S2 replaces". S2b items are marked "[S2b]" and are specified as
-formats only unless stated. The S2 index entries are #187 to #232 (section 12; #212 to #223
-are the fix round of the S2-W0 wave audit, #224 to #232 its second round).
+formats only unless stated. The S2 index entries are #187 to #239 (section 12; #212 to #223
+are the fix round of the S2-W0 wave audit, #224 to #232 its second round, #233 the S2-W1
+wave audit, #234 to #239 the S2-W3 native doc pass).
+
+**S2-W3 native doc pass (2026-11-12, #234 to #239).** Text marked "As built (S2-W3)" records
+what the native wave does at desktop `feat/protected-s2-native` `876c034`, read from the
+code; where it differs from earlier text here, the earlier text is kept and the difference
+is stated. It covers the S3-N0 envelope v2 decoder (3.6.1), the native command and storage
+changes (8.2 to 8.4), the 4.4.1 rules as built, the #223 supersession, and a release note
+(rolling back past S2 is unsafe, 8.2).
 
 How to read it:
 
@@ -513,6 +521,16 @@ A hostile or compromised server (or an operator with database access):
   other device X seated Y", 4.4.1 rule 9, #227). It is the S1 exposure of a stolen single
   owner device, multiplied by the number of listed devices; the detection shortens the
   window, it does not close it.
+  **As built (S2-W3, #236).** The "drops THIS device" alert is a stored per-channel flag
+  (`mls_text_owner_alerts`, 8.2), set in the same transaction as the adoption that drops
+  the device, so a commit whose decryption half is then refused cannot lose it; it fires
+  only for a device that WAS signing (the pinned owner device, or listed in the held
+  authority), so a never-listed owner-user device is never alerted. What stays open by
+  design: a member that skipped list versions cannot check the authority's `prev` or the
+  #225 signer-device rule (both need the held version + 1, 4.4.1 "As built"), so it accepts
+  any authority whose named signer is an entry of the authority it holds. A thief with a
+  listed owner device signs such authorities, and a hostile server chooses which lists each
+  member sees. Detection, not prevention.
   **Step 3b verification race (S2-W2; W2 wave audit ruling 1, ACCEPTED).** The route
   verifies a CHANGED authority against the signer device's directory key BEFORE the write
   transaction (4.3 step 3b), comparing with the stored authority it read outside the
@@ -1246,6 +1264,26 @@ text_group_id_v2(channel_id, g, salt) = lowercase_hex( SHA-256(
   it. Production holds no Text group (the HOLD, 1.1), so this costs one successor per DEV
   channel; accepting both derivations for one generation was rejected because it would keep
   a public id in use with no end date.
+- **As built (S2-W3, #237).** (a) **Predicate.** Native has ONE superseded test, shared by
+  `_encrypt` and `_state`: a group is superseded when its row records a successor
+  (`superseded_by`) OR its id is not `group_id_for(channel, generation, held salt)` (the
+  held list's derivation). So a v1-id group under a held v2 list counts even with nothing
+  recorded. `_encrypt` refuses it (`MlsGroupNotFound`), `_state` reports its stored state
+  with verdict `no_group` (8.3), and `_decrypt` follows 3.9 "S2". (b) **AD path.** Adopting
+  the first v2 list from a commit AD records `superseded_by` = the generation + 1 id under
+  the adopted salt, in the same transaction as the adoption. (c) **GET path (#223 upgrade,
+  planner ruling 2026-11-11).** A v1 holder with an active v1-id group, shown a v2 list
+  whose snapshot names a group that is not the v1 derivation, defers the 4.4 step 0
+  recompute to the CANDIDATE list's salt, run only after anti-rollback, the signature, 4.4.1
+  rules 1 to 6 and signer acceptance passed and before anything is written: the candidate
+  salt must derive `as_of_group_id` at `as_of_generation` (else `ChannelMismatch`), and that
+  generation must be newer than the held group's (older: `SeatListBehind`). It then adopts
+  as a joiner would: the v1 group is NOT caught up, no signer-leaf check runs against it
+  (the signer's leaf is checked at the successor's Welcome), and no `superseded_by` is
+  written (the predicate in (a) already covers it). A v2 holder always uses its held salt.
+  (d) Commits later drained in the v1-id group are judged with the v1 rules (3.12.3 "As
+  built"). (e) **Known exceptions to "never poisoned"** (3.12.3 "As built"): the v1-id group
+  can still be poisoned on an upgraded member in two cases.
 - `sloga-text-group-v1` and the v1 derivation are untouched. Vectors: 5.8 (`g` = 0, 1, 64
   and 65535, and the 91-byte hash input for `g = 0`). A control that reuses the v1
   derivation for a v2 channel must fail on both sides.
@@ -1332,6 +1370,70 @@ Compact JSON object, UTF-8:
   Mentions are not parsed server-side, so in S1 a mention inside protected text never pings
   (documented UX limitation).
 
+#### 3.6.1 Envelope v2 (S3-N0; decode only in S2)
+
+**DECISION (S2-W3), #234.** S2 native decodes the inner envelope v2 that S3 defines (S3 plan
+`protected-s3-attachments-plan.md` section 2.3 and its N0 row), so a file message from an S3
+sender is never red on an S2 client. S2 has NO v2 send path: `_encrypt` builds v1 only, so a
+text-only message stays a v1 envelope byte for byte (S3 rule M-7; S9 overrules M-7 for
+franked messages, below). Compact JSON, keys in this order, unknown, duplicate or missing
+keys refused:
+
+| Key | Type | Rule |
+|---|---|---|
+| `v` | number | exactly `2` |
+| `cid`, `ts`, `replies` | | as v1 (3.6) |
+| `text` | string | may be empty only when `files` is non-empty |
+| `files` | array of file ref | required; at most 5; `[]` only with a non-empty `text` |
+| `fk` | string | S9's franking key. MUST be ABSENT under an outer v1 payload: any present value, `null` included, refuses the envelope |
+
+A file ref is `{ blob_id, key, digest, sha256, size, name, mime }` in that order, unknown
+keys refused: `blob_id` 1 to 32 ASCII alphanumerics (the DM ref rule); `key` canonical b64
+of exactly 32 bytes; `digest` the ciphertext SHA-256 and `sha256` the plaintext SHA-256
+(reserved for S9 franking), each 64 lowercase hex; `size` the plaintext size,
+`1 ..= 2^53 - 1` (no per-scope cap here: caps belong to S3's download path); `name` at most
+120 UTF-8 bytes (a channel cap, tighter than the DM cap of 200 characters); `name` and
+`mime` are sanitized for display only.
+
+- **Decode order** (native `decode_envelope`, after the AEAD open of 3.9 step 6): (1) more
+  than 16368 bytes is `too_large`, so the cap counts the refs; (2) the first non-whitespace
+  byte must be `{`, then `v` alone is PEEKED (not an object, or no `v`: `envelope`); (3) by
+  `v`: `1` the 3.6 rules, `2` the rules above (every failure `envelope`), an integer `3` to
+  `255` `UnsupportedEnvelopeVersion { v }` (8.4, the grey "update" marker, never red),
+  anything else `envelope`. Peeking first is what lets a newer version reach the grey
+  marker; its strict decode would fail as `envelope`.
+- **Outer payload.** Before the 2.6 structure check, `_decrypt` peeks `encrypted.v`: an
+  integer `2` to `255` is `UnsupportedEnvelopeVersion { v }` and nothing is decrypted (S9's
+  ask 1); any other value goes on to 2.6 (`structure`). The server still accepts only
+  `v: 1` and refuses `franking` (2.6) until S9 changes it.
+- **Signature and AAD unchanged.** The 3.7 payload is the same for both versions: the refs
+  sit inside the signed ciphertext (S3 plan 2.3). An explicit `files` line is left to S9's
+  signature v2.
+- **Result.** `TextDecrypted.files` (8.3) carries one `FileMeta { idx, name, mime, size,
+  state, fail_reason }` per ref (`[]` for v1). S2 has no download path, so every file is
+  `state: "failed"`, `fail_reason: "unsupported"` (snake_case; the frontend maps it), with
+  `name` and `mime` through the DM sanitizers. The key, the blob id and both digests never
+  leave native. The `files[*].blob_id` subset check against `Message.blob_ids`, and the
+  `blob_ids` decrypt argument it needs, are S3's (not in S2).
+- **Version table.** S9 pins outer `encrypted.v` against envelope `v` in its finding F1
+  (`protected-s9a-safety-plan.md` section 2; S9 handoff `protected-s9-HANDOFF.md`). What S2
+  native does with each row:
+
+| outer `v` | envelope `v` | S9 meaning | S2 native |
+|---|---|---|---|
+| 1 | 1 | not franked | decoded (3.6) |
+| 1 | 2 | S3 files, not franked; `fk` absent | decoded (above); a present `fk` is `envelope` |
+| 2 | 2 | franked; `fk` required | `UnsupportedEnvelopeVersion { v: 2 }`, nothing decrypted |
+| 2 | 1 | refused | the same: the outer peek runs first |
+
+- **Residual (accepted).** The outer `v` is not authenticated, so a hostile server can turn a
+  message into the grey "update" marker by editing it (a red `structure` included). That is
+  equivalent to withholding the message; no plaintext is shown.
+- **Vectors are native-only** (`vectors_test.rs`, the `n0_*` tests: a one-file v2 envelope
+  reusing the 5.1 `cid`, `ts`, `text` and `replies`, its corruption table, v3 and later
+  grey, the ref budget against 16368 bytes, text-only encrypt still v1, outer v2 grey, `fk`
+  under outer v1 refused). This document carries no `tv2:` block for envelope v2.
+
 ### 3.7 Signature
 
 Ed25519 by the sender device's **vodozemac identity key** (`account.sign`, the same key that
@@ -1404,6 +1506,17 @@ Each failure is a typed, loud result (section 8.4); nothing is silently dropped.
 10. **Replay** (3.10): `Replay` if this `cid` is already bound to a different message id.
 11. Success returns the plaintext plus `ts_skew = |ts - ulid_time(Message.id)| > 10 minutes`
     (**DECISION (W0)**; rendered as an informational marker, not red).
+
+**S2 (As built, S2-W3; #234, #237).** Step 2 first peeks the outer `encrypted.v` (an integer
+`2` to `255` is `UnsupportedEnvelopeVersion`, nothing decrypted) and step 7 decodes either
+envelope version, peeking `v` first (3.6.1); step 11 adds `files`. **Superseded groups
+(#223).** Decrypt names no refusal for a superseded group, so it is unchanged there: while
+the superseded group is still the channel's newest, its messages decrypt, live ones
+included (members that have not adopted the v2 list still send in it; refusing them early
+would show them as removed). Once the successor is held, the superseded group is no longer
+the channel's current group, so a live message in it is `RemovedSender` (step 9; the L6
+rule for any older generation), and history still decrypts from held keys. Only `_encrypt`
+refuses a superseded group (3.1.1 "As built").
 
 ### 3.10 Replay dedupe
 
@@ -1855,6 +1968,31 @@ than this device's record of that device's latest Add is refused is STAGING-only
 `_remove` and `_admit`), because a receiver refusal would be the poisoned path and clock
 skew could then poison a group under an honest server.
 
+**As built (S2-W3, #237): a commit in a v1-id group under a held v2 list (W3 audit finding
+2).** A commit in a group whose id is the v1 derivation of its generation, processed while
+the held list is v2 (a group the first v2 list superseded, on either path, 3.1.1), is judged
+with the v1 rules, as the members that had not upgraded judged it when they merged it:
+rejoin intents are verified with no held salt (an S1 payload verifies), and rule g names the
+signer device of the list the commit's AD carries, not the held v2 list's signer. That AD
+list is the held one (adopted, or byte-identical) or an OLDER one that step 3 settled
+without any check. An older one names a device only when it is signed by the held list's
+signer USER, verifies under that device's usable slice-5 key, and that device (device and
+key) is still an owner device here: the owner pin, or an `owner_devices` entry of the held
+authority of that user. Otherwise rule g names nobody and the commit is `NotOwner`
+(poisoned). `_commit_won` applies the same predicate to the committer's own commit, so the
+committer and the receivers decide alike. The predicate is the id derivation alone: a group
+with a v2 id superseded by a recovery successor keeps the v2 rules.
+**Known exceptions to "#223 never poisons" (W3 re-review, accepted).** Both stay inside the
+superseded group, which takes no sends. (1) Under the v1 rules, rule h, the caps and
+forced-removal memory still read the HELD v2 list's seats, so a pending v1 Add of a user the
+v2 list unseated poisons the superseded group on a member that already upgraded (follow-up
+owed). (2) An older AD list whose signer device was since revoked or re-keyed (or is not
+pinned on this device), or is no longer an owner device, names nobody for rule g, so a
+commit that members who never upgraded merged poisons the superseded group on upgraded
+members. A hostile server can produce the same split on purpose by replaying a genuine old
+list signed by a FORMER owner device as a commit's AD: a member that never upgraded merges,
+an upgraded one poisons.
+
 There is no fetch, no post-decrypt deferral and no "named but not held" state. A Welcome
 carries no commit AD; a joiner verifies the list via `GET .../seats` before it signs its join
 intent (6.3), as before.
@@ -2254,6 +2392,27 @@ decrypted, and a failure there is a poisoned epoch instead of a refused fetch. A
 stored together with the handover chain it arrived with (from `GET` or from the AD), because
 the device's own commits must embed exactly that chain (3.12.1).
 
+**Step 0 as built (S2-W3, #237; S2-D33).** With an active group, `as_of_epoch` and
+`as_of_group_id` are required. The held group itself: a stated `as_of_generation` that
+differs is `ChannelMismatch`, and a held epoch below `as_of_epoch` is `MlsEpochGap` (catch up
+first). Another group: its id is RECOMPUTED for exactly `as_of_generation` with the held
+list's salt; no `as_of_generation`, one above 65535 (no id derives from it: the server's
+snapshot is wrong, W3 audit finding 4) or an id that is not that derivation is
+`ChannelMismatch`; then a NEWER generation is `MlsGroupNotFound` (take the join path), an
+OLDER one `SeatListBehind { have, need }` and the same one `ChannelMismatch`. The single
+exception is the #223 upgrade over `GET` (3.1.1 "As built" (c)). Without an active group the
+list is adopted directly, as a joiner's.
+**Member recovery order (S2-D22).** A recovery successor's snapshot names a newer
+generation, so a member whose old group is still active gets `MlsGroupNotFound` from
+`_seat_list_verify` until it starts the join: `_join` of the successor writes a `joining`
+row, which makes the successor the channel's current group, so the next verify adopts
+directly. The order is therefore: join the successor; verify the recovery list (signed by
+a device that is neither the pin nor in the held authority: `OwnerChanged { same_user:
+true }`, step 4, or 4.4.1 rule 5 for the new authority on a v2 channel); confirm
+(4.7, the pin moves, source `confirmed`); verify again (adopted); then process the
+Welcome, whose signer-leaf check (step 5) now names the recovery device. A Welcome
+processed before the confirmation is `SignerLeafMissing` and is retried.
+
 #### 4.4.1 S2 rules for v2 lists and authorities (S2-D1, S2-D2, S2-D22)
 
 **DECISION (S2-W0), #189, #191, #198.** Within step 2 (anti-rollback, which still runs
@@ -2312,6 +2471,44 @@ FIRST) and steps 3 to 6:
 
 Native stores the newest accepted authority per channel (`mls_text_authorities`, 8.2) with
 the list.
+
+**As built (S2-W3, #236; W3 audit finding 1, W3 re-review items 1 and 3).** The rules run in
+one function on BOTH paths (`GET` and AD), in this order: anti-rollback, rules 1 to 3, the
+chain bodies, rule 4, (AD only) the signer's leaf present, the list signature, rule 5,
+signer acceptance with rule 6, the signer-leaf check, adoption, rule 9. Native details the
+rules above leave open:
+
+- **Rule 4, the native mirror of #225.** A NEW authority (not byte-identical to the held
+  one) must also name the list's signer device as its `signer_device_id`, but ONLY when the
+  list is exactly the held version + 1 (the server compared it with the authority it
+  stored, 4.3 step 3b, which a member holding the previous version also holds). A member
+  that skipped versions, or sees its first list, may get an authority an earlier list
+  introduced, carried unchanged by another owner device, and cannot tell the two apart;
+  checking it there would poison a skipper and make the channel unjoinable at first sight.
+  For those, signer acceptance (below) holds the signer to the carried authority instead.
+  A failure is `SeatListInvalid { reason: authority_invalid }`. The rule 4 owner-user check
+  also applies to a NEW authority only: a list by anyone else that carries the held
+  authority unchanged reaches signer acceptance and is `OwnerChanged` (rule 7).
+- **Rule 5, `prev`.** At exactly the held authority version + 1, a `prev` that is not the
+  held body's SHA-256 is `authority_invalid`, not `OwnerChanged`: no confirmation could make
+  that authority acceptable.
+- **Rule 6, signer acceptance under a carried authority.** When the list carries an
+  authority (new or held), the handover-chain walk from the pin may keep or hand over the
+  pin only to a signer that is an `owner_devices` entry (device and key) of THAT authority.
+  Otherwise the rule-6 case decides, and failing it the list is `OwnerChanged`. So a pinned
+  device that an authority dropped is answered with `OwnerChanged` by a member that skipped
+  the dropping list, exactly as by members that adopted it.
+- **Rule 9, one notice, the loudest.** Only on a device of the list's signer user, and never
+  at first sight (no held list): (1) `dropped_this_device` for a NEW authority signed by
+  another device that no longer lists this device (device and key) while this device was
+  signing (the pinned owner device, or listed in the held authority); (2) else
+  `changed_by_other` for a NEW authority signed by another device; (3) else
+  `seated_by_other`, naming the users, for a list signed by another device that seats users
+  the held list does not. It is returned as `owner_notice` (8.3). The `dropped_this_device`
+  case is ALSO stored in `mls_text_owner_alerts` in the adoption's transaction (on the AD
+  path, before decryption, so a refused decryption cannot lose it) and read back as
+  `TextChannelState.owner_alert`; an adoption that leaves this device the pinned owner
+  device, or an entry of the authority now held, clears it.
 
 ### 4.5 Owner pinning
 
@@ -2525,6 +2722,18 @@ with step 1.
     (4.7).
   - `_seat_list_sign` refuses `format: 1` while this device holds a v2 list for the channel
     (`SeatListRollback`; #222).
+  - **Signer qualification as built (S2-W3, #236; W3 re-review item 1).** The sign side
+    refuses what members would answer with `OwnerChanged` (4.4.1 "As built"). Under a held
+    authority, `_seat_list_sign` needs the pinned owner user and this device to be an
+    `owner_devices` entry (device and key) of the held authority, or the pinned owner device
+    (device and key) passing a NEW authority that names it; the held handover chain
+    qualifies no one there, so an unlisted handover target is `NotOwner`, a stricter rule
+    than 8.3's "pinned owner key OR a chain-verified successor", which still holds with no
+    held authority. `_authority_sign` needs the pinned owner user and this device to be the
+    pinned owner device or an entry of the held authority. A recovery list is exempt from
+    both (#232; its own dialog, members confirm it in 4.7). Accepted consequence: a
+    same-user device that the carried authority does not list gets a 4.7 confirmation that
+    can never settle, so W4 words that dialog accordingly.
   - **A recovery list keeps the held list's format (second fix round, #232).** On a v1
     channel it is a v1 list and the recovery successor gets a v1 id; the upgrade to v2 is a
     later ordinary list (the #223 supersession then applies). Chosen over "a v2-id recovery
@@ -3424,6 +3633,18 @@ document follows the plan and lists the difference as #210 OPEN item (b). The co
 on a label is R8's (1.3): a hostile server can mislabel a kick to avoid memory, which is no
 stronger than never reporting the kick.
 
+**Staging-only `issued_at`, as built (S2-W3, #238).** The record is
+`mls_text_admitted_intents` (8.2): `_admit` writes the `issued_at` of the intent its Add
+consumes, keyed `(group, user, device)`, in the SAME transaction as the OpenMLS stage (at
+stage time, not when the commit wins; the latest Add replaces it). Only this device's own
+Adds write it: a join-request event, `join_requests` or another member's Add write nothing,
+so "the intent it saw" in the rows above means, natively, the intent this device itself
+admitted. An S1 intent (no `issued_at`) writes no record, and with no record the rule does
+not apply. The comparison is strict: an `issued_at` EQUAL to the record is allowed, only an
+older one is refused. `_admit` and `_remove` refuse it as `ReplayedRejoinIntent`, nothing
+staged (for `_remove`, before any target is looked at). A group wipe deletes the group's
+records.
+
 ### 6.3 Flows
 
 **Protect (owner).** Admin grants the entitlement (7.2). Owner device: `GET .../seats`
@@ -3898,6 +4119,22 @@ tip whose only cause is an unpinned or revoked identity returns native
 `_mark_left(catch_up_failed)` and rejoins, never poisoned (W3 D12 refuses `_mark_left` on a
 poisoned group, so poisoning over a harmless history would brick the device). A key that
 exists but mismatches stays poisoned. The rejoin Welcome re-verifies every current leaf.
+**As built (S2-W3, #238).** Native cannot know the server tip by itself, so `_process`
+takes `catch_up_tip: Option<i64>` (8.3): the server's current epoch while the bridge pages
+through history, `None` for a live envelope (the S1 poisoned path). A commit is behind the
+tip only when its epoch is below `catch_up_tip`. A bridge that lies there can only turn a
+poisoned epoch into left plus rejoin, whose Welcome re-verifies every leaf. "Unresolvable"
+means the added leaf's device is revoked, or still unpinned after its one pin retry (W3
+D5). The rule covers LEAVES only: the signer of a newer list embedded in the commit's AD
+(3.12.3 step 3) keeps the S1 handling even behind the tip, so an unpinned signer is retried
+once and then poisoned as `BadSig`, and a revoked or re-keyed signer device is `BadSig`
+and poisoned at once (W3 wave audit item (b), accepted).
+**Late Welcome, as built (S2-D28, #238).** The Text join intent window is native's own
+24 h constant (the boundary is inclusive; one millisecond past it a Welcome is
+`MlsUnsolicitedWelcome` with nothing written); the call plane keeps its 1 h. A test
+processes a Welcome 23 h 59 m after `_join` and joins. Those tests pass the clock in, so
+they prove native's window; that OpenMLS keeps the KeyPackage private key for a real 24 h
+(the O-12 spike above) is not proven by them.
 
 **Recovery gates (S2-D32; #203).** Recovery operations pass under the available gate
 (`e2ee_enabled`) plus the entitlement's `allows_text_traffic()` (S5's predicate: `Active` or
@@ -4825,6 +5062,34 @@ renamed by W3 with a note in its report.
   CHECKs are created outside the schema ladder).
 - `mls_text_join_intents`: a Text intent lives 24 h (S2-D28).
 
+**As built (S2-W3, #235, #239).**
+- **CHECK widening, no marker.** S2-W3 uses no version marker: on every open, the stored
+  DDL text of `mls_text_groups` and `mls_text_owner_pins` is compared with the current DDL,
+  and a table that differs is rebuilt (renamed aside, recreated under its own name, rows
+  copied, old table dropped) in the same transaction that creates any missing table. The
+  CHECKs only widen, so every S1 row fits. A `has_text_tables` fast path skips all of it
+  once every text table exists, and the S2 tables are created in the rebuild's
+  transaction, so "all present" also means "wide".
+- NEW `mls_text_admitted_intents` (`(group_id, user_id, device_id)` PK, `issued_at`): the
+  staging-only `issued_at` record (6.2 "As built"). Group-scoped: a group wipe deletes it.
+- NEW `mls_text_owner_alerts` (`channel_id` PK, `device_id`, `at`): the 4.4.1 rule 9
+  `dropped_this_device` flag (4.4.1 "As built"). Channel-scoped: kept on wipe-and-rejoin
+  like the authority, since a wipe that cleared it would silence the alert.
+- **Add-device split** (the "make this a separate device" step of the multi-device plan):
+  it deletes `mls_text_owner_alerts` with the other per-device rows (a flag names the OLD
+  device, which the twin keeps and alerts on in its own store; the new device was never a
+  signing device), and keeps `mls_text_authorities`, `mls_text_admitted_intents` and the
+  seat lists and pins. Both new tables are excluded from key backup like every text table.
+- Native holds 15 text tables in all; the table above omits `mls_text_own_device_pins` and
+  `mls_text_pin_attempts`, which S1 W3 added.
+- **Release note: rolling back past S2 is unsafe (#239).** An S1 build of the core
+  reopening an S2 store treats its S2 data as corruption: S1 parses an owner pin with
+  source `owner_device` as `StoreCorrupt`, and a held v2 seat list fails S1's v1-only
+  parser, also `StoreCorrupt`. A group at generation 64 or above still loads, but S1
+  cannot derive its id (`InvalidArgument { field: "generation" }`), and S1 never reads the
+  S2 tables. So no shell (desktop, Android, Electron) may ship an S1 core over a store an
+  S2 core has opened; a rollback past S2 is not a plain binary downgrade.
+
 ### 8.3 Commands
 
 Each command needs its autogenerated permission TOML and a `capabilities/default.json` allow;
@@ -4909,6 +5174,40 @@ with "the signer device of the newest list adopted after 3.12.3 step 3", and the
 builds it after the adoption. A parity test pins server rule 1 and native rule g to the same
 device, with a control that protects `owner_devices` on one side only.
 
+**As built (S2-W3, #235; W3 addendum rulings OR-5 to OR-20).** Native at `876c034`. The
+dialog commands also take display arguments (`channel_name`, `display_names`) that only feed
+the native dialog.
+
+| Command | As built |
+|---|---|
+| `e2ee_text_seat_list_sign` | `format` other than absent, 1 or 2 is `InvalidArgument { field: "format" }`; an `authority` for a v1 list, or with `recovery`, is `InvalidArgument { field: "authority" }`; `recovery` without a held list, or from the pinned device or a device the held authority lists, is `InvalidArgument { field: "recovery" }`, and from another user's device `NotOwner`. Signer qualification: 4.9 "As built". `SignedSeatList` gains `authority: Option<SignedAuthority>` (omitted when absent) |
+| `e2ee_text_authority_sign` | `channel_id, user_id, owner_devices: Vec<String>`: 1 to 5 device ids, no repeat, this device included (else `InvalidArgument { field: "owner_devices" }`); each key comes from this device's pin of that own device (unpinned `IdentityPinRequired`, changed or revoked `BadSig`); the held `delegates`, `delegate_max_device_cap` and `successors` are carried unchanged. Returns `SignedAuthority { body, signature }`. Refuses `NotOwner` unless this device is the pinned owner device or an entry of the held authority, under the pinned owner user (4.9 "As built"; narrower than "may sign the next list" above) |
+| `e2ee_text_seat_list_verify` | `as_of_generation` sits beside `as_of_epoch` and `as_of_group_id`; the list input carries `authority`; step 0 as 4.4 "Step 0 as built". `SeatListVerdict` gains `owner_notice: Option<OwnerDeviceNotice>` (omitted when absent) |
+| `e2ee_text_process` | NEW `catch_up_tip: Option<i64>` (OR-9; 6.3 "As built"). `TextProcessOutcome` gains `owner_notice` (omitted when absent) |
+| `e2ee_text_commit_won` | `group_id, won_epoch, stored_commit_b64, rejoin_intents: Vec<MlsJoinRequest>, removed_reasons: Vec<MlsRemovedReason>`. The bridge copies both lists from the commit's `MlsCommitInfo` (`rejoin_intents` since S1 W3 D11). `removed_reasons` is NEW and REQUIRED (`[]` when none, OR-8): the committer's own forced-removal memory follows the labels exactly as receivers' does (6.2); a v1-id group under a held v2 list uses the v1 rules (3.12.3 "As built") |
+| `e2ee_text_group_create` | NEW `recovery: bool, supersedes_generation: Option<u32>` (OR-17). `recovery` only from a device of the held list's signer user that is not the signer device (from the signer device `InvalidArgument { field: "recovery" }`, from another user's device `NotOwner`), and only with `supersedes` (else `InvalidArgument { field: "supersedes" }`); the DS enforces `signer_lost` (#213), which native cannot see. A `supersedes` this store holds gives the generation (a disagreeing `supersedes_generation` is `InvalidArgument`); one it does not hold (a recovery device that never joined) needs `supersedes_generation`, never trusted: it must derive `supersedes` under the held format (else `ChannelMismatch`; absent: `MlsGroupNotFound`). The successor keeps the held format (#232); past 65535 is `InvalidArgument { field: "generation" }` |
+| `e2ee_text_encrypt` | refuses a superseded group with `MlsGroupNotFound` (3.1.1 "As built"). With no group at all the error names the channel's v1 generation-0 id even on a v2 channel: a public label, never used for trust (OR-20) |
+| `e2ee_text_decrypt` | `TextDecrypted` gains `files: Vec<FileMeta>` (3.6.1; always serialized); `UnsupportedEnvelopeVersion`; superseded groups per 3.9 "S2" |
+| `e2ee_text_state` | `TextChannelState` gains `owner_alert: Option<OwnerDeviceNotice>` (omitted when absent), read ONLY from the stored flag (4.4.1 "As built"; `device_id` names this device). A superseded group is reported in its stored state with verdict `no_group`, so **`verdict == "ok"` iff the group is active AND not superseded** (#223) and the other conditions above hold; the order of the verdicts is unchanged |
+
+- `OwnerDeviceNotice { kind: "dropped_this_device" | "changed_by_other" | "seated_by_other",
+  device_id, seated: Vec<String> }`: `device_id` is the other owner device that signed
+  (this device for `owner_alert`), `seated` the users seated (`seated_by_other` only). A
+  passive command never prompts (W3 plan D18): the frontend renders the 9.2 copy (OR-12).
+- **Text protocol (OR-13, S8 ask 1).** Core `TEXT_PROTOCOL = 2` (S1 shells answered 1; S9
+  takes 3): `ShellEngine::text_protocol()`, Android `text_capability` (`{"protocol":2}`),
+  Electron an internal napi `textProtocol()`. It is not a Tauri command. **Protocol floor:**
+  the server half is S4's (its plan's 2026-11-11 appendix): on a channel whose stored list is
+  v2, Text join intents and Text group creates carry `protocol`, and `join_intent`, Text
+  `groups_create`, an Add in `commits_submit` and `welcome_fetch` refuse an absent or lower
+  one with `ProtectedClientOutdated { min: 2 }`, so an S1-only device is refused cleanly
+  instead of being poisoned by v2 commits. The client half (the bridge sends `protocol`,
+  the frontend maps the error to "Update Sloga") is S2-W4. S2-W3 native and S2-W4 land as
+  a PAIR: an S1 frontend leaves protocol-2 shells dark.
+- **`issued_at` across napi (OR-15).** The native wire types accept `issued_at` as a JSON
+  integer or an integral float (napi passes millisecond times as `f64`); a string is
+  refused. Electron's napi path is not exercised by a built `.node` yet (a landing blocker).
+
 ### 8.4 Typed errors (added to `e2ee-core` `Error`, serde tag `type`, snake_case)
 
 No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `BadSig`,
@@ -4941,7 +5240,8 @@ No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `Bad
 | `TextGroupFull` | `max: usize` | admit; processing an Add that exceeds 100 leaves (poisoned path) |
 | `MalformedTextPayload` | `reason` (closed: `structure`, `envelope`, `cid_mismatch`, `too_large`) | encrypt and decrypt |
 | `WrongGroupKind` | `group_id` | call commands given a text id and vice versa |
-| `CatchUpLeafUnresolvable` (S2, #203) | `group_id, epoch: i64` | a leaf failure on a commit BEHIND the server tip whose only cause is an unpinned or revoked identity (S2-D31); the bridge marks the group `left` (`catch_up_failed`) and rejoins; never poisoned |
+| `CatchUpLeafUnresolvable` (S2, #203) | `group_id, epoch: i64` | a leaf failure on a commit BEHIND the server tip whose only cause is an unpinned or revoked identity (S2-D31); the bridge marks the group `left` (`catch_up_failed`) and rejoins; never poisoned. As built (#238): only when `_process` got a `catch_up_tip` above the commit's epoch, and for added leaves only, never for the signer of an embedded list (6.3 "As built") |
+| `UnsupportedEnvelopeVersion` (S3-N0 in S2, #234) | `v: u8` | decrypt: an outer `encrypted.v` of `2` to `255`, or an envelope `v` of `3` to `255` (3.6.1); nothing is shown. The grey "update" marker (9.2), never red |
 
 Existing `MlsGroupNotFound`, `MlsUnsolicitedWelcome`, `MlsLeafRejected`, `MlsEpochGap`,
 `MlsPoisonedEpoch` and `Declined` (a cancelled native dialog) apply to text groups with their
@@ -4954,6 +5254,13 @@ raised on the commit-AD path, for a format downgrade or an authority rollback (p
 path, 3.12.3 "S2"). `OwnerChanged` can come from an authority whose named signer entry is
 ineligible (4.4.1 rule 5). The native wire `MlsRemovalReason` gains a
 `#[serde(other)] Unknown` catch-all (#219).
+**As built (S2-W3, #234, #235).** `CatchUpLeafUnresolvable` and `UnsupportedEnvelopeVersion`
+are appended after the S1 variants; the webview pins the variant order, and later slices
+append in slice order (S2, then S3, S4, S9). `authority_invalid` also covers, natively, a
+NEW authority whose `signer_device_id` is not the list's signer device at the held list
+version + 1, and a wrong `prev` at the held authority version + 1 (4.4.1 "As built").
+`ReplayedRejoinIntent` is also the staging-only `issued_at` refusal of `_admit` and
+`_remove` (6.2 "As built").
 
 ---
 
@@ -5131,6 +5438,10 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Client | deleting an account that owns servers with protected channels (S2-D43) | `Account.tsx` | "You own N servers with protected channels. Deleting your account deletes them, including their protected channels." |
 | Server | `revoked_owner_devices` non-empty in `GET .../seats` (owner caller, #216) | owner seat UI | "A device that could sign this channel's member list was signed out or changed its key. Re-sign your signing devices." (#231) One native dialog signs an authority without those devices (`e2ee_text_authority_sign`) |
 | Native | an adopted authority drops this device, another device of the owner changed it, or another owner device's list seated someone (4.4.1 rule 9, #216, #227) | owner-user device: alert / notice; "Your other device {device} seated {names}." for the last | "This device can no longer sign #channel's member list. If you didn't do this, secure your account." / "Your signing devices were changed from {device}." |
+| Native | `TextChannelState.owner_alert` (`dropped_this_device`, the stored flag; S2-W3, #236) | owner-user device: the same alert, shown on every state read until an adoption pins or lists this device again (the `owner_notice` of an adoption is shown once) | "This device can no longer sign #channel's member list. If you didn't do this, secure your account." |
+| Native | `UnsupportedEnvelopeVersion { v }` (S3-N0 in S2, #234) | message marker (gray), never red | "Update Sloga to see this message." |
+| Native | `TextDecrypted.files[]` entry with `state: "failed"`, `fail_reason: "unsupported"` (envelope v2, 3.6.1) | the message renders; each file shows as unavailable (name, type, size), never as another file | "Update Sloga to open this file." |
+| Server | `ProtectedClientOutdated { min }` (S4 server half of the protocol floor, 8.3 "As built") | unchanged; notice, never a generic failure | "Update Sloga to use this protected channel." |
 | Client | a role or permission edit in a server with protected channels (S2-D16) | role editor | "Roles make members eligible; the owner seats them." plus a generic warning before the edit |
 
 **S2 client surfaces (S2-W0, #208; S2-D38 to S2-D44).** Owner seat UI (S2-D39): a "Released"
@@ -5587,6 +5898,18 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
     than this device's record of the latest Add is not staged by `_remove` or `_admit`,
     while a commit citing one is still merged (staging-only, #214); after the first v2 list
     over v1, the v1-id group is superseded, not poisoned (#223).
+  - **Native as built (S2-W3, `876c034`; #234 to #238):** the envelope v2 decoder (the
+    `n0_*` tests, 3.6.1); a Welcome 23 h 59 m late joins and one past 24 h is unsolicited
+    (simulated clock); a skipper and a first sight adopt an authority another owner device
+    carries unchanged, and a pinned device the authority dropped is `OwnerChanged` for a
+    skipper too (4.4.1 "As built"); `prev` is checked only at the next version, on both
+    paths; the rule 9 flag survives a refused decryption half and is never set for a
+    never-listed device; draining a v1-id group after a `GET` upgrade uses the v1 rules
+    (3.12.3 "As built"); a superseded group decrypts live until its successor is held; a
+    member confirms a recovery list through the same-user dialog. **Owed before landing**
+    (pair-landing with S2-W4): a built Electron `.node`, the napi argument-path and OR-15
+    tests on it, and a live leg. A follow-up, not a landing blocker: the first exception of
+    3.12.3 "As built".
   - **Frontend (S2-W4, `node --test` on pure modules with the production options bag):**
     shield precedence including `capacity` and the `never` check; a `DeviceCapReached` retry
     never reaches 6d; capacity never from a server field alone; the re-securing policy is
@@ -6849,6 +7172,59 @@ Added in the S2-W0 second fix round (targeted re-review NEEDS CHANGE, 2026-10-26
      second unseat freeing it at once as `DeviceNeverJoined`. A re-seat after a no-cooldown
      release or after the cooldown expired is a new slot use and clears the stamp. Amends
      #205, #206 (2.3).
+
+Added in the S2-W3 native doc pass (desktop `feat/protected-s2-native` `876c034`,
+2026-11-12). Each records what the native code does; the code was read, not the notes.
+
+234. DECISION (S2-W3, S3-N0): native decodes envelope v2 (S3 plan 2.3) with no v2 send
+     path; `v` is peeked before the strict decode, so outer `encrypted.v` 2 to 255 and
+     envelope `v` 3 to 255 are `UnsupportedEnvelopeVersion { v }` (grey, never red); `fk`
+     present under outer v1 refuses; every v2 file is reported `failed` / `unsupported`
+     with no key, blob id or digest leaving native; the 3.7 signature is unchanged;
+     pointer to S9's F1 version table; vectors native-only. Residual: a hostile server can
+     grey a message by editing the unauthenticated outer `v` (withholding-equivalent)
+     (3.6.1, 3.9, 8.3, 8.4, 9.2, 11).
+235. DECISION (S2-W3): the native command and storage surface as built:
+     `_process(catch_up_tip)`, `_commit_won(rejoin_intents, removed_reasons)`,
+     `_group_create(recovery, supersedes_generation)`, `_seat_list_verify` with
+     `as_of_generation` and `authority`, `_authority_sign(owner_devices)`, `owner_notice`
+     on verdicts and outcomes, `owner_alert` on the state, `TextDecrypted.files`; verdict
+     `ok` needs a group that is active AND not superseded; `TEXT_PROTOCOL = 2` with the
+     protocol floor's server half in S4 and client half in S2-W4 (pair landing);
+     `issued_at` accepted as an integral float across napi; NEW
+     `mls_text_admitted_intents` and `mls_text_owner_alerts`; the CHECK widening detected
+     by the stored DDL text, no marker; the add-device split wipes the owner alerts; error
+     append order S2, S3, S4, S9 (8.2, 8.3, 8.4).
+236. DECISION (S2-W3; W3 wave audit finding 1, re-review items 1 and 3): 4.4.1 as
+     built. The native mirror of #225 checks a NEW authority's `signer_device_id` against
+     the list signer only at the held list version + 1 (a skipper or a first sight is held
+     to the carried authority by signer acceptance instead); a wrong `prev` at the next
+     authority version is `authority_invalid`; under a carried authority the chain walk
+     keeps or hands over the pin only to its `owner_devices` entries; rule 9 is one notice
+     (dropped > changed > seated) and `dropped_this_device` is a stored flag, set in the
+     adoption's transaction and cleared when this device is pinned or listed again; the
+     sign side refuses what members would refuse (4.9). R27 gains its as-built detection
+     and the version-skipping residual (1.3 R27, 4.4.1, 4.9, 8.2, 9.2, 11).
+237. DECISION (S2-W3; W3 wave audit findings 2 and 4, re-review item 2; planner ruling
+     2026-11-11): #223 as built. One superseded predicate (a recorded successor, or an id
+     that is not the held list's derivation) for `_encrypt` and `_state`; decrypt
+     unchanged, live in the newest group until the successor is held; the `GET`-path
+     upgrade recomputes with the candidate salt after every check and does not catch up,
+     leaf-check or record the v1 group; commits drained in a v1-id group under a held v2
+     list are judged with the v1 rules, rule g on the AD list's signer only while that
+     device is still an owner device; two known exceptions to "never poisoned" are
+     recorded; the member recovery order is join, verify, confirm, Welcome (3.1.1, 3.9,
+     3.12.3, 4.4, 8.3).
+238. DECISION (S2-W3): 6.2 and 6.3 as built. The staging-only `issued_at` record is
+     written by `_admit` at stage time from the intent its own Add consumes (no record from
+     join-request events or others' Adds), and an equal `issued_at` is allowed;
+     `CatchUpLeafUnresolvable` needs a `catch_up_tip` above the commit's epoch and covers
+     added leaves only, while an embedded list's revoked or unpinned signer still poisons
+     (W3 wave audit item (b), accepted); the Text intent window is 24 h and a 23 h 59 m
+     Welcome joins under a simulated clock (O-12 not proven by it) (6.2, 6.3, 8.4, 11).
+239. DECISION (S2-W3): release note. An S1 core reopening a store an S2 core opened reads
+     an `owner_device` pin and a held v2 list as `StoreCorrupt` and cannot derive a group
+     id past generation 63, so rolling back past S2 is unsafe (8.2).
 
 ---
 
