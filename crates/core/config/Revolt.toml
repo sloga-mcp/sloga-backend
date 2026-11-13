@@ -171,8 +171,10 @@ key = ""
 max_concurrent_connections = 50
 
 [api.livekit]
-# How long to ring devices for when calling in dms/groups, in seconds
-call_ring_duration = 30
+# How long a call in a dm/group rings, in seconds. Every client rings for this
+# long, and the push that rings a phone expires after it, so a phone that was
+# offline does not start ringing for a call nobody is waiting on any more
+call_ring_duration = 45
 
 [api.livekit.nodes]
 
@@ -449,6 +451,24 @@ afk_auto_move = true
 # an explicit [features] header, or REVOLT__FEATURES__IOS_CALL_E2EE=false, and
 # RESTART delta. Global for iOS; never per user or per channel.
 ios_call_e2ee = true
+# Call ring signals: each ring carries a call id, and the other devices stop
+# ringing when the call is answered on another device or declined. ON by
+# default (the field's serde default is true as well, so a config without this
+# line also reads ON). This is the kill switch: set it false in
+# Revolt.overrides.toml under an explicit [features] header, or
+# REVOLT__FEATURES__CALL_SIGNALS=false, and RESTART voice-ingress AND delta.
+# Off, rings carry no call id, nothing tells a device that the call was
+# answered on another one, the decline route does nothing, and the `answer`
+# flag on a join is ignored.
+call_signals = true
+# Per-session push preferences: a session can ask for chats only (direct
+# messages, groups, friend requests and calls) or ask not to be rung for
+# incoming calls. ON by default (the field's serde default is true as well, so
+# a config without this line also reads ON). This is the kill switch: set it
+# false in Revolt.overrides.toml under an explicit [features] header, or
+# REVOLT__FEATURES__PUSH_SESSION_SCOPE=false, and RESTART pushd. Off, the push
+# daemon ignores both preferences and delivers everything as before.
+push_session_scope = true
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,

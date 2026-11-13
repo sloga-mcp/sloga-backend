@@ -38,6 +38,14 @@ auto_derived!(
         /// Delivery mechanism, absent for browser Web Push subscriptions
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub kind: Option<PushSubscriptionKind>,
+
+        /// This session wants direct messages, groups, friend requests and calls only
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub chats_only: Option<bool>,
+
+        /// This session must not be rung for incoming calls
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub no_ring: Option<bool>,
     }
 
     /// Push subscription delivery mechanism

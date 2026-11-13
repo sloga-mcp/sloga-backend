@@ -129,6 +129,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::AlreadyConnected => Status::BadRequest,
             ErrorType::NotConnected => Status::BadRequest,
             ErrorType::UnknownNode => Status::BadRequest,
+            ErrorType::CallEnded => Status::BadRequest,
             ErrorType::RemoteControlOfferPending => Status::Conflict,
             ErrorType::RemoteControlGrantActive => Status::Conflict,
             ErrorType::WatchSessionExists => Status::Conflict,

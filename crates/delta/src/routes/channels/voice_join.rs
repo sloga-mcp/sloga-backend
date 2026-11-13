@@ -71,6 +71,8 @@ pub async fn call(
         recipients,
         device_id,
         rejoin,
+        answer,
+        video,
     } = data.into_inner();
 
     if user.bot.is_some() && force_disconnect == Some(true) {
@@ -498,6 +500,8 @@ mod test {
                     recipients: None,
                     device_id: None,
                     rejoin: None,
+                    answer: None,
+                    video: None,
                 })
                 .unwrap(),
             )
@@ -1688,7 +1692,7 @@ mod test {
         let body = join_call_body();
         statement_at(
             &body,
-            "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,rejoin,\u{7d}=data.into_inner();",
+            "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,rejoin,answer,video,\u{7d}=data.into_inner();",
         );
         assert_eq!(
             body.matches(SEAT).count(),

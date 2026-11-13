@@ -2365,6 +2365,8 @@ impl From<crate::WebPushSubscription> for WebPushSubscription {
             p256dh: value.p256dh,
             auth: value.auth,
             kind: value.kind.map(Into::into),
+            chats_only: value.chats_only,
+            no_ring: value.no_ring,
         }
     }
 }
@@ -2376,6 +2378,8 @@ impl From<WebPushSubscription> for crate::WebPushSubscription {
             p256dh: value.p256dh,
             auth: value.auth,
             kind: value.kind.map(Into::into),
+            chats_only: value.chats_only,
+            no_ring: value.no_ring,
         }
     }
 }

@@ -408,12 +408,14 @@ mod tests {
                 channel_id: "01CHANNEL".to_string(),
                 started_at: Some("2026-09-23T00:00:00.000Z".to_string()),
                 ended: false,
+                ..Default::default()
             }),
             PayloadKind::DmCallStartEnd(DmCallPayload {
                 initiator_id: "01USER".to_string(),
                 channel_id: "01CHANNEL".to_string(),
                 started_at: None,
                 ended: true,
+                ..Default::default()
             }),
             PayloadKind::CalendarEvent(CalendarEventPayload {
                 user: "01RECIPIENT".to_string(),
@@ -565,6 +567,7 @@ mod tests {
             channel_id: "01CHANNEL".to_string(),
             started_at: None,
             ended: true,
+            ..Default::default()
         }))
         .await?
         .expect("FCM sends call pushes");

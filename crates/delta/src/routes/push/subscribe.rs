@@ -191,6 +191,8 @@ mod tests {
             p256dh: p256dh.to_string(),
             auth: auth.to_string(),
             kind: Some(v0::PushSubscriptionKind::UnifiedPush),
+            chats_only: None,
+            no_ring: None,
         }
     }
 
