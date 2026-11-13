@@ -31,11 +31,8 @@ struct MessagePayload<'a> {
 
     message: &'a Message,
     url: &'a str,
-    #[serde(rename = "camelCase")]
     author_avatar: &'a str,
-    #[serde(rename = "camelCase")]
     author_display_name: &'a str,
-    #[serde(rename = "camelCase")]
     channel_name: &'a str,
 }
 
@@ -57,11 +54,8 @@ struct CallStartStopPayload<'a> {
     device_token: &'a str,
 
     initiator_id: &'a str,
-    #[serde(rename = "camelCase")]
     channel_id: &'a str,
-    #[serde(rename = "camelCase")]
     started_at: &'a str,
-    #[serde(rename = "camelCase")]
     ended: bool,
 }
 
@@ -489,5 +483,93 @@ impl Consumer for ApnsOutboundConsumer {
         };
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn keys(payload: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = payload
+            .as_object()
+            .expect("payload is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// The custom keys sit next to `aps` and match the FCM `push.dm.call` data keys.
+    #[test]
+    fn dm_call_payload_keys() {
+        let payload = CallStartStopPayload {
+            aps: APS::default(),
+            options: NotificationOptions::default(),
+            device_token: "token",
+            initiator_id: "01USER",
+            channel_id: "01CHANNEL",
+            started_at: "2026-09-23T00:00:00.000Z",
+            ended: true,
+        };
+
+        // `to_value` keeps only the last of several identical keys, so check the raw text too.
+        let raw = serde_json::to_string(&payload).unwrap();
+        assert!(!raw.contains("camelCase"), "{raw}");
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            keys(&value),
+            ["aps", "channel_id", "ended", "initiator_id", "started_at"]
+        );
+        assert_eq!(value["initiator_id"], json!("01USER"));
+        assert_eq!(value["channel_id"], json!("01CHANNEL"));
+        assert_eq!(value["started_at"], json!("2026-09-23T00:00:00.000Z"));
+        assert_eq!(value["ended"], json!(true));
+    }
+
+    #[test]
+    fn message_payload_keys() {
+        let message: Message = serde_json::from_value(json!({
+            "_id": "01MESSAGE",
+            "channel": "01CHANNEL",
+            "author": "01USER",
+        }))
+        .expect("minimal message");
+
+        let payload = MessagePayload {
+            aps: APS::default(),
+            options: NotificationOptions::default(),
+            device_token: "token",
+            message: &message,
+            url: "https://example.com/channel/01CHANNEL/01MESSAGE",
+            author_avatar: "https://example.com/avatar.png",
+            author_display_name: "Alice",
+            channel_name: "general",
+        };
+
+        let raw = serde_json::to_string(&payload).unwrap();
+        assert!(!raw.contains("camelCase"), "{raw}");
+
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            keys(&value),
+            [
+                "aps",
+                "author_avatar",
+                "author_display_name",
+                "channel_name",
+                "message",
+                "url"
+            ]
+        );
+        assert_eq!(
+            value["author_avatar"],
+            json!("https://example.com/avatar.png")
+        );
+        assert_eq!(value["author_display_name"], json!("Alice"));
+        assert_eq!(value["channel_name"], json!("general"));
     }
 }
