@@ -576,6 +576,10 @@ prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 # formats_v2 (S2) governs only a channel ENTERING the v2 formats; a channel
 # already on v2 keeps working with it off. Flip it once every protected
 # device runs S2. The reconcile sweep runs with either flag in any state.
+# history_setting (S4) gates history-link writes, a non-empty boundary or a
+# wiped list at protect, and the wipe route; flip it once every protected
+# device runs S4. ios = false keeps iPhone clients off protected channels
+# whatever enabled says (S8-O5; the client enforces it from the root advert).
 #
 # [features.protected_channels]
 # enabled = false              # master switch for growth (grants, protect, seating, adds)
@@ -585,6 +589,11 @@ prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 # reconcile_sweep_secs = 300      # S2-D14 sweep period
 # text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver)
 # successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h
+# history_setting = false                  # S4: link writes, a non-empty boundary at protect, `wiped`; flip once every protected device runs S4
+# history_link_group_cap_bytes = 67108864  # S4-D6: per holder group, decoded ciphertext bytes (64 MiB)
+# history_link_user_cap_bytes = 13421772   # S4-RR-1: per writer user per holder group (64 MiB / 5)
+# history_wipe_batch = 1000                # S4-D22: rows per wipe batch; 0 is treated as 1
+# ios = false                              # S8-O5: iPhone-only server off switch for protected channels
 
 [features.limits]
 

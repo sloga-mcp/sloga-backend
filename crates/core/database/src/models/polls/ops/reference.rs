@@ -160,6 +160,18 @@ impl AbstractPolls for ReferenceDb {
             .collect())
     }
 
+    /// Fetch every open poll of a channel, ordered by poll id.
+    async fn fetch_open_polls_for_channel(&self, channel: &str) -> Result<Vec<Poll>> {
+        let polls = self.polls.lock().await;
+        let mut open: Vec<Poll> = polls
+            .values()
+            .filter(|poll| poll.channel == channel && !poll.closed)
+            .cloned()
+            .collect();
+        open.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(open)
+    }
+
     /// Delete the polls carried by the given messages, and their ballots.
     async fn delete_polls_for_messages(&self, message_ids: &[String]) -> Result<()> {
         let mut polls = self.polls.lock().await;

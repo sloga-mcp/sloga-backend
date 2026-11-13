@@ -255,6 +255,7 @@ async fn submit_call_commit(
         // Nor removal reasons (Text-only, B48): never serialized for Call
         removed_reasons: vec![],
         welcome: None,
+        history_visible: None,
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -539,6 +540,7 @@ async fn submit_text_commit(
         // Stored on the row for the Welcome route (S2-D29); never part of
         // a commit fetch or a 409 body
         welcome: welcome.clone(),
+        history_visible: None,
     };
 
     match db
@@ -1794,6 +1796,7 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: None,
+                    history_visible: None,
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -1942,6 +1945,7 @@ mod tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
         };
         let ad = current_ad(&setup.harness, setup.channel_id()).await;
         let at = |epoch: i64| {
@@ -2906,6 +2910,7 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: Some(STANDARD_NO_PAD.encode(b"opaque welcome")),
+                    history_visible: None,
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -3319,6 +3324,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -3504,6 +3510,7 @@ mod tests {
             created_at,
             generation: None,
             issued_at: None,
+            protocol: None,
         };
         db.upsert_mls_join_intent(&intent(before_add))
             .await
@@ -3958,6 +3965,7 @@ mod tests {
             created_at,
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 
@@ -4317,6 +4325,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .await
         .expect("the rejoin intent");
@@ -4463,6 +4472,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .await
         .expect("the rejoin intent");
@@ -4696,6 +4706,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -4865,6 +4876,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),

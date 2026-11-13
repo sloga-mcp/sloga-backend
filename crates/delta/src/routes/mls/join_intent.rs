@@ -515,6 +515,7 @@ fn join_intent_row(
         created_at: Timestamp::now_utc(),
         generation,
         issued_at,
+        protocol: None,
     }
 }
 
@@ -639,6 +640,7 @@ mod tests {
             signature: device.sign(&payload),
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 
@@ -684,6 +686,7 @@ mod tests {
             )),
             generation: Some(generation),
             issued_at: Some(issued_at),
+            protocol: None,
         }
     }
 
@@ -754,6 +757,7 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: None,
+                    history_visible: None,
                 },
                 &hash,
                 0,
@@ -807,6 +811,7 @@ mod tests {
                 rejoin_intents: vec![],
                 removed_reasons: vec![],
                 welcome: None,
+                history_visible: None,
             },
             &hash,
             0,
@@ -943,6 +948,7 @@ mod tests {
                 handover: None,
                 authority: None,
             },
+            wipe_history: None,
         };
         harness.protect_with_db(&channel, &protect).await;
         let channel = harness
@@ -2234,6 +2240,7 @@ mod tests {
                     signature: STANDARD_NO_PAD.encode([1u8; 64]),
                     generation: None,
                     issued_at: None,
+                    protocol: None,
                 },
             };
             if malformed {

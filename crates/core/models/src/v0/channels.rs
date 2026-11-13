@@ -151,6 +151,17 @@ auto_derived!(
                 serde(skip_serializing_if = "crate::if_false", default)
             )]
             protected: bool,
+
+            /// Protected channels only (design §2.1 "S4"): the history
+            /// boundary and wipe state. Absent on a channel protected while
+            /// empty. Informational: clients take both from the verified
+            /// seat list, never from this field. Boxed so every `Channel` value
+            /// stays small (debug-build futures hold many)
+            #[cfg_attr(
+                feature = "serde",
+                serde(default, skip_serializing_if = "Option::is_none")
+            )]
+            protected_history: Option<Box<ProtectedHistory>>,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -348,6 +359,37 @@ auto_derived!(
         pub disabled: bool,
     }
 
+    /// A protected channel's pre-protect history (design §2.1 "S4")
+    pub struct ProtectedHistory {
+        /// The boundary message id B: plaintext at or below it predates the
+        /// protect. Never changes once written
+        pub boundary: String,
+        /// Where the history wipe stands
+        pub wipe: HistoryWipe,
+    }
+
+    /// State of a protected channel's history wipe. Only moves `none ->
+    /// requested -> done` (design §2.1 "S4")
+    #[cfg_attr(feature = "serde", serde(tag = "state", rename_all = "snake_case"))]
+    pub enum HistoryWipe {
+        /// The history is kept
+        None,
+        /// The owner asked for the wipe; the rows are unservable from now
+        Requested {
+            /// When the wipe was requested
+            at: Timestamp,
+            /// The user who requested it
+            by: String,
+        },
+        /// Every plaintext row at or below the boundary is deleted
+        Done {
+            /// When the wipe finished
+            at: Timestamp,
+            /// Rows deleted
+            count: u64,
+        },
+    }
+
     /// Partial representation of a channel
     #[derive(Default)]
     pub struct PartialChannel {
@@ -401,6 +443,12 @@ auto_derived!(
         pub announcement: Option<bool>,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub protected: Option<bool>,
+        /// Carried by the protect update and the wipe updates only
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub protected_history: Option<Box<ProtectedHistory>>,
     }
 
     /// Optional fields on channel object
@@ -905,6 +953,14 @@ auto_derived!(
     pub struct DataProtectChannel {
         /// The genesis seat list (`version: 1`)
         pub seat_list: DataSeatList,
+        /// S4: whether the genesis wipes the pre-protect history. Absent
+        /// takes the signed `pre_history` line; present must agree with it
+        /// (design §4.3 "S4", §7.2 "S4")
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        pub wipe_history: Option<bool>,
     }
 
     /// The channel's newest stored seat list (design §2.4, §7.2)
@@ -1265,5 +1321,162 @@ mod protected_dto_tests {
         assert_eq!(parsed.source, ChannelEntitlementSource::AdminGrant);
         assert_eq!(parsed.state, ChannelEntitlementState::Active);
         assert_eq!(serde_json::to_string(&parsed).unwrap(), entitlement);
+    }
+}
+
+#[cfg(test)]
+mod protected_history_dto_tests {
+    use iso8601_timestamp::Timestamp;
+
+    use super::{Channel, DataProtectChannel, HistoryWipe, PartialChannel, ProtectedHistory};
+
+    /// A protected text channel exactly as an S2 build serializes it
+    const TEXT_CHANNEL_S2: &str = r#"{"channel_type":"TextChannel","_id":"01JA0000000000000000CHANNEL","server":"01JA00000000000000000SERVER","name":"general","protected":true}"#;
+
+    /// The 5.9 `boundary_message_id`
+    const BOUNDARY: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W0";
+
+    fn at() -> Timestamp {
+        serde_json::from_str(r#""2026-10-04T12:00:00.000Z""#).unwrap()
+    }
+
+    /// Design §2.1 "S4": the wipe state is internally tagged under `state`,
+    /// snake_case, with exactly these keys
+    #[test]
+    fn history_wipe_is_internally_tagged() {
+        for (wipe, wire) in [
+            (HistoryWipe::None, r#"{"state":"none"}"#),
+            (
+                HistoryWipe::Requested {
+                    at: at(),
+                    by: "01JA00000000000000000USERA".to_string(),
+                },
+                r#"{"state":"requested","at":"2026-10-04T12:00:00.000Z","by":"01JA00000000000000000USERA"}"#,
+            ),
+            (
+                HistoryWipe::Done {
+                    at: at(),
+                    count: 1234,
+                },
+                r#"{"state":"done","at":"2026-10-04T12:00:00.000Z","count":1234}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&wipe).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<HistoryWipe>(wire).unwrap(), wipe);
+        }
+
+        for refused in [r#"{"state":"None"}"#, r#"{"state":"requested"}"#, r#"{}"#] {
+            assert!(
+                serde_json::from_str::<HistoryWipe>(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
+    }
+
+    /// `protected_history` is additive: an S2 channel decodes with none and
+    /// re-encodes byte-identical; when set it travels under its exact key
+    #[test]
+    fn protected_history_is_absent_when_none() {
+        let parsed: Channel = serde_json::from_str(TEXT_CHANNEL_S2).unwrap();
+        let Channel::TextChannel {
+            protected_history, ..
+        } = &parsed
+        else {
+            panic!("a text channel");
+        };
+        assert_eq!(protected_history, &None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), TEXT_CHANNEL_S2);
+
+        let history = ProtectedHistory {
+            boundary: BOUNDARY.to_string(),
+            wipe: HistoryWipe::None,
+        };
+        let with = match parsed {
+            Channel::TextChannel {
+                id,
+                server,
+                name,
+                description,
+                icon,
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                spoiler,
+                voice,
+                slowmode,
+                announcement,
+                protected,
+                protected_history: _,
+            } => Channel::TextChannel {
+                id,
+                server,
+                name,
+                description,
+                icon,
+                last_message_id,
+                default_permissions,
+                role_permissions,
+                nsfw,
+                spoiler,
+                voice,
+                slowmode,
+                announcement,
+                protected,
+                protected_history: Some(Box::new(history.clone())),
+            },
+            _ => unreachable!(),
+        };
+        let wire = format!(
+            r#"{},"protected_history":{{"boundary":"{BOUNDARY}","wipe":{{"state":"none"}}}}}}"#,
+            TEXT_CHANNEL_S2.strip_suffix('}').unwrap()
+        );
+        assert_eq!(serde_json::to_string(&with).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Channel>(&wire).unwrap(), with);
+
+        // The partial: empty is `{}`, set carries only the key
+        assert_eq!(
+            serde_json::to_string(&PartialChannel::default()).unwrap(),
+            "{}"
+        );
+        let partial = PartialChannel {
+            protected_history: Some(Box::new(history)),
+            ..Default::default()
+        };
+        let wire = format!(
+            r#"{{"protected_history":{{"boundary":"{BOUNDARY}","wipe":{{"state":"none"}}}}}}"#
+        );
+        assert_eq!(serde_json::to_string(&partial).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<PartialChannel>(&wire).unwrap(),
+            partial
+        );
+        assert_eq!(
+            serde_json::from_str::<PartialChannel>("{}")
+                .unwrap()
+                .protected_history,
+            None
+        );
+    }
+
+    /// Design §7.2 "S4": `wipe_history` is optional and omitted when absent,
+    /// so an S2 protect body is unchanged
+    #[test]
+    fn protect_body_wipe_history_is_optional() {
+        let s2 = r#"{"seat_list":{"body":"sloga-seat-list-v2\nv:2\n...","signature":"c2ln","signer_device_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+        let parsed: DataProtectChannel = serde_json::from_str(s2).unwrap();
+        assert_eq!(parsed.wipe_history, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), s2);
+
+        let wiped = DataProtectChannel {
+            wipe_history: Some(true),
+            ..parsed
+        };
+        let wire = format!(r#"{},"wipe_history":true}}"#, s2.strip_suffix('}').unwrap());
+        assert_eq!(serde_json::to_string(&wiped).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<DataProtectChannel>(&wire).unwrap(),
+            wiped
+        );
     }
 }

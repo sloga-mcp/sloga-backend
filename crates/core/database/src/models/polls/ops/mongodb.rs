@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bson::Document;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use revolt_result::Result;
 
@@ -244,26 +244,49 @@ impl AbstractPolls for MongoDb {
             .await)
     }
 
+    /// Fetch every open poll of a channel, ordered by poll id.
+    async fn fetch_open_polls_for_channel(&self, channel: &str) -> Result<Vec<Poll>> {
+        // `closed: false` is a missing key, as in `close_poll_if_open`.
+        Ok(self
+            .col::<Poll>(COL)
+            .find(doc! {
+                "channel": channel,
+                "closed": { "$ne": true }
+            })
+            .sort(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .filter_map(|s| async { s.ok() })
+            .collect()
+            .await)
+    }
+
     /// Delete the polls carried by the given messages, and their ballots.
     async fn delete_polls_for_messages(&self, message_ids: &[String]) -> Result<()> {
-        let polls: Vec<Poll> = self
-            .col::<Poll>(COL)
+        // Ids only, read as plain documents: a row that no longer decodes as
+        // a `Poll` is still deleted (the history wipe must not leave poll
+        // text behind), and a cursor error fails the call instead of
+        // silently skipping a row.
+        let poll_ids: Vec<String> = self
+            .col::<Document>(COL)
             .find(doc! {
                 "message": {
                     "$in": message_ids
                 }
             })
+            .projection(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await;
+            .try_collect::<Vec<Document>>()
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .iter()
+            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
+            .collect();
 
-        if polls.is_empty() {
+        if poll_ids.is_empty() {
             return Ok(());
         }
-
-        let poll_ids: Vec<&str> = polls.iter().map(|poll| poll.id.as_str()).collect();
 
         self.col::<Document>(COL_VOTES)
             .delete_many(doc! {

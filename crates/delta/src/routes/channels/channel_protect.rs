@@ -272,6 +272,7 @@ mod test {
                     authority,
                 }
                 .signed(),
+                wipe_history: None,
             }
         }
     }

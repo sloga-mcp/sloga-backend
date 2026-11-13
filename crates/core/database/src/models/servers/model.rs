@@ -304,7 +304,13 @@ impl Server {
         .p(self.id.clone())
         .await;
 
-        db.delete_server(&self.id).await
+        db.delete_server(&self.id).await?;
+
+        // Legal hold (design 2.9): cleared only after the server row is gone,
+        // so no failure above can leave a surviving server without its hold.
+        // A failure here leaves a row naming a deleted server, which holds
+        // nothing.
+        db.clear_server_legal_hold(&self.id).await
     }
 
     /// Remove a field from Server
@@ -1224,6 +1230,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -1637,6 +1644,7 @@ mod protected_delete_tests {
                 pending_device_removals: vec![],
                 signer_lost: None,
                 rejoin_readd: vec![],
+                history_visible_at_create: None,
             };
             db.create_text_mls_group(&group, None)
                 .await

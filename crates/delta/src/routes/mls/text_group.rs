@@ -765,6 +765,7 @@ mod tests {
             created_at: ago(age),
             generation: Some(0),
             issued_at: Some(FIXTURE_ISSUED_AT),
+            protocol: None,
         };
         harness
             .db

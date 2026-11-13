@@ -771,6 +771,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         };
         db.insert_channel(&parent).await.unwrap();
 

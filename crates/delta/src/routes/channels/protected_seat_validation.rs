@@ -154,7 +154,7 @@ async fn validate(
     // `unchanged`, never applied.
     let stored = db.fetch_seat_list(channel.id()).await?;
     let retry = match (kind, &stored) {
-        (SeatListWriteKind::Put, Some(stored)) => {
+        (SeatListWriteKind::Put | SeatListWriteKind::Wipe, Some(stored)) => {
             stored.body == submission.body && stored.signature == submission.signature
         }
         (SeatListWriteKind::Protect, Some(stored)) => is_genesis_reprotect(&submission, stored),
@@ -180,7 +180,7 @@ async fn validate(
     // row or a newer one, where it is no change or is refused as stale.
     let config = revolt_config::config().await;
     let stored_before = match kind {
-        SeatListWriteKind::Put => stored.as_ref(),
+        SeatListWriteKind::Put | SeatListWriteKind::Wipe => stored.as_ref(),
         SeatListWriteKind::Protect => None,
     };
     check_seat_list_format(
@@ -793,6 +793,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         };
         harness.db.insert_channel(&channel).await.expect("channel");
 
@@ -996,6 +997,7 @@ mod tests {
             &world.owner_session,
             &v0::DataProtectChannel {
                 seat_list: data.clone(),
+                wipe_history: None,
             },
         )
         .await

@@ -1243,6 +1243,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         mongo
             .col::<MlsGroup>("mls_groups")

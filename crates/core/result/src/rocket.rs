@@ -191,6 +191,9 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::SeatListNamesRemovedUsers { .. } => Status::BadRequest,
             ErrorType::RemovalReasonRequired => Status::BadRequest,
             ErrorType::ProtectedHandoverRequired { .. } => Status::BadRequest,
+            ErrorType::ProtectHistoryMoved => Status::Conflict,
+            ErrorType::HistoryLinkExists => Status::Conflict,
+            ErrorType::ProtectedClientOutdated { .. } => Status::BadRequest,
 
             ErrorType::InsufficientProt { .. } => Status::Conflict,
             ErrorType::ProtDisabled => Status::BadRequest,
@@ -416,6 +419,69 @@ mod tests {
                 "type": "ProtectedHandoverRequired",
                 "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD"],
             })
+        );
+    }
+
+    /// S4 (#274): 409 and a body that is the type alone; `axum.rs` pins the
+    /// same answer
+    #[rocket::async_test]
+    async fn protect_history_moved_is_conflict_with_type_only_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(ProtectHistoryMoved)
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::Conflict);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "ProtectHistoryMoved" }));
+    }
+
+    /// S4 (#274): 409 and a body that is the type alone; `axum.rs` pins the
+    /// same answer
+    #[rocket::async_test]
+    async fn history_link_exists_is_conflict_with_type_only_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(HistoryLinkExists)
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::Conflict);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "HistoryLinkExists" }));
+    }
+
+    /// S4 protocol floor: 400, the minimum in `min`, nothing else in the
+    /// body; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn protected_client_outdated_is_bad_request_with_min_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(ProtectedClientOutdated { min: 2 })
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 })
         );
     }
 }

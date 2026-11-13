@@ -135,6 +135,38 @@ pub trait AbstractMessages: Sync + Send {
     ) -> Result<HashMap<String, Vec<String>>>;
 
     async fn delete_messages_by_user(&self, user_id: &str) -> Result<()>;
+
+    /// One batch of the `history_wipes` job (design 7.5 "S4"): the plaintext
+    /// rows of `channel` with an id at or below `boundary`, oldest first, at
+    /// most `limit` of them
+    ///
+    /// The filter is `{ channel, _id: { $lte: boundary }, encrypted: null }`.
+    /// On MongoDB `encrypted: null` matches a missing field and an explicit
+    /// null, exactly the rows that decode to `encrypted: None`; the Reference
+    /// driver tests `encrypted.is_none()`. A row carrying `encrypted` is never
+    /// returned, whatever its id. Ids compare as strings (ULIDs sort by time).
+    ///
+    /// Sorted by `_id` ascending, so a job that stopped between this read and
+    /// the delete resumes on the same rows. `limit` is clamped to at least 1
+    /// and a row that does not decode fails the call instead of being skipped:
+    /// an empty answer must only ever mean nothing is left to wipe.
+    async fn fetch_history_wipe_batch(
+        &self,
+        channel: &str,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>>;
+
+    /// Delete the listed plaintext rows of `channel`; returns how many went
+    ///
+    /// Scoped to `channel` AND `encrypted: null` as well as to the ids, so a
+    /// wrong id list can never delete a row carrying `encrypted` or another
+    /// channel's row. No cascade: attachments, polls, softres sheets and
+    /// unread mentions are the caller's (the `history_wipes` job).
+    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64>;
+
+    /// Id of the newest row of `channel`, encrypted or not; None when it has none
+    async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>>;
 }
 
 #[cfg(test)]
@@ -830,6 +862,339 @@ mod tests {
                 seen,
                 vec![("MessageAppend".to_string(), live.id.clone())],
                 "ghost or unexpected events on the channel topic"
+            );
+        });
+    }
+
+    /// A structurally valid `encrypted` payload; only its presence matters
+    /// to the wipe driver fns
+    fn wipe_payload(seed: u8) -> crate::EncryptedPayload {
+        use crate::EncryptedPayload;
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+
+        EncryptedPayload {
+            v: EncryptedPayload::VERSION,
+            group_id: "ab".repeat(32),
+            epoch: 0,
+            sender_device_id: "cd".repeat(16),
+            nonce: STANDARD_NO_PAD.encode([seed; EncryptedPayload::NONCE_BYTES]),
+            ciphertext: STANDARD_NO_PAD.encode([seed; EncryptedPayload::CIPHERTEXT_MIN_BYTES]),
+            sig: STANDARD_NO_PAD.encode([seed; EncryptedPayload::SIG_BYTES]),
+            franking: None,
+        }
+    }
+
+    /// A wipe fixture row: plaintext, or carrying `encrypted` when `seed` is set
+    fn wipe_row(ms: u64, rand: u128, channel: &str, seed: Option<u8>) -> Message {
+        Message {
+            id: ulid::Ulid::from_parts(ms, rand).to_string(),
+            channel: channel.to_string(),
+            author: "01USER000000000000000000000".to_string(),
+            content: seed.is_none().then(|| "before protect".to_string()),
+            nonce: seed.map(|seed| format!("01JA00000000000000000000{seed:02}")),
+            encrypted: seed.map(wipe_payload),
+            ..Default::default()
+        }
+    }
+
+    /// Store a row as-is, past `insert_message`'s protected-shape check, so a
+    /// fixture can hold what a buggy or hostile writer could leave behind
+    async fn insert_raw(db: &crate::Database, message: &Message) {
+        match db {
+            crate::Database::Reference(reference) => {
+                reference
+                    .messages
+                    .lock()
+                    .await
+                    .insert(message.id.clone(), message.clone());
+            }
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => {
+                mongo
+                    .col::<Message>("messages")
+                    .insert_one(message)
+                    .await
+                    .expect("raw insert");
+            }
+        }
+    }
+
+    async fn exists(db: &crate::Database, id: &str) -> bool {
+        db.fetch_message(id).await.is_ok()
+    }
+
+    fn wipe_ids(batch: &[Message]) -> Vec<String> {
+        batch.iter().map(|message| message.id.clone()).collect()
+    }
+
+    /// The wipe batch takes the rows at or below the boundary, the boundary
+    /// row itself included, oldest first, never more than the limit and never
+    /// nothing because of the limit; the delete reports what it removed.
+    #[tokio::test]
+    async fn wipe_batch_respects_the_boundary_and_the_limit() {
+        database_test!(|db| async move {
+            let channel = "01CHANWIPE0000000000000001";
+            let rows: Vec<Message> = (1..=5u64)
+                .map(|i| wipe_row(i * 1_000, 1, channel, None))
+                .collect();
+            // Stored newest first, so the order of an answer is the sort's
+            for row in rows.iter().rev() {
+                insert_raw(&db, row).await;
+            }
+            let id = |i: usize| rows[i].id.clone();
+            let boundary = id(2);
+
+            let batch = db
+                .fetch_history_wipe_batch(channel, &boundary, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                wipe_ids(&batch),
+                vec![id(0), id(1), id(2)],
+                "the row at B is in the batch, the rows above it are not"
+            );
+
+            let batch = db
+                .fetch_history_wipe_batch(channel, &boundary, 2)
+                .await
+                .unwrap();
+            assert_eq!(wipe_ids(&batch), vec![id(0), id(1)], "oldest first");
+
+            for limit in [0, -5] {
+                let batch = db
+                    .fetch_history_wipe_batch(channel, &boundary, limit)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    wipe_ids(&batch),
+                    vec![id(0)],
+                    "limit {limit} is clamped to 1"
+                );
+            }
+
+            // Just below the B row's id leaves that row out
+            let below = ulid::Ulid::from_parts(3_000, 0).to_string();
+            let batch = db
+                .fetch_history_wipe_batch(channel, &below, 100)
+                .await
+                .unwrap();
+            assert_eq!(wipe_ids(&batch), vec![id(0), id(1)]);
+
+            let listed = [id(0), id(1), id(2)];
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                3
+            );
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                0,
+                "a repeat deletes nothing"
+            );
+            assert_eq!(db.delete_messages_by_ids(channel, &[]).await.unwrap(), 0);
+            assert!(db
+                .fetch_history_wipe_batch(channel, &boundary, 100)
+                .await
+                .unwrap()
+                .is_empty());
+            for i in [3, 4] {
+                assert!(exists(&db, &id(i)).await, "row {i} above B was touched");
+            }
+        });
+    }
+
+    /// The hostile fixture (design 11 "Backend, wipe"): a row carrying
+    /// `encrypted` with an id at or below B is never returned or deleted, not
+    /// even when the delete lists it, and neither is another channel's row
+    /// whose id is listed.
+    #[tokio::test]
+    async fn wipe_never_touches_an_encrypted_row_or_another_channel() {
+        database_test!(|db| async move {
+            let channel = "01CHANWIPE0000000000000002";
+            let other = "01CHANWIPE0000000000000003";
+            let oldest = wipe_row(1_000, 1, channel, None);
+            let injected = wipe_row(1_500, 1, channel, Some(1));
+            let at_boundary = wipe_row(2_000, 1, channel, None);
+            let above = wipe_row(2_500, 1, channel, Some(2));
+            let elsewhere = wipe_row(1_200, 1, other, None);
+            for row in [&oldest, &injected, &at_boundary, &above, &elsewhere] {
+                insert_raw(&db, row).await;
+            }
+            let boundary = at_boundary.id.clone();
+
+            let batch = db
+                .fetch_history_wipe_batch(channel, &boundary, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                wipe_ids(&batch),
+                vec![oldest.id.clone(), at_boundary.id.clone()],
+                "the encrypted row at or below B must never be in a batch"
+            );
+
+            // A wrong list: every id of the fixture
+            let listed = [
+                oldest.id.clone(),
+                injected.id.clone(),
+                at_boundary.id.clone(),
+                above.id.clone(),
+                elsewhere.id.clone(),
+            ];
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                2,
+                "only the channel's two plaintext rows may go"
+            );
+            assert!(!exists(&db, &oldest.id).await);
+            assert!(!exists(&db, &at_boundary.id).await);
+            assert!(
+                exists(&db, &injected.id).await,
+                "an encrypted row at or below B was deleted"
+            );
+            assert!(
+                exists(&db, &above.id).await,
+                "an encrypted row above B was deleted"
+            );
+            assert!(
+                exists(&db, &elsewhere.id).await,
+                "another channel's listed row was deleted"
+            );
+
+            assert!(db
+                .fetch_history_wipe_batch(channel, &boundary, 100)
+                .await
+                .unwrap()
+                .is_empty());
+            let theirs = db
+                .fetch_history_wipe_batch(other, &boundary, 100)
+                .await
+                .unwrap();
+            assert_eq!(wipe_ids(&theirs), vec![elsewhere.id.clone()]);
+        });
+    }
+
+    /// MongoDB's `encrypted: null` also matches an explicit null, which
+    /// decodes to `encrypted: None`: such a row is plaintext to the wipe as it
+    /// is to the read rule. Mongo only; the Reference driver stores typed rows.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn wipe_treats_an_explicit_null_encrypted_as_plaintext() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Bson, Document};
+
+            let channel = "01CHANWIPE0000000000000004";
+            let row = wipe_row(1_000, 1, channel, None);
+            let mut raw = bson::to_document(&row).expect("encode the row");
+            raw.insert("encrypted", Bson::Null);
+            let messages = mongo.col::<Document>("messages");
+            messages.insert_one(raw).await.expect("insert the row");
+            assert_eq!(
+                messages
+                    .count_documents(
+                        doc! { "_id": row.id.as_str(), "encrypted": { "$type": "null" } }
+                    )
+                    .await
+                    .unwrap(),
+                1,
+                "the fixture must store an explicit null"
+            );
+            assert!(db.fetch_message(&row.id).await.unwrap().encrypted.is_none());
+
+            let batch = db
+                .fetch_history_wipe_batch(channel, &row.id, 10)
+                .await
+                .unwrap();
+            assert_eq!(wipe_ids(&batch), vec![row.id.clone()]);
+            assert_eq!(
+                db.delete_messages_by_ids(channel, std::slice::from_ref(&row.id))
+                    .await
+                    .unwrap(),
+                1
+            );
+        });
+    }
+
+    /// A row the batch cannot decode fails the call instead of vanishing from
+    /// it: a batch that silently loses rows could come back empty while
+    /// plaintext is left. Mongo only; the Reference driver stores typed rows.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn wipe_batch_fails_closed_on_an_undecodable_row() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+            use bson::{doc, Document};
+            use revolt_result::ErrorType;
+
+            let channel = "01CHANWIPE0000000000000005";
+            let good = wipe_row(1_000, 1, channel, None);
+            insert_raw(&db, &good).await;
+            // An Int32 author cannot decode into `Message.author: String`
+            let bad_id = ulid::Ulid::from_parts(2_000, 1).to_string();
+            mongo
+                .col::<Document>("messages")
+                .insert_one(doc! { "_id": bad_id.as_str(), "channel": channel, "author": 5_i32 })
+                .await
+                .expect("insert the poisoned row");
+
+            let err = db
+                .fetch_history_wipe_batch(channel, &bad_id, 10)
+                .await
+                .expect_err("an undecodable row must fail the batch, not be skipped");
+            assert!(
+                matches!(
+                    &err.error_type,
+                    ErrorType::DatabaseError { operation, collection }
+                        if operation == "find" && collection == "messages"
+                ),
+                "{err:?}"
+            );
+
+            // With the poisoned row out of range the same call goes through
+            let batch = db
+                .fetch_history_wipe_batch(channel, &good.id, 10)
+                .await
+                .unwrap();
+            assert_eq!(wipe_ids(&batch), vec![good.id.clone()]);
+        });
+    }
+
+    /// The newest row decides `last_message_id` after a wipe: an encrypted
+    /// row counts, another channel's does not, and an emptied channel has none.
+    #[tokio::test]
+    async fn wipe_newest_message_id_follows_the_newest_row() {
+        database_test!(|db| async move {
+            let channel = "01CHANWIPE0000000000000006";
+            let other = "01CHANWIPE0000000000000007";
+            assert_eq!(db.fetch_newest_message_id(channel).await.unwrap(), None);
+
+            let first = wipe_row(1_000, 1, channel, None);
+            let newest = wipe_row(3_000, 1, channel, Some(3));
+            let middle = wipe_row(2_000, 1, channel, None);
+            let elsewhere = wipe_row(9_000, 1, other, None);
+            for row in [&first, &newest, &middle, &elsewhere] {
+                insert_raw(&db, row).await;
+            }
+
+            assert_eq!(
+                db.fetch_newest_message_id(channel).await.unwrap(),
+                Some(newest.id.clone())
+            );
+            db.delete_message(&newest.id).await.unwrap();
+            assert_eq!(
+                db.fetch_newest_message_id(channel).await.unwrap(),
+                Some(middle.id.clone())
+            );
+            db.delete_messages_by_ids(channel, &[first.id.clone(), middle.id.clone()])
+                .await
+                .unwrap();
+            assert_eq!(db.fetch_newest_message_id(channel).await.unwrap(), None);
+            assert_eq!(
+                db.fetch_newest_message_id(other).await.unwrap(),
+                Some(elsewhere.id.clone())
             );
         });
     }

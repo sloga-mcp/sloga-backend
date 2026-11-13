@@ -44,6 +44,11 @@ pub trait AbstractSoftRes: Sync + Send {
     /// explicit edit, which re-snapshots `locks_at` from the event).
     async fn set_sheet_unlocked(&self, id: &str) -> Result<()>;
 
+    /// Ids of every sheet of a channel whose stored `locked` flag is not
+    /// set, ascending (protect closes them). Ids only, so a row that no
+    /// longer decodes is still listed and locked.
+    async fn fetch_open_sheet_ids_for_channel(&self, channel: &str) -> Result<Vec<String>>;
+
     /// Insert or replace a user's reserve row, returning the previous row
     /// if one existed (drives the WS delta and cap compensation).
     async fn upsert_reserve(&self, row: &SoftResReserveRow)
@@ -73,7 +78,8 @@ pub trait AbstractSoftRes: Sync + Send {
     ) -> Result<u32>;
 
     /// Delete the sheets carried by the given messages, and their
-    /// reserves (message-deletion cascade, single and bulk paths).
+    /// reserves (message-deletion cascade, single and bulk paths, history
+    /// wipe).
     async fn delete_softres_for_messages(&self, message_ids: &[String]) -> Result<()>;
 
     /// Delete every sheet and reserve in a channel (channel-deletion

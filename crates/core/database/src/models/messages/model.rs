@@ -366,6 +366,59 @@ pub fn validate_protected_send(
     validate_protected_ciphertext(encrypted.as_ref(), data.nonce.as_deref())
 }
 
+/// What a history read needs to know about a channel to decide which stored
+/// rows it may serve (design 7.5 "S4", S4-D15; pinned name)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedReadView {
+    /// The channel is protected
+    pub protected: bool,
+    /// The channel's history boundary B, when it was protected with one
+    pub boundary: Option<String>,
+    /// The pre-protect history is wiped or being wiped: true from the moment
+    /// the wipe is `Requested`, not only once it is `Done` (S4-D21)
+    pub wiped: bool,
+}
+
+impl ProtectedReadView {
+    /// The view of a channel that is not protected
+    pub fn unprotected() -> Self {
+        ProtectedReadView {
+            protected: false,
+            boundary: None,
+            wiped: false,
+        }
+    }
+
+    /// The view of `channel` from its own fields only. A thread is judged
+    /// by its PARENT (#182): pass the parent here, never the thread (a
+    /// thread's own view is unprotected).
+    pub fn of(channel: &Channel) -> Self {
+        match channel {
+            Channel::TextChannel {
+                protected,
+                protected_history,
+                ..
+            } => ProtectedReadView {
+                protected: *protected,
+                boundary: protected_history
+                    .as_ref()
+                    .map(|history| history.boundary.clone()),
+                wiped: protected_history.as_ref().is_some_and(|history| {
+                    matches!(
+                        history.wipe,
+                        crate::HistoryWipe::Requested { .. } | crate::HistoryWipe::Done { .. }
+                    )
+                }),
+            },
+            Channel::SavedMessages { .. }
+            | Channel::DirectMessage { .. }
+            | Channel::Group { .. }
+            | Channel::Thread { .. }
+            | Channel::Forum { .. } => Self::unprotected(),
+        }
+    }
+}
+
 auto_derived!(
     /// System Event
     #[serde(tag = "type")]
@@ -3701,5 +3754,116 @@ mod encrypted_payload_tests {
         let document = bson::to_document(&payload).expect("to bson");
         let back: EncryptedPayload = bson::from_document(document).expect("from bson");
         assert_eq!(back, payload);
+    }
+}
+
+#[cfg(test)]
+mod protected_read_view_tests {
+    use std::collections::HashMap;
+
+    use super::ProtectedReadView;
+    use crate::{Channel, HistoryWipe, ProtectedHistory};
+
+    fn text(protected: bool, protected_history: Option<ProtectedHistory>) -> Channel {
+        Channel::TextChannel {
+            id: "T".to_string(),
+            server: "S".to_string(),
+            name: "text".to_string(),
+            description: None,
+            icon: None,
+            last_message_id: None,
+            default_permissions: None,
+            role_permissions: HashMap::new(),
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            slowmode: None,
+            announcement: None,
+            protected,
+            protected_history: protected_history.map(Box::new),
+        }
+    }
+
+    fn history(wipe: HistoryWipe) -> Option<ProtectedHistory> {
+        Some(ProtectedHistory {
+            boundary: "B".to_string(),
+            wipe,
+        })
+    }
+
+    /// Design 7.5 "S4": the view is the protected flag plus the boundary,
+    /// and `wiped` is true from `Requested` on, not only at `Done`
+    ///
+    /// Control: the `Requested` arm dropped from the `wiped` match.
+    #[test]
+    fn view_reads_flag_boundary_and_wipe() {
+        let unprotected = ProtectedReadView::unprotected();
+        assert_eq!(
+            unprotected,
+            ProtectedReadView {
+                protected: false,
+                boundary: None,
+                wiped: false,
+            }
+        );
+        assert_eq!(ProtectedReadView::of(&text(false, None)), unprotected);
+
+        // Protected while empty: no boundary, nothing wiped
+        assert_eq!(
+            ProtectedReadView::of(&text(true, None)),
+            ProtectedReadView {
+                protected: true,
+                boundary: None,
+                wiped: false,
+            }
+        );
+
+        let at = iso8601_timestamp::Timestamp::UNIX_EPOCH;
+        for (wipe, wiped) in [
+            (HistoryWipe::None, false),
+            (
+                HistoryWipe::Requested {
+                    at,
+                    by: "U".to_string(),
+                },
+                true,
+            ),
+            (HistoryWipe::Done { at, count: 0 }, true),
+        ] {
+            assert_eq!(
+                ProtectedReadView::of(&text(true, history(wipe.clone()))),
+                ProtectedReadView {
+                    protected: true,
+                    boundary: Some("B".to_string()),
+                    wiped,
+                },
+                "{wipe:?}"
+            );
+        }
+
+        // Every other kind is unprotected; a thread's view is its parent's,
+        // which the caller passes instead
+        for channel in [
+            Channel::SavedMessages {
+                id: "M".to_string(),
+                user: "U".to_string(),
+            },
+            Channel::Thread {
+                id: "TH".to_string(),
+                server: "S".to_string(),
+                parent_channel: "T".to_string(),
+                name: "thread".to_string(),
+                creator: "U".to_string(),
+                origin_message_id: None,
+                last_message_id: None,
+                archived: false,
+                archived_timestamp: None,
+                auto_archive_minutes: 1440,
+                locked: false,
+                applied_tags: vec![],
+            },
+        ] {
+            assert_eq!(ProtectedReadView::of(&channel), unprotected);
+        }
     }
 }

@@ -10,6 +10,35 @@ use crate::{
 mod mongodb;
 mod reference;
 
+/// The configuration flags a seat-list write reads (7.1): S2's `formats_v2`
+/// and S4's `history_setting`. Both drivers read them once per call, before
+/// any lock or transaction, and hand them to the planner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SeatListFlags {
+    pub formats_v2: bool,
+    pub history_setting: bool,
+}
+
+impl SeatListFlags {
+    /// The configured flags
+    pub(super) async fn read() -> SeatListFlags {
+        // Test-only (compiled out of every build but `cargo test`): a test
+        // may scope other flags over its own task (`tests::with_flags`); the
+        // configuration cannot be overwritten per test in this crate
+        #[cfg(test)]
+        if let Some(flags) = super::tests::seat_list_flags_override() {
+            return flags;
+        }
+
+        let config = revolt_config::config().await;
+        let features = &config.features.protected_channels;
+        SeatListFlags {
+            formats_v2: features.formats_v2,
+            history_setting: features.history_setting,
+        }
+    }
+}
+
 /// Protected-channel data (design 2.2 to 2.5).
 ///
 /// Atomicity: every method that writes more than one document does so in
@@ -19,8 +48,9 @@ mod reference;
 /// or, in the Reference driver, while holding its collection locks in the
 /// order `channels -> messages -> channel_entitlements -> servers ->
 /// server_members -> channel_seat_lists -> channel_seats -> mls_groups ->
-/// mls_commits -> mls_join_intents -> e2ee_identities -> e2ee_queue` (the
-/// 2.5 (d) order with five collections prefixed and one appended; see
+/// mls_commits -> mls_history_links -> mls_join_intents -> e2ee_identities
+/// -> e2ee_queue` (the 2.5 (d) order with five collections prefixed and one
+/// appended, and S4's `mls_history_links` where 2.8 puts it; see
 /// `ops/reference.rs`). On Mongo, a
 /// transaction that only READS a document it depends on also writes it
 /// (`txn_serial`), so the dependency cannot write-skew: Text create writes
@@ -84,6 +114,19 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// as_of_group_id)` is always a consistent triple under a racing PUT
     async fn fetch_seat_list_snapshot(&self, channel_id: &str) -> Result<SeatListSnapshot>;
 
+    /// [`Self::protect_channel_with_wipe`] without a `wipe_history` flag:
+    /// the wipe state comes from the signed genesis alone (7.2 "S4": an
+    /// absent flag takes the signed line)
+    async fn protect_channel(
+        &self,
+        channel_id: &str,
+        submission: &SeatListSubmission,
+        now: Timestamp,
+    ) -> Result<SeatListWriteOutcome> {
+        self.protect_channel_with_wipe(channel_id, submission, None, now)
+            .await
+    }
+
     /// Protect a channel with its genesis seat list (7.2 protect), in one
     /// transaction.
     ///
@@ -93,18 +136,55 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// writes nothing (N3, #128 as amended by decision 4 (W2)).
     ///
     /// Otherwise: the channel must be a server `TextChannel` that is not
-    /// protected, has no `voice`, is not an announcement channel, has no
-    /// threads and has no messages (no stored message in the channel, not
-    /// just `last_message_id` unset, which lags), else `InvalidOperation`;
-    /// the list's signer must own the server (`NotOwner`; the server
-    /// document is claimed, decision 13 (W2)); the entitlement must be
-    /// `Active` and belong to the channel's server (else
-    /// `InvalidOperation`); the list is planned per 4.3 (version 1, no
-    /// stored list); every seated user must be a member of the server (its
-    /// membership is claimed, else `FailedValidation`); then the list row is
-    /// stored, the seats are claimed under the slot cap, and the channel's
-    /// `protected` flag is set.
-    async fn protect_channel(
+    /// protected, has no `voice`, is not an announcement channel and has no
+    /// threads, else `InvalidOperation`; the list's signer must own the
+    /// server (`NotOwner`; the server document is claimed, decision 13
+    /// (W2)); the entitlement must be `Active` and belong to the channel's
+    /// server (else `InvalidOperation`); the list is planned per 4.3
+    /// (version 1, no stored list); every seated user must be a member of
+    /// the server (its membership is claimed, else `FailedValidation`); then
+    /// the list row is stored, the seats are claimed under the slot cap, and
+    /// the channel's `protected` flag is set.
+    ///
+    /// Messages (S4, 7.2 "S4"; the boundary B is the signed genesis's
+    /// `history_boundary`, never taken from anywhere else): with an EMPTY
+    /// boundary (a v1 list included) the channel must hold no message at
+    /// all (no stored message, not just `last_message_id` unset, which
+    /// lags), else `InvalidOperation` (S1). With a boundary, first the
+    /// genesis rules of `check_protect_genesis_history` (`history_setting`
+    /// on, the signer seated alone, `ulid_time(B) <= now + 2 min`,
+    /// `wipe_history` agreeing with the signed `pre_history`; each
+    /// `FailedValidation`), then no message of the channel newer than B,
+    /// else `ProtectHistoryMoved` with nothing written. The channel's
+    /// `protected_history { boundary: B, wipe }` is written with the flag,
+    /// `wipe` from the SIGNED line (`kept`: `None`; `wiped`: `Requested { at:
+    /// now, by: signer }`). The legal hold is the route's (W2), not read
+    /// here.
+    async fn protect_channel_with_wipe(
+        &self,
+        channel_id: &str,
+        submission: &SeatListSubmission,
+        wipe_history: Option<bool>,
+        now: Timestamp,
+    ) -> Result<SeatListWriteOutcome>;
+
+    /// The history wipe write (`POST .../history_wipe`, 4.3 "S4",
+    /// `SeatListWriteKind::Wipe`), in the seat-list write's transaction:
+    /// the same version rule with the byte-identical retry first (it
+    /// returns `unchanged: true` and writes nothing, so a repeated request
+    /// is idempotent), the signer-leaf check (5b), the `signer_lost` and
+    /// removed-user refusals, the open Text group's `seat_list_ad_sha256`
+    /// and its 2.5 "Clearing", with 4c turned around (`kept -> wiped`
+    /// required, every other line but `version`, `issued_at` and the signer
+    /// lines equal to the stored list's). No growth gate, no seat claims,
+    /// any entitlement state; `history_setting` must be on (read from the
+    /// configuration). The channel must be protected with a
+    /// `protected_history` carrying the list's boundary (else
+    /// `InvalidOperation`); its `wipe` becomes `Requested { at: now, by:
+    /// signer }` in the same transaction, unless it is already `Requested`
+    /// or `Done`, which is never rewritten. The legal hold is the route's
+    /// (W2), not read here.
+    async fn request_history_wipe(
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
@@ -129,6 +209,11 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// claimed or reactivated user must be a member of the entitlement's
     /// server (its membership is claimed, else `FailedValidation`;
     /// decision 13 (W2)).
+    ///
+    /// S4: `history_setting` is read from the config too; while it is off a
+    /// list carrying a boundary or `wiped` is refused, and while it is on
+    /// the list keeps the stored boundary and never moves `kept -> wiped`
+    /// (only `request_history_wipe` does), 4.3 "S4".
     ///
     /// S2: `formats_v2` is read from the config. While the open Text group
     /// carries `signer_lost`, a list that does not resolve it (4.3 step 7)
@@ -275,9 +360,10 @@ pub trait AbstractProtectedChannels: Sync + Send {
 
     /// Delete cascade (7.5): remove the channel's entitlement, seats and
     /// seat list, and every Text group of the channel (open or closed) with
-    /// its commits and join intents, in one transaction. The Text group rows
-    /// are deleted, not only closed (C7, W2 audit): the channel goes with
-    /// this cascade and its Text group ids derive from its id, so no row is
-    /// ever read again.
+    /// its commits, history links (S4, 2.8: every `mls_history_links` row
+    /// held by those groups) and join intents, in one transaction. The Text
+    /// group rows are deleted, not only closed (C7, W2 audit): the channel
+    /// goes with this cascade and its Text group ids derive from its id, so
+    /// no row is ever read again.
     async fn delete_protected_channel_data(&self, channel_id: &str) -> Result<()>;
 }

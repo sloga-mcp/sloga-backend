@@ -6,11 +6,13 @@
 //!
 //! `channels -> messages -> channel_entitlements -> servers ->
 //!  server_members -> channel_seat_lists -> channel_seats -> mls_groups
-//!  -> mls_commits -> mls_join_intents -> e2ee_identities -> e2ee_queue`
+//!  -> mls_commits -> mls_history_links -> mls_join_intents ->
+//!  e2ee_identities -> e2ee_queue`
 //!
 //! `e2ee_queue` is APPENDED (A6, W2 audit: the M9 eviction deletes the
 //! squat's queued envelopes); every other Reference path takes that lock
-//! alone.
+//! alone. `mls_history_links` sits right after `mls_commits` (S4, doc 2.8);
+//! here only the delete cascade holds it.
 //!
 //! The doc's order starts at `channel_seat_lists`. `channels` (protect sets
 //! the flag atomically with the genesis list, and refuses a channel with
@@ -36,17 +38,18 @@ use revolt_result::Result;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    channel_seats_used, check_channel_protectable, check_text_first_generation,
-    check_text_successor, is_genesis_reprotect, plan_device_removal_effect,
-    plan_release_group_effect, plan_seat_list_write, prepare_text_group, report_signer_lost,
-    seat_list_channel_server, text_group_user_ids, Channel, ChannelEntitlement, ChannelSeat,
+    channel_seats_used, check_channel_protectable, check_channel_wipeable,
+    check_protect_genesis_history, check_text_first_generation, check_text_successor,
+    is_genesis_reprotect, plan_device_removal_effect, plan_release_group_effect,
+    plan_seat_list_write, prepare_text_group, report_signer_lost, seat_list_channel_server,
+    submitted_history_boundary, text_group_user_ids, Channel, ChannelEntitlement, ChannelSeat,
     DeviceRemovalEffect, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
     ReferenceDb, ReleaseGroupEffect, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
     SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
     SeatReleaseCause, TextGroupCreator, MAX_CHANNEL_SLOT_CAP,
 };
 
-use super::AbstractProtectedChannels;
+use super::{AbstractProtectedChannels, SeatListFlags};
 
 fn is_open_text_group_of(group: &MlsGroup, channel_id: &str) -> bool {
     group.channel_id == channel_id && group.open && group.kind == MlsGroupKind::Text
@@ -280,17 +283,14 @@ impl AbstractProtectedChannels for ReferenceDb {
         })
     }
 
-    async fn protect_channel(
+    async fn protect_channel_with_wipe(
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
+        wipe_history: Option<bool>,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
-        let formats_v2 = revolt_config::config()
-            .await
-            .features
-            .protected_channels
-            .formats_v2;
+        let flags = SeatListFlags::read().await;
 
         let mut channels = self.channels.lock().await;
         let messages = self.messages.lock().await;
@@ -321,7 +321,10 @@ impl AbstractProtectedChannels for ReferenceDb {
             }
         }
 
-        check_channel_protectable(channels.get(channel_id))?;
+        check_channel_protectable(
+            channels.get(channel_id),
+            submitted_history_boundary(submission).as_deref(),
+        )?;
 
         // Decision 13 (W2): the list's signer owns the server
         let body = SeatListBody::parse(&submission.body)?;
@@ -330,6 +333,10 @@ impl AbstractProtectedChannels for ReferenceDb {
         }
         let server_id = server_id.ok_or_else(|| create_error!(InvalidOperation))?;
 
+        // S4 (4.3 "S4"): the genesis's history rules, before the message
+        // probe, so a refused genesis never answers `ProtectHistoryMoved`
+        check_protect_genesis_history(&body, flags.history_setting, wipe_history, now)?;
+
         // Decision 13 (W2): a channel with threads is refused
         if channels.values().any(|channel| {
             matches!(channel, Channel::Thread { parent_channel, .. } if parent_channel == channel_id)
@@ -337,13 +344,23 @@ impl AbstractProtectedChannels for ReferenceDb {
             return Err(create_error!(InvalidOperation));
         }
 
-        // `last_message_id` is written asynchronously (batched), so it can
-        // lag a stored message: ask the messages themselves
-        if messages
-            .values()
-            .any(|message| message.channel == channel_id)
-        {
-            return Err(create_error!(InvalidOperation));
+        // The message probe, under the `messages` lock (7.2 "S4"): with an
+        // empty boundary no message at all (S1; `last_message_id` is written
+        // asynchronously, so it can lag a stored message: ask the messages
+        // themselves); with a boundary B no message newer than B, else
+        // `ProtectHistoryMoved`. Nothing has been written yet.
+        let boundary = body
+            .v2
+            .as_ref()
+            .and_then(|lines| lines.history_boundary.as_deref());
+        if messages.values().any(|message| {
+            message.channel == channel_id
+                && boundary.is_none_or(|boundary| message.id.as_str() > boundary)
+        }) {
+            return Err(match boundary {
+                None => create_error!(InvalidOperation),
+                Some(_) => create_error!(ProtectHistoryMoved),
+            });
         }
 
         let entitlement = entitlements
@@ -376,7 +393,9 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims: true,
-            formats_v2,
+            formats_v2: flags.formats_v2,
+            history_setting: flags.history_setting,
+            wipe_history,
             text_group_users: &text_group_users,
             removal_reason: None,
             now,
@@ -390,8 +409,19 @@ impl AbstractProtectedChannels for ReferenceDb {
             &mut groups,
             text_group.as_ref().map(|group| group.id.as_str()),
         );
-        if let Some(Channel::TextChannel { protected, .. }) = channels.get_mut(channel_id) {
+        if let Some(Channel::TextChannel {
+            protected,
+            protected_history,
+            ..
+        }) = channels.get_mut(channel_id)
+        {
             *protected = true;
+            // S4 (2.1 "S4"): with the flag, from the signed genesis
+            if let SeatListWriteDecision::Apply(plan) = &decision {
+                if let Some(history) = &plan.protected_history {
+                    *protected_history = Some(Box::new(history.clone()));
+                }
+            }
         }
 
         Ok(decision.outcome())
@@ -405,11 +435,7 @@ impl AbstractProtectedChannels for ReferenceDb {
         now: Timestamp,
         removal_reason: Option<&str>,
     ) -> Result<SeatListWriteOutcome> {
-        let formats_v2 = revolt_config::config()
-            .await
-            .features
-            .protected_channels
-            .formats_v2;
+        let flags = SeatListFlags::read().await;
 
         let entitlements = self.channel_entitlements.lock().await;
         let members = self.server_members.lock().await;
@@ -441,7 +467,9 @@ impl AbstractProtectedChannels for ReferenceDb {
             seats: &channel_seats,
             text_group: text_group.as_ref(),
             allow_claims,
-            formats_v2,
+            formats_v2: flags.formats_v2,
+            history_setting: flags.history_setting,
+            wipe_history: None,
             text_group_users: &text_group_users,
             removal_reason,
             now,
@@ -461,6 +489,78 @@ impl AbstractProtectedChannels for ReferenceDb {
             &mut groups,
             text_group.as_ref().map(|group| group.id.as_str()),
         );
+
+        Ok(decision.outcome())
+    }
+
+    async fn request_history_wipe(
+        &self,
+        channel_id: &str,
+        submission: &SeatListSubmission,
+        now: Timestamp,
+    ) -> Result<SeatListWriteOutcome> {
+        let flags = SeatListFlags::read().await;
+
+        // A subsequence of the module's order. No entitlement and no
+        // memberships: the wipe claims no seat (4.3 "S4").
+        let mut channels = self.channels.lock().await;
+        let mut seat_lists = self.channel_seat_lists.lock().await;
+        let mut seats = self.channel_seats.lock().await;
+        let mut groups = self.mls_groups.lock().await;
+
+        let channel_seats: Vec<ChannelSeat> = seats
+            .values()
+            .filter(|seat| seat.channel_id == channel_id)
+            .cloned()
+            .collect();
+        let text_group = groups
+            .values()
+            .find(|group| is_open_text_group_of(group, channel_id))
+            .cloned();
+        let text_group_users = text_group_user_ids(groups.values(), channel_id);
+
+        let decision = plan_seat_list_write(&SeatListWriteInput {
+            kind: SeatListWriteKind::Wipe,
+            channel_id,
+            submission,
+            stored: seat_lists.get(channel_id),
+            entitlement: None,
+            seats: &channel_seats,
+            text_group: text_group.as_ref(),
+            allow_claims: false,
+            formats_v2: flags.formats_v2,
+            history_setting: flags.history_setting,
+            wipe_history: None,
+            text_group_users: &text_group_users,
+            removal_reason: None,
+            now,
+        })?;
+        // The byte-identical retry (N3) writes nothing
+        let SeatListWriteDecision::Apply(plan) = &decision else {
+            return Ok(decision.outcome());
+        };
+        let history = plan
+            .protected_history
+            .as_ref()
+            .ok_or_else(|| create_error!(InternalError))?;
+        let request = check_channel_wipeable(channels.get(channel_id), &history.boundary)?;
+
+        apply_decision(
+            &decision,
+            &mut seat_lists,
+            &mut seats,
+            &mut groups,
+            text_group.as_ref().map(|group| group.id.as_str()),
+        );
+        if request {
+            if let Some(Channel::TextChannel {
+                protected_history: Some(stored),
+                ..
+            }) = channels.get_mut(channel_id)
+            {
+                stored.wipe = history.wipe.clone();
+            }
+        }
 
         Ok(decision.outcome())
     }
@@ -708,6 +808,7 @@ impl AbstractProtectedChannels for ReferenceDb {
         let mut seats = self.channel_seats.lock().await;
         let mut groups = self.mls_groups.lock().await;
         let mut commits = self.mls_commits.lock().await;
+        let mut links = self.mls_history_links.lock().await;
         let mut intents = self.mls_join_intents.lock().await;
 
         entitlements.retain(|_, entitlement| entitlement.channel_id != channel_id);
@@ -723,6 +824,8 @@ impl AbstractProtectedChannels for ReferenceDb {
         groups.retain(|id, _| !text_group_ids.contains(id));
 
         commits.retain(|_, commit| !text_group_ids.contains(&commit.group_id));
+        // S4 (2.8): the history links these groups hold go with them
+        links.retain(|_, link| !text_group_ids.contains(&link.group_id));
         intents.retain(|_, intent| !text_group_ids.contains(&intent.group_id));
         Ok(())
     }

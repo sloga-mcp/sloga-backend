@@ -206,6 +206,10 @@ auto_derived!(
         /// `Text`, refused for `Call`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub generation: Option<u32>,
+        /// Text only: the text protocol the creating client speaks
+        /// (CLIENT-CLAIMED; the minimum text protocol, S4)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
     }
 
     /// Response to registering a group — 200 on create, 409 on conflict
@@ -244,6 +248,10 @@ auto_derived!(
         /// Text join payload only: the signed issue time (ms)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub issued_at: Option<i64>,
+        /// Text only: the text protocol the joining client speaks
+        /// (CLIENT-CLAIMED, not signed; the minimum text protocol, S4)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
     }
 
     /// Submit a commit for the next epoch (plan §2.2.3 arbitration)
@@ -461,14 +469,66 @@ auto_derived!(
         /// The stored Welcome, unpadded standard base64
         pub welcome: String,
     }
+
+    /// One history link (design §3.14.5 "Wire"): the PUT body, each GET row
+    /// and the native argument and result. Every field is required; the
+    /// keys travel in this order
+    pub struct HistoryLinkWire {
+        /// The holder group G' (64 lowercase hex chars)
+        pub group_id: String,
+        /// The holder epoch e'
+        pub epoch: i64,
+        /// G, the group whose keys the link carries
+        pub prev_group_id: String,
+        /// e, the epoch whose keys the link carries
+        pub prev_epoch: i64,
+        /// b64 of the 24-byte nonce
+        pub nonce: String,
+        /// b64 of the ciphertext with its tag
+        pub ciphertext: String,
+        /// The writer user
+        pub writer_user_id: String,
+        /// The writer device
+        pub writer_device_id: String,
+        /// b64 Ed25519 signature by the writer device (design §3.14.5)
+        pub signature: String,
+    }
+
+    /// `GET /mls/groups/:group_id/history_links` (design §7.2 "S4")
+    pub struct ResponseHistoryLinks {
+        /// Links of the holder group, newest holder epoch first
+        pub links: Vec<HistoryLinkWire>,
+        /// The lowest holder epoch on this page while more may exist;
+        /// absent at the end
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub next_before: Option<i64>,
+    }
+
+    /// Query of `GET /mls/groups/:group_id/history_links`
+    #[cfg_attr(feature = "rocket", derive(rocket::FromForm))]
+    pub struct OptionsFetchHistoryLinks {
+        /// Only holder epochs below this one
+        pub before: Option<i64>,
+        /// Rows per page (`5..=200`)
+        pub limit: Option<i64>,
+    }
+
+    /// Query of `PUT /mls/groups/:group_id/history_links/:epoch` (fix F9:
+    /// `contest` is a query parameter, never a body field)
+    #[cfg_attr(feature = "rocket", derive(rocket::FromForm))]
+    pub struct OptionsPutHistoryLink {
+        /// Marks a contest (design §3.14.6)
+        pub contest: Option<bool>,
+    }
 );
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DataCreateMlsGroup, DataMlsJoinIntent, MlsCommitInfo, MlsGroupKind, MlsRejoinIntentInfo,
-        MlsRemovalReason, MlsRemovedReasonInfo, MlsSignerLostCause, MlsSignerLostInfo,
-        ResponseFetchMlsCommits, ResponseTextGroup, ResponseTextWelcome,
+        DataCreateMlsGroup, DataMlsJoinIntent, HistoryLinkWire, MlsCommitInfo, MlsGroupKind,
+        MlsRejoinIntentInfo, MlsRemovalReason, MlsRemovedReasonInfo, MlsSignerLostCause,
+        MlsSignerLostInfo, OptionsFetchHistoryLinks, OptionsPutHistoryLink,
+        ResponseFetchMlsCommits, ResponseHistoryLinks, ResponseTextGroup, ResponseTextWelcome,
     };
 
     /// The 7.2 text group example, with concrete values in its placeholders
@@ -735,6 +795,153 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&reported).unwrap(),
             r#"{"commits":[],"current_epoch":3,"oldest_epoch":2}"#
+        );
+    }
+
+    /// Design §5.9 `tv4:link_wire_json`, byte for byte (1073 bytes)
+    const LINK_WIRE_JSON: &str = r#"{"group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","epoch":8,"prev_group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","prev_epoch":7,"nonce":"yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f","ciphertext":"zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg","writer_user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","writer_device_id":"ffeeddccbbaa99887766554433221100","signature":"axkfh3Uwi6uZMXT6C47i3SBEUCTvDwiqCcWGob94L3B8AmBtYWeyayKENT4QwPPuBy1QzP7aAg92tblg+E73BQ"}"#;
+
+    /// Design §5.9 `tv4:bridge_wire_json`, byte for byte (1075 bytes)
+    const BRIDGE_WIRE_JSON: &str = r#"{"group_id":"f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f","epoch":0,"prev_group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","prev_epoch":12,"nonce":"YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4","ciphertext":"NS+dYd1ABXnEMJWPBe1aVlFcfklyUndpJ7IPYY5KK+IDXEavpv63lbi/q4CYT9jfoe9SUK9B2ShzbcIpWI+QfwQ2Cohr1KCtfTaI+noUbemx+cJTAoxCxcE+Im1SJZPuMa0bfAGUKlQvybwQXqtArixxbR1EOPMVwNF5ysgmB4JkFb70ZI6buEbh/iVBKZleJyszC0+UzM19vZmBem9oWd4LzhqZc0TmXpWgVK5p6lAm6/Rh4S0qO4iKqU4AHwgKScoCxcLxmcZxAn7LOxaduGXYZ8d3vKfKPUYI7f+N+uDb6bG4YqLGHlU7a9ILHAKVSCFYL1RUX8rbjAwYx/vHwzYjV4u7sgUaTRgU/bYv8OgYTx2ROl2ctwAnMqgu0IAywMGbw8BzSdm6Bk/KxrHHnA2/C75R29kXXzGcPLBDSCzghxtowb/DwV4H1bIvCiBTk7moWvMBcbIUdm70GqwhCM28N4zCpk/2MnVjIXg5Hd2SjQ9XGmNoGibvg4oTm4gBMNkaXfZnR4HYOzjTiuwYJKHEmDH0uBM6sViuOFCBC54hnqG/njDM6Mha51CfVxNOzVqGLOPOiIRQZEGX0TuiF4aAGtXKiNBeB+IeQ1a0UO+sn/wTnDU","writer_user_id":"01HZXAAAAAAAAAAAAAAAAAAAAA","writer_device_id":"00112233445566778899aabbccddeeff","signature":"1haHQEC4icTkVB4a/gnceVc2XX+ce2RxtlBiOqkaiBd5gc529ZFrs/CdyeLHDWeiVWt4EQSIRwGl2RhfOMhcBA"}"#;
+
+    /// G0 (`tv2:group_id_v2_g0`)
+    const G0: &str = "6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3";
+
+    /// The `nonce:` line of `tv4:link_sig_input` (b64 of `link_nonce_hex`)
+    const LINK_NONCE_B64: &str = "yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f";
+
+    /// `tv4:link_ciphertext_b64`
+    const LINK_CIPHERTEXT_B64: &str = "zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg";
+
+    /// `tv4:link_signature`
+    const LINK_SIGNATURE: &str =
+        "axkfh3Uwi6uZMXT6C47i3SBEUCTvDwiqCcWGob94L3B8AmBtYWeyayKENT4QwPPuBy1QzP7aAg92tblg+E73BQ";
+
+    /// Design §3.14.5 "Wire": both 5.9 wire vectors decode into
+    /// `HistoryLinkWire` and re-serialize byte for byte (key order
+    /// included); the link vector is also exactly the struct built from
+    /// the separately pinned 5.9 parts; every field is required
+    ///
+    /// Control: one byte of `LINK_WIRE_JSON` flipped.
+    #[test]
+    fn history_link_wire_is_the_5_9_vector() {
+        assert_eq!(LINK_WIRE_JSON.len(), 1073);
+        assert_eq!(BRIDGE_WIRE_JSON.len(), 1075);
+
+        let built = HistoryLinkWire {
+            group_id: G0.to_string(),
+            epoch: 8,
+            prev_group_id: G0.to_string(),
+            prev_epoch: 7,
+            nonce: LINK_NONCE_B64.to_string(),
+            ciphertext: LINK_CIPHERTEXT_B64.to_string(),
+            writer_user_id: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            writer_device_id: "ffeeddccbbaa99887766554433221100".to_string(),
+            signature: LINK_SIGNATURE.to_string(),
+        };
+        assert_eq!(serde_json::to_string(&built).unwrap(), LINK_WIRE_JSON);
+
+        let link: HistoryLinkWire = serde_json::from_str(LINK_WIRE_JSON).unwrap();
+        assert_eq!(link.group_id, link.prev_group_id);
+        assert_eq!((link.epoch, link.prev_epoch), (8, 7));
+        assert_eq!(link.writer_user_id, "01HZXBBBBBBBBBBBBBBBBBBBBB");
+        assert_eq!(link.writer_device_id, "ffeeddccbbaa99887766554433221100");
+        assert_eq!(serde_json::to_string(&link).unwrap(), LINK_WIRE_JSON);
+
+        let bridge: HistoryLinkWire = serde_json::from_str(BRIDGE_WIRE_JSON).unwrap();
+        assert_ne!(bridge.group_id, bridge.prev_group_id);
+        assert_eq!((bridge.epoch, bridge.prev_epoch), (0, 12));
+        assert_eq!(serde_json::to_string(&bridge).unwrap(), BRIDGE_WIRE_JSON);
+
+        // A missing key refuses the body, whichever it is
+        let value = serde_json::to_value(&link).unwrap();
+        let keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        assert_eq!(
+            keys,
+            [
+                "group_id",
+                "epoch",
+                "prev_group_id",
+                "prev_epoch",
+                "nonce",
+                "ciphertext",
+                "writer_user_id",
+                "writer_device_id",
+                "signature"
+            ]
+        );
+        for key in &keys {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<HistoryLinkWire>(missing).is_err(),
+                "{key} is required"
+            );
+        }
+    }
+
+    /// Design §7.2 "S4": `next_before` is absent at the end; the query
+    /// options are all optional
+    #[test]
+    fn history_links_response_and_options() {
+        let end = ResponseHistoryLinks {
+            links: vec![],
+            next_before: None,
+        };
+        assert_eq!(serde_json::to_string(&end).unwrap(), r#"{"links":[]}"#);
+        assert_eq!(
+            serde_json::from_str::<ResponseHistoryLinks>(r#"{"links":[]}"#).unwrap(),
+            end
+        );
+
+        let page = format!(r#"{{"links":[{LINK_WIRE_JSON}],"next_before":8}}"#);
+        let parsed: ResponseHistoryLinks = serde_json::from_str(&page).unwrap();
+        assert_eq!(parsed.next_before, Some(8));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), page);
+
+        let options: OptionsFetchHistoryLinks = serde_json::from_str("{}").unwrap();
+        assert_eq!((options.before, options.limit), (None, None));
+        let options: OptionsPutHistoryLink = serde_json::from_str("{}").unwrap();
+        assert_eq!(options.contest, None);
+    }
+
+    /// The minimum text protocol (plan appendix (2)): `protocol` is optional
+    /// on the join intent and the group create, and absent when `None`, so
+    /// S1 and S2 bodies are unchanged
+    #[test]
+    fn text_protocol_is_optional() {
+        let parsed: DataMlsJoinIntent = serde_json::from_str(JOIN_INTENT_S1).unwrap();
+        assert_eq!(parsed.protocol, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), JOIN_INTENT_S1);
+        let v2 = DataMlsJoinIntent {
+            protocol: Some(2),
+            ..parsed
+        };
+        let wire = format!(
+            r#"{},"protocol":2}}"#,
+            JOIN_INTENT_S1.strip_suffix('}').unwrap()
+        );
+        assert_eq!(serde_json::to_string(&v2).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<DataMlsJoinIntent>(&wire).unwrap(),
+            v2
+        );
+
+        let parsed: DataCreateMlsGroup = serde_json::from_str(CREATE_AT_996641F1).unwrap();
+        assert_eq!(parsed.protocol, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), CREATE_AT_996641F1);
+        let v2 = DataCreateMlsGroup {
+            protocol: Some(2),
+            ..parsed
+        };
+        let wire = format!(
+            r#"{},"protocol":2}}"#,
+            CREATE_AT_996641F1.strip_suffix('}').unwrap()
+        );
+        assert_eq!(serde_json::to_string(&v2).unwrap(), wire);
+        assert_eq!(
+            serde_json::from_str::<DataCreateMlsGroup>(&wire).unwrap(),
+            v2
         );
     }
 

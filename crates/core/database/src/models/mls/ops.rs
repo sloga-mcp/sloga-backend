@@ -5,9 +5,10 @@ use revolt_result::Result;
 
 use crate::{
     mls_text_enforced_device_cap, removal_reason_rank, retain_member_pending_device_removals,
-    E2EEIdentity, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval,
-    MlsRejoinReadd, MlsRemovalReason, MlsRemovedReason, SeatList, SeatListBody,
+    E2EEIdentity, InsertOutcome, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
+    MlsGroupKind, MlsHistoryLink, MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice,
+    MlsPendingDeviceRemoval, MlsRejoinReadd, MlsRemovalReason, MlsRemovedReason, SeatList,
+    SeatListBody, HISTORY_LINK_MAX_CANDIDATES, HISTORY_LINK_PAGE_MAX, HISTORY_LINK_PAGE_MIN,
     MAX_MLS_TEXT_GROUP_MEMBERS,
 };
 
@@ -16,7 +17,7 @@ mod mongodb;
 mod reference;
 
 #[cfg(all(test, feature = "mongodb"))]
-pub(crate) use mongodb::TEXT_COMMIT_RETRIES;
+pub(crate) use mongodb::{HISTORY_LINK_RETRIES, TEXT_COMMIT_RETRIES};
 
 #[async_trait]
 pub trait AbstractMls: Sync + Send {
@@ -295,6 +296,208 @@ pub trait AbstractMls: Sync + Send {
     /// `created_at < older_than`. Call commits are never touched. Returns
     /// how many rows went.
     async fn prune_mls_text_commits(&self, older_than: Timestamp) -> Result<u64>;
+
+    /// Store one history link (design 2.8, 3.14.6). The row is keyed by
+    /// its SLOT `{group_id}:{epoch}:{writer_user_id}`, derived here (the
+    /// given `link.id` is not trusted), so each writer USER holds at most
+    /// one candidate per holder epoch, whichever of its devices wrote it.
+    /// In one atomic unit (Mongo: a transaction whose FIRST write claims
+    /// the holder group document, `$inc txn_serial`, the #143 pattern;
+    /// Reference: `mls_groups -> mls_history_links`):
+    ///
+    /// 1. the shape rules of [`crate::check_history_link_wire`], and `size`
+    ///    must be the decoded ciphertext length (`FailedValidation`);
+    /// 2. the holder group must be a Text group, open or closed (else
+    ///    `NotFound`);
+    /// 3. a row in the slot: every field but `created_at` and `size` equal
+    ///    is `Identical` (nothing written, the first `created_at` kept),
+    ///    anything else `HistoryLinkExists`;
+    /// 4. [`crate::HISTORY_LINK_MAX_CANDIDATES`] rows at the holder epoch
+    ///    already: `HistoryLinkExists`;
+    /// 5. the byte caps of `features.protected_channels`, over the stored
+    ///    `size`s of the holder group's rows, refused only when the sum
+    ///    plus `size` exceeds the cap: for the group
+    ///    (`history_link_group_cap_bytes`) and for the writer user in that
+    ///    group (`history_link_user_cap_bytes`) (`FailedValidation`).
+    ///
+    /// Route rules (6.1 "S4": access, the writer, membership, epochs,
+    /// visibility, the signature) are the caller's and must already have
+    /// run.
+    async fn insert_mls_history_link(&self, link: &MlsHistoryLink) -> Result<InsertOutcome>;
+
+    /// One page of holder group `group_id`'s history links (design 2.8):
+    /// the rows with `epoch < before` (every epoch when `None`), sorted by
+    /// `epoch` descending, then `created_at` ascending (millisecond
+    /// precision on both drivers), then `writer_user_id`. `limit` is
+    /// clamped to [`crate::HISTORY_LINK_PAGE_MIN`] ..=
+    /// [`crate::HISTORY_LINK_PAGE_MAX`] and caps ROWS; a holder epoch is
+    /// never split: a trailing epoch that does not fit whole is dropped,
+    /// so every candidate of an epoch arrives on one page.
+    async fn fetch_mls_history_links(
+        &self,
+        group_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MlsHistoryLink>>;
+
+    /// Delete every history link held by `group_id` (design 2.8).
+    /// Idempotent.
+    async fn delete_mls_history_links_for_group(&self, group_id: &str) -> Result<()>;
+}
+
+/// The byte caps a history-link insert enforces (design 7.1 "S4")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryLinkCaps {
+    /// Per holder group, over every writer
+    pub group_bytes: u64,
+    /// Per writer user per holder group
+    pub user_bytes: u64,
+}
+
+impl HistoryLinkCaps {
+    /// The configured caps (`features.protected_channels`)
+    pub(crate) async fn configured() -> Self {
+        let protected = revolt_config::config().await.features.protected_channels;
+        HistoryLinkCaps {
+            group_bytes: protected.history_link_group_cap_bytes,
+            user_bytes: protected.history_link_user_cap_bytes,
+        }
+    }
+}
+
+/// What a holder group already stores, read inside the insert's atomic unit
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryLinkUsage {
+    /// Rows at the inserted link's holder epoch (one per writer user)
+    pub epoch_writers: u64,
+    /// Sum of `size` over the group's rows
+    pub group_bytes: u64,
+    /// Sum of `size` over the group's rows of the inserted link's writer
+    pub user_bytes: u64,
+}
+
+/// The slot (row id) of a history link: one per (holder group, holder
+/// epoch, writer USER), design 3.14.6 "Slots" (S4-RR-1: never per device)
+pub(crate) fn history_link_slot_id(link: &MlsHistoryLink) -> String {
+    MlsHistoryLink::composite_id(&link.group_id, link.epoch, &link.writer_user_id)
+}
+
+/// The row an insert stores: the shape rules, `size` equal to the decoded
+/// ciphertext length (the caps sum it, so it is never taken on trust), and
+/// the slot id
+pub(crate) fn prepare_history_link_row(link: &MlsHistoryLink) -> Result<MlsHistoryLink> {
+    let decoded = link.check_shape()?;
+    if link.size != decoded {
+        return Err(failed(
+            "history link size must be the decoded ciphertext length",
+        ));
+    }
+    Ok(MlsHistoryLink {
+        id: history_link_slot_id(link),
+        ..link.clone()
+    })
+}
+
+/// A slot already holds `stored`: byte-identical (every field but
+/// `created_at` and `size`) is `Identical`, anything else
+/// `HistoryLinkExists` (first write wins per writer user)
+pub(crate) fn history_link_existing_outcome(
+    stored: &MlsHistoryLink,
+    row: &MlsHistoryLink,
+) -> Result<InsertOutcome> {
+    let identical = stored.group_id == row.group_id
+        && stored.epoch == row.epoch
+        && stored.prev_group_id == row.prev_group_id
+        && stored.prev_epoch == row.prev_epoch
+        && stored.nonce == row.nonce
+        && stored.ciphertext == row.ciphertext
+        && stored.writer_user_id == row.writer_user_id
+        && stored.writer_device_id == row.writer_device_id
+        && stored.signature == row.signature;
+    if identical {
+        Ok(InsertOutcome::Identical)
+    } else {
+        Err(create_error!(HistoryLinkExists))
+    }
+}
+
+/// Whether a new row fits: a free candidate slot at its holder epoch, then
+/// both byte caps (refused only when `sum + size > cap`)
+pub(crate) fn check_history_link_room(
+    row: &MlsHistoryLink,
+    usage: &HistoryLinkUsage,
+    caps: HistoryLinkCaps,
+) -> Result<()> {
+    if usage.epoch_writers >= HISTORY_LINK_MAX_CANDIDATES as u64 {
+        return Err(create_error!(HistoryLinkExists));
+    }
+    // `prepare_history_link_row` bounds `size` to 17 ..= 40960
+    let size = u64::try_from(row.size).map_err(|_| failed("history link size out of range"))?;
+    if usage.group_bytes.saturating_add(size) > caps.group_bytes {
+        return Err(failed("history link group byte cap reached"));
+    }
+    if usage.user_bytes.saturating_add(size) > caps.user_bytes {
+        return Err(failed("history link user byte cap reached"));
+    }
+    Ok(())
+}
+
+/// The stored usage of `row`'s holder group, from its rows (the Reference
+/// driver; Mongo sums the same three values in one aggregation). A
+/// negative stored `size` can only be a corrupt row: fail closed.
+pub(crate) fn history_link_usage<'a>(
+    rows: impl Iterator<Item = &'a MlsHistoryLink>,
+    row: &MlsHistoryLink,
+) -> Result<HistoryLinkUsage> {
+    let (mut epoch_writers, mut group_bytes, mut user_bytes) = (0u64, 0i64, 0i64);
+    for stored in rows.filter(|stored| stored.group_id == row.group_id) {
+        group_bytes = group_bytes.saturating_add(stored.size);
+        if stored.writer_user_id == row.writer_user_id {
+            user_bytes = user_bytes.saturating_add(stored.size);
+        }
+        if stored.epoch == row.epoch {
+            epoch_writers += 1;
+        }
+    }
+    let unsigned = |sum: i64| {
+        u64::try_from(sum).map_err(|_| create_database_error!("sum", "mls_history_links"))
+    };
+    Ok(HistoryLinkUsage {
+        epoch_writers,
+        group_bytes: unsigned(group_bytes)?,
+        user_bytes: unsigned(user_bytes)?,
+    })
+}
+
+/// A requested page size clamped to `HISTORY_LINK_PAGE_MIN ..=
+/// HISTORY_LINK_PAGE_MAX` (design 2.8)
+pub(crate) fn history_link_page_limit(limit: i64) -> usize {
+    limit.clamp(HISTORY_LINK_PAGE_MIN, HISTORY_LINK_PAGE_MAX) as usize
+}
+
+/// Cut a page without splitting a holder epoch. `rows` are in page order
+/// and the driver fetched up to `limit + 1` of them: the extra row tells
+/// whether the epoch at the cut continues past it, and if it does that
+/// whole epoch is dropped. At most five rows share an epoch and `limit` is
+/// at least five, so a page with more rows behind it is never empty.
+pub(crate) fn trim_history_link_page(
+    mut rows: Vec<MlsHistoryLink>,
+    limit: usize,
+) -> Vec<MlsHistoryLink> {
+    if rows.len() <= limit {
+        return rows;
+    }
+    let next_epoch = rows[limit].epoch;
+    rows.truncate(limit);
+    rows.retain(|row| row.epoch != next_epoch);
+    rows
+}
+
+/// Unix milliseconds of a timestamp: the precision Mongo stores
+/// `created_at` at, used by the Reference driver's page order
+pub(crate) fn history_link_created_ms(at: &Timestamp) -> i64 {
+    at.duration_since(Timestamp::UNIX_EPOCH)
+        .whole_milliseconds() as i64
 }
 
 /// The effects of an accepted Text commit, computed from ONE consistent read

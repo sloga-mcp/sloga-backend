@@ -1,5 +1,5 @@
 use bson::{to_bson, Document};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use mongodb::options::{FindOneAndReplaceOptions, ReturnDocument};
 use revolt_result::Result;
 
@@ -174,6 +174,31 @@ impl AbstractSoftRes for MongoDb {
             .map_err(|_| create_database_error!("update_one", COL))
     }
 
+    /// Ids of every sheet of a channel whose stored `locked` flag is not
+    /// set, ascending.
+    async fn fetch_open_sheet_ids_for_channel(&self, channel: &str) -> Result<Vec<String>> {
+        // `locked: false` is a missing key, as in
+        // `set_sheet_locked_if_unlocked`.
+        let rows: Vec<Document> = self
+            .col::<Document>(COL)
+            .find(doc! {
+                "channel": channel,
+                "locked": { "$ne": true }
+            })
+            .projection(doc! { "_id": 1_i32 })
+            .sort(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
+            .collect())
+    }
+
     /// Insert or replace a user's reserve row, returning the previous row
     /// if one existed.
     async fn upsert_reserve(
@@ -274,24 +299,32 @@ impl AbstractSoftRes for MongoDb {
     /// Delete the sheets carried by the given messages, and their
     /// reserves.
     async fn delete_softres_for_messages(&self, message_ids: &[String]) -> Result<()> {
-        let sheets: Vec<SoftResSheet> = self
-            .col::<SoftResSheet>(COL)
+        // Ids only, read as plain documents: a sheet that no longer decodes
+        // as a `SoftResSheet` is still deleted (the history wipe must not
+        // leave its title or note behind), and a cursor error fails the
+        // call instead of silently skipping a row. Reserves go first, so a
+        // failure between the two deletes leaves the sheets for a retry to
+        // find.
+        let sheet_ids: Vec<String> = self
+            .col::<Document>(COL)
             .find(doc! {
                 "message": {
                     "$in": message_ids
                 }
             })
+            .projection(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await;
+            .try_collect::<Vec<Document>>()
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .iter()
+            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
+            .collect();
 
-        if sheets.is_empty() {
+        if sheet_ids.is_empty() {
             return Ok(());
         }
-
-        let sheet_ids: Vec<&str> = sheets.iter().map(|sheet| sheet.id.as_str()).collect();
 
         self.col::<Document>(COL_RESERVES)
             .delete_many(doc! {

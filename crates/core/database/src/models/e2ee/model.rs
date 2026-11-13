@@ -933,6 +933,7 @@ mod envelope_shape_tests {
             created_at: Timestamp::UNIX_EPOCH,
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 

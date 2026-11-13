@@ -16,8 +16,15 @@ use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::ErrorType;
 use sha2::{Digest, Sha256};
 
+use super::ops::SeatListFlags;
 use crate::{
-    channel_seats_used, check_removal_reason, check_seat_list_authority, check_seat_list_v2_lines,
+    channel_seats_used, check_channel_protectable, check_channel_wipeable,
+    check_protect_genesis_history, check_removal_reason, check_seat_list_authority,
+    check_seat_list_history_lines, check_seat_list_v2_lines, seat_list_history_visible, ulid_time,
+    HistoryWipe, Message, MlsHistoryLink, PartialChannel, ProtectedHistory,
+    MAX_BOUNDARY_CLOCK_SKEW_MS,
+};
+use crate::{
     plan_seat_list_write, prepare_text_group, resolve_signer_lost,
     retain_member_pending_device_removals, seat_list_removed_users, text_group_id_v2,
     text_group_id_v2_input, AuthorityOwnerDevice, AuthorityUserDevice, Channel, ChannelAuthority,
@@ -151,6 +158,7 @@ fn text_group(id_byte: u8, creator: &MlsMemberDevice, generation: u32) -> MlsGro
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     }
 }
 
@@ -170,6 +178,7 @@ fn text_channel(last_message_id: Option<String>) -> Channel {
         slowmode: None,
         announcement: None,
         protected: false,
+        protected_history: None,
     }
 }
 
@@ -1549,6 +1558,7 @@ async fn delete_cascade_removes_the_protected_channel_data() {
             created_at: at(0),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .await
         .unwrap();
@@ -1749,6 +1759,7 @@ async fn text_commit_stream(
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
         };
         match db.insert_mls_text_commit(&commit, &hash, 0).await {
             Ok(crate::MlsCommitOutcome::Won) => {
@@ -3305,6 +3316,7 @@ fn call_group(group_id: &str, call_channel: &str) -> MlsGroup {
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     }
 }
 
@@ -3322,6 +3334,7 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
         rejoin_intents: vec![],
         removed_reasons: vec![],
         welcome: None,
+        history_visible: None,
     }
 }
 
@@ -3365,6 +3378,7 @@ async fn squat(db: &Database, group_id: &str, call_channel: &str) {
         created_at: at(0),
         generation: None,
         issued_at: None,
+        protocol: None,
     })
     .await
     .unwrap();
@@ -3484,6 +3498,7 @@ async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &Ml
         rejoin_intents: vec![],
         removed_reasons: vec![],
         welcome: None,
+        history_visible: None,
     };
     let outcome = db
         .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)
@@ -5348,6 +5363,9 @@ fn plan_with_reason(
         text_group: None,
         allow_claims: true,
         formats_v2,
+        // S2's tests: the S4 flag off, as in the test configuration
+        history_setting: false,
+        wipe_history: None,
         text_group_users: &BTreeSet::new(),
         removal_reason,
         now: at(1),
@@ -7674,6 +7692,1530 @@ async fn a_recovery_successor_by_a_signer_user_device_lands_through_both_drivers
                 .await
                 .unwrap(),
             MlsGroupCreateOutcome::Created
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// S4 (4.1.1 "S4", 4.3 "S4", 7.2 "S4", 2.5 "S4", 2.8; doc 11 "Backend,
+// protect" at the driver level): the boundary, protect with history, the
+// wipe write, the visibility of epoch 0, the history links in the cascade
+// ---------------------------------------------------------------------------
+
+/// The 5.9 `boundary_message_id` and its `boundary_ulid_time` vector
+const TV4_BOUNDARY_MESSAGE_ID: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W0";
+const TV4_BOUNDARY_ULID_TIME: u64 = 1_728_694_555_269;
+
+/// `at(0)` in unix milliseconds: every S4 list here is issued then unless
+/// a test says otherwise
+const AT0_MS: i64 = 1_790_812_800_000;
+
+/// Both flags on: a v2 genesis, a boundary and `wiped` are accepted
+const S4_ON: SeatListFlags = SeatListFlags {
+    formats_v2: true,
+    history_setting: true,
+};
+
+tokio::task_local! {
+    /// What `SeatListFlags::read` answers inside `with_flags`
+    static SEAT_LIST_FLAGS: SeatListFlags;
+}
+
+/// Called by `SeatListFlags::read` (`ops.rs`, `#[cfg(test)]` only)
+pub(super) fn seat_list_flags_override() -> Option<SeatListFlags> {
+    SEAT_LIST_FLAGS.try_with(|flags| *flags).ok()
+}
+
+/// Run `test` with the drivers reading `flags` instead of the configuration.
+/// Task-local, so the tests running beside it keep the test configuration
+/// (the configuration cannot be overwritten per test in this crate).
+async fn with_flags<F: std::future::Future>(flags: SeatListFlags, test: F) -> F::Output {
+    SEAT_LIST_FLAGS.scope(flags, test).await
+}
+
+/// A message id timed `offset_ms` after `at(0)`; `salt` orders ids of the
+/// same millisecond
+fn message_id_at(offset_ms: i64, salt: u128) -> String {
+    ulid::Ulid::from_parts((AT0_MS + offset_ms) as u64, salt).to_string()
+}
+
+fn plaintext(id: &str) -> Message {
+    Message {
+        id: id.to_string(),
+        channel: CHANNEL.to_string(),
+        author: USER_B.to_string(),
+        content: Some("before protect".to_string()),
+        ..Default::default()
+    }
+}
+
+/// v2 lines with `boundary` and `pre_history` (salt `GROUP_SALT`, visible)
+fn s4_lines(boundary: Option<impl AsRef<str>>, pre_history: SeatListPreHistory) -> SeatListV2Lines {
+    SeatListV2Lines {
+        history_boundary: boundary.map(|boundary| boundary.as_ref().to_string()),
+        pre_history,
+        ..v2_lines(GROUP_SALT)
+    }
+}
+
+/// A v2 list of `channel_id` by A on `DEVICE_A`, issued at `issued_at`
+fn s4_submit_in(
+    channel_id: &str,
+    version: i64,
+    seats: &[&str],
+    lines: SeatListV2Lines,
+    issued_at: i64,
+) -> SeatListSubmission {
+    SeatListSubmission {
+        body: SeatListBody {
+            channel_id: channel_id.to_string(),
+            version,
+            device_cap: 5,
+            issued_at,
+            signer_user_id: USER_A.to_string(),
+            signer_device_id: DEVICE_A.to_string(),
+            seats: seats.iter().map(|seat| seat.to_string()).collect(),
+            v2: Some(lines),
+        }
+        .build()
+        .unwrap(),
+        signature: signature(version),
+        signer_device_id: DEVICE_A.to_string(),
+        handover: None,
+        authority: None,
+    }
+}
+
+fn s4_submit(version: i64, seats: &[&str], lines: SeatListV2Lines) -> SeatListSubmission {
+    s4_submit_in(CHANNEL, version, seats, lines, AT0_MS)
+}
+
+fn s4_body(version: i64, seats: &[&str], lines: SeatListV2Lines) -> SeatListBody {
+    SeatListBody::parse(&s4_submit(version, seats, lines).body).unwrap()
+}
+
+/// The planner as a driver calls it, with the S4 inputs
+fn plan_s4(
+    kind: SeatListWriteKind,
+    submission: &SeatListSubmission,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+    text_group: Option<&MlsGroup>,
+    history_setting: bool,
+) -> revolt_result::Result<SeatListWriteDecision> {
+    let entitlement = entitlement(100);
+    plan_seat_list_write(&SeatListWriteInput {
+        kind,
+        channel_id: CHANNEL,
+        submission,
+        stored,
+        entitlement: Some(&entitlement),
+        seats,
+        text_group,
+        allow_claims: kind != SeatListWriteKind::Wipe,
+        formats_v2: true,
+        history_setting,
+        wipe_history: None,
+        text_group_users: &BTreeSet::new(),
+        removal_reason: Some(SEAT_PUT_REASON),
+        now: at(1),
+    })
+}
+
+fn requested(boundary: &str, at_time: Timestamp) -> ProtectedHistory {
+    ProtectedHistory {
+        boundary: boundary.to_string(),
+        wipe: HistoryWipe::Requested {
+            at: at_time,
+            by: USER_A.to_string(),
+        },
+    }
+}
+
+fn kept_history(boundary: &str) -> ProtectedHistory {
+    ProtectedHistory {
+        boundary: boundary.to_string(),
+        wipe: HistoryWipe::None,
+    }
+}
+
+// --- pure ---------------------------------------------------------------------
+
+#[test]
+fn ulid_time_matches_the_5_9_boundary_vector() {
+    assert_eq!(
+        ulid_time(TV4_BOUNDARY_MESSAGE_ID).unwrap(),
+        TV4_BOUNDARY_ULID_TIME
+    );
+    // The ulid crate agrees wherever the id is canonical
+    for id in [TV4_BOUNDARY_MESSAGE_ID, CHANNEL, USER_A, CID] {
+        assert_eq!(
+            ulid_time(id).unwrap(),
+            ulid::Ulid::from_string(id).unwrap().timestamp_ms(),
+            "{id}"
+        );
+    }
+    assert_eq!(ulid_time("00000000000000000000000000").unwrap(), 0);
+    assert_eq!(
+        ulid_time("7ZZZZZZZZZZZZZZZZZZZZZZZZZ").unwrap(),
+        (1u64 << 48) - 1
+    );
+}
+
+/// Fix F15: only an uppercase canonical Crockford ULID whose first
+/// character is `0` to `7`
+#[test]
+fn ulid_time_refuses_every_non_canonical_spelling() {
+    let lowercase = TV4_BOUNDARY_MESSAGE_ID.to_lowercase();
+    for (case, id) in [
+        ("lowercase", lowercase.as_str()),
+        ("I", "01J9Z3K4MI6P7Q8R9S0T1V2W00"),
+        ("L", "01J9Z3K4ML6P7Q8R9S0T1V2W00"),
+        ("O", "01J9Z3K4MO6P7Q8R9S0T1V2W00"),
+        ("U", "01J9Z3K4MU6P7Q8R9S0T1V2W00"),
+        ("first character 8", "81J9Z3K4M5N6P7Q8R9S0T1V2W0"),
+        ("first character Z", "Z1J9Z3K4M5N6P7Q8R9S0T1V2W0"),
+        ("25 characters", "01J9Z3K4M5N6P7Q8R9S0T1V2W"),
+        ("27 characters", "01J9Z3K4M5N6P7Q8R9S0T1V2W00"),
+        ("empty", ""),
+    ] {
+        assert_refused(ulid_time(id), "malformed ULID", case);
+    }
+}
+
+/// 4.1.1 "S4" / 4.3 "S4" step 1: every parser refuses `ulid_time(B) >
+/// issued_at` and a non-canonical boundary as malformed
+#[test]
+fn a_v2_body_refuses_a_boundary_later_than_its_issued_at() {
+    let lines = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let issued = |issued_at: i64| SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version: 1,
+        device_cap: 5,
+        issued_at,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        seats: vec![USER_A.to_string()],
+        v2: Some(lines.clone()),
+    };
+    let at_boundary = TV4_BOUNDARY_ULID_TIME as i64;
+    let body = issued(at_boundary).build().unwrap();
+    assert!(SeatListBody::parse(&body).is_ok());
+    assert_refused(
+        issued(at_boundary - 1).build(),
+        "history_boundary is later than issued_at",
+        "issued 1 ms before B",
+    );
+    assert_refused(
+        SeatListBody::parse(&with_line(
+            &body,
+            "history_boundary",
+            "81J9Z3K4M5N6P7Q8R9S0T1V2W0",
+        )),
+        "seat list history_boundary",
+        "a first character above 7",
+    );
+}
+
+/// 4.3 "S4" step 4c on the seat PUT with `history_setting` on: the boundary
+/// stays, `kept -> wiped` is the wipe write's alone, `wiped` never goes back
+#[test]
+fn step4c_with_history_setting_a_put_keeps_the_boundary_and_never_wipes() {
+    let put = SeatListWriteKind::Put;
+    let kept = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let wiped = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Wiped);
+    let stored = stored_v2(kept.clone());
+
+    assert!(
+        check_seat_list_history_lines(put, &next_v2(kept.clone()), Some(&stored), true).is_ok()
+    );
+    for (case, lines, needle) in [
+        (
+            "another boundary",
+            s4_lines(Some(CID), SeatListPreHistory::Kept),
+            "history_boundary is immutable",
+        ),
+        (
+            "boundary dropped",
+            v2_lines(GROUP_SALT),
+            "history_boundary is immutable",
+        ),
+        (
+            "kept to wiped",
+            wiped.clone(),
+            "only through the history wipe",
+        ),
+    ] {
+        assert_refused(
+            check_seat_list_history_lines(put, &next_v2(lines), Some(&stored), true),
+            needle,
+            case,
+        );
+    }
+
+    let stored_wiped = stored_v2(wiped.clone());
+    assert!(
+        check_seat_list_history_lines(put, &next_v2(wiped.clone()), Some(&stored_wiped), true)
+            .is_ok()
+    );
+    assert_refused(
+        check_seat_list_history_lines(put, &next_v2(kept.clone()), Some(&stored_wiped), true),
+        "cannot go from wiped to kept",
+        "wiped to kept",
+    );
+
+    // The v1 predecessor has no boundary
+    let v1 = stored_row(&submit(1, &[USER_A]));
+    assert_refused(
+        check_seat_list_history_lines(put, &next_v2(kept), Some(&v1), true),
+        "history_boundary is immutable",
+        "a boundary over v1",
+    );
+    // A genesis may set both
+    assert!(
+        check_seat_list_history_lines(SeatListWriteKind::Protect, &next_v2(wiped), None, true)
+            .is_ok()
+    );
+}
+
+/// 4.1.1 "S4": with `history_setting` off, S2's refusals apply on every
+/// path, a channel that already carries a boundary included (pinned: the
+/// doc says "every path")
+#[test]
+fn step4c_without_history_setting_refuses_a_boundary_and_wiped_on_every_path() {
+    let kept = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let stored = stored_v2(kept.clone());
+    assert_refused(
+        check_seat_list_history_lines(
+            SeatListWriteKind::Protect,
+            &next_v2(kept.clone()),
+            None,
+            false,
+        ),
+        "history_boundary is refused until S4",
+        "protect",
+    );
+    assert_refused(
+        check_seat_list_history_lines(
+            SeatListWriteKind::Put,
+            &next_v2(kept.clone()),
+            Some(&stored),
+            false,
+        ),
+        "history_boundary is refused until S4",
+        "put on a boundary channel",
+    );
+    assert_refused(
+        check_seat_list_history_lines(
+            SeatListWriteKind::Wipe,
+            &next_v2(s4_lines(
+                Some(TV4_BOUNDARY_MESSAGE_ID),
+                SeatListPreHistory::Wiped,
+            )),
+            Some(&stored),
+            false,
+        ),
+        "pre_history wiped is refused until S4",
+        "wipe",
+    );
+    // S2's entry point is the flag-off call
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(kept), Some(&stored)),
+        "history_boundary is refused until S4",
+        "S2 entry point",
+    );
+}
+
+/// 4.3 "S4": the wipe list moves `pre_history` and nothing else but
+/// `version`, `issued_at` and the signer lines
+#[test]
+fn step4c_the_wipe_list_changes_only_pre_history() {
+    let wipe = |body: &SeatListBody, stored: &SeatList| {
+        check_seat_list_history_lines(SeatListWriteKind::Wipe, body, Some(stored), true)
+    };
+    let kept = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let wiped = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Wiped);
+    let stored = stored_v2(kept.clone());
+
+    assert!(wipe(&next_v2(wiped.clone()), &stored).is_ok());
+    let by_other_device =
+        SeatListBody::parse(&v2_body_by(DEVICE_A2, 2, &[USER_A], wiped.clone())).unwrap();
+    assert!(wipe(&by_other_device, &stored).is_ok());
+    assert_refused(
+        wipe(&next_v2(kept.clone()), &stored),
+        "must set pre_history wiped",
+        "kept again",
+    );
+
+    let mut device_cap = next_v2(wiped.clone());
+    device_cap.device_cap = 4;
+    for (case, body) in [
+        (
+            "seats",
+            SeatListBody::parse(&v2_body(2, &[USER_A, USER_B], wiped.clone())).unwrap(),
+        ),
+        ("device_cap", device_cap),
+        (
+            "history",
+            next_v2(SeatListV2Lines {
+                history: SeatListHistory::Hidden,
+                ..wiped.clone()
+            }),
+        ),
+        (
+            "group_salt",
+            next_v2(SeatListV2Lines {
+                group_salt: "5".repeat(64),
+                ..wiped.clone()
+            }),
+        ),
+        (
+            "authority",
+            next_v2(SeatListV2Lines {
+                authority_sha256: Some("6".repeat(64)),
+                ..wiped.clone()
+            }),
+        ),
+        (
+            "boundary",
+            next_v2(s4_lines(Some(CID), SeatListPreHistory::Wiped)),
+        ),
+    ] {
+        assert_refused(wipe(&body, &stored), "changes only pre_history", case);
+    }
+
+    assert_refused(
+        wipe(&next_v2(wiped.clone()), &stored_v2(wiped.clone())),
+        "already wiped",
+        "a second wipe",
+    );
+    assert_refused(
+        wipe(&next_v2(wiped.clone()), &stored_row(&submit(1, &[USER_A]))),
+        "needs a v2 seat list",
+        "over a v1 list",
+    );
+    assert_refused(
+        wipe(&next_v2(wiped), &stored_v2(v2_lines(GROUP_SALT))),
+        "changes only pre_history",
+        "a channel without a boundary",
+    );
+}
+
+/// 4.3 "S4" protect: the flag, owner-only, the request flag, the wipe state
+/// from the signed line
+#[test]
+fn a_protect_genesis_with_a_boundary_follows_the_s4_rules() {
+    let now = at(0);
+    let b = TV4_BOUNDARY_MESSAGE_ID;
+    let kept = s4_body(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+    let wiped = s4_body(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+
+    for flag in [None, Some(false)] {
+        assert_eq!(
+            check_protect_genesis_history(&kept, true, flag, now).unwrap(),
+            Some(kept_history(b))
+        );
+    }
+    for flag in [None, Some(true)] {
+        assert_eq!(
+            check_protect_genesis_history(&wiped, true, flag, now).unwrap(),
+            Some(requested(b, now))
+        );
+    }
+    assert_refused(
+        check_protect_genesis_history(&kept, true, Some(true), now),
+        "disagrees",
+        "kept signed, wipe asked",
+    );
+    assert_refused(
+        check_protect_genesis_history(&wiped, true, Some(false), now),
+        "disagrees",
+        "wiped signed, keep asked",
+    );
+
+    // Without a boundary there is nothing to write, and nothing to wipe
+    let empty = s4_body(1, &[USER_A], v2_lines(GROUP_SALT));
+    let v1 = SeatListBody::parse(&submit(1, &[USER_A]).body).unwrap();
+    for body in [&empty, &v1] {
+        assert_eq!(
+            check_protect_genesis_history(body, true, None, now).unwrap(),
+            None
+        );
+        assert_eq!(
+            check_protect_genesis_history(body, false, Some(false), now).unwrap(),
+            None
+        );
+        assert_refused(
+            check_protect_genesis_history(body, true, Some(true), now),
+            "disagrees",
+            "no boundary, wipe asked",
+        );
+    }
+
+    assert_refused(
+        check_protect_genesis_history(&kept, false, None, now),
+        "refused until S4",
+        "history_setting off",
+    );
+    let seats_others = s4_body(
+        1,
+        &[USER_A, USER_B],
+        s4_lines(Some(b), SeatListPreHistory::Kept),
+    );
+    assert_refused(
+        check_protect_genesis_history(&seats_others, true, None, now),
+        "seats only its signer",
+        "a boundary genesis seating B",
+    );
+}
+
+/// 4.3 "S4" (#283 (e)): `ulid_time(B) <= now + 2 min` by the server's clock
+#[test]
+fn a_protect_boundary_may_be_at_most_2_minutes_after_the_server_clock() {
+    let skew = MAX_BOUNDARY_CLOCK_SKEW_MS as i64;
+    let genesis = |offset: i64| {
+        let b = message_id_at(offset, 1);
+        let lines = s4_lines(Some(&b), SeatListPreHistory::Kept);
+        SeatListBody::parse(&s4_submit_in(CHANNEL, 1, &[USER_A], lines, AT0_MS + offset).body)
+            .unwrap()
+    };
+    assert!(check_protect_genesis_history(&genesis(skew), true, None, at(0)).is_ok());
+    assert_refused(
+        check_protect_genesis_history(&genesis(skew + 1), true, None, at(0)),
+        "in the future",
+        "2 min + 1 ms",
+    );
+}
+
+/// 4.3 "S4" (S4-PA-6): the wipe write is a seat-list write with the group
+/// hash, no seat change, and the `Requested` wipe; N3 first
+#[test]
+fn the_wipe_write_plans_a_list_and_a_requested_wipe_and_claims_nothing() {
+    let b = TV4_BOUNDARY_MESSAGE_ID;
+    let stored = stored_row(&s4_submit(
+        1,
+        &[USER_A, USER_B],
+        s4_lines(Some(b), SeatListPreHistory::Kept),
+    ));
+    let seats = active_seats(&[USER_A, USER_B]);
+    let wipe = s4_submit(
+        2,
+        &[USER_A, USER_B],
+        s4_lines(Some(b), SeatListPreHistory::Wiped),
+    );
+
+    let planned = applied(
+        plan_s4(
+            SeatListWriteKind::Wipe,
+            &wipe,
+            Some(&stored),
+            &seats,
+            None,
+            true,
+        )
+        .unwrap(),
+    );
+    assert_eq!(planned.row.version, 2);
+    assert_eq!(planned.protected_history, Some(requested(b, at(1))));
+    assert!(planned.claimed.is_empty() && planned.released.is_empty());
+    assert!(planned.seat_rows.is_empty());
+    assert_eq!(
+        planned.seat_list_ad_sha256,
+        planned.row.commit_ad_sha256().unwrap()
+    );
+
+    // N3: the same bytes once they landed
+    assert!(matches!(
+        plan_s4(
+            SeatListWriteKind::Wipe,
+            &wipe,
+            Some(&stored_row(&wipe)),
+            &seats,
+            None,
+            true
+        ),
+        Ok(SeatListWriteDecision::Unchanged(_))
+    ));
+
+    // A seat the wipe would reactivate (the signer's own, released)
+    let mut released = seats.clone();
+    released[0]
+        .release(at(0), SeatReleaseCause::OwnerUnseat, false)
+        .unwrap();
+    assert_refused(
+        plan_s4(
+            SeatListWriteKind::Wipe,
+            &wipe,
+            Some(&stored),
+            &released,
+            None,
+            true,
+        ),
+        "changes no seat",
+        "the signer's released seat",
+    );
+
+    // 5b applies: the signer device must hold a leaf in the open group
+    let mut group = text_group(0x5b, &device(USER_B, DEVICE_B), 0);
+    group.kind = MlsGroupKind::Text;
+    assert_refused(
+        plan_s4(
+            SeatListWriteKind::Wipe,
+            &wipe,
+            Some(&stored),
+            &seats,
+            Some(&group),
+            true,
+        ),
+        "holds no leaf",
+        "signer without a leaf",
+    );
+
+    assert_refused(
+        plan_s4(
+            SeatListWriteKind::Wipe,
+            &wipe,
+            Some(&stored),
+            &seats,
+            None,
+            false,
+        ),
+        "refused until S4",
+        "history_setting off",
+    );
+    // A seat PUT writes no `protected_history`
+    let put = s4_submit(2, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+    assert_eq!(
+        applied(
+            plan_s4(
+                SeatListWriteKind::Put,
+                &put,
+                Some(&stored),
+                &seats,
+                None,
+                true
+            )
+            .unwrap()
+        )
+        .protected_history,
+        None
+    );
+}
+
+/// 2.5 "S4" (fix F3): the visibility of epoch 0 comes from the bound list
+#[test]
+fn prepare_text_group_records_the_visibility_of_epoch_0() {
+    let owner = device(USER_A, DEVICE_A);
+    let group = text_group(0x41, &owner, 0);
+    let hidden = SeatListV2Lines {
+        history: SeatListHistory::Hidden,
+        ..v2_lines(GROUP_SALT)
+    };
+    for (case, submission, expected) in [
+        (
+            "v2 visible",
+            s4_submit(1, &[USER_A], v2_lines(GROUP_SALT)),
+            true,
+        ),
+        ("v2 hidden", s4_submit(1, &[USER_A], hidden), false),
+        ("v1", submit(1, &[USER_A]), false),
+    ] {
+        let list = stored_row(&submission);
+        assert_eq!(
+            seat_list_history_visible(&SeatListBody::parse(&list.body).unwrap()),
+            expected,
+            "{case}"
+        );
+        let prepared = prepare_text_group(&group, &list, &TextGroupCreator::SignerDevice).unwrap();
+        assert_eq!(prepared.history_visible_at_create, Some(expected), "{case}");
+    }
+}
+
+/// 7.2 "S4": a boundary lifts only the `last_message_id` rule
+#[test]
+fn a_boundary_lifts_only_the_last_message_id_rule() {
+    let b = TV4_BOUNDARY_MESSAGE_ID;
+    let busy = text_channel(Some(b.to_string()));
+    assert!(is_invalid_operation(
+        &check_channel_protectable(Some(&busy), None).unwrap_err()
+    ));
+    assert!(check_channel_protectable(Some(&busy), Some(b)).is_ok());
+    assert!(check_channel_protectable(Some(&text_channel(None)), None).is_ok());
+
+    let mut protected = text_channel(None);
+    if let Channel::TextChannel {
+        protected: flag, ..
+    } = &mut protected
+    {
+        *flag = true;
+    }
+    assert!(is_invalid_operation(
+        &check_channel_protectable(Some(&protected), Some(b)).unwrap_err()
+    ));
+
+    // The wipe's channel: protected with this boundary; written only over
+    // `HistoryWipe::None`
+    if let Channel::TextChannel {
+        protected_history, ..
+    } = &mut protected
+    {
+        *protected_history = Some(Box::new(kept_history(b)));
+    }
+    assert!(check_channel_wipeable(Some(&protected), b).unwrap());
+    assert!(is_invalid_operation(
+        &check_channel_wipeable(Some(&protected), CID).unwrap_err()
+    ));
+    if let Channel::TextChannel {
+        protected_history: Some(history),
+        ..
+    } = &mut protected
+    {
+        history.wipe = HistoryWipe::Done {
+            at: at(0),
+            count: 3,
+        };
+    }
+    assert!(!check_channel_wipeable(Some(&protected), b).unwrap());
+    assert!(is_invalid_operation(
+        &check_channel_wipeable(Some(&busy), b).unwrap_err()
+    ));
+}
+
+// --- drivers (REFERENCE and MONGODB) ------------------------------------------
+
+/// `setup` for a channel that already holds plaintext messages, timed
+/// `offsets` ms after `at(0)` (oldest first), and says so in
+/// `last_message_id`. Returns their ids, oldest first.
+async fn busy_setup(db: &Database, offsets: &[i64]) -> Vec<String> {
+    server_ready(db).await;
+    let ids: Vec<String> = offsets
+        .iter()
+        .enumerate()
+        .map(|(n, offset)| message_id_at(*offset, n as u128 + 1))
+        .collect();
+    db.insert_channel(&text_channel(ids.last().cloned()))
+        .await
+        .unwrap();
+    db.upsert_channel_entitlement(&entitlement(10), at(0))
+        .await
+        .unwrap();
+    for id in &ids {
+        db.insert_message(&plaintext(id)).await.unwrap();
+    }
+    ids
+}
+
+/// A message row written straight into the collection: no validation and
+/// no protect hold
+async fn raw_insert_message(db: &Database, message: &Message) {
+    match db {
+        Database::Reference(reference) => {
+            reference
+                .messages
+                .lock()
+                .await
+                .insert(message.id.clone(), message.clone());
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            mongo
+                .col::<Message>("messages")
+                .insert_one(message)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// A plaintext send as delta makes it: `insert_message`, which holds the
+/// channel after its insert (`hold_channel_unprotected`, R15)
+async fn held_send(db: &Database, message: &Message) {
+    let _ = db.insert_message(message).await;
+}
+
+async fn protected_history_of(db: &Database) -> Option<ProtectedHistory> {
+    match db.fetch_channel(CHANNEL).await.unwrap() {
+        Channel::TextChannel {
+            protected_history, ..
+        } => protected_history.map(|history| *history),
+        other => panic!("not a text channel: {other:?}"),
+    }
+}
+
+/// Mongo's `txn_serial` of the server document (protect's owner claim);
+/// `None` under REFERENCE or when never written
+async fn server_serial(db: &Database) -> Option<i64> {
+    match db {
+        Database::Reference(_) => None,
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => mongo
+            .col::<bson::Document>("servers")
+            .find_one(doc! { "_id": SERVER })
+            .await
+            .unwrap()
+            .and_then(|row| row.get_i64("txn_serial").ok()),
+    }
+}
+
+/// Protect wrote nothing: no list, no seat, the channel unprotected and
+/// without `protected_history`
+async fn assert_not_protected(db: &Database, case: &str) {
+    assert!(
+        db.fetch_seat_list(CHANNEL).await.unwrap().is_none(),
+        "{case}: a list landed"
+    );
+    assert!(
+        db.fetch_channel_seats(CHANNEL).await.unwrap().is_empty(),
+        "{case}: a seat was claimed"
+    );
+    assert!(
+        !db.fetch_channel(CHANNEL).await.unwrap().is_protected(),
+        "{case}: the channel is protected"
+    );
+    assert_eq!(
+        protected_history_of(db).await,
+        None,
+        "{case}: protected_history written"
+    );
+}
+
+fn is_history_moved(error: &revolt_result::Error) -> bool {
+    matches!(error.error_type, ErrorType::ProtectHistoryMoved)
+}
+
+/// Doc 11 "Backend, protect": B = the newest message succeeds, on a channel
+/// whose `last_message_id` is set, and writes `protected_history` with the
+/// flag
+#[tokio::test]
+async fn s4_protect_with_the_newest_message_as_boundary_lands_with_its_history() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-3_000, -2_000, -1_000]).await;
+            let newest = ids.last().unwrap();
+            let genesis = s4_submit(
+                1,
+                &[USER_A],
+                s4_lines(Some(newest), SeatListPreHistory::Kept),
+            );
+
+            let outcome = db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+            assert!(!outcome.unchanged);
+            assert_eq!(outcome.claimed, vec![USER_A.to_string()]);
+            assert!(db.fetch_channel(CHANNEL).await.unwrap().is_protected());
+            assert_eq!(protected_history_of(&db).await, Some(kept_history(newest)));
+            assert_eq!(
+                db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().body,
+                genesis.body
+            );
+
+            // The retry of the same bytes is the stored success (N3)
+            let again = db
+                .protect_channel_with_wipe(CHANNEL, &genesis, Some(false), at(0))
+                .await
+                .unwrap();
+            assert!(again.unchanged);
+        })
+        .await;
+    });
+}
+
+/// 4.3 "S4": a wiped genesis requests the wipe in the protect transaction,
+/// from the SIGNED line
+#[tokio::test]
+async fn s4_a_wiped_genesis_requests_the_wipe_with_the_flag() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-2_000, -1_000]).await;
+            let newest = ids.last().unwrap();
+            let genesis = s4_submit(
+                1,
+                &[USER_A],
+                s4_lines(Some(newest), SeatListPreHistory::Wiped),
+            );
+            db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+            assert_eq!(
+                protected_history_of(&db).await,
+                Some(requested(newest, at(0)))
+            );
+        })
+        .await;
+    });
+}
+
+/// Doc 11 "Backend, protect": a row newer than B gives
+/// `ProtectHistoryMoved` with nothing written, and only after the N3 check
+#[tokio::test]
+async fn s4_a_message_newer_than_the_boundary_is_protect_history_moved_and_nothing_is_written() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-3_000, -2_000, -1_000]).await;
+            let serial = server_serial(&db).await;
+            for (case, boundary) in [("oldest", &ids[0]), ("middle", &ids[1])] {
+                let genesis = s4_submit(
+                    1,
+                    &[USER_A],
+                    s4_lines(Some(boundary), SeatListPreHistory::Wiped),
+                );
+                let error = db
+                    .protect_channel(CHANNEL, &genesis, at(0))
+                    .await
+                    .unwrap_err();
+                assert!(is_history_moved(&error), "{case}: {error:?}");
+                assert_not_protected(&db, case).await;
+                assert_eq!(
+                    server_serial(&db).await,
+                    serial,
+                    "{case}: the owner claim was written"
+                );
+            }
+
+            // Once the newest B landed, a later row does not turn the
+            // retry of the same bytes into `ProtectHistoryMoved`
+            let genesis = s4_submit(
+                1,
+                &[USER_A],
+                s4_lines(Some(&ids[2]), SeatListPreHistory::Kept),
+            );
+            db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+            raw_insert_message(&db, &plaintext(&message_id_at(-500, 9))).await;
+            assert!(
+                db.protect_channel(CHANNEL, &genesis, at(0))
+                    .await
+                    .unwrap()
+                    .unchanged
+            );
+        })
+        .await;
+    });
+}
+
+/// Doc 11 "Backend, protect": a future B is refused at the server's parse
+/// and by the server's clock
+#[tokio::test]
+async fn s4_protect_refuses_a_boundary_in_the_future() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            setup(&db, 10).await;
+            let skew = MAX_BOUNDARY_CLOCK_SKEW_MS as i64;
+            let far = message_id_at(skew + 1, 1);
+            let genesis = s4_submit_in(
+                CHANNEL,
+                1,
+                &[USER_A],
+                s4_lines(Some(&far), SeatListPreHistory::Kept),
+                AT0_MS + skew + 1,
+            );
+            let error = db
+                .protect_channel(CHANNEL, &genesis, at(0))
+                .await
+                .unwrap_err();
+            assert!(is_failed_validation(&error), "{error:?}");
+            assert_not_protected(&db, "future boundary").await;
+
+            let near = message_id_at(skew, 2);
+            let genesis = s4_submit_in(
+                CHANNEL,
+                1,
+                &[USER_A],
+                s4_lines(Some(&near), SeatListPreHistory::Kept),
+                AT0_MS + skew,
+            );
+            db.protect_channel(CHANNEL, &genesis, at(0)).await.unwrap();
+            assert_eq!(protected_history_of(&db).await, Some(kept_history(&near)));
+        })
+        .await;
+    });
+}
+
+/// Doc 11 "Backend, protect": a v1 genesis or an empty boundary on a
+/// non-empty channel stays the S1 refusal; a boundary genesis seating
+/// anyone but the owner, a `wipe_history` flag against the signed line and
+/// a boundary with `history_setting` off are refused, writing nothing
+#[tokio::test]
+async fn s4_protect_refuses_every_other_genesis_on_a_busy_channel() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let newest = &ids[0];
+
+            let empty = s4_submit(1, &[USER_A], v2_lines(GROUP_SALT));
+            let error = db
+                .protect_channel(CHANNEL, &empty, at(0))
+                .await
+                .unwrap_err();
+            assert!(is_invalid_operation(&error), "empty boundary: {error:?}");
+            with_flags(
+                SeatListFlags {
+                    formats_v2: false,
+                    history_setting: true,
+                },
+                async {
+                    let error = db
+                        .protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+                        .await
+                        .unwrap_err();
+                    assert!(is_invalid_operation(&error), "v1 genesis: {error:?}");
+                },
+            )
+            .await;
+
+            let seating_b = s4_submit(
+                1,
+                &[USER_A, USER_B],
+                s4_lines(Some(newest), SeatListPreHistory::Kept),
+            );
+            let error = db
+                .protect_channel(CHANNEL, &seating_b, at(0))
+                .await
+                .unwrap_err();
+            assert!(is_failed_validation(&error), "seating B: {error:?}");
+
+            for (case, pre_history, flag) in [
+                ("kept, wipe asked", SeatListPreHistory::Kept, true),
+                ("wiped, keep asked", SeatListPreHistory::Wiped, false),
+            ] {
+                let genesis = s4_submit(1, &[USER_A], s4_lines(Some(newest), pre_history));
+                let error = db
+                    .protect_channel_with_wipe(CHANNEL, &genesis, Some(flag), at(0))
+                    .await
+                    .unwrap_err();
+                assert!(is_failed_validation(&error), "{case}: {error:?}");
+            }
+
+            with_flags(
+                SeatListFlags {
+                    formats_v2: true,
+                    history_setting: false,
+                },
+                async {
+                    let genesis = s4_submit(
+                        1,
+                        &[USER_A],
+                        s4_lines(Some(newest), SeatListPreHistory::Kept),
+                    );
+                    let error = db
+                        .protect_channel(CHANNEL, &genesis, at(0))
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        is_failed_validation(&error),
+                        "history_setting off: {error:?}"
+                    );
+                },
+            )
+            .await;
+
+            assert_not_protected(&db, "every refused genesis").await;
+        })
+        .await;
+    });
+}
+
+/// The drivers read the configuration unless a test scopes other flags
+#[tokio::test]
+async fn s4_seat_list_flags_come_from_the_configuration() {
+    let config = revolt_config::config().await;
+    assert_eq!(
+        SeatListFlags::read().await,
+        SeatListFlags {
+            formats_v2: config.features.protected_channels.formats_v2,
+            history_setting: config.features.protected_channels.history_setting,
+        }
+    );
+    assert_eq!(with_flags(S4_ON, SeatListFlags::read()).await, S4_ON);
+}
+
+/// Doc 11 "Backend, protect": a seat PUT changing the boundary, dropping
+/// it, or moving `kept -> wiped` is refused; `wiped -> kept` too; with
+/// `history_setting` off every list on the channel is refused
+#[tokio::test]
+async fn s4_a_seat_put_keeps_the_boundary_and_never_moves_pre_history() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            let grown = s4_submit(
+                2,
+                &[USER_A, USER_B],
+                s4_lines(Some(b), SeatListPreHistory::Kept),
+            );
+            db.put_seat_list(CHANNEL, &grown, true, at(1), Some(SEAT_PUT_REASON))
+                .await
+                .unwrap();
+
+            for (case, lines) in [
+                (
+                    "another boundary",
+                    s4_lines(Some(&message_id_at(-2_000, 7)), SeatListPreHistory::Kept),
+                ),
+                ("no boundary", v2_lines(GROUP_SALT)),
+                (
+                    "kept to wiped",
+                    s4_lines(Some(b), SeatListPreHistory::Wiped),
+                ),
+            ] {
+                let error = db
+                    .put_seat_list(
+                        CHANNEL,
+                        &s4_submit(3, &[USER_A, USER_B], lines),
+                        true,
+                        at(2),
+                        Some(SEAT_PUT_REASON),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(is_failed_validation(&error), "{case}: {error:?}");
+                assert_eq!(
+                    db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+                    2,
+                    "{case}"
+                );
+            }
+            assert_eq!(protected_history_of(&db).await, Some(kept_history(b)));
+
+            with_flags(
+                SeatListFlags {
+                    formats_v2: true,
+                    history_setting: false,
+                },
+                async {
+                    let next = s4_submit(3, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+                    let error = db
+                        .put_seat_list(CHANNEL, &next, true, at(2), Some(SEAT_PUT_REASON))
+                        .await
+                        .unwrap_err();
+                    assert!(is_failed_validation(&error), "{error:?}");
+                },
+            )
+            .await;
+        })
+        .await;
+    });
+}
+
+#[tokio::test]
+async fn s4_a_wiped_channel_never_goes_back_to_kept() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            let back = s4_submit(2, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+            let error = db
+                .put_seat_list(CHANNEL, &back, true, at(1), Some(SEAT_PUT_REASON))
+                .await
+                .unwrap_err();
+            assert!(is_failed_validation(&error), "{error:?}");
+            let still = s4_submit(2, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+            db.put_seat_list(CHANNEL, &still, true, at(1), Some(SEAT_PUT_REASON))
+                .await
+                .unwrap();
+            assert_eq!(protected_history_of(&db).await, Some(requested(b, at(0))));
+        })
+        .await;
+    });
+}
+
+/// Doc 11 "Backend, wipe" at the driver level: the wipe write moves the
+/// open group's `seat_list_ad_sha256` with the list (without it the next
+/// commit embedding the list wedges), requests the wipe once, and is
+/// idempotent
+#[tokio::test]
+async fn s4_the_wipe_write_updates_the_group_hash_and_requests_the_wipe_once() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            let owner = device(USER_A, DEVICE_A);
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            db.create_text_mls_group(&text_group(0x5e, &owner, 0), None)
+                .await
+                .unwrap();
+            let genesis_hash = open_group(&db, CHANNEL).await.seat_list_ad_sha256;
+
+            let wipe = s4_submit(2, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+            let outcome = db
+                .request_history_wipe(CHANNEL, &wipe, at(1))
+                .await
+                .unwrap();
+            assert!(!outcome.unchanged);
+            assert!(outcome.claimed.is_empty() && outcome.released.is_empty());
+            let row = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+            assert_eq!(row.body, wipe.body);
+            let hash = open_group(&db, CHANNEL).await.seat_list_ad_sha256;
+            assert_eq!(
+                hash,
+                Some(row.commit_ad_sha256().unwrap()),
+                "the wipe left the group's AD hash on the old list"
+            );
+            assert_ne!(hash, genesis_hash);
+            assert_eq!(protected_history_of(&db).await, Some(requested(b, at(1))));
+
+            // Idempotent: the same bytes are the stored success; nothing moves
+            let again = db
+                .request_history_wipe(CHANNEL, &wipe, at(2))
+                .await
+                .unwrap();
+            assert!(again.unchanged);
+            assert_eq!(protected_history_of(&db).await, Some(requested(b, at(1))));
+            assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap().unwrap(), row);
+
+            // A further wipe list is refused (already wiped)
+            let further = s4_submit(3, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+            let error = db
+                .request_history_wipe(CHANNEL, &further, at(2))
+                .await
+                .unwrap_err();
+            assert!(is_failed_validation(&error), "{error:?}");
+            assert_eq!(protected_history_of(&db).await, Some(requested(b, at(1))));
+        })
+        .await;
+    });
+}
+
+/// The wipe write needs `history_setting`, and never rewrites a wipe that
+/// already moved on (`Done` stays `Done`, 2.1 "S4")
+#[tokio::test]
+async fn s4_the_wipe_write_needs_the_flag_and_never_rewrites_a_later_state() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            let wipe = s4_submit(2, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+
+            with_flags(
+                SeatListFlags {
+                    formats_v2: true,
+                    history_setting: false,
+                },
+                async {
+                    let error = db
+                        .request_history_wipe(CHANNEL, &wipe, at(1))
+                        .await
+                        .unwrap_err();
+                    assert!(is_failed_validation(&error), "{error:?}");
+                },
+            )
+            .await;
+            assert_eq!(
+                db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+                1
+            );
+
+            let done = ProtectedHistory {
+                boundary: b.clone(),
+                wipe: HistoryWipe::Done {
+                    at: at(0),
+                    count: 3,
+                },
+            };
+            db.update_channel(
+                CHANNEL,
+                &PartialChannel {
+                    protected_history: Some(Box::new(done.clone())),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+            db.request_history_wipe(CHANNEL, &wipe, at(1))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+                2
+            );
+            assert_eq!(protected_history_of(&db).await, Some(done));
+        })
+        .await;
+    });
+}
+
+/// What the Mongo protect runs after its message probe (test-only, see
+/// `run_protect_probe_hook`); keyed by channel id like `TEXT_CREATE_HOOK`
+static PROTECT_PROBE_HOOK: std::sync::Mutex<Option<(String, TextCreateHook)>> =
+    std::sync::Mutex::new(None);
+
+/// Called by the Mongo protect (`ops/mongodb.rs`, `#[cfg(test)]` only)
+/// inside every transaction attempt, after its message probe read
+pub(super) async fn run_protect_probe_hook(channel_id: &str) {
+    let hook = PROTECT_PROBE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|(id, _)| id == channel_id)
+        .map(|(_, hook)| hook.clone());
+    if let Some(hook) = hook {
+        hook().await;
+    }
+}
+
+/// Doc 11 "Backend, protect" (R15 "S4"): a plaintext send racing protect
+/// never leaves a plaintext row above B in a protected channel. MONGODB
+/// only (under REFERENCE protect holds the `messages` lock throughout).
+/// The sender is deterministic: it sends once, after the first attempt's
+/// probe read. Its hold write-conflicts protect's flag write, and the retry
+/// reads the row and answers `ProtectHistoryMoved`. Control: the send
+/// without the hold, and protect commits over the row.
+#[tokio::test]
+async fn s4_a_send_racing_protect_never_leaves_plaintext_above_the_boundary() {
+    database_test!(|db| async move {
+        let Database::MongoDb(_) = &db else {
+            return;
+        };
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-2_000]).await;
+            let boundary = ids[0].clone();
+            let racer = plaintext(&message_id_at(-1_000, 42));
+
+            let fired = std::sync::Arc::new(AtomicI64::new(0));
+            let hook: TextCreateHook = {
+                let (db, racer, fired) = (db.clone(), racer.clone(), fired.clone());
+                std::sync::Arc::new(move || {
+                    let (db, racer, fired) = (db.clone(), racer.clone(), fired.clone());
+                    Box::pin(async move {
+                        if fired.fetch_add(1, SeqCst) == 0 {
+                            held_send(&db, &racer).await;
+                        }
+                    })
+                })
+            };
+            *PROTECT_PROBE_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some((CHANNEL.to_string(), hook));
+            let genesis = s4_submit(
+                1,
+                &[USER_A],
+                s4_lines(Some(&boundary), SeatListPreHistory::Kept),
+            );
+            let protected = db.protect_channel(CHANNEL, &genesis, at(0)).await;
+            *PROTECT_PROBE_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+            assert!(
+                fired.load(SeqCst) >= 1,
+                "the hook never ran: the test proves nothing"
+            );
+            let channel_protected = db.fetch_channel(CHANNEL).await.unwrap().is_protected();
+            let racer_stored = db.fetch_message(&racer.id).await.is_ok();
+            assert!(
+                !(channel_protected && racer_stored),
+                "plaintext {} above the boundary {boundary} in a protected channel",
+                racer.id
+            );
+            assert!(
+                matches!(&protected, Err(error) if is_history_moved(error)),
+                "{protected:?}"
+            );
+            assert!(racer_stored);
+        })
+        .await;
+    });
+}
+
+/// 2.5 "S4" (fix F3): every Text create records the visibility of epoch 0
+/// from the list it binds, through both drivers (a first group and a
+/// successor; a v1 channel)
+#[tokio::test]
+async fn s4_every_text_create_records_the_visibility_of_epoch_0() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            setup(&db, 10).await;
+            let owner = device(USER_A, DEVICE_A);
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], v2_lines(GROUP_SALT)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            let first = text_group(0x61, &owner, 0);
+            db.create_text_mls_group(&first, None).await.unwrap();
+            assert_eq!(
+                db.fetch_mls_group(&first.id)
+                    .await
+                    .unwrap()
+                    .history_visible_at_create,
+                Some(true)
+            );
+
+            let hidden = SeatListV2Lines {
+                history: SeatListHistory::Hidden,
+                ..v2_lines(GROUP_SALT)
+            };
+            db.put_seat_list(CHANNEL, &s4_submit(2, &[USER_A], hidden), true, at(1), None)
+                .await
+                .unwrap();
+            let successor = text_group(0x62, &owner, 1);
+            db.create_text_mls_group(&successor, Some(&first.id))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_mls_group(&successor.id)
+                    .await
+                    .unwrap()
+                    .history_visible_at_create,
+                Some(false)
+            );
+
+            let v1_channel = race_channel(9_601);
+            protectable_in(&db, &v1_channel, SERVER, 10).await;
+            with_flags(
+                SeatListFlags {
+                    formats_v2: false,
+                    history_setting: true,
+                },
+                db.protect_channel(&v1_channel, &submit_in(&v1_channel, 1, &[USER_A]), at(0)),
+            )
+            .await
+            .unwrap();
+            let mut v1_group = text_group(0x63, &owner, 0);
+            v1_group.channel_id = v1_channel.clone();
+            db.create_text_mls_group(&v1_group, None).await.unwrap();
+            assert_eq!(
+                db.fetch_mls_group(&v1_group.id)
+                    .await
+                    .unwrap()
+                    .history_visible_at_create,
+                Some(false)
+            );
+        })
+        .await;
+    });
+}
+
+fn history_link(group_id: &str, epoch: i64, writer: &str) -> MlsHistoryLink {
+    MlsHistoryLink {
+        id: MlsHistoryLink::composite_id(group_id, epoch, writer),
+        group_id: group_id.to_string(),
+        epoch,
+        prev_group_id: group_id.to_string(),
+        prev_epoch: epoch - 1,
+        nonce: "A".repeat(32),
+        ciphertext: "B".repeat(24),
+        writer_user_id: writer.to_string(),
+        writer_device_id: DEVICE_A.to_string(),
+        signature: signature(epoch),
+        size: 17,
+        created_at: at(0),
+    }
+}
+
+/// History links written straight into the collection (the link PUT is
+/// another lane's)
+async fn insert_history_links(db: &Database, links: &[MlsHistoryLink]) {
+    match db {
+        Database::Reference(reference) => {
+            let mut stored = reference.mls_history_links.lock().await;
+            for link in links {
+                stored.insert(link.id.clone(), link.clone());
+            }
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            for link in links {
+                mongo
+                    .col::<MlsHistoryLink>("mls_history_links")
+                    .insert_one(link)
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+}
+
+async fn history_link_ids(db: &Database) -> BTreeSet<String> {
+    match db {
+        Database::Reference(reference) => reference
+            .mls_history_links
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect(),
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => mongo
+            .col::<bson::Document>("mls_history_links")
+            .distinct("_id", doc! {})
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|id| id.as_str().unwrap().to_string())
+            .collect(),
+    }
+}
+
+/// 2.8: the delete cascade removes every history link held by every Text
+/// group of the channel, open or closed, on both drivers, and no other
+#[tokio::test]
+async fn s4_the_delete_cascade_removes_the_history_links_of_every_text_group() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        let owner = device(USER_A, DEVICE_A);
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
+            .await
+            .unwrap();
+        let first = text_group(0xd1, &owner, 0);
+        db.create_text_mls_group(&first, None).await.unwrap();
+        let successor = text_group(0xd2, &owner, 1);
+        db.create_text_mls_group(&successor, Some(&first.id))
+            .await
+            .unwrap();
+
+        let other_channel = race_channel(9_701);
+        protected_in(&db, &other_channel, 10).await;
+        let mut other = text_group(0xd3, &owner, 0);
+        other.channel_id = other_channel.clone();
+        db.create_text_mls_group(&other, None).await.unwrap();
+
+        let kept = history_link(&other.id, 1, USER_A);
+        insert_history_links(
+            &db,
+            &[
+                history_link(&first.id, 1, USER_A),
+                history_link(&successor.id, 0, USER_A),
+                history_link(&successor.id, 2, USER_B),
+                kept.clone(),
+            ],
+        )
+        .await;
+        assert_eq!(history_link_ids(&db).await.len(), 4);
+
+        db.delete_protected_channel_data(CHANNEL).await.unwrap();
+
+        assert_eq!(
+            history_link_ids(&db).await,
+            BTreeSet::from([kept.id.clone()]),
+            "the cascade left a link of the deleted channel, or took another channel's"
         );
     });
 }

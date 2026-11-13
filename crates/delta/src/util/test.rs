@@ -923,6 +923,7 @@ impl TestE2EEDevice {
     ) -> v0::DataProtectChannel {
         v0::DataProtectChannel {
             seat_list: self.seat_list(channel_id, 1, device_cap, seats),
+            wipe_history: None,
         }
     }
 
@@ -1205,6 +1206,7 @@ impl TestHarness {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
 
         match self
@@ -1938,6 +1940,7 @@ mod protected_fixture_tests {
                 &channel,
                 &v0::DataProtectChannel {
                     seat_list: genesis.clone(),
+                    wipe_history: None,
                 },
             )
             .await;

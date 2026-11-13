@@ -813,6 +813,74 @@ impl AbstractMessages for MongoDb {
             .map(|_| ())
             .map_err(|_| create_database_error!("update_one", COL))
     }
+
+    /// One batch of the `history_wipes` job, oldest first
+    ///
+    /// `channel` + `_id` lead, so the range is served off the `{channel, _id}`
+    /// index; `encrypted: null` then needs the document, which the caller
+    /// wants anyway (attachments). The cursor is read by hand rather than
+    /// through `find_with_options`: a release build there drops a row that
+    /// does not decode, and a batch that loses rows can come back empty while
+    /// plaintext is left, which would let the job mark the wipe done.
+    async fn fetch_history_wipe_batch(
+        &self,
+        channel: &str,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let mut cursor = self
+            .col::<Message>(COL)
+            .find(doc! {
+                "channel": channel,
+                "_id": { "$lte": boundary },
+                // Missing or null: the rows that decode to `encrypted: None`
+                "encrypted": null,
+            })
+            .sort(doc! { "_id": 1_i32 })
+            .limit(limit.max(1))
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        let mut batch = Vec::new();
+        while let Some(message) = cursor.next().await {
+            let message = message.map_err(|error| {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("find", COL)
+            })?;
+            batch.push(message);
+        }
+
+        Ok(batch)
+    }
+
+    /// Delete the listed plaintext rows of a channel; returns how many went
+    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        self.col::<Document>(COL)
+            .delete_many(doc! {
+                "channel": channel,
+                "_id": { "$in": ids },
+                // Never a row carrying `encrypted`, whatever the list says
+                "encrypted": null,
+            })
+            .await
+            .map(|result| result.deleted_count)
+            .map_err(|_| create_database_error!("delete_many", COL))
+    }
+
+    /// Id of the newest row of a channel, off the `{channel, _id}` index
+    async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>> {
+        self.col::<DocumentId>(COL)
+            .find_one(doc! { "channel": channel })
+            .sort(doc! { "_id": -1_i32 })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map(|row| row.map(|row| row.id))
+            .map_err(|_| create_database_error!("find_one", COL))
+    }
 }
 
 impl IntoDocumentPath for FieldsMessage {

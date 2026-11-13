@@ -448,6 +448,58 @@ impl AbstractMessages for ReferenceDb {
 
         Ok(())
     }
+
+    /// One batch of the `history_wipes` job, oldest first
+    ///
+    /// The same rows as MongoDB's `{ channel, _id: { $lte }, encrypted: null }`.
+    async fn fetch_history_wipe_batch(
+        &self,
+        channel: &str,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let messages = self.messages.lock().await;
+        let mut batch: Vec<&Message> = messages
+            .values()
+            .filter(|message| message.channel == channel)
+            .filter(|message| message.id.as_str() <= boundary)
+            .filter(|message| message.encrypted.is_none())
+            .collect();
+
+        batch.sort_by(|a, b| a.id.cmp(&b.id));
+        batch.truncate(usize::try_from(limit.max(1)).unwrap_or(usize::MAX));
+
+        Ok(batch.into_iter().cloned().collect())
+    }
+
+    /// Delete the listed plaintext rows of a channel; returns how many went
+    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64> {
+        let listed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut messages = self.messages.lock().await;
+        let before = messages.len();
+
+        messages.retain(|id, message| {
+            let wiped = message.channel == channel
+                && message.encrypted.is_none()
+                && listed.contains(id.as_str());
+            !wiped
+        });
+
+        Ok((before - messages.len()) as u64)
+    }
+
+    /// Id of the newest row of a channel
+    async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>> {
+        Ok(self
+            .messages
+            .lock()
+            .await
+            .values()
+            .filter(|message| message.channel == channel)
+            .map(|message| &message.id)
+            .max()
+            .cloned())
+    }
 }
 
 /// Reference-driver legs of `fetch_thread_stats` and the missing-id

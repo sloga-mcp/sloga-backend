@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 use std::{borrow::Cow, collections::HashMap};
 
+use iso8601_timestamp::Timestamp;
 use redis_kiss::get_connection;
 use revolt_config::config;
 use revolt_models::v0::{self, MessageAuthor};
@@ -142,6 +143,16 @@ auto_derived!(
             /// that would lower it.
             #[serde(skip_serializing_if = "crate::if_false", default)]
             protected: bool,
+
+            /// Protected channels only (design 2.1 "S4"): the history
+            /// boundary and wipe state. Written only by protect with a
+            /// boundary, the wipe route and the `history_wipes` job;
+            /// `Channel::update` refuses a partial carrying it. Absent on a
+            /// channel protected while empty, and on every older row. Boxed
+            /// so every `Channel` value stays small: the unboxed field
+            /// overflowed the stack of debug-build route futures.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            protected_history: Option<Box<ProtectedHistory>>,
         },
         /// Thread belonging to a server text channel
         Thread {
@@ -296,6 +307,38 @@ auto_derived!(
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub disabled: bool,
     }
+
+    /// A protected channel's pre-protect history (design 2.1 "S4")
+    pub struct ProtectedHistory {
+        /// The boundary message id B; never changes once written
+        pub boundary: String,
+        /// Where the history wipe stands
+        pub wipe: HistoryWipe,
+    }
+
+    /// State of a protected channel's history wipe. Only moves `None ->
+    /// Requested -> Done`; requesting again is idempotent (design 2.1 "S4")
+    #[serde(tag = "state", rename_all = "snake_case")]
+    pub enum HistoryWipe {
+        /// The history is kept
+        None,
+        /// The wipe was requested; pre-boundary plaintext is unservable
+        /// from now on (S4-D21)
+        Requested {
+            /// When the wipe was requested
+            at: Timestamp,
+            /// The user who requested it
+            by: String,
+        },
+        /// The `history_wipes` job deleted every plaintext row at or below
+        /// the boundary
+        Done {
+            /// When the job finished
+            at: Timestamp,
+            /// Rows deleted over every run
+            count: u64,
+        },
+    }
 );
 
 auto_derived!(
@@ -353,6 +396,11 @@ auto_derived!(
         /// `Some(false)` on a protected channel and drops it on any other.
         #[serde(skip_serializing_if = "Option::is_none")]
         pub protected: Option<bool>,
+        /// Refused by `Channel::update` (`ChannelProtected`): only the
+        /// protect, wipe and `history_wipes` writers set it, through their
+        /// own driver writes (design 2.1 "S4")
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protected_history: Option<Box<ProtectedHistory>>,
     }
 
     /// Optional fields on channel object
@@ -523,6 +571,7 @@ impl Channel {
                 slowmode: None,
                 announcement: data.announcement.filter(|v| *v),
                 protected: false,
+                protected_history: None,
             },
             v0::LegacyServerChannelType::Voice => Channel::TextChannel {
                 id: id.clone(),
@@ -539,6 +588,7 @@ impl Channel {
                 slowmode: None,
                 announcement: None,
                 protected: false,
+                protected_history: None,
             },
             v0::LegacyServerChannelType::Forum => Channel::Forum {
                 id: id.clone(),
@@ -1059,7 +1109,15 @@ impl Channel {
     ///   that is not an announcement channel.
     /// - A channel that is, or becomes, protected refuses any `voice` and
     ///   `announcement: Some(true)` (`ChannelProtected`).
+    /// - `protected_history` is refused on every channel (`ChannelProtected`,
+    ///   design 2.1 "S4"): only protect, the wipe route and the
+    ///   `history_wipes` job write it, each through its own driver write,
+    ///   never through `Channel::update`.
     fn guard_protected_partial(&self, mut partial: PartialChannel) -> Result<PartialChannel> {
+        if partial.protected_history.is_some() {
+            return Err(create_error!(ChannelProtected));
+        }
+
         let requested = partial.protected;
         match requested {
             Some(false) if self.is_protected() => return Err(create_error!(ChannelProtected)),
@@ -1339,6 +1397,7 @@ impl Channel {
                 slowmode,
                 announcement,
                 protected,
+                protected_history,
                 ..
             } => {
                 if let Some(v) = partial.name {
@@ -1385,6 +1444,15 @@ impl Channel {
                 // lower it.
                 if partial.protected == Some(true) {
                     *protected = true;
+                }
+
+                // Only the driver writes of protect, the wipe route and the
+                // job carry it (`Channel::update` refuses it); applied here
+                // so the Reference driver and event consumers keep it as
+                // the MongoDB `$set` does. The writers hold the one-way
+                // rules (design 2.1 "S4").
+                if let Some(v) = partial.protected_history {
+                    *protected_history = Some(v);
                 }
             }
             Self::Thread {
@@ -1856,6 +1924,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected,
+            protected_history: None,
         }
     }
 
@@ -1914,6 +1983,242 @@ mod tests {
         assert!(channel.is_protected());
         channel.apply_options(lower());
         assert!(channel.is_protected(), "apply_options lowered the flag");
+    }
+
+    // ---- Protected channels: S4 `protected_history` (design 2.1 "S4") ------
+
+    /// A protected text channel row exactly as an S2 build stores it
+    const TEXT_CHANNEL_S2: &str =
+        r#"{"channel_type":"TextChannel","_id":"T","server":"S","name":"text","protected":true}"#;
+
+    fn history(wipe: crate::HistoryWipe) -> crate::ProtectedHistory {
+        crate::ProtectedHistory {
+            boundary: "01J9Z3K4M5N6P7Q8R9S0T1V2W0".to_string(),
+            wipe,
+        }
+    }
+
+    fn wipe_at() -> iso8601_timestamp::Timestamp {
+        serde_json::from_str(r#""2026-10-04T12:00:00.000Z""#).unwrap()
+    }
+
+    /// No client-reachable partial may carry `protected_history`: the guard
+    /// refuses it with `ChannelProtected` on every kind of channel, whatever
+    /// else the partial holds.
+    ///
+    /// Control: the `protected_history.is_some()` arm removed.
+    #[test]
+    fn protected_history_partial_is_refused() {
+        use crate::{HistoryWipe, PartialChannel};
+        use revolt_result::ErrorType;
+
+        for wipe in [
+            HistoryWipe::None,
+            HistoryWipe::Requested {
+                at: wipe_at(),
+                by: "U".to_string(),
+            },
+            HistoryWipe::Done {
+                at: wipe_at(),
+                count: 3,
+            },
+        ] {
+            for partial in [
+                PartialChannel {
+                    protected_history: Some(Box::new(history(wipe.clone()))),
+                    ..Default::default()
+                },
+                PartialChannel {
+                    protected: Some(true),
+                    protected_history: Some(Box::new(history(wipe.clone()))),
+                    ..Default::default()
+                },
+                PartialChannel {
+                    name: Some("renamed".to_string()),
+                    protected_history: Some(Box::new(history(wipe.clone()))),
+                    ..Default::default()
+                },
+            ] {
+                for channel in [text_channel(true), text_channel(false)] {
+                    assert!(
+                        refused_with(channel.guard_protected_partial(partial.clone()), |e| {
+                            matches!(e, ErrorType::ChannelProtected)
+                        }),
+                        "{partial:?} on {channel:?}"
+                    );
+                }
+            }
+        }
+
+        // Without it, the same partials pass as before
+        let renamed = PartialChannel {
+            name: Some("renamed".to_string()),
+            ..Default::default()
+        };
+        assert!(text_channel(true).guard_protected_partial(renamed).is_ok());
+    }
+
+    /// `apply_options` (the Reference driver's `update_channel` and event
+    /// consumers) keeps a `protected_history` the driver writes carry, on a
+    /// text channel only, and leaves it alone when the partial has none
+    #[test]
+    fn protected_history_is_applied_by_driver_partials() {
+        use crate::{HistoryWipe, PartialChannel};
+
+        let mut channel = text_channel(true);
+        channel.apply_options(PartialChannel {
+            protected_history: Some(Box::new(history(HistoryWipe::None))),
+            ..Default::default()
+        });
+        let requested = history(HistoryWipe::Requested {
+            at: wipe_at(),
+            by: "U".to_string(),
+        });
+        channel.apply_options(PartialChannel {
+            protected_history: Some(Box::new(requested.clone())),
+            ..Default::default()
+        });
+        channel.apply_options(PartialChannel {
+            name: Some("renamed".to_string()),
+            ..Default::default()
+        });
+        let crate::Channel::TextChannel {
+            protected_history, ..
+        } = &channel
+        else {
+            panic!("{channel:?}");
+        };
+        assert_eq!(protected_history, &Some(Box::new(requested)));
+    }
+
+    /// Serde back-compat: an S2 row decodes with no `protected_history`,
+    /// re-encodes byte-identical (JSON) with the same stored BSON keys; set,
+    /// it is stored under its exact key with the wipe state internally
+    /// tagged (`{"state":"none"}`, `{"state":"requested","at","by"}`,
+    /// `{"state":"done","at","count"}`)
+    ///
+    /// Control: `skip_serializing_if` dropped from the field.
+    #[test]
+    fn protected_history_serde_is_additive() {
+        use crate::{Channel, HistoryWipe, PartialChannel};
+
+        let parsed: Channel = serde_json::from_str(TEXT_CHANNEL_S2).unwrap();
+        assert_eq!(parsed, text_channel(true));
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), TEXT_CHANNEL_S2);
+        let expected: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(TEXT_CHANNEL_S2).unwrap();
+        let document = bson::to_document(&parsed).unwrap();
+        assert_eq!(
+            document.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(bson::from_document::<Channel>(document).unwrap(), parsed);
+
+        // The partial a non-S4 writer sends stays `{}`-shaped
+        assert_eq!(
+            bson::to_document(&PartialChannel::default()).unwrap(),
+            bson::doc! {}
+        );
+
+        for (wipe, wire) in [
+            (HistoryWipe::None, r#"{"state":"none"}"#),
+            (
+                HistoryWipe::Requested {
+                    at: wipe_at(),
+                    by: "U".to_string(),
+                },
+                r#"{"state":"requested","at":"2026-10-04T12:00:00.000Z","by":"U"}"#,
+            ),
+            (
+                HistoryWipe::Done {
+                    at: wipe_at(),
+                    count: 3,
+                },
+                r#"{"state":"done","at":"2026-10-04T12:00:00.000Z","count":3}"#,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&wipe).unwrap(), wire);
+
+            let mut with = text_channel(true);
+            with.apply_options(PartialChannel {
+                protected_history: Some(Box::new(history(wipe.clone()))),
+                ..Default::default()
+            });
+            let json = serde_json::to_string(&with).unwrap();
+            assert_eq!(
+                json,
+                format!(
+                    r#"{},"protected_history":{{"boundary":"01J9Z3K4M5N6P7Q8R9S0T1V2W0","wipe":{wire}}}}}"#,
+                    TEXT_CHANNEL_S2.strip_suffix('}').unwrap()
+                )
+            );
+            assert_eq!(serde_json::from_str::<Channel>(&json).unwrap(), with);
+
+            let document = bson::to_document(&with).unwrap();
+            let stored = document.get_document("protected_history").unwrap();
+            assert_eq!(
+                stored
+                    .get_document("wipe")
+                    .unwrap()
+                    .get_str("state")
+                    .unwrap(),
+                serde_json::from_str::<serde_json::Value>(wire).unwrap()["state"]
+                    .as_str()
+                    .unwrap()
+            );
+            assert_eq!(bson::from_document::<Channel>(document).unwrap(), with);
+        }
+    }
+
+    /// `Channel::update` refuses a partial carrying `protected_history` before
+    /// anything is written; the driver write (`update_channel`), the path
+    /// protect, the wipe route and the job use, stores it on both drivers.
+    /// Runs on whichever driver `TEST_DB` names.
+    ///
+    /// Control: the guard's `protected_history.is_some()` arm removed.
+    #[tokio::test]
+    async fn protected_history_only_through_the_driver_write() {
+        database_test!(|db| async move {
+            use crate::{HistoryWipe, PartialChannel};
+            use revolt_result::ErrorType;
+
+            let mut channel = text_channel(true);
+            db.insert_channel(&channel).await.expect("insert");
+
+            let partial = PartialChannel {
+                protected_history: Some(Box::new(history(HistoryWipe::None))),
+                ..Default::default()
+            };
+            let result = channel.update(&db, partial.clone(), vec![]).await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(error) if matches!(error.error_type, ErrorType::ChannelProtected)
+                ),
+                "{result:?}"
+            );
+            assert_eq!(channel, text_channel(true), "the copy was changed");
+            assert_eq!(
+                db.fetch_channel("T").await.expect("fetch"),
+                text_channel(true),
+                "the store was written"
+            );
+
+            db.update_channel("T", &partial, vec![])
+                .await
+                .expect("the driver write");
+            let stored = db.fetch_channel("T").await.expect("fetch");
+            let crate::Channel::TextChannel {
+                protected_history, ..
+            } = &stored
+            else {
+                panic!("{stored:?}");
+            };
+            assert_eq!(
+                protected_history,
+                &Some(Box::new(history(HistoryWipe::None)))
+            );
+        });
     }
 
     /// Only a server `TextChannel` with no voice that is not an announcement
@@ -2474,6 +2779,7 @@ mod tests {
                 pending_device_removals: vec![],
                 signer_lost: None,
                 rejoin_readd: vec![],
+                history_visible_at_create: None,
             };
             db.create_text_mls_group(&group, None).await.unwrap();
             let list = db
@@ -2494,6 +2800,7 @@ mod tests {
                 rejoin_intents: vec![],
                 removed_reasons: vec![],
                 welcome: None,
+                history_visible: None,
             };
             let outcome = db
                 .insert_mls_text_commit(&commit, &list.commit_ad_sha256().unwrap(), 0)
@@ -2661,6 +2968,7 @@ mod tests {
                 slowmode: None,
                 announcement: None,
                 protected: false,
+                protected_history: None,
             };
             let forum = Channel::Forum {
                 id: "F".to_string(),

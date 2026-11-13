@@ -117,6 +117,20 @@ auto_derived!(
         /// SeatReleaseCause>)}]`. Served only to readers with ViewChannel
         /// on `channel` (#221).
         ProtectedSeatRelease,
+        /// A channel was protected (design §7.5 "S4"; the design's
+        /// `ChannelProtect { channel, boundary, wiped }`). `channel` = the
+        /// channel; `changes` = `[{key: "boundary", new: String(B)}, {key:
+        /// "wiped", new: Bool}]`; the `boundary` change has no `new` when the
+        /// genesis had no boundary. Served only to readers with ViewChannel
+        /// on `channel` (#221).
+        ChannelProtect,
+        /// A protected channel's pre-protect history wipe (design §7.5 "S4";
+        /// the design's `ChannelHistoryWipe { channel, count }`). `channel` =
+        /// the channel; `changes` = `[{key: "count", new: Int(rows
+        /// deleted)}]` written by the job at `Done`, and empty for the
+        /// route's entry at `Requested` (the design's `count: None`).
+        /// Served only to readers with ViewChannel on `channel` (#221).
+        ChannelHistoryWipe,
         /// An action this build does not know. A rolled-back binary reading
         /// entries written by a newer one decodes them to this instead of
         /// failing the whole fetch.
@@ -239,7 +253,7 @@ mod tests {
         );
     }
 
-    /// S2 (design §7.5): the protected-seat actions round-trip under their
+    /// S2 and S4 (design §7.5): the protected-channel actions round-trip under their
     /// snake_case names on both the stored and the v0 enum, convert both
     /// ways, and an unknown action still decodes to `Unknown` on both
     #[test]
@@ -254,6 +268,17 @@ mod tests {
                 AuditLogAction::ProtectedSeatRelease,
                 v0::AuditLogAction::ProtectedSeatRelease,
                 "protected_seat_release",
+            ),
+            // S4 (design §7.5 "S4")
+            (
+                AuditLogAction::ChannelProtect,
+                v0::AuditLogAction::ChannelProtect,
+                "channel_protect",
+            ),
+            (
+                AuditLogAction::ChannelHistoryWipe,
+                v0::AuditLogAction::ChannelHistoryWipe,
+                "channel_history_wipe",
             ),
         ] {
             assert_eq!(serde_json::to_value(action).unwrap(), wire);
@@ -290,7 +315,12 @@ mod tests {
             );
         }
 
-        for unknown in ["protected_seat_moved", "ProtectedSeatsUpdate"] {
+        for unknown in [
+            "protected_seat_moved",
+            "ProtectedSeatsUpdate",
+            "ChannelProtect",
+            "channel_history_wiped",
+        ] {
             assert_eq!(
                 serde_json::from_value::<AuditLogAction>(serde_json::json!(unknown)).unwrap(),
                 AuditLogAction::Unknown

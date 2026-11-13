@@ -15,6 +15,7 @@
 //! divergence breaks KeyPackage publish / join intents loudly. Plan §1.3.
 
 use iso8601_timestamp::Timestamp;
+use revolt_models::v0::HistoryLinkWire;
 
 /// Roster ceiling for an E2EE call group (plan A3/Q5: the Welcome
 /// envelope-budget ceiling, user-decided 2026-07-09; 6.4 churn measurements
@@ -40,6 +41,19 @@ pub const MLS_REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 30;
 /// `features.protected_channels.text_rejoin_window_secs`, whose default
 /// must equal this.
 pub const TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS: i64 = 86400;
+
+/// The minimum text protocol a client must claim on a channel whose stored
+/// seat list is v2 (S4, plan appendix (2) "minimum text protocol"); below
+/// it, or absent, is `ProtectedClientOutdated { min }`
+pub const MIN_TEXT_PROTOCOL_V2: u32 = 2;
+
+/// The most decoded ciphertext bytes one history link may carry (design
+/// §2.8, planner ruling #300)
+pub const HISTORY_LINK_MAX_CIPHERTEXT: usize = 40960;
+
+/// The most writer users (candidates) one holder epoch keeps (design §2.8,
+/// §3.14.7)
+pub const HISTORY_LINK_MAX_CANDIDATES: usize = 5;
 
 /// The Text rule-6 window for a configured `text_rejoin_window_secs`,
 /// clamped to at least the Call window (30 s)
@@ -409,6 +423,12 @@ auto_derived!(
         /// Text only (S2): rule-6 evictions whose re-Add is recovery.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub rejoin_readd: Vec<MlsRejoinReadd>,
+        /// Text only (S4, design §2.5 "S4"): the visibility of epoch 0 (for
+        /// a successor, of its bridge transition), from the seat list the
+        /// create binds: `Some(true)` for a v2 list with `history:visible`,
+        /// else `Some(false)`. `None` only on groups created before S4.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub history_visible_at_create: Option<bool>,
     }
 );
 
@@ -501,6 +521,14 @@ auto_derived!(
         /// serves it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub welcome: Option<String>,
+        /// Text only (S4, design §2.5 "S4"): the visibility of the
+        /// transition INTO this row's epoch, from the AD the commit route
+        /// parses: `Some(true)` for a v2 list with `history:visible`, else
+        /// `Some(false)`; `None` on rows written before S4 and on Call
+        /// rows. Read by the history-link PUT only. NEVER part of
+        /// `MlsCommitInfo` or any envelope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub history_visible: Option<bool>,
     }
 );
 
@@ -543,6 +571,11 @@ auto_derived!(
         /// Text join payload only (design §3.13): the signed issue time (ms)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub issued_at: Option<i64>,
+        /// Text only (S4): the text protocol the joining client claimed
+        /// (CLIENT-CLAIMED, not signed; the minimum text protocol). `None`
+        /// on intents stored before S4 and on clients that send none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
     }
 );
 
@@ -550,6 +583,259 @@ impl MlsJoinIntent {
     /// Composite row id for a join intent
     pub fn composite_id(group_id: &str, user_id: &str, device_id: &str) -> String {
         format!("{group_id}:{user_id}:{device_id}")
+    }
+}
+
+auto_derived!(
+    /// One stored history link (design §2.8, §3.14.5): one row per (holder
+    /// group, holder epoch, writer USER). The server never reads the
+    /// ciphertext; it checks shapes, stores and serves.
+    pub struct MlsHistoryLink {
+        /// Composite id: `{group_id}:{epoch}:{writer_user_id}`
+        #[serde(rename = "_id")]
+        pub id: String,
+        /// The holder group G' (64 lowercase hex chars)
+        pub group_id: String,
+        /// The holder epoch e', `0 ..= current_epoch(G')`
+        pub epoch: i64,
+        /// G; equal to `group_id` when `epoch >= 1`
+        pub prev_group_id: String,
+        /// e; equal to `epoch - 1` when `epoch >= 1`
+        pub prev_epoch: i64,
+        /// b64 of the 24-byte nonce
+        pub nonce: String,
+        /// b64 of the ciphertext with its tag (decoded `17 ..= 40960` bytes)
+        pub ciphertext: String,
+        /// The writer user
+        pub writer_user_id: String,
+        /// The writer device
+        pub writer_device_id: String,
+        /// b64 of the 64-byte Ed25519 signature (design §3.14.5)
+        pub signature: String,
+        /// The decoded ciphertext length, for the byte caps
+        pub size: i64,
+        /// Server-stamped insert time: the candidate order (§3.14.7)
+        pub created_at: Timestamp,
+    }
+);
+
+impl MlsHistoryLink {
+    /// Composite row id for a history link
+    pub fn composite_id(group_id: &str, epoch: i64, writer_user_id: &str) -> String {
+        format!("{group_id}:{epoch}:{writer_user_id}")
+    }
+}
+
+/// Outcome of `insert_mls_history_link` (design §2.8)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The row was written
+    Inserted,
+    /// A byte-identical row already exists (every field but `created_at`
+    /// and `size` equal); nothing was written
+    Identical,
+}
+
+/// First line of the history-link signature payload (design 3.14.5)
+pub const CONTEXT_HISTORY_LINK_SIG: &str = "sloga-text-history-link-sig-v1";
+
+/// Decoded nonce length of a history link (XChaCha20-Poly1305)
+pub const HISTORY_LINK_NONCE_BYTES: usize = 24;
+
+/// Decoded signature length of a history link (Ed25519)
+pub const HISTORY_LINK_SIG_BYTES: usize = 64;
+
+/// Smallest decoded ciphertext of a history link: one plaintext byte plus
+/// the 16-byte tag
+pub const HISTORY_LINK_MIN_CIPHERTEXT: usize = 17;
+
+/// Unpadded b64 length of [`HISTORY_LINK_MAX_CIPHERTEXT`] bytes. The
+/// encoded length is checked against it before anything is decoded
+/// (design 6.1 "S4")
+pub const HISTORY_LINK_MAX_CIPHERTEXT_ENCODED: usize = 54614;
+
+/// Largest epoch a history link may name (the JSON-safe integer range, as
+/// `EncryptedPayload::MAX_EPOCH`)
+pub const HISTORY_LINK_MAX_EPOCH: i64 = (1 << 53) - 1;
+
+/// Fewest rows one history-link page may be asked for (design 2.8); a
+/// smaller `limit` is raised to it
+pub const HISTORY_LINK_PAGE_MIN: i64 = 5;
+
+/// Most rows one history-link page may hold (design 2.8); a larger `limit`
+/// is lowered to it
+pub const HISTORY_LINK_PAGE_MAX: i64 = 200;
+
+/// The fields of one history link, borrowed from the wire or from a row, so
+/// the shape check and the signature payload have one implementation
+struct HistoryLinkFields<'a> {
+    group_id: &'a str,
+    epoch: i64,
+    prev_group_id: &'a str,
+    prev_epoch: i64,
+    nonce: &'a str,
+    ciphertext: &'a str,
+    writer_user_id: &'a str,
+    writer_device_id: &'a str,
+    signature: &'a str,
+}
+
+impl<'a> From<&'a HistoryLinkWire> for HistoryLinkFields<'a> {
+    fn from(wire: &'a HistoryLinkWire) -> Self {
+        HistoryLinkFields {
+            group_id: &wire.group_id,
+            epoch: wire.epoch,
+            prev_group_id: &wire.prev_group_id,
+            prev_epoch: wire.prev_epoch,
+            nonce: &wire.nonce,
+            ciphertext: &wire.ciphertext,
+            writer_user_id: &wire.writer_user_id,
+            writer_device_id: &wire.writer_device_id,
+            signature: &wire.signature,
+        }
+    }
+}
+
+impl<'a> From<&'a MlsHistoryLink> for HistoryLinkFields<'a> {
+    fn from(link: &'a MlsHistoryLink) -> Self {
+        HistoryLinkFields {
+            group_id: &link.group_id,
+            epoch: link.epoch,
+            prev_group_id: &link.prev_group_id,
+            prev_epoch: link.prev_epoch,
+            nonce: &link.nonce,
+            ciphertext: &link.ciphertext,
+            writer_user_id: &link.writer_user_id,
+            writer_device_id: &link.writer_device_id,
+            signature: &link.signature,
+        }
+    }
+}
+
+/// Canonical unpadded standard base64 of exactly `length` bytes (design
+/// 0.1): the encoded length is checked before decoding, and
+/// `STANDARD_NO_PAD` refuses padding, whitespace, the URL-safe alphabet and
+/// non-canonical trailing bits
+fn history_link_b64_exact(value: &str, length: usize) -> bool {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+
+    value.len() == (length * 4).div_ceil(3)
+        && STANDARD_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == length)
+}
+
+impl HistoryLinkFields<'_> {
+    /// Design 3.14.5 "Signature": exactly 9 lines, no trailing LF
+    fn signature_payload(&self) -> String {
+        format!(
+            "{CONTEXT_HISTORY_LINK_SIG}\ngroup:{}\nepoch:{}\nprev_group:{}\nprev_epoch:{}\n\
+             writer_user:{}\nwriter_device:{}\nnonce:{}\nciphertext:{}",
+            self.group_id,
+            self.epoch,
+            self.prev_group_id,
+            self.prev_epoch,
+            self.writer_user_id,
+            self.writer_device_id,
+            self.nonce,
+            self.ciphertext
+        )
+    }
+
+    /// The shape rules; returns the decoded ciphertext length
+    fn check(&self) -> revolt_result::Result<i64> {
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+
+        let invalid = |error: &str| {
+            Err(create_error!(FailedValidation {
+                error: format!("history_link.{error}")
+            }))
+        };
+
+        if !is_valid_group_id(self.group_id) {
+            return invalid("group_id must be 64 lowercase hex");
+        }
+        if !(0..=HISTORY_LINK_MAX_EPOCH).contains(&self.epoch) {
+            return invalid("epoch out of range");
+        }
+        if !is_valid_group_id(self.prev_group_id) {
+            return invalid("prev_group_id must be 64 lowercase hex");
+        }
+        if !(0..=HISTORY_LINK_MAX_EPOCH).contains(&self.prev_epoch) {
+            return invalid("prev_epoch out of range");
+        }
+        // Both ids land in the composite `_id` and in the signature payload:
+        // their charsets keep `:` and LF out of either
+        if !crate::is_valid_ulid_id(self.writer_user_id) {
+            return invalid("writer_user_id must be a ULID");
+        }
+        if !crate::is_valid_device_id(self.writer_device_id) {
+            return invalid("writer_device_id must be 32 lowercase hex");
+        }
+        if !history_link_b64_exact(self.nonce, HISTORY_LINK_NONCE_BYTES) {
+            return invalid("nonce must be b64 of 24 bytes");
+        }
+
+        // Encoded length first, so an oversized ciphertext is never decoded
+        if self.ciphertext.len() > HISTORY_LINK_MAX_CIPHERTEXT_ENCODED {
+            return invalid("ciphertext too large");
+        }
+        let size = match STANDARD_NO_PAD.decode(self.ciphertext) {
+            Ok(bytes)
+                if (HISTORY_LINK_MIN_CIPHERTEXT..=HISTORY_LINK_MAX_CIPHERTEXT)
+                    .contains(&bytes.len()) =>
+            {
+                bytes.len()
+            }
+            Ok(_) => return invalid("ciphertext length out of range"),
+            Err(_) => return invalid("ciphertext must be b64"),
+        };
+
+        if !history_link_b64_exact(self.signature, HISTORY_LINK_SIG_BYTES) {
+            return invalid("signature must be b64 of 64 bytes");
+        }
+
+        Ok(size as i64)
+    }
+}
+
+/// The history-link signature payload (design 3.14.5) of a wire link: the
+/// bytes the writer device signed. The route verifies the wire signature
+/// over it under the writer device's directory identity key (design 6.1
+/// "S4"). Only meaningful on a wire that passed
+/// [`check_history_link_wire`].
+pub fn history_link_signature_payload(wire: &HistoryLinkWire) -> String {
+    HistoryLinkFields::from(wire).signature_payload()
+}
+
+/// Shape check of a wire history link (design 2.8, 3.14.5, 6.1 "S4"
+/// request validation), `FailedValidation` on the first failure: both group
+/// ids 64 lowercase hex; both epochs in `0 ..= 2^53 - 1`; `writer_user_id` a
+/// ULID and `writer_device_id` 32 lowercase hex; `nonce` b64 of 24 bytes;
+/// `ciphertext` b64 of `17 ..= 40960` bytes, its ENCODED length checked
+/// before it is decoded; `signature` b64 of 64 bytes (canonical unpadded
+/// standard b64 throughout). Returns the decoded ciphertext length, the
+/// row's `size`.
+///
+/// Not checked here (route rules, in the 6.1 order): the body's `group_id`
+/// and `epoch` against the path, `prev_group_id`/`prev_epoch` against the
+/// holder, the writer against the caller and its session, membership,
+/// visibility and the signature itself.
+pub fn check_history_link_wire(wire: &HistoryLinkWire) -> revolt_result::Result<i64> {
+    HistoryLinkFields::from(wire).check()
+}
+
+impl MlsHistoryLink {
+    /// The signature payload of a stored link (design 3.14.5), as
+    /// [`history_link_signature_payload`]
+    pub fn signature_payload(&self) -> String {
+        HistoryLinkFields::from(self).signature_payload()
+    }
+
+    /// The shape rules of [`check_history_link_wire`] on a row; returns
+    /// the decoded ciphertext length
+    pub fn check_shape(&self) -> revolt_result::Result<i64> {
+        HistoryLinkFields::from(self).check()
     }
 }
 
@@ -614,6 +900,7 @@ mod removed_reasons_shape_tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
         }
     }
 
@@ -658,8 +945,9 @@ mod s2_shape_tests {
     use iso8601_timestamp::Timestamp;
 
     use super::{
-        MlsCommit, MlsGroup, MlsJoinIntent, MlsPendingDeviceRemoval, MlsRejoinReadd,
-        MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
+        InsertOutcome, MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent, MlsPendingDeviceRemoval,
+        MlsRejoinReadd, MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
+        HISTORY_LINK_MAX_CANDIDATES, HISTORY_LINK_MAX_CIPHERTEXT, MIN_TEXT_PROTOCOL_V2,
     };
 
     /// A Text group exactly as an S1 build (dafb3433) stores it
@@ -821,6 +1109,100 @@ mod s2_shape_tests {
         assert_eq!(commit.removed_reasons[0].reason, MlsRemovalReason::Unknown);
     }
 
+    /// S4 (design §2.5 "S4"): `history_visible_at_create` and
+    /// `history_visible` are absent on an older row, which re-encodes
+    /// byte-identical, and stored under their exact keys when set; the
+    /// intent's `protocol` likewise
+    ///
+    /// Control: `skip_serializing_if` dropped from any of the three.
+    #[test]
+    fn s4_fields_are_absent_when_empty() {
+        let group: MlsGroup = s1_round_trip(GROUP_S1);
+        assert_eq!(group.history_visible_at_create, None);
+        let visible = MlsGroup {
+            history_visible_at_create: Some(false),
+            ..group
+        };
+        let document = bson::to_document(&visible).unwrap();
+        assert!(!document.get_bool("history_visible_at_create").unwrap());
+        assert_eq!(bson::from_document::<MlsGroup>(document).unwrap(), visible);
+
+        let commit: MlsCommit = s1_round_trip(COMMIT_S1);
+        assert_eq!(commit.history_visible, None);
+        let visible = MlsCommit {
+            history_visible: Some(true),
+            ..commit
+        };
+        let document = bson::to_document(&visible).unwrap();
+        assert!(document.get_bool("history_visible").unwrap());
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), visible);
+
+        let intent: MlsJoinIntent = s1_round_trip(INTENT_S1);
+        assert_eq!(intent.protocol, None);
+        let v2 = MlsJoinIntent {
+            protocol: Some(2),
+            ..intent
+        };
+        let document = bson::to_document(&v2).unwrap();
+        assert!(document.contains_key("protocol"));
+        assert_eq!(bson::from_document::<MlsJoinIntent>(document).unwrap(), v2);
+    }
+
+    /// Design §2.8: the stored link's keys, its composite `_id`, and a
+    /// BSON round trip
+    #[test]
+    fn history_link_row_shape() {
+        let link = MlsHistoryLink {
+            id: MlsHistoryLink::composite_id(&"6".repeat(64), 8, "01HZXBBBBBBBBBBBBBBBBBBBBB"),
+            group_id: "6".repeat(64),
+            epoch: 8,
+            prev_group_id: "6".repeat(64),
+            prev_epoch: 7,
+            nonce: "bm9uY2U".to_string(),
+            ciphertext: "Y2lwaGVy".to_string(),
+            writer_user_id: "01HZXBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            writer_device_id: "f".repeat(32),
+            signature: "c2ln".to_string(),
+            size: 6,
+            created_at: at(),
+        };
+        assert_eq!(
+            link.id,
+            format!("{}:8:01HZXBBBBBBBBBBBBBBBBBBBBB", "6".repeat(64))
+        );
+        let document = bson::to_document(&link).unwrap();
+        assert_eq!(
+            document.keys().collect::<Vec<_>>(),
+            [
+                "_id",
+                "group_id",
+                "epoch",
+                "prev_group_id",
+                "prev_epoch",
+                "nonce",
+                "ciphertext",
+                "writer_user_id",
+                "writer_device_id",
+                "signature",
+                "size",
+                "created_at"
+            ]
+        );
+        assert_eq!(
+            bson::from_document::<MlsHistoryLink>(document).unwrap(),
+            link
+        );
+    }
+
+    /// The S4 constants (design §2.8, plan appendix (2))
+    #[test]
+    fn s4_constants() {
+        assert_eq!(MIN_TEXT_PROTOCOL_V2, 2);
+        assert_eq!(HISTORY_LINK_MAX_CIPHERTEXT, 40960);
+        assert_eq!(HISTORY_LINK_MAX_CANDIDATES, 5);
+        assert_ne!(InsertOutcome::Inserted, InsertOutcome::Identical);
+    }
+
     /// #222: the stored signer-lost cause is `device_revoked` only
     #[test]
     fn signer_lost_cause_is_snake_case() {
@@ -882,5 +1264,205 @@ mod s2_rule_tests {
             revolt_config::ProtectedChannelFeatures::default().text_rejoin_window_secs,
             TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS as u64
         );
+    }
+}
+
+#[cfg(test)]
+mod history_link_wire_tests {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use ed25519_dalek::{Signature, SigningKey, Verifier};
+    use iso8601_timestamp::Timestamp;
+    use revolt_models::v0::HistoryLinkWire;
+    use revolt_result::ErrorType;
+
+    use super::{
+        check_history_link_wire, history_link_signature_payload, MlsHistoryLink,
+        CONTEXT_HISTORY_LINK_SIG, HISTORY_LINK_MAX_CIPHERTEXT, HISTORY_LINK_MAX_CIPHERTEXT_ENCODED,
+    };
+
+    /// The committed design document: every vector below is read from it,
+    /// so these tests follow the doc byte for byte
+    const DESIGN: &str = include_str!("../../../../../../docs/protected-channels-design.md");
+
+    /// A `tv4:NAME` block (design 5.9 reading rule): its lines joined by LF,
+    /// no trailing LF
+    fn tv4(name: &str) -> String {
+        let marker = format!("<!-- tv4:{name} -->\n```text\n");
+        let start = DESIGN.find(&marker).expect("vector present") + marker.len();
+        let end = start + DESIGN[start..].find("\n```").expect("vector closed");
+        DESIGN[start..end].to_string()
+    }
+
+    /// A `NAME_seed_hex = ...` input of `tv:inputs` (design 5.2)
+    fn seed(name: &str) -> SigningKey {
+        let marker = format!("\n{name}_seed_hex = ");
+        let start = DESIGN.find(&marker).expect("seed present") + marker.len();
+        let hex = &DESIGN[start..start + 64];
+        let mut bytes = [0u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).expect("hex");
+        }
+        SigningKey::from_bytes(&bytes)
+    }
+
+    fn wire(name: &str) -> HistoryLinkWire {
+        serde_json::from_str(&tv4(name)).expect("wire vector decodes")
+    }
+
+    fn refusal(wire: &HistoryLinkWire) -> String {
+        match check_history_link_wire(wire) {
+            Err(error) => match error.error_type {
+                ErrorType::FailedValidation { error } => error,
+                other => panic!("expected FailedValidation, got {other:?}"),
+            },
+            Ok(size) => panic!("expected a refusal, got size {size}"),
+        }
+    }
+
+    /// Design 5.9: the payload of both vectors is `tv4:*_sig_input` byte
+    /// for byte, and the vector signature verifies over it under the
+    /// writer's key (member for the link, owner for the bridge)
+    #[test]
+    fn signature_payload_matches_the_vectors() {
+        for (prefix, writer) in [("link", "member"), ("bridge", "owner")] {
+            let wire = wire(&format!("{prefix}_wire_json"));
+            let payload = history_link_signature_payload(&wire);
+            assert_eq!(payload, tv4(&format!("{prefix}_sig_input")), "{prefix}");
+            assert_eq!(payload.lines().count(), 9);
+            assert!(payload.starts_with(CONTEXT_HISTORY_LINK_SIG));
+            assert!(!payload.ends_with('\n'));
+
+            assert_eq!(wire.signature, tv4(&format!("{prefix}_signature")));
+            let signature: [u8; 64] = STANDARD_NO_PAD
+                .decode(&wire.signature)
+                .unwrap()
+                .try_into()
+                .unwrap();
+            seed(writer)
+                .verifying_key()
+                .verify(payload.as_bytes(), &Signature::from_bytes(&signature))
+                .expect("vector signature verifies over the payload");
+
+            // A row built from the wire signs the same bytes
+            let row = MlsHistoryLink::from_wire(wire.clone(), 1, Timestamp::now_utc());
+            assert_eq!(row.signature_payload(), payload);
+        }
+    }
+
+    /// Design 5.9: both wire vectors pass the shape check, which returns the
+    /// decoded ciphertext length (469 and 470 bytes)
+    #[test]
+    fn wire_vectors_pass_and_report_their_size() {
+        let link = wire("link_wire_json");
+        assert_eq!(check_history_link_wire(&link).unwrap(), 469);
+        assert_eq!(link.ciphertext, tv4("link_ciphertext_b64"));
+        let bridge = wire("bridge_wire_json");
+        assert_eq!(check_history_link_wire(&bridge).unwrap(), 470);
+
+        let row = MlsHistoryLink::from_wire(link, 469, Timestamp::now_utc());
+        assert_eq!(row.check_shape().unwrap(), 469);
+    }
+
+    /// Design 2.8 / 6.1 "S4": every shape rule refuses, the ciphertext
+    /// bounds are inclusive, and an oversized ciphertext is refused on its
+    /// ENCODED length before any decode
+    #[test]
+    fn wire_shape_rules_refuse() {
+        assert_eq!(
+            HISTORY_LINK_MAX_CIPHERTEXT_ENCODED,
+            (HISTORY_LINK_MAX_CIPHERTEXT * 4).div_ceil(3)
+        );
+
+        let good = wire("link_wire_json");
+        let with = |edit: &dyn Fn(&mut HistoryLinkWire)| {
+            let mut wire = good.clone();
+            edit(&mut wire);
+            wire
+        };
+
+        let cases: Vec<(HistoryLinkWire, &str)> = vec![
+            (
+                with(&|w| w.group_id = w.group_id.to_uppercase()),
+                "history_link.group_id must be 64 lowercase hex",
+            ),
+            (
+                with(&|w| w.group_id = w.group_id[..63].to_string()),
+                "history_link.group_id must be 64 lowercase hex",
+            ),
+            (with(&|w| w.epoch = -1), "history_link.epoch out of range"),
+            (
+                with(&|w| w.epoch = 1 << 53),
+                "history_link.epoch out of range",
+            ),
+            (
+                with(&|w| w.prev_group_id = format!("{}:", &w.prev_group_id[..63])),
+                "history_link.prev_group_id must be 64 lowercase hex",
+            ),
+            (
+                with(&|w| w.prev_epoch = -1),
+                "history_link.prev_epoch out of range",
+            ),
+            (
+                with(&|w| w.writer_user_id = "01HZXBBBBBBBBBBBBBBBBBBB:B".to_string()),
+                "history_link.writer_user_id must be a ULID",
+            ),
+            (
+                with(&|w| w.writer_user_id = "01hzxbbbbbbbbbbbbbbbbbbbbb".to_string()),
+                "history_link.writer_user_id must be a ULID",
+            ),
+            (
+                with(&|w| w.writer_device_id = "FFEEDDCCBBAA99887766554433221100".to_string()),
+                "history_link.writer_device_id must be 32 lowercase hex",
+            ),
+            (
+                with(&|w| w.nonce = STANDARD_NO_PAD.encode([7u8; 23])),
+                "history_link.nonce must be b64 of 24 bytes",
+            ),
+            (
+                with(&|w| w.nonce = format!("{}==", STANDARD_NO_PAD.encode([7u8; 23]))),
+                "history_link.nonce must be b64 of 24 bytes",
+            ),
+            (
+                with(&|w| w.ciphertext = STANDARD_NO_PAD.encode([7u8; 16])),
+                "history_link.ciphertext length out of range",
+            ),
+            (
+                with(&|w| w.ciphertext = STANDARD_NO_PAD.encode(vec![7u8; 40961])),
+                "history_link.ciphertext too large",
+            ),
+            (
+                // Not b64 at all, but over the encoded cap: refused on its
+                // length, never decoded
+                with(&|w| w.ciphertext = "!".repeat(HISTORY_LINK_MAX_CIPHERTEXT_ENCODED + 1)),
+                "history_link.ciphertext too large",
+            ),
+            (
+                with(&|w| w.ciphertext = format!("{}=", w.ciphertext)),
+                "history_link.ciphertext must be b64",
+            ),
+            (
+                with(&|w| w.signature = STANDARD_NO_PAD.encode([7u8; 63])),
+                "history_link.signature must be b64 of 64 bytes",
+            ),
+            (
+                with(&|w| w.signature = w.signature.replace('+', "-")),
+                "history_link.signature must be b64 of 64 bytes",
+            ),
+        ];
+        for (wire, expected) in cases {
+            assert_eq!(refusal(&wire), expected);
+        }
+
+        // Both ciphertext bounds are inclusive
+        for bytes in [17usize, HISTORY_LINK_MAX_CIPHERTEXT] {
+            let wire = with(&|w| w.ciphertext = STANDARD_NO_PAD.encode(vec![7u8; bytes]));
+            assert_eq!(check_history_link_wire(&wire).unwrap(), bytes as i64);
+        }
+        // Epoch 0 (a bridge) and the top of the range pass
+        let wire = with(&|w| {
+            w.epoch = 0;
+            w.prev_epoch = (1 << 53) - 1;
+        });
+        assert!(check_history_link_wire(&wire).is_ok());
     }
 }

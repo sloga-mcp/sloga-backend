@@ -121,6 +121,17 @@ auto_derived!(
         /// | device_never_joined)}]`. Only returned to readers who can view
         /// `channel`
         ProtectedSeatRelease,
+        /// A channel was protected. `channel` = the channel; `changes` =
+        /// `[{key: "boundary", new: String(boundary message id)}, {key:
+        /// "wiped", new: Bool}]`, where `boundary` has no `new` when the
+        /// channel was protected empty. Only returned to readers who can
+        /// view `channel`
+        ChannelProtect,
+        /// A protected channel's pre-protect history wipe. `channel` = the
+        /// channel; `changes` = `[{key: "count", new: Int(rows deleted)}]`
+        /// once the wipe is done, empty when it is requested. Only returned
+        /// to readers who can view `channel`
+        ChannelHistoryWipe,
         /// An action this build does not know
         #[cfg_attr(feature = "serde", serde(other))]
         Unknown,

@@ -41,6 +41,8 @@ fn targets_a_user(action: AuditLogAction) -> bool {
         | AuditLogAction::ProtectedSeatRelease => true,
         AuditLogAction::MessageBulkDelete
         | AuditLogAction::ProtectedSeatsUpdate
+        | AuditLogAction::ChannelProtect
+        | AuditLogAction::ChannelHistoryWipe
         | AuditLogAction::ChannelCreate
         | AuditLogAction::ChannelUpdate
         | AuditLogAction::ChannelDelete
@@ -62,7 +64,10 @@ fn targets_a_user(action: AuditLogAction) -> bool {
 /// cannot name has no channel rule it could apply.
 fn needs_channel_view(action: AuditLogAction) -> bool {
     match action {
-        AuditLogAction::ProtectedSeatsUpdate | AuditLogAction::ProtectedSeatRelease => true,
+        AuditLogAction::ProtectedSeatsUpdate
+        | AuditLogAction::ProtectedSeatRelease
+        | AuditLogAction::ChannelProtect
+        | AuditLogAction::ChannelHistoryWipe => true,
         AuditLogAction::MemberKick
         | AuditLogAction::MemberBanAdd
         | AuditLogAction::MemberBanRemove
@@ -290,6 +295,23 @@ mod test {
     use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{Header, Status};
     use serde_json::Value;
+
+    /// S4 (design §7.5 "S4"): the protect and history-wipe entries name a
+    /// protected channel, so only readers with ViewChannel on it get them
+    /// (#221), and neither stores a user in `target`
+    ///
+    /// Control: either action moved to the `false` arm of
+    /// `needs_channel_view`.
+    #[test]
+    fn s4_channel_entries_need_view_channel() {
+        for action in [
+            AuditLogAction::ChannelProtect,
+            AuditLogAction::ChannelHistoryWipe,
+        ] {
+            assert!(super::needs_channel_view(action), "{action:?}");
+            assert!(!super::targets_a_user(action), "{action:?}");
+        }
+    }
 
     /// A 26-character ULID-shaped id that sorts by `n`.
     fn id(n: u32) -> String {

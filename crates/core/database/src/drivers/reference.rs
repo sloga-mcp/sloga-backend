@@ -8,10 +8,10 @@ use crate::{
     AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
-    MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
-    RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
+    MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll,
+    PollVote, RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
     ReminderSentKey, Report, Respect, ScheduledMessage, SeatList, Server, ServerBan, ServerBoost,
-    Snapshot,
+    ServerLegalHold, Snapshot,
     SoftResReserveRow, SoftResSheet, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
@@ -64,6 +64,9 @@ database_derived!(
         pub server_audit_log: Arc<Mutex<HashMap<String, AuditLogEntry>>>,
         pub server_bans: Arc<Mutex<HashMap<MemberCompositeKey, ServerBan>>>,
         pub server_boosts: Arc<Mutex<HashMap<String, ServerBoost>>>,
+        /// Keyed by server id; its own lock, never held with another
+        /// (design 2.9)
+        pub server_legal_holds: Arc<Mutex<HashMap<String, ServerLegalHold>>>,
         pub channel_entitlements: Arc<Mutex<HashMap<String, ChannelEntitlement>>>,
         pub channel_seats: Arc<Mutex<HashMap<String, ChannelSeat>>>,
         pub channel_seat_lists: Arc<Mutex<HashMap<String, SeatList>>>,
@@ -83,6 +86,9 @@ database_derived!(
         pub mls_key_packages: Arc<Mutex<HashMap<String, MlsKeyPackage>>>,
         pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
         pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,
+        /// Keyed by `MlsHistoryLink::composite_id`; locked right after
+        /// `mls_commits` (design 2.8)
+        pub mls_history_links: Arc<Mutex<HashMap<String, MlsHistoryLink>>>,
         pub mls_join_intents: Arc<Mutex<HashMap<String, MlsJoinIntent>>>,
         pub payment_events: Arc<Mutex<HashMap<String, PaymentEvent>>>,
         pub payment_orders: Arc<Mutex<HashMap<String, PaymentOrder>>>,

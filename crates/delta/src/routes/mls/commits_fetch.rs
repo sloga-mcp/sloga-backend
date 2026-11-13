@@ -244,6 +244,7 @@ mod tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
         }
     }
 
@@ -375,6 +376,7 @@ mod tests {
             created_at: seconds_ago(5),
             generation: None,
             issued_at: None,
+            protocol: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -423,6 +425,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             db.create_mls_group(&call_group, None)

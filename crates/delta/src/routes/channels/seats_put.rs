@@ -786,7 +786,13 @@ mod test {
         }
         .signed();
         harness
-            .protect_with_db(&channel, &v0::DataProtectChannel { seat_list: genesis })
+            .protect_with_db(
+                &channel,
+                &v0::DataProtectChannel {
+                    seat_list: genesis,
+                    wipe_history: None,
+                },
+            )
             .await;
         let channel = harness
             .db

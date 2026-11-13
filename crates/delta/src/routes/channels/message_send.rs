@@ -459,6 +459,7 @@ mod test {
             applied_tags: None,
             announcement: None,
             protected: None,
+            protected_history: None,
         };
         locked_channel
             .update(&harness.db, partial, vec![])
@@ -1933,6 +1934,7 @@ mod protected_tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
         };
         let outcome = db
             .insert_mls_text_commit(&commit, &hash, 0)

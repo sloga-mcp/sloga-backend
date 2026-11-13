@@ -118,6 +118,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected,
+            protected_history: None,
         }
     }
 

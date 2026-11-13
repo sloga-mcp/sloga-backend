@@ -1899,6 +1899,32 @@ pub struct ProtectedChannelFeatures {
     /// one more is refused with `InSlowmode`
     #[serde(default = "ProtectedChannelFeatures::default_successor_rate_per_day")]
     pub successor_rate_per_day: u32,
+    /// Rollout gate for the S4 history setting (7.1 "S4", S4-PA-9): the
+    /// history-link PUT, a non-empty boundary at protect, a `wiped` list
+    /// and the wipe route all need it on. The history-link GET does not.
+    /// Flip it once every protected device runs S4. Carried in the root
+    /// advert
+    #[serde(default)]
+    pub history_setting: bool,
+    /// Per holder group cap on stored history links, in decoded ciphertext
+    /// bytes summed over the group's rows (S4-D6; 64 MiB)
+    #[serde(default = "ProtectedChannelFeatures::default_history_link_group_cap_bytes")]
+    pub history_link_group_cap_bytes: u64,
+    /// Per writer user cap within one holder group, in decoded ciphertext
+    /// bytes (S4-RR-1): the group cap over the five candidate slots
+    #[serde(default = "ProtectedChannelFeatures::default_history_link_user_cap_bytes")]
+    pub history_link_user_cap_bytes: u64,
+    /// Plaintext rows deleted per batch of the history wipe job (S4-D22).
+    /// Read it through `history_wipe_batch_size()`, which treats 0 as 1 so
+    /// a misconfigured batch still makes progress
+    #[serde(default = "ProtectedChannelFeatures::default_history_wipe_batch")]
+    pub history_wipe_batch: u32,
+    /// iPhone-only server off switch for protected channels (S8-O5). Off,
+    /// iPhone clients keep protected channels closed whatever `enabled`
+    /// says; the global flags still stop every platform. Enforced by the
+    /// client gate, not the server. Carried in the root advert
+    #[serde(default)]
+    pub ios: bool,
 }
 
 impl Default for ProtectedChannelFeatures {
@@ -1911,11 +1937,34 @@ impl Default for ProtectedChannelFeatures {
             reconcile_sweep_secs: Self::default_reconcile_sweep_secs(),
             text_rejoin_window_secs: Self::default_text_rejoin_window_secs(),
             successor_rate_per_day: Self::default_successor_rate_per_day(),
+            history_setting: false,
+            history_link_group_cap_bytes: Self::default_history_link_group_cap_bytes(),
+            history_link_user_cap_bytes: Self::default_history_link_user_cap_bytes(),
+            history_wipe_batch: Self::default_history_wipe_batch(),
+            ios: false,
         }
     }
 }
 
 impl ProtectedChannelFeatures {
+    /// Rows per history wipe batch, never below 1 (a batch of 0 would let
+    /// the job run forever deleting nothing)
+    pub fn history_wipe_batch_size(&self) -> u32 {
+        self.history_wipe_batch.max(1)
+    }
+
+    fn default_history_link_group_cap_bytes() -> u64 {
+        67108864
+    }
+
+    fn default_history_link_user_cap_bytes() -> u64 {
+        13421772
+    }
+
+    fn default_history_wipe_batch() -> u32 {
+        1000
+    }
+
     fn default_device_cap() -> u32 {
         5
     }
@@ -2566,6 +2615,16 @@ mod protected_channels_config_tests {
         assert_eq!(protected.successor_rate_per_day, 10);
     }
 
+    /// The S4 keys (and the S8-O5 switch) at their design 7.1 values
+    fn assert_s4_defaults(protected: &ProtectedChannelFeatures) {
+        assert!(!protected.history_setting);
+        assert_eq!(protected.history_link_group_cap_bytes, 67108864);
+        assert_eq!(protected.history_link_user_cap_bytes, 13421772);
+        assert_eq!(protected.history_wipe_batch, 1000);
+        assert_eq!(protected.history_wipe_batch_size(), 1000);
+        assert!(!protected.ios);
+    }
+
     #[test]
     fn hand_written_defaults_have_the_documented_values() {
         let protected = ProtectedChannelFeatures::default();
@@ -2573,6 +2632,19 @@ mod protected_channels_config_tests {
         assert_eq!(protected.default_device_cap, 5);
         assert_eq!(protected.commit_retention_days, 30);
         assert_s2_defaults(&protected);
+        assert_s4_defaults(&protected);
+    }
+
+    /// The per-user cap is the group cap over the five candidate slots
+    /// (7.1 "S4", #283 (d))
+    #[test]
+    fn the_history_link_user_cap_is_a_fifth_of_the_group_cap() {
+        let protected = ProtectedChannelFeatures::default();
+        assert_eq!(protected.history_link_user_cap_bytes, 67108864 / 5);
+        assert_eq!(
+            protected.history_link_user_cap_bytes,
+            protected.history_link_group_cap_bytes / 5
+        );
     }
 
     /// An S1 overrides block names none of the S2 keys: it still loads, and
@@ -2586,6 +2658,137 @@ mod protected_channels_config_tests {
         assert_eq!(protected.default_device_cap, 7);
         assert_eq!(protected.commit_retention_days, 14);
         assert_s2_defaults(&protected);
+        assert_s4_defaults(&protected);
+    }
+
+    /// An S2 overrides block names none of the S4 keys: each takes its own
+    /// default, so the history setting and the iPhone switch stay off
+    #[test]
+    fn an_s2_block_takes_the_s4_defaults() {
+        let protected = layered(
+            "[features.protected_channels]\nenabled = true\nformats_v2 = true\nsuccessor_rate_per_day = 3\n",
+        );
+        assert!(protected.enabled);
+        assert!(protected.formats_v2);
+        assert_eq!(protected.successor_rate_per_day, 3);
+        assert_s4_defaults(&protected);
+    }
+
+    #[test]
+    fn a_toml_override_sets_each_s4_key() {
+        let protected = layered(
+            "[features.protected_channels]\nhistory_setting = true\nhistory_link_group_cap_bytes = 1048576\nhistory_link_user_cap_bytes = 4096\nhistory_wipe_batch = 25\nios = true\n",
+        );
+        assert!(protected.history_setting);
+        assert_eq!(protected.history_link_group_cap_bytes, 1048576);
+        assert_eq!(protected.history_link_user_cap_bytes, 4096);
+        assert_eq!(protected.history_wipe_batch, 25);
+        assert_eq!(protected.history_wipe_batch_size(), 25);
+        assert!(protected.ios);
+        // The keys it does not name keep theirs
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+        assert_s2_defaults(&protected);
+
+        // Each key alone moves only that key
+        type Moved = fn(&ProtectedChannelFeatures) -> bool;
+        let cases: [(&str, Moved); 5] = [
+            ("history_setting = true", |p| p.history_setting),
+            ("history_link_group_cap_bytes = 7", |p| {
+                p.history_link_group_cap_bytes == 7
+            }),
+            ("history_link_user_cap_bytes = 7", |p| {
+                p.history_link_user_cap_bytes == 7
+            }),
+            ("history_wipe_batch = 7", |p| p.history_wipe_batch == 7),
+            ("ios = true", |p| p.ios),
+        ];
+        for (line, moved) in cases {
+            let protected = layered(&format!("[features.protected_channels]\n{line}\n"));
+            assert!(moved(&protected), "{line} did not take");
+            let defaults = ProtectedChannelFeatures::default();
+            let unchanged = [
+                (
+                    "history_setting",
+                    protected.history_setting == defaults.history_setting,
+                ),
+                (
+                    "history_link_group_cap_bytes",
+                    protected.history_link_group_cap_bytes == defaults.history_link_group_cap_bytes,
+                ),
+                (
+                    "history_link_user_cap_bytes",
+                    protected.history_link_user_cap_bytes == defaults.history_link_user_cap_bytes,
+                ),
+                (
+                    "history_wipe_batch",
+                    protected.history_wipe_batch == defaults.history_wipe_batch,
+                ),
+                ("ios", protected.ios == defaults.ios),
+            ];
+            for (key, same) in unchanged {
+                assert!(same || line.starts_with(key), "{line} moved {key}");
+            }
+            assert!(!protected.enabled, "{line}");
+            assert_s2_defaults(&protected);
+        }
+    }
+
+    /// The wipe batch is read through `history_wipe_batch_size()`: 0 is
+    /// treated as 1 so the job still makes progress; any other value passes
+    /// through untouched
+    #[test]
+    fn the_wipe_batch_size_is_never_zero() {
+        let protected = layered("[features.protected_channels]\nhistory_wipe_batch = 0\n");
+        assert_eq!(protected.history_wipe_batch, 0);
+        assert_eq!(protected.history_wipe_batch_size(), 1);
+
+        for batch in [1, 2, 1000, u32::MAX] {
+            let protected = ProtectedChannelFeatures {
+                history_wipe_batch: batch,
+                ..Default::default()
+            };
+            assert_eq!(protected.history_wipe_batch_size(), batch);
+        }
+    }
+
+    /// The documented env form (double underscores) reaches the S4 keys
+    #[test]
+    fn environment_override_reaches_the_s4_keys() {
+        let vars: HashMap<String, String> = [
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_SETTING",
+                "true",
+            ),
+            ("REVOLT__FEATURES__PROTECTED_CHANNELS__IOS", "true"),
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_WIPE_BATCH",
+                "50",
+            ),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let protected = &settings.features.protected_channels;
+        assert!(protected.history_setting);
+        assert!(protected.ios);
+        assert_eq!(protected.history_wipe_batch, 50);
+        assert_eq!(protected.history_link_group_cap_bytes, 67108864);
+        assert_eq!(protected.history_link_user_cap_bytes, 13421772);
+        assert!(!protected.enabled);
     }
 
     #[test]
@@ -2601,6 +2804,7 @@ mod protected_channels_config_tests {
         assert!(!protected.enabled);
         assert_eq!(protected.default_device_cap, 5);
         assert_eq!(protected.commit_retention_days, 30);
+        assert_s4_defaults(&protected);
 
         // One key alone moves only that key
         let protected = layered("[features.protected_channels]\nformats_v2 = true\n");
@@ -2662,11 +2866,14 @@ mod protected_channels_config_tests {
             30
         );
         assert_s2_defaults(&settings.features.protected_channels);
+        assert_s4_defaults(&settings.features.protected_channels);
     }
 
     /// The test config turns growth on, on top of the E2EE plane it needs,
     /// so the W2 route tests run with the feature live. `formats_v2` stays
     /// off there: the existing route tests protect with a v1 genesis.
+    /// `history_setting` stays off too: an S4 test turns it on for itself
+    /// with `overwrite_config`.
     #[test]
     fn the_test_config_turns_growth_on() {
         let settings: Settings = Config::builder()
@@ -2688,6 +2895,7 @@ mod protected_channels_config_tests {
             30
         );
         assert_s2_defaults(&settings.features.protected_channels);
+        assert_s4_defaults(&settings.features.protected_channels);
     }
 }
 

@@ -27,8 +27,9 @@ use revolt_result::Result;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    is_valid_group_id, is_valid_key_package_ref, Channel, MlsGroup, MlsGroupKind, MlsMemberAdded,
-    MlsPendingDeviceRemoval, MlsPendingRemoval, MlsSignerLost, MlsSignerLostCause,
+    is_valid_group_id, is_valid_key_package_ref, Channel, HistoryWipe, MlsGroup, MlsGroupKind,
+    MlsMemberAdded, MlsPendingDeviceRemoval, MlsPendingRemoval, MlsSignerLost, MlsSignerLostCause,
+    ProtectedHistory,
 };
 
 /// How long a released seat keeps counting against the slot cap (2.3)
@@ -115,6 +116,10 @@ pub const PROTECTED_SCOPE_SEATS: &str = "seats";
 
 /// `ProtectedChannelChanged.scope` item: the open Text group changed (7.5)
 pub const PROTECTED_SCOPE_TEXT_GROUP: &str = "text_group";
+
+/// `ProtectedChannelChanged.scope` item: a history link was contested
+/// (7.5 "S4", fix F9)
+pub const PROTECTED_SCOPE_HISTORY: &str = "history";
 
 /// Length of an Ed25519 signature in unpadded b64 (0.1)
 const SIGNATURE_B64_LEN: usize = 86;
@@ -630,6 +635,29 @@ pub fn is_valid_ulid_id(value: &str) -> bool {
         })
 }
 
+/// Crockford base32, the ULID alphabet (no `I`, `L`, `O`, `U`)
+const CROCKFORD_ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+/// The 48-bit millisecond time of a ULID (4.1.1 "S4", fix F15, #299): the
+/// first 10 characters of an UPPERCASE canonical Crockford ULID whose first
+/// character is `0` to `7`, so the time fits 48 bits. Any other spelling
+/// (lowercase, `I`, `L`, `O`, `U`, a first character above `7`, another
+/// length) is malformed, `FailedValidation` (vector 5.9 `boundary_ulid_time`).
+pub fn ulid_time(id: &str) -> Result<u64> {
+    if !is_valid_ulid_id(id) || !matches!(id.as_bytes()[0], b'0'..=b'7') {
+        return Err(invalid("malformed ULID"));
+    }
+    let mut time = 0u64;
+    for byte in &id.as_bytes()[..10] {
+        let digit = CROCKFORD_ALPHABET
+            .iter()
+            .position(|letter| letter == byte)
+            .ok_or_else(|| invalid("malformed ULID"))?;
+        time = (time << 5) | digit as u64;
+    }
+    Ok(time)
+}
+
 /// Device id: 32 lowercase hex chars (0.1)
 pub fn is_valid_device_id_hex(value: &str) -> bool {
     value.len() == 32
@@ -700,8 +728,11 @@ impl SeatListBody {
     /// Strict v2 parse (4.1.1): the nine v1 lines under the v2 context and
     /// `v:2`, then `authority`, `history`, `history_boundary`,
     /// `pre_history` and `group_salt`. `wiped` with an empty boundary is
-    /// malformed (4.1.1, 4.4.1 rule 3). A boundary and `wiped` are otherwise
-    /// format-valid; S2's refusal of them is 4.3 step 4c.
+    /// malformed (4.1.1, 4.4.1 rule 3), and so is a boundary that is not an
+    /// uppercase canonical ULID with a first character `0` to `7`, or whose
+    /// `ulid_time` is later than the list's own `issued_at` (4.1.1 "S4", fix
+    /// F15, S4-PA-1; 4.3 "S4" step 1). A boundary and `wiped` are otherwise
+    /// format-valid; whether a write may carry them is 4.3 step 4c.
     pub fn parse_v2(body: &str) -> Result<SeatListBody> {
         let lines = seat_list_lines(body, 14)?;
         if lines[0] != CONTEXT_SEAT_LIST_V2 || lines[1] != "v:2" {
@@ -725,8 +756,16 @@ impl SeatListBody {
         };
         let history_boundary = match field(11, "history_boundary")? {
             "" => None,
-            boundary if is_valid_ulid_id(boundary) => Some(boundary.to_string()),
-            _ => return Err(invalid("seat list history_boundary")),
+            boundary => {
+                let time =
+                    ulid_time(boundary).map_err(|_| invalid("seat list history_boundary"))?;
+                if time > parsed.issued_at as u64 {
+                    return Err(invalid(
+                        "seat list history_boundary is later than issued_at",
+                    ));
+                }
+                Some(boundary.to_string())
+            }
         };
         let pre_history = match field(12, "pre_history")? {
             "kept" => SeatListPreHistory::Kept,
@@ -1675,6 +1714,11 @@ pub enum SeatListWriteKind {
     Protect,
     /// `PUT .../seats` (version = stored + 1, or a byte-identical re-PUT)
     Put,
+    /// S4 `POST .../history_wipe` (4.3 "S4", S4-PA-6): the next list, which
+    /// moves `pre_history` from `kept` to `wiped` and keeps every other
+    /// line; no growth gate and no seat claims (version = stored + 1, or a
+    /// byte-identical re-POST)
+    Wipe,
 }
 
 /// Everything the planner reads, as the driver read it inside its
@@ -1698,6 +1742,14 @@ pub struct SeatListWriteInput<'a> {
     /// genesis, a v1-to-v2 upgrade). A channel whose stored list is v2 keeps
     /// v2 whatever it says (4.3 step 1).
     pub formats_v2: bool,
+    /// S4 `history_setting` (7.1 "S4"), read from the configuration by the
+    /// driver: a protect genesis with a boundary or `wiped`, and the wipe
+    /// write, need it. While it is off, S2's "until S4" refusals of a
+    /// non-empty boundary and of `wiped` apply on every path (4.1.1 "S4").
+    pub history_setting: bool,
+    /// Protect only: the request's `wipe_history` flag (7.2 "S4"); `None`
+    /// takes the signed `pre_history` line. Every other write passes `None`.
+    pub wipe_history: Option<bool>,
     /// `text_group_user_ids` of the channel (the 2.3 no-cooldown fallback)
     pub text_group_users: &'a BTreeSet<String>,
     /// The PUT's `X-Audit-Log-Reason` (4.3 step 4d, S2-D20), already
@@ -1726,6 +1778,12 @@ pub struct SeatListWritePlan {
     pub pending_device_removals: Option<Vec<MlsPendingDeviceRemoval>>,
     /// Unset the open Text group's `signer_lost` (4.3 step 7)
     pub clear_signer_lost: bool,
+    /// S4 (2.1 "S4"): the channel's `protected_history` this write sets in
+    /// the same transaction. Protect: the boundary and the wipe state of the
+    /// signed genesis (`None` for a genesis without a boundary). Wipe: the
+    /// request (`HistoryWipe::Requested`), which the driver writes only over
+    /// `HistoryWipe::None` (the state only moves forward). A seat PUT: `None`.
+    pub protected_history: Option<ProtectedHistory>,
 }
 
 impl SeatListWritePlan {
@@ -1794,6 +1852,12 @@ impl SeatListWriteDecision {
 /// open group's `pending_device_removals`. So is 4d (`check_removal_reason`):
 /// a plan that releases anyone without `removal_reason` is refused before
 /// any write, after the step-4 retry return.
+///
+/// S4 (4.3 "S4"): 4c reads `history_setting` (`check_seat_list_history_lines`);
+/// a protect genesis also runs `check_protect_genesis_history`, whose
+/// `protected_history` the plan carries; the wipe write (`Wipe`) is planned
+/// as a seat PUT with 4c turned around, refuses any seat change, and carries
+/// the `Requested` wipe.
 pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWriteDecision> {
     let submission = input.submission;
     let now = input.now;
@@ -1829,10 +1893,10 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
                 return Err(invalid("genesis seat list must be version 1"));
             }
         }
-        (SeatListWriteKind::Put, None) => {
+        (SeatListWriteKind::Put | SeatListWriteKind::Wipe, None) => {
             return Err(invalid("channel has no seat list"));
         }
-        (SeatListWriteKind::Put, Some(stored)) => {
+        (SeatListWriteKind::Put | SeatListWriteKind::Wipe, Some(stored)) => {
             if body.version == stored.version
                 && submission.body == stored.body
                 && submission.signature == stored.signature
@@ -1846,8 +1910,33 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         }
     }
 
-    // Step 4c (S2): immutable and one-way v2 lines, after the retry return
-    check_seat_list_v2_lines(&body, input.stored)?;
+    // Step 4c (S2, with the S4 semantics): immutable and one-way v2 lines,
+    // after the retry return; turned around for the wipe write
+    check_seat_list_history_lines(input.kind, &body, input.stored, input.history_setting)?;
+
+    // S4 (2.1 "S4"): what this write sets as the channel's
+    // `protected_history`, from the signed lines alone
+    let protected_history = match input.kind {
+        SeatListWriteKind::Protect => {
+            check_protect_genesis_history(&body, input.history_setting, input.wipe_history, now)?
+        }
+        SeatListWriteKind::Wipe => {
+            // 4c made sure the list carries the (stored) boundary
+            let boundary = body
+                .v2
+                .as_ref()
+                .and_then(|lines| lines.history_boundary.clone())
+                .ok_or_else(|| create_error!(InternalError))?;
+            Some(ProtectedHistory {
+                boundary,
+                wipe: HistoryWipe::Requested {
+                    at: now,
+                    by: body.signer_user_id.clone(),
+                },
+            })
+        }
+        SeatListWriteKind::Put => None,
+    };
 
     // C1 (W2 audit, decision 2): a list that still names a user the server
     // removed since the stored list is refused before any claim, whatever
@@ -1859,8 +1948,9 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
     }
 
     // Step 5b: when the channel has an open Text group, the signer device
-    // must hold a leaf in it (genesis exempt: no group can exist yet)
-    if input.kind == SeatListWriteKind::Put {
+    // must hold a leaf in it (genesis exempt: no group can exist yet; the
+    // wipe write is not, 4.3 "S4")
+    if input.kind != SeatListWriteKind::Protect {
         if let Some(group) = input.text_group {
             if !group.has_member(&body.signer_user_id, &body.signer_device_id) {
                 return Err(invalid("seat list signer device holds no leaf"));
@@ -1926,6 +2016,14 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
             released.push(seat.user_id.clone());
             seat_rows.push(seat);
         }
+    }
+
+    // 4.3 "S4" (S4-PA-6): the wipe write claims and releases no seat. Its
+    // list names exactly the stored list's seats, so a seat row that would
+    // change here is a state the wipe must not paper over (the signer's own
+    // released seat, say, which only the step-7 recovery list reactivates).
+    if input.kind == SeatListWriteKind::Wipe && (!claimed.is_empty() || !released.is_empty()) {
+        return Err(invalid("the history wipe changes no seat"));
     }
 
     // Step 4d (S2-D20): a list that releases anyone carries a reason. Here,
@@ -2067,6 +2165,7 @@ pub fn plan_seat_list_write(input: &SeatListWriteInput<'_>) -> Result<SeatListWr
         seat_list_ad_sha256,
         pending_device_removals,
         clear_signer_lost,
+        protected_history,
     }))
 }
 
@@ -2140,8 +2239,9 @@ pub fn seat_list_removed_users(
 /// stored v2 list only a v2 body is accepted, whatever the flag says (so a
 /// removal-only PUT keeps working with the flag off); over a stored v1 list
 /// a v2 body (the upgrade) needs the flag. Protect takes a v2 genesis only
-/// while the flag is on and a v1 genesis only while it is off. Every refusal
-/// is `FailedValidation`.
+/// while the flag is on and a v1 genesis only while it is off. The S4 wipe
+/// write needs a v2 list over a stored v2 list (only v2 carries
+/// `pre_history`). Every refusal is `FailedValidation`.
 pub fn check_seat_list_format(
     kind: SeatListWriteKind,
     body: &SeatListBody,
@@ -2157,6 +2257,10 @@ pub fn check_seat_list_format(
             if !submitted_v2 && formats_v2 {
                 return Err(invalid("a genesis list must be v2 while formats_v2 is on"));
             }
+        }
+        (SeatListWriteKind::Wipe, Some(stored)) if stored.is_v2() && submitted_v2 => {}
+        (SeatListWriteKind::Wipe, _) => {
+            return Err(invalid("the history wipe needs a v2 seat list"));
         }
         (SeatListWriteKind::Put, Some(stored)) if stored.is_v2() => {
             if !submitted_v2 {
@@ -2272,31 +2376,79 @@ pub fn check_seat_list_authority(
     }))
 }
 
-/// 4.3 step 4c (S2): immutable and one-way lines of a v2 list. Until S4 a
-/// non-empty `history_boundary` and `pre_history:wiped` are refused on
-/// every path, protect included (so `kept` to `wiped` is refused on the
-/// PUT). Against a stored v2 list: `group_salt` and `history_boundary`
-/// equal, and `pre_history` never `wiped` to `kept`. A stored v1 list
-/// counts as the 4.1.1 predecessor `{ authority: empty, history: hidden,
-/// history_boundary: empty, pre_history: kept }`, so the first v2 list may
-/// pick any salt and any `history` (#222) but sets no boundary. `history`
-/// is free either way. Not here, each enforced once elsewhere: a v1 body
-/// over a stored v2 list (step 1, `check_seat_list_format`) and the
-/// authority never emptied nor lowered (step 3b,
-/// `check_seat_list_authority`). Every refusal is `FailedValidation`; a
-/// stored v2 body that no longer parses fails closed.
+/// 4.3 step 4c as S2 calls it, unchanged: [`check_seat_list_history_lines`]
+/// for a genesis (`stored == None`) or a seat PUT with `history_setting`
+/// OFF, so S2's "until S4" refusals of a non-empty `history_boundary` and of
+/// `pre_history:wiped` apply on every path. The route's pre-transaction
+/// validation (`protected_seat_validation.rs`) still calls this; until it
+/// moves to [`check_seat_list_history_lines`] with the configured flag (W2),
+/// the route refuses every boundary and `wiped` before a driver sees them,
+/// which fails closed.
 pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) -> Result<()> {
+    let kind = if stored.is_some() {
+        SeatListWriteKind::Put
+    } else {
+        SeatListWriteKind::Protect
+    };
+    check_seat_list_history_lines(kind, body, stored, false)
+}
+
+/// 4.3 step 4c with the 4.1.1 "S4" semantics: the immutable and one-way
+/// lines of a v2 list of kind `kind`.
+///
+/// Against a stored v2 list (S2, whatever the flag): `group_salt` and
+/// `history_boundary` equal, and `pre_history` never `wiped` to `kept`. A
+/// stored v1 list counts as the 4.1.1 predecessor `{ authority: empty,
+/// history: hidden, history_boundary: empty, pre_history: kept }`, so the
+/// first v2 list may pick any salt and any `history` (#222) but sets no
+/// boundary. `history` is free either way. Then:
+///
+/// - `history_setting` off: S2's "until S4" refusals, keyed on the flag,
+///   on every path (4.1.1 "S4"): a non-empty boundary and `wiped` are
+///   refused, protect and the wipe write included. A channel protected with
+///   a boundary while the flag was on is therefore refused every list while
+///   it is off (the doc's "every path").
+/// - On, a seat PUT: `kept -> wiped` is refused (only the wipe write and a
+///   protect genesis set it), and a boundary over a stored v1 list is
+///   refused (the predecessor has none).
+/// - On, protect: the genesis may set both; its own rules are
+///   [`check_protect_genesis_history`].
+/// - The wipe write: [`check_seat_list_wipe_lines`].
+///
+/// Not here, each enforced once elsewhere: a v1 body over a stored v2 list
+/// (step 1, `check_seat_list_format`), the authority never emptied nor
+/// lowered (step 3b, `check_seat_list_authority`), and the boundary's own
+/// format and future rule (step 1, `SeatListBody::parse_v2`). Every refusal
+/// is `FailedValidation`; a stored v2 body that no longer parses fails
+/// closed.
+pub fn check_seat_list_history_lines(
+    kind: SeatListWriteKind,
+    body: &SeatListBody,
+    stored: Option<&SeatList>,
+    history_setting: bool,
+) -> Result<()> {
+    if kind == SeatListWriteKind::Wipe {
+        if !history_setting {
+            return Err(invalid("pre_history wiped is refused until S4"));
+        }
+        return check_seat_list_wipe_lines(body, stored);
+    }
+
     let Some(lines) = &body.v2 else {
         return Ok(());
     };
 
     // Against a stored v2 list. Genesis and the v1 predecessor have no salt
     // and no boundary to keep and are `kept`, so nothing here applies.
-    if let Some(stored) = stored.filter(|stored| stored.is_v2()) {
-        let previous = SeatListBody::parse_v2(&stored.body)?
-            .v2
-            .ok_or_else(|| create_error!(InternalError))?;
-
+    let previous = match stored.filter(|stored| stored.is_v2()) {
+        Some(stored) => Some(
+            SeatListBody::parse_v2(&stored.body)?
+                .v2
+                .ok_or_else(|| create_error!(InternalError))?,
+        ),
+        None => None,
+    };
+    if let Some(previous) = &previous {
         if previous.pre_history == SeatListPreHistory::Wiped
             && lines.pre_history == SeatListPreHistory::Kept
         {
@@ -2310,15 +2462,140 @@ pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) 
         }
     }
 
-    // S4 has not shipped: a signed `wiped` with no wipe behind it would be
-    // false, and no path may set a boundary yet
-    if lines.pre_history == SeatListPreHistory::Wiped {
-        return Err(invalid("pre_history wiped is refused until S4"));
+    // S2's "until S4" rules, now keyed on `history_setting`: a signed
+    // `wiped` with no wipe behind it would be false, and no path may carry a
+    // boundary
+    if !history_setting {
+        if lines.pre_history == SeatListPreHistory::Wiped {
+            return Err(invalid("pre_history wiped is refused until S4"));
+        }
+        if lines.history_boundary.is_some() {
+            return Err(invalid("history_boundary is refused until S4"));
+        }
+        return Ok(());
     }
-    if lines.history_boundary.is_some() {
-        return Err(invalid("history_boundary is refused until S4"));
+
+    if kind == SeatListWriteKind::Put {
+        let stored_wiped = previous
+            .as_ref()
+            .is_some_and(|previous| previous.pre_history == SeatListPreHistory::Wiped);
+        if lines.pre_history == SeatListPreHistory::Wiped && !stored_wiped {
+            return Err(invalid(
+                "pre_history goes from kept to wiped only through the history wipe",
+            ));
+        }
+        if previous.is_none() && lines.history_boundary.is_some() {
+            return Err(invalid("history_boundary is immutable"));
+        }
     }
     Ok(())
+}
+
+/// 4.3 "S4" step 4c turned around, for the wipe write (S4-PA-6): over a
+/// stored v2 list, `pre_history` MUST go from `kept` to `wiped`, and every
+/// line but `version`, `issued_at` and the two signer lines MUST equal the
+/// stored list's: `seats`, `device_cap`, `authority`, `history`, the
+/// boundary and the salt (`channel_id` is step 1's). A wipe list therefore
+/// carries the stored, non-empty boundary (`wiped` without one is
+/// malformed). Every refusal is `FailedValidation`; a stored v2 body that no
+/// longer parses fails closed.
+pub fn check_seat_list_wipe_lines(body: &SeatListBody, stored: Option<&SeatList>) -> Result<()> {
+    let (Some(lines), Some(stored)) = (&body.v2, stored.filter(|stored| stored.is_v2())) else {
+        return Err(invalid("the history wipe needs a v2 seat list"));
+    };
+    let previous = SeatListBody::parse_v2(&stored.body)?;
+    let previous_lines = previous
+        .v2
+        .as_ref()
+        .ok_or_else(|| create_error!(InternalError))?;
+
+    if previous_lines.pre_history != SeatListPreHistory::Kept {
+        return Err(invalid("pre_history is already wiped"));
+    }
+    if lines.pre_history != SeatListPreHistory::Wiped {
+        return Err(invalid("the history wipe must set pre_history wiped"));
+    }
+    if body.seats != previous.seats
+        || body.device_cap != previous.device_cap
+        || lines.authority_sha256 != previous_lines.authority_sha256
+        || lines.history != previous_lines.history
+        || lines.history_boundary != previous_lines.history_boundary
+        || lines.group_salt != previous_lines.group_salt
+    {
+        return Err(invalid("the history wipe changes only pre_history"));
+    }
+    Ok(())
+}
+
+/// How far after the server's clock a protect boundary's `ulid_time` may be
+/// (4.3 "S4", ruled in #283 (e)): B is server-minted, but delta instances'
+/// clocks differ, so the server allows the signer's 2 minutes
+pub const MAX_BOUNDARY_CLOCK_SKEW_MS: u64 = 120_000;
+
+/// 4.3 "S4", protect: the genesis's history lines against the server's
+/// rules, and the `protected_history` the protect transaction writes with
+/// the flag (2.1 "S4"); `None` for a genesis without a boundary (a channel
+/// protected while empty, a v1 list), which writes none.
+///
+/// - `wipe_history`, when present, equals the signed `pre_history` (`true`
+///   for `wiped`; a list without a boundary is `kept`), S4-PA-7;
+/// - a boundary needs `history_setting` (4.1.1 "S4", 7.1 "S4");
+/// - a genesis with a boundary seats ONLY its signer (S4-D13, S4-PA-10);
+/// - `ulid_time(B) <= now + 2 min` by the server's clock (#283 (e));
+/// - the wipe state comes from the SIGNED line alone: `kept` gives
+///   `HistoryWipe::None`, `wiped` gives `Requested { at: now, by: signer }`.
+///
+/// Every refusal is `FailedValidation`. The parse already refused a
+/// boundary that is not a canonical ULID or is later than `issued_at`.
+/// Both drivers run this before the in-transaction message probe, so a
+/// refused genesis never answers `ProtectHistoryMoved`, and the planner runs
+/// it again for the plan.
+pub fn check_protect_genesis_history(
+    body: &SeatListBody,
+    history_setting: bool,
+    wipe_history: Option<bool>,
+    now: Timestamp,
+) -> Result<Option<ProtectedHistory>> {
+    let (boundary, wiped) = match &body.v2 {
+        Some(lines) => (
+            lines.history_boundary.as_deref(),
+            lines.pre_history == SeatListPreHistory::Wiped,
+        ),
+        None => (None, false),
+    };
+    if wipe_history.is_some_and(|flag| flag != wiped) {
+        return Err(invalid(
+            "wipe_history disagrees with the signed pre_history",
+        ));
+    }
+    // `wiped` needs a boundary (the parse refuses it without one)
+    let Some(boundary) = boundary else {
+        return Ok(None);
+    };
+    if !history_setting {
+        return Err(invalid("history_boundary is refused until S4"));
+    }
+    if !(body.seats.len() == 1 && body.seats[0] == body.signer_user_id) {
+        return Err(invalid("a genesis with a boundary seats only its signer"));
+    }
+    let now_ms = now
+        .duration_since(Timestamp::UNIX_EPOCH)
+        .whole_milliseconds();
+    if i128::from(ulid_time(boundary)?) > now_ms + i128::from(MAX_BOUNDARY_CLOCK_SKEW_MS) {
+        return Err(invalid("history_boundary is in the future"));
+    }
+
+    Ok(Some(ProtectedHistory {
+        boundary: boundary.to_string(),
+        wipe: if wiped {
+            HistoryWipe::Requested {
+                at: now,
+                by: body.signer_user_id.clone(),
+            }
+        } else {
+            HistoryWipe::None
+        },
+    }))
 }
 
 /// 4.3 step 4d (S2-D20): a seat write whose planner releases anyone needs a
@@ -2441,6 +2718,10 @@ pub enum TextGroupCreator {
 /// the superseded group's `signer_lost` itself, #213), and the creator's
 /// `member_added` entry at epoch 0. `creator` names the 6.1 creator rule
 /// the route applied; a recovery create is never a first group.
+///
+/// S4 (2.5 "S4", fix F3, #287): `history_visible_at_create`, the
+/// visibility of the group's epoch 0, from the list this create binds, for
+/// EVERY Text create (a first group too): `seat_list_history_visible`.
 pub fn prepare_text_group(
     group: &MlsGroup,
     list: &SeatList,
@@ -2489,6 +2770,8 @@ pub fn prepare_text_group(
     prepared.pending_device_removals = vec![];
     prepared.signer_lost = None;
     prepared.rejoin_readd = vec![];
+    prepared.history_visible_at_create =
+        Some(seat_list_history_visible(&SeatListBody::parse(&list.body)?));
     prepared.member_added = vec![MlsMemberAdded {
         user_id: group.created_by.user_id.clone(),
         device_id: group.created_by.device_id.clone(),
@@ -2496,6 +2779,15 @@ pub fn prepare_text_group(
         at: group.created_at,
     }];
     Ok(prepared)
+}
+
+/// The history visibility a seat list gives a transition (2.5 "S4", O-2):
+/// `true` only for a v2 list with `history:visible`; a v2 `hidden` list and
+/// every v1 list (which promised nothing) give `false`
+pub fn seat_list_history_visible(body: &SeatListBody) -> bool {
+    body.v2
+        .as_ref()
+        .is_some_and(|lines| lines.history == SeatListHistory::Visible)
 }
 
 /// Successor rule (6.1): the superseded group is a Text group of the same
@@ -2542,20 +2834,56 @@ pub fn seat_list_channel_server(channel: &Channel) -> Option<&str> {
     }
 }
 
+/// The `history_boundary` a submitted list carries, read leniently: `None`
+/// when the body does not parse (the strict parse that follows refuses it)
+/// or has no boundary. Lets the protect preconditions run before the strict
+/// parse, in their S1 order.
+pub fn submitted_history_boundary(submission: &SeatListSubmission) -> Option<String> {
+    SeatListBody::parse(&submission.body)
+        .ok()
+        .and_then(|body| body.v2)
+        .and_then(|lines| lines.history_boundary)
+}
+
 /// Protect preconditions the driver re-checks inside the protect
 /// transaction, so a racing message or edit cannot slip between the route's
 /// checks and the flag write (7.2 protect): a server `TextChannel`, not yet
-/// protected, no `voice`, not an announcement channel, no messages
-pub fn check_channel_protectable(channel: Option<&Channel>) -> Result<()> {
+/// protected, no `voice`, not an announcement channel. With an EMPTY
+/// `boundary` also no messages as far as `last_message_id` tells (S1); with
+/// a boundary B the channel may hold messages and the driver's
+/// in-transaction probe alone decides (no row newer than B, 7.2 "S4": the
+/// four S1 refusals of a non-empty channel change together).
+pub fn check_channel_protectable(channel: Option<&Channel>, boundary: Option<&str>) -> Result<()> {
     match channel {
         None => Err(create_error!(NotFound)),
         Some(Channel::TextChannel {
             protected: false,
-            last_message_id: None,
+            last_message_id,
             voice: None,
             announcement,
             ..
-        }) if *announcement != Some(true) => Ok(()),
+        }) if *announcement != Some(true) && (boundary.is_some() || last_message_id.is_none()) => {
+            Ok(())
+        }
+        Some(_) => Err(create_error!(InvalidOperation)),
+    }
+}
+
+/// 4.3 "S4", the wipe write's channel, re-read inside its transaction: a
+/// protected server `TextChannel` whose `protected_history` carries the
+/// list's boundary `boundary`, else `InvalidOperation` (the route's answer
+/// for a channel without a boundary; `NotFound` when it is gone). `true`
+/// when the wipe still has to be requested (`HistoryWipe::None`); a wipe
+/// already `Requested` or `Done` is never written again (2.1 "S4": the
+/// state only moves `None -> Requested -> Done`).
+pub fn check_channel_wipeable(channel: Option<&Channel>, boundary: &str) -> Result<bool> {
+    match channel {
+        None => Err(create_error!(NotFound)),
+        Some(Channel::TextChannel {
+            protected: true,
+            protected_history: Some(history),
+            ..
+        }) if history.boundary == boundary => Ok(matches!(history.wipe, HistoryWipe::None)),
         Some(_) => Err(create_error!(InvalidOperation)),
     }
 }

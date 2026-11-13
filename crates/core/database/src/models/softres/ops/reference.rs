@@ -98,6 +98,19 @@ impl AbstractSoftRes for ReferenceDb {
         Ok(())
     }
 
+    /// Ids of every sheet of a channel whose stored `locked` flag is not
+    /// set, ascending.
+    async fn fetch_open_sheet_ids_for_channel(&self, channel: &str) -> Result<Vec<String>> {
+        let sheets = self.softres_sheets.lock().await;
+        let mut open: Vec<String> = sheets
+            .values()
+            .filter(|sheet| sheet.channel == channel && !sheet.locked)
+            .map(|sheet| sheet.id.clone())
+            .collect();
+        open.sort();
+        Ok(open)
+    }
+
     /// Insert or replace a user's reserve row, returning the previous row
     /// if one existed.
     async fn upsert_reserve(

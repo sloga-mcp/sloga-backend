@@ -235,6 +235,13 @@ pub struct ProtectedChannelsFeature {
     /// Whether channels may enter the S2 (v2) formats (design 7.2 "Root
     /// advert"); the bridge passes it to native when signing a list
     pub formats_v2: bool,
+    /// Whether the server accepts the S4 history setting (design 7.1 "S4"
+    /// root advert): history-link writes, a boundary or `wiped` at protect,
+    /// and the wipe. The bridge offers them only while this is true
+    pub history_setting: bool,
+    /// iPhone-only server off switch for protected channels (S8-O5): while
+    /// false, iPhone clients keep protected channels closed
+    pub ios: bool,
 }
 
 /// # Feature Configuration
@@ -530,6 +537,12 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 default_device_cap: config.features.protected_channels.default_device_cap,
                 // As configured: protect and the seat PUT read the same key
                 formats_v2: config.features.protected_channels.formats_v2,
+                // As configured: the history-link PUT, protect and the wipe
+                // read the same key
+                history_setting: config.features.protected_channels.history_setting,
+                // As configured: the iPhone client gate combines it with
+                // `enabled` itself
+                ios: config.features.protected_channels.ios,
             },
             prot,
         },
@@ -807,36 +820,46 @@ mod test {
     /// the test proves the configured value is the one advertised
     const ADVERT_DEVICE_CAP: u32 = 7;
 
-    /// Sets both flags, `formats_v2` (and the device cap) explicitly, then
-    /// fetches the root and checks the protected channels advert. Every case
-    /// is its own `#[test]`: `overwrite_config` runs once per process
-    /// (nextest)
+    /// The protected channels advert of `GET /` as raw JSON, so the
+    /// assertions cover the wire shape, not the typed struct
+    async fn fetch_protected_channels_advert() -> serde_json::Map<String, serde_json::Value> {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        body["features"]["protected_channels"]
+            .as_object()
+            .expect("protected_channels object")
+            .clone()
+    }
+
+    /// Sets both flags, `formats_v2`, `history_setting`, `ios` (and the
+    /// device cap) explicitly, then fetches the root and checks the
+    /// protected channels advert. Every case is its own `#[test]`:
+    /// `overwrite_config` runs once per process (nextest)
     async fn protected_channels_advert_case(
         e2ee: bool,
         enabled: bool,
         advertised: bool,
         formats_v2: bool,
+        history_setting: bool,
+        ios: bool,
     ) {
         revolt_config::overwrite_config(|settings| {
             settings.features.e2ee_enabled = e2ee;
             settings.features.protected_channels.enabled = enabled;
             settings.features.protected_channels.default_device_cap = ADVERT_DEVICE_CAP;
             settings.features.protected_channels.formats_v2 = formats_v2;
+            settings.features.protected_channels.history_setting = history_setting;
+            settings.features.protected_channels.ios = ios;
         })
         .await;
 
-        let harness = crate::util::test::TestHarness::new().await;
-        let response = harness.client.get("/").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
+        let advert = fetch_protected_channels_advert().await;
 
-        // Raw JSON so the assertions cover the wire shape, not the typed struct
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
-        let advert = body["features"]["protected_channels"]
-            .as_object()
-            .expect("protected_channels object");
-
-        assert_eq!(advert.len(), 3, "advert fields: {advert:?}");
+        assert_eq!(advert.len(), 5, "advert fields: {advert:?}");
         assert_eq!(
             advert["formats_v2"].as_bool(),
             Some(formats_v2),
@@ -848,39 +871,100 @@ mod test {
             advert["default_device_cap"].as_u64(),
             Some(ADVERT_DEVICE_CAP as u64)
         );
+        assert_eq!(
+            advert["history_setting"].as_bool(),
+            Some(history_setting),
+            "advert: {advert:?}"
+        );
+        assert_eq!(advert["ios"].as_bool(), Some(ios), "advert: {advert:?}");
+    }
+
+    /// The test config sets neither S4 key on (and names no `ios` at all),
+    /// so both advertise false: the advert defaults to off
+    #[test]
+    fn protected_channels_advert_defaults_history_setting_and_ios_off() {
+        crate::util::test::rt().block_on(async {
+            let advert = fetch_protected_channels_advert().await;
+            assert_eq!(advert.len(), 5, "advert fields: {advert:?}");
+            assert_eq!(
+                advert["history_setting"].as_bool(),
+                Some(false),
+                "advert: {advert:?}"
+            );
+            assert_eq!(advert["ios"].as_bool(), Some(false), "advert: {advert:?}");
+        })
+    }
+
+    /// 7.1 "S4" root advert: `history_setting` is the configured flag, and
+    /// it does not move `ios`
+    #[test]
+    fn protected_channels_advert_carries_history_setting() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, true, false,
+        ))
+    }
+
+    /// S8-O5: `ios` is the configured flag, and it does not move
+    /// `history_setting`
+    #[test]
+    fn protected_channels_advert_carries_ios() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, false, true,
+        ))
+    }
+
+    /// Both are advertised as configured, not ANDed with growth or E2EE:
+    /// the clients combine them with `enabled` themselves
+    #[test]
+    fn protected_channels_advert_carries_history_setting_and_ios_with_growth_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, false, true, true,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, false, false, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, true, false, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, false, false, false,
+        ))
     }
 
     /// 7.2 "Root advert" (#206): `formats_v2` is the configured flag
     #[test]
     fn protected_channels_advert_carries_formats_v2() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, true, false, false,
+        ))
     }
 
     /// `formats_v2` is advertised as configured even with growth off: it
     /// also governs the revocation hook, which runs with growth off (#219)
     #[test]
     fn protected_channels_advert_carries_formats_v2_with_growth_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, true, false, false,
+        ))
     }
 
     /// The node's own config with every Prot switch on and a valid sale

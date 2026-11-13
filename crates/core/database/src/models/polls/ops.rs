@@ -74,8 +74,12 @@ pub trait AbstractPolls: Sync + Send {
     /// Fetch open polls whose expiry instant has passed (crond scan).
     async fn fetch_expired_open_polls(&self, now_ms: i64) -> Result<Vec<Poll>>;
 
+    /// Fetch every open poll of a channel, ordered by poll id (protect
+    /// closes them).
+    async fn fetch_open_polls_for_channel(&self, channel: &str) -> Result<Vec<Poll>>;
+
     /// Delete the polls carried by the given messages, and their ballots
-    /// (message-deletion cascade, single and bulk paths).
+    /// (message-deletion cascade, single and bulk paths, history wipe).
     async fn delete_polls_for_messages(&self, message_ids: &[String]) -> Result<()>;
 
     /// Delete every poll and ballot in a channel (channel-deletion cascade).

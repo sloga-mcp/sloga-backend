@@ -137,6 +137,7 @@ pub async fn create_group(
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     };
 
     match db.create_mls_group(&group, data.supersedes.as_deref()).await? {
@@ -270,6 +271,7 @@ async fn create_text_group(
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     };
 
     match db
@@ -760,6 +762,7 @@ mod tests {
             supersedes: supersedes.map(str::to_string),
             kind: Some(v0::MlsGroupKind::Text),
             generation,
+            protocol: None,
         }
     }
 
@@ -2074,6 +2077,7 @@ mod tests {
                 supersedes: None,
                 kind: kind.clone(),
                 generation: None,
+                protocol: None,
             };
             assert_created(
                 fixture.create_as_owner(request.clone()).await,
@@ -2098,6 +2102,7 @@ mod tests {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         };
         assert_refused(
             fixture.create_as_owner(request.clone()).await,
@@ -2325,53 +2330,77 @@ mod tests {
         }
     }
 
+    /// The oracle case polled straight from the test thread overflows the
+    /// default 2 MiB test stack in a debug build: measured 2026-11-12, base
+    /// 12cfa219 needs 2,093,056 to 2,099,200 bytes and S4-W1 2,097,152 to
+    /// 2,105,344. Run it on a thread with room, as `payments/webhook.rs`
+    /// does. A panic in the case still fails the test.
+    fn on_a_big_stack(case: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(case)
+            .expect("test thread")
+            .join()
+            .expect("the case passes")
+    }
+
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_every_flag_on() {
-        crate::util::test::rt().block_on(Box::pin(hidden_and_missing_channels_answer_alike()))
+        on_a_big_stack(|| {
+            crate::util::test::rt().block_on(Box::pin(hidden_and_missing_channels_answer_alike()))
+        })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_e2ee_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.e2ee_enabled = false;
+        on_a_big_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.protected_channels.enabled = false;
+        on_a_big_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.protected_channels.enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_media_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.media_e2ee_enabled = false;
+        on_a_big_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.media_e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_and_media_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.protected_channels.enabled = false;
-                settings.features.media_e2ee_enabled = false;
+        on_a_big_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.protected_channels.enabled = false;
+                    settings.features.media_e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 }

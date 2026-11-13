@@ -34,17 +34,19 @@ use revolt_result::Result;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    channel_seats_used, check_channel_protectable, check_text_first_generation,
-    check_text_successor, is_genesis_reprotect, plan_seat_list_write, prepare_text_group,
-    report_signer_lost, seat_list_channel_server, seat_release_terms, Channel, ChannelEntitlement,
-    ChannelSeat, MlsGroup, MlsGroupCreateOutcome, MlsPendingDeviceRemoval, MlsSignerLost,
-    MlsSignerLostCause, MongoDb, SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission,
-    SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome,
-    SeatReleaseCause, TextGroupCreator, MAX_CHANNEL_SLOT_CAP,
+    channel_seats_used, check_channel_protectable, check_channel_wipeable,
+    check_protect_genesis_history, check_text_first_generation, check_text_successor,
+    is_genesis_reprotect, plan_seat_list_write, prepare_text_group, report_signer_lost,
+    seat_list_channel_server, seat_release_terms, submitted_history_boundary, Channel,
+    ChannelEntitlement, ChannelSeat, HistoryWipe, MlsGroup, MlsGroupCreateOutcome,
+    MlsPendingDeviceRemoval, MlsSignerLost, MlsSignerLostCause, MongoDb, ProtectedHistory,
+    SeatList, SeatListBody, SeatListSnapshot, SeatListSubmission, SeatListWriteDecision,
+    SeatListWriteInput, SeatListWriteKind, SeatListWriteOutcome, SeatReleaseCause,
+    TextGroupCreator, MAX_CHANNEL_SLOT_CAP,
 };
 
 use super::reference::{is_derived_text_group_id, log_call_squat_evicted};
-use super::AbstractProtectedChannels;
+use super::{AbstractProtectedChannels, SeatListFlags};
 
 const COL_CHANNELS: &str = "channels";
 const COL_SERVERS: &str = "servers";
@@ -54,6 +56,7 @@ const COL_SEATS: &str = "channel_seats";
 const COL_SEAT_LISTS: &str = "channel_seat_lists";
 const COL_GROUPS: &str = "mls_groups";
 const COL_COMMITS: &str = "mls_commits";
+const COL_HISTORY_LINKS: &str = "mls_history_links";
 const COL_JOIN_INTENTS: &str = "mls_join_intents";
 const COL_MESSAGES: &str = "messages";
 const COL_E2EE_QUEUE: &str = "e2ee_queue";
@@ -211,6 +214,32 @@ fn signer_lost_bson(lost: &MlsSignerLost) -> Attempt<Document> {
         "device_id": &lost.device_id,
         "cause": enum_bson(&lost.cause)?,
         "at": timestamp_bson(&lost.at)
+    })
+}
+
+/// A hand-built `HistoryWipe` (2.1 "S4": internally tagged by `state`)
+fn history_wipe_bson(wipe: &HistoryWipe) -> Attempt<Document> {
+    Ok(match wipe {
+        HistoryWipe::None => doc! { "state": "none" },
+        HistoryWipe::Requested { at, by } => doc! {
+            "state": "requested",
+            "at": timestamp_bson(at),
+            "by": by
+        },
+        HistoryWipe::Done { at, count } => doc! {
+            "state": "done",
+            "at": timestamp_bson(at),
+            "count": i64::try_from(*count)
+                .map_err(|_| TxnFail::Refuse(create_error!(InternalError)))?
+        },
+    })
+}
+
+/// A hand-built `protected_history` (2.1 "S4")
+fn protected_history_bson(history: &ProtectedHistory) -> Attempt<Document> {
+    Ok(doc! {
+        "boundary": &history.boundary,
+        "wipe": history_wipe_bson(&history.wipe)?
     })
 }
 
@@ -720,7 +749,8 @@ impl MongoDb {
         channel_id: &str,
         submission: &SeatListSubmission,
         allow_claims: bool,
-        formats_v2: bool,
+        flags: SeatListFlags,
+        wipe_history: Option<bool>,
         now: Timestamp,
         removal_reason: Option<&str>,
     ) -> Attempt<SeatListWriteOutcome> {
@@ -748,7 +778,10 @@ impl MongoDb {
         let mut protect_server: Option<String> = None;
         if kind == SeatListWriteKind::Protect {
             let channel = self.find_channel(session, channel_id).await?;
-            check_channel_protectable(channel.as_ref())?;
+            check_channel_protectable(
+                channel.as_ref(),
+                submitted_history_boundary(submission).as_deref(),
+            )?;
             let server_id = channel
                 .as_ref()
                 .and_then(seat_list_channel_server)
@@ -760,6 +793,10 @@ impl MongoDb {
             let body = SeatListBody::parse(&submission.body)?;
             self.claim_server_owner(session, &server_id, &body.signer_user_id)
                 .await?;
+
+            // S4 (4.3 "S4"): the genesis's history rules, before the message
+            // probe, so a refused genesis never answers `ProtectHistoryMoved`
+            check_protect_genesis_history(&body, flags.history_setting, wipe_history, now)?;
 
             // Decision 13 (W2): a channel with threads is refused. A thread
             // created after this read holds its parent (`txn_serial`,
@@ -775,17 +812,42 @@ impl MongoDb {
                 return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
             }
 
-            // `last_message_id` is written asynchronously (batched), so it
-            // can lag a stored message: ask the messages collection itself
+            // The message probe (7.2 "S4"). With an empty boundary no
+            // message at all (S1; `last_message_id` is written
+            // asynchronously, so it can lag a stored message: ask the
+            // messages collection itself). With a boundary B no message
+            // newer than B, else `ProtectHistoryMoved`; the transaction
+            // aborts, so nothing is written. A plaintext send racing this
+            // transaction holds the channel document
+            // (`hold_channel_unprotected`, after its insert), which
+            // write-conflicts the flag write below, so the retry reads its
+            // row; a send whose hold comes after this commit deletes itself
+            // (R15 "S4").
+            let boundary = body
+                .v2
+                .as_ref()
+                .and_then(|lines| lines.history_boundary.as_deref());
+            let mut probe = doc! { "channel": channel_id };
+            if let Some(boundary) = boundary {
+                probe.insert("_id", doc! { "$gt": boundary });
+            }
             let message: Option<Document> = self
                 .col::<Document>(COL_MESSAGES)
-                .find_one(doc! { "channel": channel_id })
+                .find_one(probe)
                 .session(&mut *session)
                 .await
                 .map_err(db_err("find_one", COL_MESSAGES))?;
             if message.is_some() {
-                return Err(TxnFail::Refuse(create_error!(InvalidOperation)));
+                return Err(TxnFail::Refuse(match boundary {
+                    None => create_error!(InvalidOperation),
+                    Some(_) => create_error!(ProtectHistoryMoved),
+                }));
             }
+
+            // Test-only (compiled out of every build but `cargo test`): the
+            // send-race test's sender writes here, after the probe read
+            #[cfg(test)]
+            super::super::tests::run_protect_probe_hook(channel_id).await;
 
             protect_server = Some(server_id);
         }
@@ -819,11 +881,26 @@ impl MongoDb {
             seats: &seats,
             text_group: text_group.as_ref(),
             allow_claims,
-            formats_v2,
+            formats_v2: flags.formats_v2,
+            history_setting: flags.history_setting,
+            wipe_history,
             text_group_users: &text_group_users,
             removal_reason,
             now,
         })?;
+
+        // S4 (4.3 "S4"): the wipe write reads its channel in this
+        // transaction before any write, and requests the wipe only over
+        // `HistoryWipe::None`
+        let mut request_wipe = false;
+        if let (SeatListWriteKind::Wipe, SeatListWriteDecision::Apply(plan)) = (kind, &decision) {
+            let history = plan
+                .protected_history
+                .as_ref()
+                .ok_or_else(|| TxnFail::Refuse(create_error!(InternalError)))?;
+            let channel = self.find_channel(session, channel_id).await?;
+            request_wipe = check_channel_wipeable(channel.as_ref(), &history.boundary)?;
+        }
 
         // Decision 13 (W2): every newly claimed or reactivated user is a
         // member of the server at commit. Claims need an active
@@ -864,16 +941,53 @@ impl MongoDb {
         .await?;
 
         if kind == SeatListWriteKind::Protect {
+            // No `last_message_id` filter (7.2 "S4"): the in-transaction
+            // probe above is the authority; with the filter a busy channel's
+            // protect would retry until the budget ran out
+            let mut set = doc! { "protected": true };
+            if let SeatListWriteDecision::Apply(plan) = &decision {
+                if let Some(history) = &plan.protected_history {
+                    set.insert("protected_history", protected_history_bson(history)?);
+                }
+            }
             let result = self
                 .col::<Document>(COL_CHANNELS)
                 .update_one(
                     doc! {
                         "_id": channel_id,
                         "channel_type": "TextChannel",
-                        "protected": { "$ne": true },
-                        "last_message_id": null
+                        "protected": { "$ne": true }
                     },
-                    doc! { "$set": { "protected": true } },
+                    doc! { "$set": set },
+                )
+                .session(&mut *session)
+                .await
+                .map_err(db_err("update_one", COL_CHANNELS))?;
+            if result.matched_count == 0 {
+                return Err(TxnFail::Retry {
+                    operation: "update_one",
+                    collection: COL_CHANNELS,
+                });
+            }
+        }
+
+        // S4: the wipe request, field-level, filtered on what was read
+        if let (true, SeatListWriteDecision::Apply(plan)) = (request_wipe, &decision) {
+            let history = plan
+                .protected_history
+                .as_ref()
+                .ok_or_else(|| TxnFail::Refuse(create_error!(InternalError)))?;
+            let result = self
+                .col::<Document>(COL_CHANNELS)
+                .update_one(
+                    doc! {
+                        "_id": channel_id,
+                        "channel_type": "TextChannel",
+                        "protected": true,
+                        "protected_history.boundary": &history.boundary,
+                        "protected_history.wipe.state": "none"
+                    },
+                    doc! { "$set": { "protected_history.wipe": history_wipe_bson(&history.wipe)? } },
                 )
                 .session(&mut *session)
                 .await
@@ -1658,6 +1772,12 @@ impl MongoDb {
                 .session(&mut *session)
                 .await
                 .map_err(db_err("delete_many", COL_COMMITS))?;
+            // S4 (2.8): the history links these groups hold go with them
+            self.col::<Document>(COL_HISTORY_LINKS)
+                .delete_many(doc! { "group_id": { "$in": &group_ids } })
+                .session(&mut *session)
+                .await
+                .map_err(db_err("delete_many", COL_HISTORY_LINKS))?;
             self.col::<Document>(COL_JOIN_INTENTS)
                 .delete_many(doc! { "group_id": { "$in": &group_ids } })
                 .session(&mut *session)
@@ -1744,24 +1864,42 @@ impl AbstractProtectedChannels for MongoDb {
             .snapshot_attempt(&mut session, channel_id))
     }
 
-    async fn protect_channel(
+    async fn protect_channel_with_wipe(
         &self,
         channel_id: &str,
         submission: &SeatListSubmission,
+        wipe_history: Option<bool>,
         now: Timestamp,
     ) -> Result<SeatListWriteOutcome> {
-        let formats_v2 = revolt_config::config()
-            .await
-            .features
-            .protected_channels
-            .formats_v2;
+        let flags = SeatListFlags::read().await;
         run_transaction!(self, |session| self.seat_list_write_attempt(
             &mut session,
             SeatListWriteKind::Protect,
             channel_id,
             submission,
             true,
-            formats_v2,
+            flags,
+            wipe_history,
+            now,
+            None
+        ))
+    }
+
+    async fn request_history_wipe(
+        &self,
+        channel_id: &str,
+        submission: &SeatListSubmission,
+        now: Timestamp,
+    ) -> Result<SeatListWriteOutcome> {
+        let flags = SeatListFlags::read().await;
+        run_transaction!(self, |session| self.seat_list_write_attempt(
+            &mut session,
+            SeatListWriteKind::Wipe,
+            channel_id,
+            submission,
+            false,
+            flags,
+            None,
             now,
             None
         ))
@@ -1775,18 +1913,15 @@ impl AbstractProtectedChannels for MongoDb {
         now: Timestamp,
         removal_reason: Option<&str>,
     ) -> Result<SeatListWriteOutcome> {
-        let formats_v2 = revolt_config::config()
-            .await
-            .features
-            .protected_channels
-            .formats_v2;
+        let flags = SeatListFlags::read().await;
         run_transaction!(self, |session| self.seat_list_write_attempt(
             &mut session,
             SeatListWriteKind::Put,
             channel_id,
             submission,
             allow_claims,
-            formats_v2,
+            flags,
+            None,
             now,
             removal_reason
         ))
