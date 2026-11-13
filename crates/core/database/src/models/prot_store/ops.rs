@@ -681,6 +681,7 @@ mod tests {
                 ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
                     user_id: buyer.clone(),
                     intent_id: intent_id.to_string(),
+                    reason: v0::ProtStoreHoldReason::Paused,
                 }),
             ] {
                 let (answer, after) = run_move(&db, &seeded, &event, NOW).await;
@@ -1265,6 +1266,7 @@ mod tests {
             let hold = ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
                 user_id: buyer.clone(),
                 intent_id: held_intent.to_string(),
+                reason: v0::ProtStoreHoldReason::Paused,
             });
             run_move(&db, &held_seed, &hold, NOW).await;
             let mut moves = Vec::new();
@@ -1639,6 +1641,7 @@ mod tests {
             let hold = ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
                 user_id: buyer.clone(),
                 intent_id,
+                reason: v0::ProtStoreHoldReason::Paused,
             });
             run_move(&db, &seeded, &hold, NOW - HOUR).await;
 
@@ -1920,6 +1923,7 @@ mod tests {
             let hold = ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
                 user_id: gone.clone(),
                 intent_id: held_intent.to_string(),
+                reason: v0::ProtStoreHoldReason::Paused,
             });
             let (_, held) = run_move(&db, &held_seed, &hold, NOW).await;
             let held = held.unwrap();
@@ -2444,6 +2448,7 @@ mod tests {
                 ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
                     user_id: tester.clone(),
                     intent_id: intent_id.to_string(),
+                    reason: v0::ProtStoreHoldReason::Paused,
                 })
             };
             for (n, intent_id) in [
@@ -2708,5 +2713,116 @@ mod tests {
         for u in 0..3 {
             assert_eq!(stored(&db, &apple(7_000 + u)).await.user_id, None);
         }
+    }
+
+    /// R63 through both drivers: an over-cap hold is stored with its reason
+    /// and work item (an optional field, no migration) and no automatic
+    /// credit moves it; a pause hold becomes one through a CAS with no
+    /// posting (R50 accepts it); a staff release credits it once and clears
+    /// both; the held sum counts every Held row whatever its reason
+    #[tokio::test]
+    async fn over_cap_hold_is_stored_converted_and_released_once() {
+        database_test!(|db| async move {
+            install_indexes(&db).await;
+            let buyer = user(63);
+            let (first, second) = (apple(630), apple(631));
+            let intents = [
+                "01INTS6L1C0000000000000630".to_string(),
+                "01INTS6L1C0000000000000631".to_string(),
+            ];
+            for intent_id in &intents {
+                db.insert_prot_store_intent(&intent(
+                    intent_id,
+                    Some(&buyer),
+                    v0::ProtStoreIntentState::Open,
+                ))
+                .await
+                .unwrap();
+            }
+            let hold = |intent_id: &str, reason: v0::ProtStoreHoldReason| {
+                ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
+                    user_id: buyer.clone(),
+                    intent_id: intent_id.to_string(),
+                    reason,
+                })
+            };
+            let first_seed = seed(&first, v0::ProtStore::Apple, 2_600);
+            let second_seed = seed(&second, v0::ProtStore::Apple, 1_000);
+
+            let over = hold(&intents[0], v0::ProtStoreHoldReason::OverCap);
+            let (answer, row) = run_move(&db, &first_seed, &over, NOW).await;
+            assert_eq!(answer, ProtStoreAnswer::Held);
+            let row = row.unwrap();
+            assert_eq!(
+                (row.state, row.hold_reason, row.needs_action.as_deref()),
+                (
+                    v0::ProtStoreState::Held,
+                    Some(v0::ProtStoreHoldReason::OverCap),
+                    Some("over_cap_review")
+                )
+            );
+            assert_eq!(stored(&db, &first).await, row);
+            let used = db
+                .fetch_prot_store_intent(&intents[0])
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(used.state, v0::ProtStoreIntentState::Used);
+
+            for event in [
+                credit(&buyer, &intents[0]),
+                ProtStoreEvent::Unpause { buyer_live: true },
+            ] {
+                let (answer, _) = run_move(&db, &first_seed, &event, NOW + HOUR).await;
+                assert_eq!(answer, ProtStoreAnswer::Held);
+            }
+            assert_eq!(stored(&db, &first).await.version, row.version);
+            assert!(entry(&db, &prot_store_key_purchase(&first)).await.is_none());
+            assert_eq!(wallet(&db, &buyer).await, 0);
+
+            // A pause hold found over the cap: the reason and the work item
+            // change, nothing is posted
+            let paused = hold(&intents[1], v0::ProtStoreHoldReason::Paused);
+            let (_, row) = run_move(&db, &second_seed, &paused, NOW).await;
+            let row = row.unwrap();
+            assert_eq!(row.hold_reason, Some(v0::ProtStoreHoldReason::Paused));
+            assert_eq!(row.needs_action, None);
+            let (answer, converted) = run_move(
+                &db,
+                &second_seed,
+                &hold(&intents[1], v0::ProtStoreHoldReason::OverCap),
+                NOW + HOUR,
+            )
+            .await;
+            assert_eq!(answer, ProtStoreAnswer::Held);
+            let converted = converted.unwrap();
+            assert_eq!(converted.version, row.version + 1);
+            assert_eq!(converted.state, v0::ProtStoreState::Held);
+            assert_eq!(
+                converted.hold_reason,
+                Some(v0::ProtStoreHoldReason::OverCap)
+            );
+            assert_eq!(converted.needs_action.as_deref(), Some("over_cap_review"));
+            assert!(entry(&db, &prot_store_key_purchase(&second))
+                .await
+                .is_none());
+            assert_eq!(db.sum_held_prot_store(&buyer).await.unwrap(), 3_600);
+
+            // The staff release credits once and clears the hold
+            let (answer, released) =
+                run_move(&db, &first_seed, &ProtStoreEvent::Release, NOW + 2 * HOUR).await;
+            assert_eq!(answer, ProtStoreAnswer::Credited);
+            let released = released.unwrap();
+            assert_eq!(released.state, v0::ProtStoreState::Credited);
+            assert_eq!((released.hold_reason, released.needs_action), (None, None));
+            assert_eq!(released.credited_at, Some(NOW + 2 * HOUR));
+            assert!(entry(&db, &prot_store_key_purchase(&first)).await.is_some());
+            assert_eq!(wallet(&db, &buyer).await, 2_600);
+            let (answer, _) =
+                run_move(&db, &first_seed, &ProtStoreEvent::Release, NOW + 3 * HOUR).await;
+            assert_eq!(answer, ProtStoreAnswer::NotAssignable);
+            assert_eq!(wallet(&db, &buyer).await, 2_600);
+            assert_eq!(db.sum_held_prot_store(&buyer).await.unwrap(), 1_000);
+        });
     }
 }

@@ -569,6 +569,20 @@ auto_derived!(
         WrongAccount,
         #[cfg_attr(feature = "serde", serde(rename = "no_buyer"))]
         NoBuyer,
+        /// Held for staff review: crediting it would take the wallet past its cap (R63)
+        #[cfg_attr(feature = "serde", serde(rename = "over_cap"))]
+        OverCap,
+    }
+
+    /// Why a store purchase is Held (R63). A Held row without one is a legacy credit-pause hold.
+    #[derive(Copy)]
+    pub enum ProtStoreHoldReason {
+        /// Store credits were paused when it was seen (or assigned)
+        #[cfg_attr(feature = "serde", serde(rename = "paused"))]
+        Paused,
+        /// Crediting it would take the wallet past `wallet_cap`; only staff release it
+        #[cfg_attr(feature = "serde", serde(rename = "over_cap"))]
+        OverCap,
     }
 
     pub struct ProtStoreVerifyResponse {
@@ -599,6 +613,9 @@ auto_derived!(
         pub state: ProtStoreState,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub reject_reason: Option<ProtStoreRejectReason>,
+        /// Why a Held purchase is held (R63; absent on a legacy pause hold and on every other state)
+        #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+        pub hold_reason: Option<ProtStoreHoldReason>,
         pub refund_gen: u32,
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub storefront: Option<String>,
@@ -1163,13 +1180,19 @@ mod store_tests {
         (ProtStoreVerifyStatus::Rejected, "rejected"),
     ];
 
-    const VERIFY_REASONS: [(ProtStoreVerifyReason, &str); 6] = [
+    const VERIFY_REASONS: [(ProtStoreVerifyReason, &str); 7] = [
         (ProtStoreVerifyReason::Test, "test"),
         (ProtStoreVerifyReason::Unbound, "unbound"),
         (ProtStoreVerifyReason::Refunded, "refunded"),
         (ProtStoreVerifyReason::UnknownProduct, "unknown_product"),
         (ProtStoreVerifyReason::WrongAccount, "wrong_account"),
         (ProtStoreVerifyReason::NoBuyer, "no_buyer"),
+        (ProtStoreVerifyReason::OverCap, "over_cap"),
+    ];
+
+    const HOLD_REASONS: [(ProtStoreHoldReason, &str); 2] = [
+        (ProtStoreHoldReason::Paused, "paused"),
+        (ProtStoreHoldReason::OverCap, "over_cap"),
     ];
 
     /// Fails to compile when a variant is added without a row in the tables above
@@ -1220,8 +1243,50 @@ mod store_tests {
             | ProtStoreVerifyReason::Refunded
             | ProtStoreVerifyReason::UnknownProduct
             | ProtStoreVerifyReason::WrongAccount
-            | ProtStoreVerifyReason::NoBuyer => {}
+            | ProtStoreVerifyReason::NoBuyer
+            | ProtStoreVerifyReason::OverCap => {}
         }
+    }
+
+    /// Fails to compile when a hold reason is added without a row in `HOLD_REASONS`
+    #[allow(dead_code)]
+    fn listed_in_hold_reasons(reason: ProtStoreHoldReason) {
+        match reason {
+            ProtStoreHoldReason::Paused | ProtStoreHoldReason::OverCap => {}
+        }
+    }
+
+    /// R63: the hold reasons and the `over_cap` verify reason are wire strings
+    /// the clients match on; another spelling is refused
+    #[test]
+    fn hold_reasons_round_trip_as_their_wire_names() {
+        round_trips(&HOLD_REASONS);
+        assert!(serde_json::from_str::<ProtStoreHoldReason>(r#""OverCap""#).is_err());
+        assert!(serde_json::from_str::<ProtStoreHoldReason>(r#""overCap""#).is_err());
+        assert_eq!(
+            serde_json::to_value(ProtStoreVerifyReason::OverCap).unwrap(),
+            serde_json::json!("over_cap")
+        );
+    }
+
+    /// R63: verify of an over-cap hold answers pending with the reason
+    #[test]
+    fn verify_response_of_an_over_cap_hold_carries_the_reason() {
+        let held = ProtStoreVerifyResponse {
+            status: ProtStoreVerifyStatus::Pending,
+            reason: Some(ProtStoreVerifyReason::OverCap),
+            purchase_id: Some("apple:prod:2000000123456789".to_string()),
+            balance: None,
+            ledger_id: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&held).unwrap(),
+            serde_json::json!({
+                "status": "pending",
+                "reason": "over_cap",
+                "purchase_id": "apple:prod:2000000123456789"
+            })
+        );
     }
 
     fn round_trips<T>(table: &[(T, &str)])
@@ -1399,6 +1464,7 @@ mod store_tests {
             environment: ProtStoreEnvironment::Production,
             state: ProtStoreState::Rejected,
             reject_reason: Some(ProtStoreRejectReason::Unbound),
+            hold_reason: None,
             refund_gen: 0,
             storefront: None,
             needs_action: None,
@@ -1431,6 +1497,34 @@ mod store_tests {
                 "ledger": []
             })
         );
+    }
+
+    /// R63: staff see why a Held purchase is held
+    #[test]
+    fn admin_purchase_shows_the_hold_reason() {
+        let view: ProtStorePurchaseView = serde_json::from_value(serde_json::json!({
+            "id": "play:00000000000000000000000000000000000000000000000000000000000000ff",
+            "store": "play",
+            "product_id": "gg.sloga.prot.p10",
+            "prot": 1000,
+            "quantity": 1,
+            "environment": "Production",
+            "state": "Held",
+            "refund_gen": 0,
+            "created_at": 1_700_000_000_000i64,
+            "updated_at": 1_700_000_000_000i64
+        }))
+        .unwrap();
+        assert_eq!(view.hold_reason, None);
+
+        let held = ProtStorePurchaseView {
+            hold_reason: Some(ProtStoreHoldReason::OverCap),
+            needs_action: Some("over_cap_review".to_string()),
+            ..view
+        };
+        let value = serde_json::to_value(&held).unwrap();
+        assert_eq!(value["hold_reason"], "over_cap");
+        assert_eq!(value["needs_action"], "over_cap_review");
     }
 
     /// Bounds of the bodies (only built with the `validator` feature)

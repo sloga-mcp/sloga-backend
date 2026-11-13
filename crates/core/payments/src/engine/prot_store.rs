@@ -28,16 +28,17 @@ use std::sync::{LazyLock, Mutex, PoisonError};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use revolt_database::util::prot_store_alert::{
     send_ops_alert, PROT_STORE_LOG_UNDECODABLE_NOTIFICATION, PROT_STORE_NEEDS_CHARGEBACK,
-    PROT_STORE_NEEDS_HELD, PROT_STORE_NEEDS_REVERSED_UNPAID, PROT_STORE_NEEDS_UNBOUND,
-    PROT_STORE_NEEDS_UNCONSUMED,
+    PROT_STORE_NEEDS_HELD, PROT_STORE_NEEDS_OVER_CAP, PROT_STORE_NEEDS_REVERSED_UNPAID,
+    PROT_STORE_NEEDS_UNBOUND, PROT_STORE_NEEDS_UNCONSUMED,
 };
 use revolt_database::{
     build_store_move, is_store_purchase_id, plan_store_move, prot_store_key_purchase,
     prot_store_refund_gen_of, prot_user_account, store_country_alpha2, Database, OrderState,
-    ProtLedgerEntry, ProtStoreAnswer, ProtStoreApple, ProtStoreCursor, ProtStoreEvent,
-    ProtStoreIntent, ProtStoreLedgerPlan, ProtStoreMoveOutcome, ProtStoreMovePlan, ProtStorePlay,
-    ProtStorePurchase, ProtStoreVerdict, PROT_STORE_CURSOR_APPLE, PROT_STORE_CURSOR_PLAY,
-    PROT_STORE_INTENT_TTL_MS, PROT_STORE_MAX_OPEN_INTENTS, PROT_STORE_MOVE_RETRIES,
+    PaymentOrder, ProtLedgerEntry, ProtStoreAnswer, ProtStoreApple, ProtStoreCursor,
+    ProtStoreEvent, ProtStoreIntent, ProtStoreLedgerPlan, ProtStoreMoveOutcome, ProtStoreMovePlan,
+    ProtStorePlay, ProtStorePurchase, ProtStoreVerdict, PROT_STORE_CURSOR_APPLE,
+    PROT_STORE_CURSOR_PLAY, PROT_STORE_INTENT_TTL_MS, PROT_STORE_MAX_OPEN_INTENTS,
+    PROT_STORE_MOVE_RETRIES,
 };
 use revolt_models::v0::{self, ProductFamily, ProtEntryKind};
 use revolt_result::{create_error, ErrorType, Result};
@@ -237,6 +238,9 @@ struct SeenPurchase {
     priced: Priced,
     /// Apple `type == "Consumable"` (Play: always)
     consumable: bool,
+    /// `wallet_cap` of the Prot settings the purchase was seen under: an
+    /// automatic credit past it is held for staff (R63)
+    wallet_cap: i64,
 }
 
 /// What a store reports about a purchase
@@ -286,6 +290,7 @@ fn seed_row(
         country,
         state: v0::ProtStoreState::Rejected,
         reject_reason: None,
+        hold_reason: None,
         refund_gen: 0,
         refunds: Vec::new(),
         unreinstated_reversals: 0,
@@ -368,13 +373,78 @@ fn seed_token(seed: &ProtStorePurchase) -> Option<&str> {
     }
 }
 
+/// R5's Stripe term: the Prot of the user's Paid Prot orders not credited
+/// yet (they will be, whatever the cap says then). `orders` may hold orders
+/// in any state; only Paid ones count.
+async fn uncredited_stripe_prot(db: &Database, orders: &[PaymentOrder]) -> Result<i64> {
+    let mut uncredited = 0_i64;
+    for order in orders
+        .iter()
+        .filter(|o| o.state == OrderState::Paid && o.sku.family() == ProductFamily::Prot)
+    {
+        if !purchase_applied(db, &order.id).await? {
+            uncredited = uncredited.saturating_add(catalog::sku_prot(&order.sku).unwrap_or(0));
+        }
+    }
+    Ok(uncredited)
+}
+
+/// R63: whether an AUTOMATIC credit of `prot` to `user_id` would take the
+/// wallet past `wallet_cap`, in R5's terms: the balance (S5b's `held` is part
+/// of it), uncredited Stripe Prot, every OTHER Held store row of the user
+/// (any hold reason; `own_row` is left out), the user's live intents (R62)
+/// except the purchase's own bound intent, and this purchase. Read outside
+/// the move's transaction: two concurrent credits may both pass (soft cap,
+/// R25).
+async fn over_wallet_cap(
+    db: &Database,
+    wallet_cap: i64,
+    user_id: &str,
+    own_row: Option<&ProtStorePurchase>,
+    own_intent: Option<&str>,
+    prot: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let orders = db
+        .fetch_payment_orders_by_user(user_id, &[OrderState::Paid])
+        .await?;
+    let uncredited = uncredited_stripe_prot(db, &orders).await?;
+    let own_held = own_row
+        .filter(|row| {
+            row.state == v0::ProtStoreState::Held && row.user_id.as_deref() == Some(user_id)
+        })
+        .map_or(0, |row| row.prot.max(0));
+    let held = db
+        .sum_held_prot_store(user_id)
+        .await?
+        .saturating_sub(own_held)
+        .max(0);
+    let intents = db
+        .fetch_live_prot_store_intents(user_id, now_ms)
+        .await?
+        .iter()
+        .filter(|intent| Some(intent.id.as_str()) != own_intent)
+        .fold(0_i64, |total, intent| total.saturating_add(intent.prot));
+    let committed = wallet_balance(db, user_id)
+        .await?
+        .saturating_add(uncredited)
+        .saturating_add(held)
+        .saturating_add(intents)
+        .saturating_add(prot);
+    Ok(committed > wallet_cap)
+}
+
 /// The verdict on a verified, not-revoked purchase (9.4 steps 3, 5-7),
 /// decided before the row is looked at. Read again on every move attempt, so
 /// a re-plan after a Conflict sees an intent that was used or unlinked since.
+/// `row` is the purchase's row as this attempt read it (the cap leaves it
+/// out of the held sum, R63).
 async fn seen_verdict(
     db: &Database,
     st: &ProtStoreSettings,
     purchase: &SeenPurchase,
+    row: Option<&ProtStorePurchase>,
+    now_ms: i64,
 ) -> Result<ProtStoreVerdict> {
     use revolt_models::v0::ProtStoreRejectReason as Reason;
 
@@ -424,11 +494,36 @@ async fn seen_verdict(
         return Ok(reject(Reason::UnknownProduct));
     }
 
-    Ok(if st.credit_paused {
-        ProtStoreVerdict::Hold { user_id, intent_id }
-    } else {
-        ProtStoreVerdict::Credit { user_id, intent_id }
-    })
+    if st.credit_paused {
+        return Ok(ProtStoreVerdict::Hold {
+            user_id,
+            intent_id,
+            reason: v0::ProtStoreHoldReason::Paused,
+        });
+    }
+
+    // R63 (owner, "hold over-cap credits"): money that arrived is never
+    // refused; a credit that would take the wallet past its cap is held for
+    // staff instead. Sandbox purchases too (the tester cap stays as well).
+    if over_wallet_cap(
+        db,
+        purchase.wallet_cap,
+        &user_id,
+        row,
+        Some(&intent_id),
+        priced_prot(purchase.priced),
+        now_ms,
+    )
+    .await?
+    {
+        return Ok(ProtStoreVerdict::Hold {
+            user_id,
+            intent_id,
+            reason: v0::ProtStoreHoldReason::OverCap,
+        });
+    }
+
+    Ok(ProtStoreVerdict::Credit { user_id, intent_id })
 }
 
 // ---------------------------------------------------------------------------
@@ -445,12 +540,18 @@ enum StoreEvent<'a> {
         revocation: Revocation,
     },
     Reverse,
-    Unpause,
+    /// The end of a credit pause; a pause hold that would take the wallet
+    /// past `wallet_cap` becomes an over-cap hold instead (R63)
+    Unpause {
+        wallet_cap: i64,
+    },
     Assign {
         user_id: String,
         admin_id: String,
         paused: bool,
     },
+    /// R63: a staff release of an over-cap hold
+    Release,
 }
 
 /// The row's user is set, exists and is not deleted
@@ -467,9 +568,12 @@ async fn plan_event(
     seed: &ProtStorePurchase,
     event: &StoreEvent<'_>,
     row: Option<&ProtStorePurchase>,
+    now_ms: i64,
 ) -> Result<ProtStoreEvent> {
     Ok(match event {
-        StoreEvent::Seen(purchase) => ProtStoreEvent::Seen(seen_verdict(db, st, purchase).await?),
+        StoreEvent::Seen(purchase) => {
+            ProtStoreEvent::Seen(seen_verdict(db, st, purchase, row, now_ms).await?)
+        }
         StoreEvent::Revoke { revocation } => {
             // R53: a refund seen before any row is a tombstone that marks the
             // intent its token resolved to Used (and names its user); an
@@ -493,9 +597,41 @@ async fn plan_event(
         StoreEvent::Reverse => ProtStoreEvent::Reverse {
             buyer_live: buyer_live(db, row).await?,
         },
-        StoreEvent::Unpause => ProtStoreEvent::Unpause {
-            buyer_live: buyer_live(db, row).await?,
-        },
+        StoreEvent::Unpause { wallet_cap } => {
+            let live = buyer_live(db, row).await?;
+            let mut planned = ProtStoreEvent::Unpause { buyer_live: live };
+            // R63: the end of a pause is an automatic credit, so the cap
+            // applies (the row's own Prot is left out of the held sum). An
+            // over-cap hold is never unpaused (reconcile skips it and the
+            // planner refuses it).
+            let pause_hold =
+                row.filter(|row| live && row.hold_reason != Some(v0::ProtStoreHoldReason::OverCap));
+            if let Some((row, user_id)) =
+                pause_hold.and_then(|row| Some((row, row.user_id.as_deref()?)))
+            {
+                if over_wallet_cap(
+                    db,
+                    *wallet_cap,
+                    user_id,
+                    Some(row),
+                    row.intent_id.as_deref(),
+                    row.prot,
+                    now_ms,
+                )
+                .await?
+                {
+                    planned = ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
+                        user_id: user_id.to_string(),
+                        // An assigned row has no intent; the planner's move
+                        // of an existing row never reads it
+                        intent_id: row.intent_id.clone().unwrap_or_default(),
+                        reason: v0::ProtStoreHoldReason::OverCap,
+                    });
+                }
+            }
+            planned
+        }
+        StoreEvent::Release => ProtStoreEvent::Release,
         StoreEvent::Assign {
             user_id,
             admin_id,
@@ -622,7 +758,7 @@ async fn run_store_move(
     let id = seed.id.as_str();
     for _ in 0..PROT_STORE_MOVE_RETRIES {
         let row = db.fetch_prot_store_purchase(id).await?;
-        let planned = plan_event(db, st, seed, event, row.as_ref()).await?;
+        let planned = plan_event(db, st, seed, event, row.as_ref(), now_ms).await?;
         let reinstate = match (&row, &planned) {
             (Some(row), ProtStoreEvent::Reverse { .. })
                 if row.state == v0::ProtStoreState::Revoked && row.refund_gen >= 1 =>
@@ -744,6 +880,23 @@ async fn after_move(
     if newly_unpaid {
         if let Err(err) = alert_row(db, st, id, PROT_STORE_NEEDS_REVERSED_UNPAID).await {
             log::warn!("payments: could not claim the reversed_unpaid alert of {id}: {err:?}");
+        }
+    }
+
+    // R63: a purchase that just entered an over-cap hold (first sight, or a
+    // pause hold found over the cap) is staff work, mailed once
+    let over_cap = |row: &ProtStorePurchase| {
+        row.state == v0::ProtStoreState::Held
+            && row.hold_reason == Some(v0::ProtStoreHoldReason::OverCap)
+    };
+    if over_cap(stored) && !before.is_some_and(over_cap) {
+        log::warn!(
+            "payments: PROT_STORE_OVER_CAP_HELD id={id} user={} prot={}",
+            stored.user_id.as_deref().unwrap_or("-"),
+            stored.prot
+        );
+        if let Err(err) = alert_row(db, st, id, PROT_STORE_NEEDS_OVER_CAP).await {
+            log::warn!("payments: could not claim the over_cap_review alert of {id}: {err:?}");
         }
     }
 
@@ -995,15 +1148,7 @@ async fn issue_store_intent(
 
     // R5. `held` (S5b) is part of the balance, so it is not added again. A
     // Paid Stripe order not credited yet will be, whatever the cap says then.
-    let mut uncredited = 0_i64;
-    for order in orders
-        .iter()
-        .filter(|o| o.state == OrderState::Paid && o.sku.family() == ProductFamily::Prot)
-    {
-        if !purchase_applied(db, &order.id).await? {
-            uncredited = uncredited.saturating_add(catalog::sku_prot(&order.sku).unwrap_or(0));
-        }
-    }
+    let uncredited = uncredited_stripe_prot(db, &orders).await?;
     // R62: a cancelled intent still binds a late purchase until it expires
     // (E9), so the cap counts it; counting Open only let intent → cancel →
     // intent buy past the cap
@@ -1265,6 +1410,7 @@ fn apple_purchase(
         token,
         priced,
         consumable: tx.r#type == "Consumable",
+        wallet_cap: ps.wallet_cap,
     }
 }
 
@@ -1326,6 +1472,7 @@ fn play_purchase(
         token: found.obfuscated_external_account_id.clone(),
         priced,
         consumable: true,
+        wallet_cap: ps.wallet_cap,
     })
 }
 
@@ -1398,7 +1545,8 @@ fn rejected(
 /// Verify a store purchase the app reports and credit it to the caller
 /// (9.4). Works whether or not the store is open (E9). Answers 200 with
 /// `credited` / `already_credited` (balance and ledger row), `pending` (Play
-/// PENDING, or recorded Held while credits are paused) or `rejected` with a
+/// PENDING, or recorded Held while credits are paused; with reason
+/// `over_cap` when held for staff over the wallet cap, R63) or `rejected` with a
 /// reason (`wrong_account` writes nothing). Errors: `IsBot`;
 /// `ProtStoreUnavailable` (store client not configured);
 /// `FailedValidation` (body shape); `ProtStoreVerifyFailed` (signature,
@@ -1562,15 +1710,26 @@ pub async fn verify_store_purchase(
         Settled::Moved(result) => result,
     };
 
-    verify_answer(db, user_id, &purchase_id, &result.answer, now_ms).await
+    verify_answer(
+        db,
+        user_id,
+        &purchase_id,
+        &result.answer,
+        result.row.as_ref(),
+        now_ms,
+    )
+    .await
 }
 
-/// 9.4 step 8: the answer of a verify
+/// 9.4 step 8: the answer of a verify. `row` is the purchase's row after the
+/// move (as read, when nothing moved): a Held row held over the cap answers
+/// `pending` with reason `over_cap` (R63); a pause hold, `pending` alone.
 async fn verify_answer(
     db: &Database,
     user_id: &str,
     purchase_id: &str,
     answer: &ProtStoreAnswer,
+    row: Option<&ProtStorePurchase>,
     now_ms: i64,
 ) -> Result<v0::ProtStoreVerifyResponse> {
     use revolt_models::v0::{
@@ -1594,7 +1753,11 @@ async fn verify_answer(
                 ledger_id: Some(entry.id),
             }
         }
-        ProtStoreAnswer::Held => verify_response(Status::Pending, None, id),
+        ProtStoreAnswer::Held => {
+            let over_cap =
+                row.is_some_and(|row| row.hold_reason == Some(v0::ProtStoreHoldReason::OverCap));
+            verify_response(Status::Pending, over_cap.then_some(Reason::OverCap), id)
+        }
         ProtStoreAnswer::Rejected(Reject::TestPurchase) => rejected(Reason::Test, id),
         ProtStoreAnswer::Rejected(Reject::Unbound) => rejected(Reason::Unbound, id),
         ProtStoreAnswer::Rejected(Reject::UnknownProduct) => rejected(Reason::UnknownProduct, id),
@@ -2098,9 +2261,12 @@ pub async fn reconcile_store(
         reconcile_apple_history(db, ps, st, apple, now_ms, &mut report).await;
     }
     if st.credit_paused {
-        reconcile_paused_play(db, st, now_ms, &mut report).await;
+        reconcile_paused_play(db, st, now_ms, false, &mut report).await;
     } else {
-        reconcile_held(db, st, apple, play, now_ms, &mut report).await;
+        reconcile_held(db, ps, st, apple, play, now_ms, &mut report).await;
+        // R63: an over-cap Play hold is not credited when a pause ends, so
+        // the 24 h Play alert covers it while credits run too
+        reconcile_paused_play(db, st, now_ms, true, &mut report).await;
     }
 
     match db
@@ -2531,12 +2697,15 @@ async fn reconcile_apple_history(
     }
 }
 
-/// 16 step 5: credit pause off → every Held row is looked up at the store
-/// again (audit N3): revoked → Revoke; bought → Unpause; a failed lookup
-/// waits for the next tick. A Play credit is then consumed. Rows rotate
-/// (MINOR 6).
+/// 16 step 5: credit pause off → every pause hold is looked up at the store
+/// again (audit N3): revoked → Revoke; bought → Unpause, or (R63) an
+/// over-cap hold when the credit would take the wallet past `wallet_cap`; a
+/// failed lookup waits for the next tick. A Play credit is then consumed.
+/// An over-cap hold is never unpaused: it waits for staff or a refund. Rows
+/// rotate (MINOR 6).
 async fn reconcile_held(
     db: &Database,
+    ps: &ProtSalesSettings,
     st: &ProtStoreSettings,
     apple: &dyn AppleStoreApi,
     play: &dyn PlayStoreApi,
@@ -2571,8 +2740,13 @@ async fn reconcile_held(
         };
 
         for row in rows {
+            if row.hold_reason == Some(v0::ProtStoreHoldReason::OverCap) {
+                continue;
+            }
             let event = match fresh_store_state(st, apple, play, &row, now_ms).await {
-                Ok(FreshState::Live) => StoreEvent::Unpause,
+                Ok(FreshState::Live) => StoreEvent::Unpause {
+                    wallet_cap: ps.wallet_cap,
+                },
                 Ok(FreshState::Revoked(revocation)) => StoreEvent::Revoke { revocation },
                 Ok(FreshState::Missing | FreshState::Unsettled) => {
                     log::warn!(
@@ -2615,10 +2789,14 @@ async fn reconcile_held(
 /// gets the `play_held_24h` work item, then the claimed (mailed) alert: Play
 /// refunds an unconsumed purchase after 3 days (owner Q2). Leaving Held
 /// clears it (`after_move`). No store call is made; nothing moves.
+/// R63: an over-cap Play hold gets the same day alert, paused or not
+/// (`over_cap_only` while credits run), and keeps its `over_cap_review` work
+/// item (the item its release clears).
 async fn reconcile_paused_play(
     db: &Database,
     st: &ProtStoreSettings,
     now_ms: i64,
+    over_cap_only: bool,
     report: &mut StoreReconcileReport,
 ) {
     let rows = match db
@@ -2636,12 +2814,14 @@ async fn reconcile_paused_play(
             return;
         }
     };
-    for row in rows
-        .iter()
-        .filter(|row| now_ms.saturating_sub(row.created_at) > PLAY_HELD_ALERT_MS)
-    {
+    let held_over_cap =
+        |row: &ProtStorePurchase| row.hold_reason == Some(v0::ProtStoreHoldReason::OverCap);
+    for row in rows.iter().filter(|row| {
+        now_ms.saturating_sub(row.created_at) > PLAY_HELD_ALERT_MS
+            && (!over_cap_only || held_over_cap(row))
+    }) {
         let raised = async {
-            if row.needs_action.as_deref() != Some(PROT_STORE_NEEDS_HELD) {
+            if !held_over_cap(row) && row.needs_action.as_deref() != Some(PROT_STORE_NEEDS_HELD) {
                 db.set_prot_store_needs_action(&row.id, PROT_STORE_NEEDS_HELD, now_ms)
                     .await?;
             }
@@ -2725,6 +2905,7 @@ fn purchase_view(row: &ProtStorePurchase) -> v0::ProtStorePurchaseView {
         environment: row.environment,
         state: row.state,
         reject_reason: row.reject_reason,
+        hold_reason: row.hold_reason,
         refund_gen: row.refund_gen,
         storefront: row.storefront.clone(),
         needs_action: row.needs_action.clone(),
@@ -2886,6 +3067,96 @@ pub async fn admin_assign_store_purchase(
     log::info!(
         "payments: store purchase {id} assigned to {target_user_id} by {admin_id} ({:?})",
         result.answer
+    );
+    admin_store_purchase(db, id).await
+}
+
+/// R63: staff release of a purchase held over the wallet cap: credit it to
+/// its buyer, ignoring the cap. Only a `Held` row whose `hold_reason` is
+/// `over_cap` moves; anything else → `InvalidOperation`. The buyer must
+/// exist, not be deleted, not be a bot, and not be the acting admin. While
+/// store credits are paused nothing is released (`InvalidOperation`; the
+/// pause wins, as for assign, R16). The purchase is looked up at the store
+/// first: revoked → the normal Revoke move (nothing credited) and
+/// `InvalidOperation`; unknown or unsettled → `InvalidOperation`; a failed
+/// lookup → `InternalError`; no credentials → `ProtStoreUnavailable`. A Play
+/// credit is consumed after it commits. Clears `over_cap_review`.
+pub async fn admin_release_store_purchase(
+    db: &Database,
+    st: &ProtStoreSettings,
+    apple: &dyn AppleStoreApi,
+    play: &dyn PlayStoreApi,
+    admin_id: &str,
+    id: &str,
+    now_ms: i64,
+) -> Result<v0::ProtStoreAdminPurchase> {
+    if !is_store_purchase_id(id) {
+        return Err(create_error!(NotFound));
+    }
+    let row = db
+        .fetch_prot_store_purchase(id)
+        .await?
+        .ok_or_else(|| create_error!(NotFound))?;
+    if row.state != v0::ProtStoreState::Held
+        || row.hold_reason != Some(v0::ProtStoreHoldReason::OverCap)
+    {
+        return Err(create_error!(InvalidOperation));
+    }
+    // The buyer: never the acting admin, never a bot, deleted or gone account
+    let Some(buyer_id) = row.user_id.as_deref() else {
+        return Err(create_error!(InvalidOperation));
+    };
+    if buyer_id == admin_id {
+        return Err(create_error!(InvalidOperation));
+    }
+    let buyer = match db.fetch_user(buyer_id).await {
+        Ok(user) => user,
+        Err(err) if matches!(err.error_type, ErrorType::NotFound) => {
+            return Err(create_error!(InvalidOperation))
+        }
+        Err(err) => return Err(err),
+    };
+    if buyer.bot.is_some() || is_deleted(&buyer) {
+        return Err(create_error!(InvalidOperation));
+    }
+    if st.credit_paused {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    match fresh_store_state(st, apple, play, &row, now_ms).await {
+        Ok(FreshState::Live) => {}
+        Ok(FreshState::Revoked(revocation)) => {
+            let event = StoreEvent::Revoke { revocation };
+            run_store_move(db, st, &row, &event, now_ms).await?;
+            return Err(create_error!(InvalidOperation));
+        }
+        Ok(FreshState::Missing | FreshState::Unsettled) => {
+            return Err(create_error!(InvalidOperation))
+        }
+        Err(FreshError::Api(StoreApiError::NotConfigured)) => {
+            return Err(create_error!(ProtStoreUnavailable))
+        }
+        Err(err) => {
+            log::warn!(
+                "payments: PROT_STORE_LOOKUP_FAILED id={id}: {}",
+                fresh_error_text(&err)
+            );
+            return Err(create_error!(InternalError));
+        }
+    }
+
+    let result = run_store_move(db, st, &row, &StoreEvent::Release, now_ms).await?;
+    if result.answer != ProtStoreAnswer::Credited {
+        return Err(create_error!(InvalidOperation));
+    }
+    if let Some(moved) = result.row.as_ref().filter(|_| result.posted) {
+        if moved.store == v0::ProtStore::Play {
+            consume_after_credit(db, play, moved, now_ms).await;
+        }
+    }
+    log::info!(
+        "payments: PROT_STORE_RELEASED id={id} user={buyer_id} prot={} by {admin_id}",
+        row.prot
     );
     admin_store_purchase(db, id).await
 }
@@ -5914,6 +6185,625 @@ mod tests {
             admin_store_purchase(&h.db, &id).await.unwrap().ledger.len(),
             1
         );
+        done(h).await;
+    }
+
+    // --- R63: over-cap holds ----------------------------------------------------
+
+    /// The Prot settings with `wallet_cap` = `cap`
+    fn capped(h: &Harness, cap: i64) -> ProtSalesSettings {
+        ProtSalesSettings {
+            wallet_cap: cap,
+            ..h.ps.clone()
+        }
+    }
+
+    async fn verify_apple_under(
+        h: &Harness,
+        ps: &ProtSalesSettings,
+        st: &ProtStoreSettings,
+        user: &str,
+        signed: &str,
+        now: i64,
+    ) -> v0::ProtStoreVerifyResponse {
+        let data = v0::DataProtStoreVerify {
+            store: v0::ProtStore::Apple,
+            signed_transaction: Some(signed.to_string()),
+            product_id: None,
+            purchase_token: None,
+        };
+        verify_store_purchase(&h.db, ps, st, &h.apple, &h.play, user, &data, now)
+            .await
+            .expect("verified")
+    }
+
+    async fn verify_play_under(
+        h: &Harness,
+        ps: &ProtSalesSettings,
+        user: &str,
+        product: &str,
+        token: &str,
+        now: i64,
+    ) -> v0::ProtStoreVerifyResponse {
+        let data = v0::DataProtStoreVerify {
+            store: v0::ProtStore::Play,
+            signed_transaction: None,
+            product_id: Some(product.to_string()),
+            purchase_token: Some(token.to_string()),
+        };
+        verify_store_purchase(&h.db, ps, &h.st, &h.apple, &h.play, user, &data, now)
+            .await
+            .expect("verified")
+    }
+
+    async fn release(
+        h: &Harness,
+        st: &ProtStoreSettings,
+        admin: &str,
+        id: &str,
+        at: i64,
+    ) -> Result<v0::ProtStoreAdminPurchase> {
+        admin_release_store_purchase(&h.db, st, &h.apple, &h.play, admin, id, at).await
+    }
+
+    /// The row is held over the cap for staff: reason, work item, alert
+    fn assert_over_cap_hold(row: &ProtStorePurchase) {
+        assert_eq!(row.state, v0::ProtStoreState::Held, "{}", row.id);
+        assert_eq!(
+            row.hold_reason,
+            Some(v0::ProtStoreHoldReason::OverCap),
+            "{}",
+            row.id
+        );
+        assert_eq!(
+            row.needs_action.as_deref(),
+            Some(PROT_STORE_NEEDS_OVER_CAP),
+            "{}",
+            row.id
+        );
+        assert!(
+            row.alerted
+                .iter()
+                .any(|kind| kind == PROT_STORE_NEEDS_OVER_CAP),
+            "{}",
+            row.id
+        );
+        assert_eq!(row.credited_at, None, "{}", row.id);
+    }
+
+    /// An over-cap Apple hold of `P10` for `user`, whose wallet holds
+    /// `balance` under a 3,000 cap; Apple answers the fresh lookup "bought"
+    async fn apple_over_cap(h: &Harness, n: u64, user: &str, balance: i64) -> Tx {
+        if balance > 0 {
+            adjust(&h.db, user, &format!("r63-fill-{n}"), balance).await;
+        }
+        let intent = new_intent(h, user, v0::ProtStore::Apple, P10).await;
+        let t = Tx {
+            product: P10,
+            ..tx(n, Some(&intent.token))
+        };
+        let response = verify_apple_under(h, &capped(h, 3000), &h.st, user, &t.jws(), NOW).await;
+        assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+        h.apple
+            .set_transaction_info(&t.transaction_id(), Ok(t.jws()));
+        assert_over_cap_hold(&stored(&h.db, &t.purchase_id()).await);
+        t
+    }
+
+    /// A pause hold of `P10` for `user` (credits paused when it was seen);
+    /// Apple answers the fresh lookup "bought"
+    async fn pause_hold(
+        h: &Harness,
+        ps: &ProtSalesSettings,
+        paused: &ProtStoreSettings,
+        user: &str,
+        n: u64,
+    ) -> Tx {
+        let intent = new_intent(h, user, v0::ProtStore::Apple, P10).await;
+        let t = Tx {
+            product: P10,
+            ..tx(n, Some(&intent.token))
+        };
+        let response = verify_apple_under(h, ps, paused, user, &t.jws(), NOW).await;
+        assert_eq!(answer(&response), (Status::Pending, None));
+        let row = stored(&h.db, &t.purchase_id()).await;
+        assert_eq!(row.hold_reason, Some(v0::ProtStoreHoldReason::Paused));
+        assert_eq!(row.needs_action, None);
+        h.apple
+            .set_transaction_info(&t.transaction_id(), Ok(t.jws()));
+        t
+    }
+
+    /// An App Store notification handled under the Prot settings `ps`
+    async fn notify_under(
+        h: &Harness,
+        ps: &ProtSalesSettings,
+        kind: &str,
+        transaction: &str,
+        at: i64,
+    ) -> AppleNotificationOutcome {
+        let body = json!({ "signedPayload": notification_jws(kind, transaction, at) }).to_string();
+        handle_apple_notification(&h.db, ps, &h.st, &h.apple, body.as_bytes(), at).await
+    }
+
+    /// R63 (control: drop the first-sight cap check). R62's residual: under a
+    /// 3,000 cap, three 1,000-Prot intents are issued and cancelled (a
+    /// cancelled intent still binds a late purchase) and a fourth is issued
+    /// once they expired; a purchase lands on every token. Credits stop at the
+    /// cap and the rest is held over it for staff (work item, alert), never
+    /// credited; verify answers pending/over_cap, also when asked again
+    /// under a roomier cap
+    #[tokio::test]
+    async fn issue_cancel_then_buy_lands_the_excess_in_hold() {
+        let h = harness().await;
+        let ps = capped(&h, 3000);
+
+        let mut tokens = Vec::new();
+        for _ in 0..3 {
+            let intent = intent_with(&h, &ps, &h.st, A, v0::ProtStore::Apple, P10)
+                .await
+                .unwrap();
+            cancel_store_intent(&h.db, A, &intent.intent_id)
+                .await
+                .unwrap();
+            tokens.push(intent.token);
+        }
+        let later = NOW + PROT_STORE_INTENT_TTL_MS;
+        let fourth = create_store_intent(
+            &h.db,
+            &h.s,
+            &ps,
+            &h.st,
+            &h.play,
+            &h.apple,
+            A,
+            &intent_data(v0::ProtStore::Apple, P10),
+            None,
+            later,
+        )
+        .await
+        .expect("the cancelled intents expired");
+        // The app buys on the live intent; the three cancelled ones bind the
+        // late purchases that arrive after it
+        tokens.insert(0, fourth.token);
+
+        let at = later + MINUTE;
+        let mut credited = Vec::new();
+        let mut held = Vec::new();
+        for (n, token) in tokens.iter().enumerate() {
+            let t = Tx {
+                product: P10,
+                ..tx(110 + n as u64, Some(token))
+            }
+            .signed_at(at);
+            let response = verify_apple_under(&h, &ps, &h.st, A, &t.jws(), at).await;
+            match answer(&response) {
+                (Status::Credited, None) => credited.push(t),
+                (Status::Pending, Some(Reason::OverCap)) => {
+                    assert_eq!(response.purchase_id, Some(t.purchase_id()));
+                    held.push(t);
+                }
+                other => panic!("purchase {n}: {other:?}"),
+            }
+            assert!(
+                balance(&h.db, A).await <= 3000,
+                "purchase {n} took the wallet past the cap"
+            );
+        }
+        assert_eq!((credited.len(), held.len()), (3, 1));
+        assert_eq!(balance(&h.db, A).await, 3000);
+
+        for t in &held {
+            let id = t.purchase_id();
+            assert_over_cap_hold(&stored(&h.db, &id).await);
+            assert!(entry(&h.db, &prot_store_key_purchase(&id)).await.is_none());
+            // Asked again, even where the wallet has room: still held
+            h.apple
+                .set_transaction_info(&t.transaction_id(), Ok(t.jws()));
+            for again in [&ps, &h.ps] {
+                let response = verify_apple_under(&h, again, &h.st, A, &t.jws(), at + HOUR).await;
+                assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+            }
+            assert_eq!(
+                admin_store_purchase(&h.db, &id)
+                    .await
+                    .unwrap()
+                    .purchase
+                    .hold_reason,
+                Some(v0::ProtStoreHoldReason::OverCap)
+            );
+        }
+        assert_eq!(h.db.sum_held_prot_store(A).await.unwrap(), 1000);
+        assert_eq!(balance(&h.db, A).await, 3000);
+        assert_conserved(&h.db, &[A]).await;
+        done(h).await;
+    }
+
+    /// R63 (control: let reconcile_held Unpause over-cap holds): a purchase
+    /// held over the cap is not credited when credits run, not even once the
+    /// wallet has room again; it is not even looked up, and its work item
+    /// stays
+    #[tokio::test]
+    async fn over_cap_hold_is_not_credited_when_the_pause_ends() {
+        let h = harness().await;
+        let mut paused = h.st.clone();
+        paused.credit_paused = true;
+        let t = apple_over_cap(&h, 120, B, 2500).await;
+        let id = t.purchase_id();
+        // The wallet is spent: a credit would fit any cap now
+        adjust(&h.db, B, "r63-spent", -2500).await;
+        assert_eq!(balance(&h.db, B).await, 0);
+
+        let before = stored(&h.db, &id).await;
+        for (st, at) in [(&paused, NOW + HOUR), (&h.st, NOW + 2 * HOUR)] {
+            let report = reconcile(&h, st, at).await;
+            assert_eq!(report.held_credited, 0);
+        }
+        let after = stored(&h.db, &id).await;
+        assert_eq!(after, before);
+        assert_over_cap_hold(&after);
+        assert_eq!(lookups(&h.apple, &t), 0);
+        assert!(entry(&h.db, &prot_store_key_purchase(&id)).await.is_none());
+        assert_eq!(balance(&h.db, B).await, 0);
+
+        let response = verify_apple(&h, &h.st, B, &t.jws(), NOW + 3 * HOUR)
+            .await
+            .unwrap();
+        assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+        assert_eq!(balance(&h.db, B).await, 0);
+        assert_conserved(&h.db, &[B]).await;
+        done(h).await;
+    }
+
+    /// R63: a purchase held while credits were paused is cap-checked when the
+    /// pause ends: over the cap it becomes an over-cap hold (work item,
+    /// alert) and nothing is credited; under it, it is credited as before
+    #[tokio::test]
+    async fn pause_hold_over_the_cap_becomes_over_cap_when_the_pause_ends() {
+        let h = harness().await;
+        let ps = capped(&h, 3000);
+        let mut paused = h.st.clone();
+        paused.credit_paused = true;
+
+        let over = pause_hold(&h, &ps, &paused, C, 130).await;
+        let under = pause_hold(&h, &ps, &paused, A, 131).await;
+        // While paused, C's wallet filled up
+        adjust(&h.db, C, "r63-filled", 2500).await;
+
+        let report = reconcile_store(&h.db, &ps, &h.st, &h.apple, &h.play, NOW + HOUR).await;
+        assert_eq!(report.held_credited, 1);
+
+        let row = stored(&h.db, &over.purchase_id()).await;
+        assert_over_cap_hold(&row);
+        assert!(entry(&h.db, &prot_store_key_purchase(&over.purchase_id()))
+            .await
+            .is_none());
+        assert_eq!(balance(&h.db, C).await, 2500);
+        let response = verify_apple(&h, &h.st, C, &over.jws(), NOW + 2 * HOUR)
+            .await
+            .unwrap();
+        assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+
+        let credited = stored(&h.db, &under.purchase_id()).await;
+        assert_eq!(credited.state, v0::ProtStoreState::Credited);
+        assert_eq!(credited.hold_reason, None);
+        assert_eq!(balance(&h.db, A).await, 1000);
+
+        // The next tick leaves the over-cap hold alone
+        let report = reconcile_store(&h.db, &ps, &h.st, &h.apple, &h.play, NOW + 2 * HOUR).await;
+        assert_eq!(report.held_credited, 0);
+        assert_eq!(
+            stored(&h.db, &over.purchase_id()).await.version,
+            row.version
+        );
+        assert_conserved(&h.db, &[A, C]).await;
+        done(h).await;
+    }
+
+    /// R63: staff release an over-cap Play hold: credited past the cap,
+    /// consumed after the credit, the work item cleared; verify then answers
+    /// already_credited and a second release is refused. Before it, the day
+    /// alert covers the Play hold while credits run (Play refunds an
+    /// unconsumed purchase after 3 days)
+    #[tokio::test]
+    async fn release_credits_an_over_cap_hold_and_consumes_play() {
+        let h = harness().await;
+        let ps = capped(&h, 3000);
+        let token = "tok-r63-release";
+        adjust(&h.db, B, "r63-play", 2500).await;
+        let intent = new_intent(&h, B, v0::ProtStore::Play, P10).await;
+        h.play.set_purchase(
+            token,
+            Ok(play_found(
+                P10,
+                Some(&intent.token),
+                PLAY_PURCHASE_STATE_PURCHASED,
+            )),
+        );
+        let response = verify_play_under(&h, &ps, B, P10, token, NOW).await;
+        assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+        let id = play_purchase_id(token);
+        let held = stored(&h.db, &id).await;
+        assert_over_cap_hold(&held);
+        assert_eq!(held.unconsumed, None);
+        assert!(consumes(&h.play).is_empty());
+
+        // A day on, with credits running: the Play day alert, the work item kept
+        let report = reconcile_store(&h.db, &ps, &h.st, &h.apple, &h.play, NOW + 25 * HOUR).await;
+        assert_eq!((report.alerts, report.held_credited), (1, 0));
+        let flagged = stored(&h.db, &id).await;
+        assert_over_cap_hold(&flagged);
+        assert!(flagged
+            .alerted
+            .iter()
+            .any(|kind| kind == PROT_STORE_NEEDS_HELD));
+        assert!(consumes(&h.play).is_empty());
+
+        let view = release(&h, &h.st, ADMIN, &id, NOW + 26 * HOUR)
+            .await
+            .unwrap();
+        assert_eq!(view.purchase.state, v0::ProtStoreState::Credited);
+        assert_eq!(view.purchase.hold_reason, None);
+        assert_eq!(view.purchase.needs_action, None);
+        assert_eq!(view.purchase.user_id.as_deref(), Some(B));
+        assert_eq!(view.purchase.consumed, Some(true));
+        assert_eq!(view.ledger.len(), 1, "{:?}", view.ledger);
+        assert_eq!(view.ledger[0].amount, 1000);
+        assert_eq!(view.unspent, Some(3500));
+        assert_eq!(balance(&h.db, B).await, 3500);
+        assert_eq!(
+            consumes(&h.play),
+            vec![format!("consume {P10} {}", sha256_hex(token))]
+        );
+        assert_eq!(stored(&h.db, &id).await.unconsumed, None);
+
+        let response = verify_play_under(&h, &ps, B, P10, token, NOW + 27 * HOUR).await;
+        assert_eq!(answer(&response), (Status::AlreadyCredited, None));
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &id, NOW + 28 * HOUR).await),
+            ErrorType::InvalidOperation
+        ));
+        assert_eq!(balance(&h.db, B).await, 3500);
+        assert_eq!(consumes(&h.play).len(), 1);
+        assert_conserved(&h.db, &[B]).await;
+        done(h).await;
+    }
+
+    /// R63: only an over-cap hold is released: a pause hold, a credited row
+    /// and ids that name no purchase are refused before any store lookup
+    #[tokio::test]
+    async fn release_refuses_a_paused_hold_and_a_credited_row() {
+        let h = harness().await;
+        let mut paused = h.st.clone();
+        paused.credit_paused = true;
+
+        let intent = new_intent(&h, A, v0::ProtStore::Apple, P25).await;
+        let pause_hold = tx(140, Some(&intent.token));
+        let response = verify_apple(&h, &paused, A, &pause_hold.jws(), NOW)
+            .await
+            .unwrap();
+        assert_eq!(answer(&response), (Status::Pending, None));
+        h.apple
+            .set_transaction_info(&pause_hold.transaction_id(), Ok(pause_hold.jws()));
+        let before = stored(&h.db, &pause_hold.purchase_id()).await;
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &pause_hold.purchase_id(), NOW).await),
+            ErrorType::InvalidOperation
+        ));
+        assert_eq!(stored(&h.db, &pause_hold.purchase_id()).await, before);
+        assert_eq!(lookups(&h.apple, &pause_hold), 0);
+
+        let credited = apple_credit(&h, 141).await;
+        h.apple
+            .set_transaction_info(&credited.transaction_id(), Ok(credited.jws()));
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &credited.purchase_id(), NOW).await),
+            ErrorType::InvalidOperation
+        ));
+        assert_eq!(lookups(&h.apple, &credited), 0);
+        assert_eq!(balance(&h.db, A).await, 2600);
+
+        for id in ["01NOTASTOREID", "apple:prod:2000000000009999"] {
+            assert!(matches!(
+                error_of(release(&h, &h.st, ADMIN, id, NOW).await),
+                ErrorType::NotFound
+            ));
+        }
+        assert_conserved(&h.db, &[A]).await;
+        done(h).await;
+    }
+
+    /// R63: never to the acting admin, a bot, a deleted or a missing account,
+    /// and nothing while credits are paused; each refused before any lookup
+    #[tokio::test]
+    async fn release_refuses_self_bots_deleted_buyers_and_the_pause() {
+        let h = harness().await;
+        insert_account(
+            &h.db,
+            User {
+                bot: Some(BotInformation {
+                    owner: A.to_string(),
+                }),
+                ..user(BOT)
+            },
+        )
+        .await;
+        let gone = "01HZS6L2C00000000000GONE01";
+        insert_account(
+            &h.db,
+            User {
+                flags: Some(v0::UserFlags::Deleted as i32),
+                ..user(gone)
+            },
+        )
+        .await;
+
+        let own = apple_over_cap(&h, 150, ADMIN, 2500).await;
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &own.purchase_id(), NOW).await),
+            ErrorType::InvalidOperation
+        ));
+
+        // The same hold, as if its buyer were a bot, deleted, or missing
+        let template = stored(&h.db, &own.purchase_id()).await;
+        for (n, buyer) in [
+            (151_u64, BOT),
+            (152, gone),
+            (153, "01HZS6L2C0000000000MISSING"),
+        ] {
+            let id = tx(n, None).purchase_id();
+            put_row(
+                &h.db,
+                ProtStorePurchase {
+                    id: id.clone(),
+                    user_id: Some(buyer.to_string()),
+                    ..template.clone()
+                },
+            )
+            .await;
+            assert!(matches!(
+                error_of(release(&h, &h.st, A, &id, NOW).await),
+                ErrorType::InvalidOperation
+            ));
+            assert_eq!(stored(&h.db, &id).await.state, v0::ProtStoreState::Held);
+        }
+
+        // Another admin may release the first hold, but not while paused
+        let mut paused = h.st.clone();
+        paused.credit_paused = true;
+        assert!(matches!(
+            error_of(release(&h, &paused, A, &own.purchase_id(), NOW).await),
+            ErrorType::InvalidOperation
+        ));
+        assert_eq!(lookups(&h.apple, &own), 0);
+        assert_over_cap_hold(&stored(&h.db, &own.purchase_id()).await);
+        let view = release(&h, &h.st, A, &own.purchase_id(), NOW + HOUR)
+            .await
+            .unwrap();
+        assert_eq!(view.purchase.state, v0::ProtStoreState::Credited);
+        assert_eq!(balance(&h.db, ADMIN).await, 3500);
+        done(h).await;
+    }
+
+    /// R63 (control: release without the fresh lookup): a held purchase the
+    /// store shows refunded or voided is recorded Revoked by the release,
+    /// which credits nothing and refuses; the hold and its review item go
+    #[tokio::test]
+    async fn release_of_a_revoked_purchase_credits_nothing() {
+        let h = harness().await;
+        let t = apple_over_cap(&h, 160, B, 2500).await;
+        let id = t.purchase_id();
+        h.apple.set_transaction_info(
+            &t.transaction_id(),
+            Ok(t.clone().revoked_at(NOW + HOUR).jws()),
+        );
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &id, NOW + 2 * HOUR).await),
+            ErrorType::InvalidOperation
+        ));
+        assert_eq!(lookups(&h.apple, &t), 1);
+        let revoked = stored(&h.db, &id).await;
+        assert_eq!(revoked.state, v0::ProtStoreState::Revoked);
+        assert_eq!(
+            (
+                revoked.hold_reason,
+                revoked.needs_action,
+                revoked.refund_gen
+            ),
+            (None, None, 0)
+        );
+        assert!(entry(&h.db, &prot_store_key_purchase(&id)).await.is_none());
+        assert!(entry(&h.db, &prot_store_key_clawback(&id, 1))
+            .await
+            .is_none());
+        assert_eq!(balance(&h.db, B).await, 2500);
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &id, NOW + 3 * HOUR).await),
+            ErrorType::InvalidOperation
+        ));
+
+        // Play: voided by the time staff release it
+        let token = "tok-r63-voided";
+        let intent = new_intent(&h, B, v0::ProtStore::Play, P10).await;
+        h.play.set_purchase(
+            token,
+            Ok(play_found(
+                P10,
+                Some(&intent.token),
+                PLAY_PURCHASE_STATE_PURCHASED,
+            )),
+        );
+        let response = verify_play_under(&h, &capped(&h, 3000), B, P10, token, NOW).await;
+        assert_eq!(answer(&response), (Status::Pending, Some(Reason::OverCap)));
+        h.play.set_purchase(
+            token,
+            Ok(play_found(
+                P10,
+                Some(&intent.token),
+                PLAY_PURCHASE_STATE_CANCELLED,
+            )),
+        );
+        let play_id = play_purchase_id(token);
+        assert!(matches!(
+            error_of(release(&h, &h.st, ADMIN, &play_id, NOW + 2 * HOUR).await),
+            ErrorType::InvalidOperation
+        ));
+        let voided = stored(&h.db, &play_id).await;
+        assert_eq!(voided.state, v0::ProtStoreState::Revoked);
+        assert_eq!((voided.hold_reason, voided.needs_action), (None, None));
+        assert!(consumes(&h.play).is_empty());
+        assert_eq!(balance(&h.db, B).await, 2500);
+        assert_conserved(&h.db, &[B]).await;
+        done(h).await;
+    }
+
+    /// R63: the cap binds automatic credits only. An E10 assign and the
+    /// re-credit of a reversed refund land past it
+    #[tokio::test]
+    async fn reinstate_and_assign_are_exempt_from_the_cap() {
+        let h = harness().await;
+        let ps = capped(&h, 3000);
+
+        // Assign: an unbound purchase to a wallet already at the cap
+        adjust(&h.db, B, "r63-at-cap", 3000).await;
+        let token = "tok-r63-assign";
+        h.play.set_purchase(
+            token,
+            Ok(play_found(P10, None, PLAY_PURCHASE_STATE_PURCHASED)),
+        );
+        let response = verify_play_under(&h, &ps, A, P10, token, NOW).await;
+        assert_eq!(answer(&response), (Status::Rejected, Some(Reason::Unbound)));
+        let id = play_purchase_id(token);
+        let view =
+            admin_assign_store_purchase(&h.db, &ps, &h.st, &h.apple, &h.play, ADMIN, &id, B, NOW)
+                .await
+                .unwrap();
+        assert_eq!(view.purchase.state, v0::ProtStoreState::Credited);
+        assert_eq!(balance(&h.db, B).await, 4000);
+
+        // Reinstate: a refund, then its reversal on a wallet at the cap
+        let t = apple_credit(&h, 170).await;
+        let refunded = t.clone().revoked_at(NOW + HOUR);
+        h.apple
+            .set_transaction_info(&t.transaction_id(), Ok(refunded.jws()));
+        assert_eq!(
+            notify_under(&h, &ps, "REFUND", &refunded.jws(), NOW + 2 * HOUR).await,
+            AppleNotificationOutcome::Handled
+        );
+        assert_eq!(balance(&h.db, A).await, 0);
+        adjust(&h.db, A, "r63-refilled", 3000).await;
+        h.apple
+            .set_transaction_info(&t.transaction_id(), Ok(t.jws()));
+        assert_eq!(
+            notify_under(&h, &ps, "REFUND_REVERSED", &t.jws(), NOW + 3 * HOUR).await,
+            AppleNotificationOutcome::Handled
+        );
+        assert_eq!(
+            stored(&h.db, &t.purchase_id()).await.state,
+            v0::ProtStoreState::Reinstated
+        );
+        assert_eq!(balance(&h.db, A).await, 5600);
+        assert_conserved(&h.db, &[A, B]).await;
         done(h).await;
     }
 }

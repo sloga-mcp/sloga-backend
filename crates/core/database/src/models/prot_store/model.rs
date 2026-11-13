@@ -40,6 +40,10 @@ auto_derived!(
         pub state: v0::ProtStoreState,
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub reject_reason: Option<v0::ProtStoreRejectReason>,
+        /// Why a Held row is held (R63): set on every move into Held, cleared on every move out. A Held row
+        /// with None is a legacy credit-pause hold (= Paused). No migration (optional field, no index)
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        pub hold_reason: Option<v0::ProtStoreHoldReason>,
         /// Refund generations applied (0 = never refunded)
         #[serde(default)]
         pub refund_gen: u32,
@@ -167,14 +171,23 @@ pub const PROT_ACTOR_STORE: &str = "sys:store";
 // strings of util/prot_store_alert.rs (section 19).
 pub(super) use crate::util::prot_store_alert::PROT_STORE_NEEDS_UNCONSUMED as NEEDS_UNCONSUMED;
 use crate::util::prot_store_alert::{
+    PROT_STORE_NEEDS_OVER_CAP as NEEDS_OVER_CAP,
     PROT_STORE_NEEDS_REVERSED_UNPAID as NEEDS_REVERSED_UNPAID,
     PROT_STORE_NEEDS_UNBOUND as NEEDS_UNBOUND,
 };
 
-/// Every move to Revoked clears these (audit 5, 6)
-const CLEARED_BY_REVOKE: &[&str] = &[NEEDS_UNBOUND, NEEDS_UNCONSUMED];
+/// Every move to Revoked clears these (audit 5, 6; R63: a refunded over-cap
+/// hold has nothing left to review)
+const CLEARED_BY_REVOKE: &[&str] = &[NEEDS_UNBOUND, NEEDS_UNCONSUMED, NEEDS_OVER_CAP];
 /// An E10 assign clears the unbound work item
 const CLEARED_BY_ASSIGN: &[&str] = &[NEEDS_UNBOUND];
+/// A staff release of an over-cap hold clears its review item (R63)
+const CLEARED_BY_RELEASE: &[&str] = &[NEEDS_OVER_CAP];
+
+/// Whether a Held row waits for staff (R63): no automatic credit moves it
+fn held_over_cap(row: &ProtStorePurchase) -> bool {
+    row.hold_reason == Some(v0::ProtStoreHoldReason::OverCap)
+}
 
 // --- Section 6: the purchase-row state machine ------------------------------
 
@@ -186,9 +199,11 @@ pub enum ProtStoreVerdict {
         user_id: String,
         intent_id: String,
     },
+    /// Recorded Held: credits are paused, or (R63) crediting it would take the wallet past its cap
     Hold {
         user_id: String,
         intent_id: String,
+        reason: v0::ProtStoreHoldReason,
     },
     Reject {
         reason: v0::ProtStoreRejectReason,
@@ -223,6 +238,9 @@ pub enum ProtStoreEvent {
         admin_id: String,
         paused: bool,
     },
+    /// R63 staff release of an over-cap hold (after a fresh lookup shows the purchase not revoked): credits it
+    /// ignoring the cap. Anything but a Held(OverCap) row is not releasable
+    Release,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +306,7 @@ fn event_name(event: &ProtStoreEvent) -> &'static str {
         ProtStoreEvent::Reverse { .. } => "reverse",
         ProtStoreEvent::Unpause { .. } => "unpause",
         ProtStoreEvent::Assign { .. } => "assign",
+        ProtStoreEvent::Release => "release",
     }
 }
 
@@ -364,19 +383,22 @@ fn plan_first_sight(event: &ProtStoreEvent) -> ProtStoreMovePlan {
                 answer: ProtStoreAnswer::Credited,
             }
         }
-        ProtStoreEvent::Seen(ProtStoreVerdict::Hold { user_id, intent_id }) => {
-            ProtStoreMovePlan::Move {
-                to: v0::ProtStoreState::Held,
-                reject_reason: None,
-                user_id: Some(user_id.clone()),
-                intent_id: Some(intent_id.clone()),
-                ledger: ProtStoreLedgerPlan::None,
-                needs_action: None,
-                clear_needs: &[],
-                unconsumed: None,
-                answer: ProtStoreAnswer::Held,
-            }
-        }
+        ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
+            user_id,
+            intent_id,
+            reason,
+        }) => ProtStoreMovePlan::Move {
+            to: v0::ProtStoreState::Held,
+            reject_reason: None,
+            user_id: Some(user_id.clone()),
+            intent_id: Some(intent_id.clone()),
+            ledger: ProtStoreLedgerPlan::None,
+            // R63: an over-cap hold is staff work from the start
+            needs_action: (*reason == v0::ProtStoreHoldReason::OverCap).then_some(NEEDS_OVER_CAP),
+            clear_needs: &[],
+            unconsumed: None,
+            answer: ProtStoreAnswer::Held,
+        },
         ProtStoreEvent::Seen(ProtStoreVerdict::Reject {
             reason,
             user_id,
@@ -415,7 +437,9 @@ fn plan_first_sight(event: &ProtStoreEvent) -> ProtStoreMovePlan {
             }
             plan
         }
-        ProtStoreEvent::Assign { .. } => ProtStoreMovePlan::Answer(ProtStoreAnswer::NotAssignable),
+        ProtStoreEvent::Assign { .. } | ProtStoreEvent::Release => {
+            ProtStoreMovePlan::Answer(ProtStoreAnswer::NotAssignable)
+        }
         ProtStoreEvent::Reverse { .. } | ProtStoreEvent::Unpause { .. } => ignored(None, event),
     }
 }
@@ -510,10 +534,40 @@ pub fn plan_store_move(
     };
 
     match (row.state, event) {
-        // Held: credit paused when it was seen
+        // Held: credit paused when it was seen, or (R63) over the wallet cap.
+        // An over-cap hold is never credited automatically: only a staff
+        // release (or a refund) moves it.
         (State::Held, Event::Seen(ProtStoreVerdict::Credit { .. }))
-        | (State::Held, Event::Unpause { buyer_live: true }) => credit_of(row, None, &[]),
-        (State::Held, Event::Seen(_)) => Answer(ProtStoreAnswer::Held),
+        | (State::Held, Event::Unpause { buyer_live: true })
+            if !held_over_cap(row) =>
+        {
+            credit_of(row, None, &[])
+        }
+        (State::Held, Event::Release) if held_over_cap(row) => {
+            credit_of(row, None, CLEARED_BY_RELEASE)
+        }
+        (State::Held, Event::Release) => Answer(ProtStoreAnswer::NotAssignable),
+        // R63: a pause hold found over the cap becomes an over-cap hold
+        (
+            State::Held,
+            Event::Seen(ProtStoreVerdict::Hold {
+                reason: v0::ProtStoreHoldReason::OverCap,
+                ..
+            }),
+        ) if !held_over_cap(row) => ProtStoreMovePlan::Move {
+            to: State::Held,
+            reject_reason: None,
+            user_id: None,
+            intent_id: None,
+            ledger: ProtStoreLedgerPlan::None,
+            needs_action: Some(NEEDS_OVER_CAP),
+            clear_needs: &[],
+            unconsumed: None,
+            answer: ProtStoreAnswer::Held,
+        },
+        (State::Held, Event::Seen(_)) | (State::Held, Event::Unpause { buyer_live: true }) => {
+            Answer(ProtStoreAnswer::Held)
+        }
         (State::Held, Event::Unpause { buyer_live: false }) => ProtStoreMovePlan::Move {
             to: State::Rejected,
             reject_reason: Some(v0::ProtStoreRejectReason::NoBuyer),
@@ -563,7 +617,9 @@ pub fn plan_store_move(
                 credit_of(row, Some(user_id.clone()), CLEARED_BY_ASSIGN)
             }
         }
-        (State::Rejected, Event::Assign { .. }) => Answer(ProtStoreAnswer::NotAssignable),
+        (State::Rejected, Event::Assign { .. } | Event::Release) => {
+            Answer(ProtStoreAnswer::NotAssignable)
+        }
         (State::Rejected, Event::Revoke { .. }) => to_revoked(
             Some(row),
             None,
@@ -609,7 +665,7 @@ pub fn plan_store_move(
             None,
             ProtStoreAnswer::Revoked,
         ),
-        (State::Credited | State::Reinstated, Event::Assign { .. }) => {
+        (State::Credited | State::Reinstated, Event::Assign { .. } | Event::Release) => {
             Answer(ProtStoreAnswer::NotAssignable)
         }
         (State::Credited | State::Reinstated, Event::Reverse { .. } | Event::Unpause { .. }) => {
@@ -620,7 +676,9 @@ pub fn plan_store_move(
         (State::Revoked, Event::Seen(_)) => Answer(ProtStoreAnswer::Refunded),
         // Already revoked: no second claw without a reversal in between
         (State::Revoked, Event::Revoke { .. }) => Answer(ProtStoreAnswer::Revoked),
-        (State::Revoked, Event::Assign { .. }) => Answer(ProtStoreAnswer::NotAssignable),
+        (State::Revoked, Event::Assign { .. } | Event::Release) => {
+            Answer(ProtStoreAnswer::NotAssignable)
+        }
         (State::Revoked, Event::Reverse { buyer_live }) => {
             plan_reversal(row, event, *buyer_live, reinstate_amount)
         }
@@ -936,6 +994,18 @@ fn store_row_after(
     };
     next.state = *to;
     next.reject_reason = *reject_reason;
+    // R63: a move into Held records why (a verdict's reason; an assign while
+    // paused is a pause hold, R16); every move out of Held clears it
+    next.hold_reason = match (*to, event) {
+        (v0::ProtStoreState::Held, ProtStoreEvent::Seen(ProtStoreVerdict::Hold { reason, .. })) => {
+            Some(*reason)
+        }
+        (v0::ProtStoreState::Held, ProtStoreEvent::Assign { .. }) => {
+            Some(v0::ProtStoreHoldReason::Paused)
+        }
+        (v0::ProtStoreState::Held, _) => next.hold_reason,
+        _ => None,
+    };
     if let Some(user_id) = user_id {
         next.user_id = Some(user_id.clone());
     }
@@ -1084,8 +1154,9 @@ fn store_ledger_for(
 /// THE move builder (R49): the move a plan describes, for `apply_store_purchase_move`. The engine and the tests
 /// both call it; nothing builds a move by hand. It stamps `credited_at`, a first-sight Play credit's `unconsumed`,
 /// `refund_gen` and the refunds entry of every generation (the gen-0 tombstone, `no_buyer`),
-/// `unreinstated_reversals`, `assigned_by`, and builds every posting (8.2). `seed` is the purchase as first seen
-/// (store, product, prot, environment, store payloads; read only when `row` is None); `reinstate_amount` is what
+/// `unreinstated_reversals`, `assigned_by`, `hold_reason` (R63), and builds every posting (8.2). `seed` is the
+/// purchase as first seen (store, product, prot, environment, store payloads; read only when `row` is None);
+/// `reinstate_amount` is what
 /// the row's latest generation clawed (8.3). `use_intent` is the plan's intent on a row's first write, never for
 /// Reject{Unbound | NoBuyer} (audit 2+19). None for an Answer plan.
 pub fn build_store_move(
@@ -1152,6 +1223,7 @@ pub(super) mod test_support {
             country: None,
             state: v0::ProtStoreState::Rejected,
             reject_reason: None,
+            hold_reason: None,
             refund_gen: 0,
             refunds: vec![],
             unreinstated_reversals: 0,
@@ -1257,6 +1329,16 @@ mod tests {
         ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
             user_id: USER.to_string(),
             intent_id: INTENT.to_string(),
+            reason: v0::ProtStoreHoldReason::Paused,
+        })
+    }
+
+    /// R63: a hold because the credit would take the wallet past its cap
+    fn over_cap() -> ProtStoreEvent {
+        ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
+            user_id: USER.to_string(),
+            intent_id: INTENT.to_string(),
+            reason: v0::ProtStoreHoldReason::OverCap,
         })
     }
 
@@ -1915,6 +1997,196 @@ mod tests {
         let plan = plan_store_move(Some(&review), &event, 0);
         let next = row_after(Some(&review), &review, &event, &plan, 1_000).unwrap();
         assert_eq!(next.needs_action.as_deref(), Some("chargeback_review"));
+    }
+
+    // --- R63: over-cap holds -------------------------------------------------
+
+    /// A Held row as `build_store_move` first writes it for `event`
+    fn first_held(event: &ProtStoreEvent) -> ProtStorePurchase {
+        let seeded = seed(APPLE_ID, v0::ProtStore::Apple, 2_600);
+        let plan = plan_store_move(None, event, 0);
+        row_after(None, &seeded, event, &plan, 1_000).expect("a Held row")
+    }
+
+    #[test]
+    fn over_cap_hold_is_staff_work_that_no_automatic_credit_moves() {
+        let plan = plan_store_move(None, &over_cap(), 0);
+        assert_eq!(
+            plan,
+            ProtStoreMovePlan::Move {
+                to: v0::ProtStoreState::Held,
+                reject_reason: None,
+                user_id: Some(USER.to_string()),
+                intent_id: Some(INTENT.to_string()),
+                ledger: ProtStoreLedgerPlan::None,
+                needs_action: Some("over_cap_review"),
+                clear_needs: &[],
+                unconsumed: None,
+                answer: ProtStoreAnswer::Held,
+            }
+        );
+        let held = first_held(&over_cap());
+        assert_eq!(held.state, v0::ProtStoreState::Held);
+        assert_eq!(held.hold_reason, Some(v0::ProtStoreHoldReason::OverCap));
+        assert_eq!(held.needs_action.as_deref(), Some("over_cap_review"));
+        assert_eq!(held.credited_at, None);
+
+        // A pause hold records its reason and is no staff work
+        let paused = first_held(&hold());
+        assert_eq!(paused.hold_reason, Some(v0::ProtStoreHoldReason::Paused));
+        assert_eq!(paused.needs_action, None);
+
+        // Nothing automatic credits it: a verify or replay that would now fit
+        // the cap, the end of a pause, another verdict
+        for event in [
+            credit(),
+            ProtStoreEvent::Unpause { buyer_live: true },
+            over_cap(),
+            hold(),
+        ] {
+            let plan = plan_store_move(Some(&held), &event, 0);
+            assert!(
+                is_answer(&plan, ProtStoreAnswer::Held),
+                "{event:?}: {plan:?}"
+            );
+        }
+        assert!(is_answer(
+            &plan_store_move(Some(&held), &assign(false), 0),
+            ProtStoreAnswer::NotAssignable
+        ));
+        assert!(is_answer(
+            &plan_store_move(
+                Some(&held),
+                &ProtStoreEvent::Reverse { buyer_live: true },
+                0
+            ),
+            ProtStoreAnswer::Ignored
+        ));
+    }
+
+    #[test]
+    fn release_credits_only_an_over_cap_hold() {
+        let held = first_held(&over_cap());
+        let plan = plan_store_move(Some(&held), &ProtStoreEvent::Release, 0);
+        assert_eq!(
+            moved(&plan),
+            Some((v0::ProtStoreState::Credited, ProtStoreLedgerPlan::Credit))
+        );
+        let ProtStoreMovePlan::Move { clear_needs, .. } = &plan else {
+            panic!("{plan:?}");
+        };
+        assert_eq!(*clear_needs, CLEARED_BY_RELEASE);
+        let m = build_store_move(
+            Some(&held),
+            &held,
+            &ProtStoreEvent::Release,
+            &plan,
+            0,
+            2_000,
+        )
+        .expect("a move");
+        assert_eq!(m.row.state, v0::ProtStoreState::Credited);
+        assert_eq!(m.row.hold_reason, None);
+        assert_eq!(m.row.needs_action, None);
+        assert_eq!(m.row.credited_at, Some(2_000));
+        assert_eq!(m.row.user_id.as_deref(), Some(USER));
+        assert_eq!(m.expected_version, Some(held.version));
+        assert_eq!(m.use_intent, None);
+        let ProtStoreLedger::Credit(posting) = &m.ledger else {
+            panic!("{:?}", m.ledger);
+        };
+        assert_eq!(posting.key, prot_store_key_purchase(APPLE_ID));
+        assert_eq!(posting.amount, ProtAmount::Exact(2_600));
+        assert_eq!(posting.credit, prot_user_account(USER));
+
+        // A pause hold (and a legacy one), and every other state: not releasable
+        let paused = first_held(&hold());
+        let legacy = ProtStorePurchase {
+            hold_reason: None,
+            ..paused.clone()
+        };
+        for row in [
+            paused,
+            legacy,
+            row(v0::ProtStoreState::Credited),
+            row(v0::ProtStoreState::Reinstated),
+            rejected(v0::ProtStoreRejectReason::Unbound),
+            revoked(1),
+        ] {
+            assert!(
+                is_answer(
+                    &plan_store_move(Some(&row), &ProtStoreEvent::Release, 0),
+                    ProtStoreAnswer::NotAssignable
+                ),
+                "{:?} {:?}",
+                row.state,
+                row.hold_reason
+            );
+        }
+        assert!(is_answer(
+            &plan_store_move(None, &ProtStoreEvent::Release, 0),
+            ProtStoreAnswer::NotAssignable
+        ));
+    }
+
+    #[test]
+    fn pause_hold_over_the_cap_becomes_an_over_cap_hold() {
+        let mut paused = first_held(&hold());
+        paused.needs_action = Some("play_held_24h".to_string());
+        let legacy = ProtStorePurchase {
+            hold_reason: None,
+            needs_action: None,
+            ..paused.clone()
+        };
+        for row in [paused.clone(), legacy] {
+            let plan = plan_store_move(Some(&row), &over_cap(), 0);
+            assert_eq!(
+                moved(&plan),
+                Some((v0::ProtStoreState::Held, ProtStoreLedgerPlan::None))
+            );
+            let m = build_store_move(Some(&row), &row, &over_cap(), &plan, 0, 3_000).unwrap();
+            assert_eq!(m.row.hold_reason, Some(v0::ProtStoreHoldReason::OverCap));
+            assert_eq!(m.row.needs_action.as_deref(), Some("over_cap_review"));
+            assert_eq!(m.row.user_id, row.user_id);
+            assert_eq!(m.row.intent_id, row.intent_id);
+            assert_eq!(m.row.credited_at, None);
+            assert_eq!(m.ledger, ProtStoreLedger::None);
+            assert_eq!(m.use_intent, None);
+        }
+
+        // Under the cap a pause hold still credits, and leaves Held
+        let plan = plan_store_move(Some(&paused), &credit(), 0);
+        let next = row_after(Some(&paused), &paused, &credit(), &plan, 3_000).unwrap();
+        assert_eq!(next.state, v0::ProtStoreState::Credited);
+        assert_eq!(next.hold_reason, None);
+    }
+
+    #[test]
+    fn refund_of_an_over_cap_hold_clears_its_review_and_credits_nothing() {
+        let held = first_held(&over_cap());
+        let event = revoke(80, true);
+        let plan = plan_store_move(Some(&held), &event, 0);
+        assert_revoke_shape(&plan, None);
+        let m = build_store_move(Some(&held), &held, &event, &plan, 0, 4_000).unwrap();
+        assert_eq!(m.row.state, v0::ProtStoreState::Revoked);
+        assert_eq!(m.row.hold_reason, None);
+        assert_eq!(m.row.needs_action, None);
+        assert_eq!(m.ledger, ProtStoreLedger::None);
+        assert_eq!(m.row.refund_gen, 0);
+    }
+
+    #[test]
+    fn assign_while_paused_records_a_pause_hold() {
+        let unbound = rejected(v0::ProtStoreRejectReason::Unbound);
+        let plan = plan_store_move(Some(&unbound), &assign(true), 0);
+        let next = row_after(Some(&unbound), &unbound, &assign(true), &plan, 5_000).unwrap();
+        assert_eq!(next.state, v0::ProtStoreState::Held);
+        assert_eq!(next.hold_reason, Some(v0::ProtStoreHoldReason::Paused));
+
+        let plan = plan_store_move(Some(&unbound), &assign(false), 0);
+        let next = row_after(Some(&unbound), &unbound, &assign(false), &plan, 5_000).unwrap();
+        assert_eq!(next.state, v0::ProtStoreState::Credited);
+        assert_eq!(next.hold_reason, None);
     }
 
     // --- property tests -----------------------------------------------------

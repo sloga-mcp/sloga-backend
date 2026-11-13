@@ -31,6 +31,9 @@ pub const PROT_STORE_NEEDS_UNCONSUMED: &str = "play_unconsumed_24h";
 pub const PROT_STORE_NEEDS_REVERSED_UNPAID: &str = "reversed_unpaid";
 /// A Play purchase still Held 24 h into a credit pause (R59)
 pub const PROT_STORE_NEEDS_HELD: &str = "play_held_24h";
+/// A purchase Held because crediting it would take the wallet past its cap
+/// (R63): staff release it, or the buyer is refunded
+pub const PROT_STORE_NEEDS_OVER_CAP: &str = "over_cap_review";
 
 // Log-only kinds are named PROT_STORE_LOG_* (no work item) and listed in
 // PROT_STORE_LOG_ONLY_KINDS, which `send_ops_alert` never mails.
@@ -100,10 +103,30 @@ fn alert_body(kind: &str, id: &str) -> String {
         "A Prot store purchase needs staff action.\n\n\
          Kind: {kind}\n\
          Purchase: {id}\n\n\
+         {}\
          Admin route: GET /admin/prot/store/{id}\n\
          Work list: GET /admin/prot/store?needs_action=true\n\
-         (privileged account, MFA ticket and audit reason)\n"
+         (privileged account, MFA ticket and audit reason)\n",
+        kind_note(kind, id)
     )
+}
+
+/// What a kind asks of staff, when the kind alone does not say it (R63)
+fn kind_note(kind: &str, id: &str) -> String {
+    if kind != PROT_STORE_NEEDS_OVER_CAP {
+        return String::new();
+    }
+    let mut note = "Held, not credited: crediting it would take the buyer's Prot wallet over \
+                    its cap. Release it (POST /admin/prot/store/<id>/release) or let the buyer \
+                    be refunded.\n"
+        .to_string();
+    if id.starts_with("play:") {
+        note.push_str("Google Play refunds an unconsumed purchase automatically after 3 days.\n");
+    } else {
+        note.push_str("An App Store refund is the buyer's request to Apple.\n");
+    }
+    note.push('\n');
+    note
 }
 
 /// What the log may say about a lettre SMTP error: the stage, the error class
@@ -232,10 +255,11 @@ mod tests {
     use revolt_models::v0;
 
     use super::{
-        alert_line, mail_failed_line, run_blocking_send, send_ops_alert, PROT_STORE_LOG_ONLY_KINDS,
-        PROT_STORE_LOG_UNDECODABLE_NOTIFICATION, PROT_STORE_NEEDS_CHARGEBACK,
-        PROT_STORE_NEEDS_HELD, PROT_STORE_NEEDS_REVERSED_UNPAID, PROT_STORE_NEEDS_UNBOUND,
-        PROT_STORE_NEEDS_UNCONSUMED, SEND_DEADLINE,
+        alert_body, alert_line, mail_failed_line, run_blocking_send, send_ops_alert,
+        PROT_STORE_LOG_ONLY_KINDS, PROT_STORE_LOG_UNDECODABLE_NOTIFICATION,
+        PROT_STORE_NEEDS_CHARGEBACK, PROT_STORE_NEEDS_HELD, PROT_STORE_NEEDS_OVER_CAP,
+        PROT_STORE_NEEDS_REVERSED_UNPAID, PROT_STORE_NEEDS_UNBOUND, PROT_STORE_NEEDS_UNCONSUMED,
+        SEND_DEADLINE,
     };
     use crate::{
         build_store_move, plan_store_move, Database, ProtStoreEvent, ProtStoreMoveOutcome,
@@ -428,6 +452,42 @@ mod tests {
             mail_failed_line("unbound_play", &id, "send timed out"),
             format!("PROT_STORE_ALERT_MAIL_FAILED kind=unbound_play id={id} reason=send timed out")
         );
+    }
+
+    /// R63: `over_cap_review` is a mailed work item; its mail says how it
+    /// ends, and on Play that Play refunds it after 3 days. Other kinds' mails
+    /// are unchanged.
+    #[test]
+    fn over_cap_review_is_mailed_and_names_the_refund_window() {
+        assert_eq!(PROT_STORE_NEEDS_OVER_CAP, "over_cap_review");
+        assert!(!PROT_STORE_LOG_ONLY_KINDS.contains(&PROT_STORE_NEEDS_OVER_CAP));
+
+        let play_id = play("c3");
+        let body = alert_body(PROT_STORE_NEEDS_OVER_CAP, &play_id);
+        assert!(body.contains("Kind: over_cap_review\n"), "{body}");
+        assert!(body.contains("over its cap"), "{body}");
+        assert!(body.contains("/release"), "{body}");
+        assert!(
+            body.contains("Google Play refunds an unconsumed purchase automatically after 3 days."),
+            "{body}"
+        );
+        assert!(body.contains(&format!("Admin route: GET /admin/prot/store/{play_id}\n")));
+
+        let apple = alert_body(PROT_STORE_NEEDS_OVER_CAP, "apple:prod:2000000000000001");
+        assert!(apple.contains("over its cap"), "{apple}");
+        assert!(!apple.contains("3 days"), "{apple}");
+
+        for kind in [
+            PROT_STORE_NEEDS_UNBOUND,
+            PROT_STORE_NEEDS_HELD,
+            PROT_STORE_NEEDS_REVERSED_UNPAID,
+        ] {
+            let other = alert_body(kind, &play_id);
+            assert!(!other.contains("over its cap"), "{kind}");
+            assert!(other.starts_with(&format!(
+                "A Prot store purchase needs staff action.\n\nKind: {kind}\nPurchase: {play_id}\n\nAdmin route:"
+            )));
+        }
     }
 
     /// No mailbox, or no SMTP: Ok(false), the pinned line still written at
@@ -687,6 +747,7 @@ mod tests {
             country: None,
             state: v0::ProtStoreState::Rejected,
             reject_reason: None,
+            hold_reason: None,
             refund_gen: 0,
             refunds: vec![],
             unreinstated_reversals: 0,

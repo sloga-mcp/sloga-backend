@@ -245,17 +245,75 @@ pub async fn resolve_prot_store_purchase(
     ))
 }
 
+/// # Release Over-Cap Prot Store Purchase
+///
+/// Credit a purchase held because crediting it would have taken its buyer's
+/// Prot wallet over the cap (`held`, hold reason `over_cap`), ignoring the
+/// cap. Anything else is `InvalidOperation`, as is a buyer who is the staff
+/// member, a bot, deleted or gone, and any release while store credits are
+/// paused. The purchase is looked up at the store first: refunded, voided
+/// or cancelled → the refund is recorded on the row, nothing is credited,
+/// `InvalidOperation`; unknown there → `InvalidOperation`; a failed lookup
+/// → 500, nothing written. A Google Play purchase is consumed after its
+/// credit. The `over_cap_review` work item is cleared.
+///
+/// Requires a privileged account, an MFA ticket and `X-Audit-Log-Reason`.
+/// Works while Prot and the stores are closed for sale.
+#[openapi(tag = "Payments")]
+#[post("/prot/store/<id>/release")]
+pub async fn release_prot_store_purchase(
+    db: &State<Database>,
+    apple: &State<Arc<dyn AppleStoreApi>>,
+    play: &State<Arc<dyn PlayStoreApi>>,
+    user: User,
+    ticket: ValidatedTicket,
+    reason: AuditLogReason,
+    id: String,
+) -> Result<Json<v0::ProtStoreAdminPurchase>> {
+    let reason = staff_reason(&user, &ticket, reason)?;
+    check_purchase_id(&id)?;
+
+    log::info!(
+        "AUDIT prot_store_release: actor={} id={} reason={:?}",
+        user.id,
+        id,
+        reason
+    );
+
+    // Loaded, never defaulted (R64): only the credit pause and the store
+    // credentials are read; the open-for-sale flags are not
+    let st = ProtStoreSettings::load().await?;
+    let apple: &dyn AppleStoreApi = &**apple.inner();
+    let play: &dyn PlayStoreApi = &**play.inner();
+
+    // The engine refuses self, bots and deleted buyers, asks the store and
+    // moves the row
+    Ok(Json(
+        engine::prot_store::admin_release_store_purchase(
+            db,
+            &st,
+            apple,
+            play,
+            &user.id,
+            &id,
+            now_ms(),
+        )
+        .await?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{error_type, new_staff, with_own_ticket};
     use crate::util::test::{without_comments, TestHarness};
     use revolt_database::util::prot_store_alert::{
-        PROT_STORE_NEEDS_CHARGEBACK, PROT_STORE_NEEDS_REVERSED_UNPAID, PROT_STORE_NEEDS_UNBOUND,
+        PROT_STORE_NEEDS_CHARGEBACK, PROT_STORE_NEEDS_OVER_CAP, PROT_STORE_NEEDS_REVERSED_UNPAID,
+        PROT_STORE_NEEDS_UNBOUND,
     };
     use revolt_database::{
         build_store_move, now_ms, plan_store_move, prot_store_key_purchase, prot_user_account,
-        BotInformation, PartialUser, ProtStoreApple, ProtStoreEvent, ProtStoreMoveOutcome,
-        ProtStorePlay, ProtStorePurchase, ProtStoreVerdict, Session,
+        BotInformation, PartialUser, ProtStoreApple, ProtStoreEvent, ProtStoreIntent,
+        ProtStoreMoveOutcome, ProtStorePlay, ProtStorePurchase, ProtStoreVerdict, Session,
     };
     use revolt_models::v0::{self, UserFlags};
     use revolt_payments::store::{
@@ -303,6 +361,7 @@ mod tests {
             country: None,
             state: v0::ProtStoreState::Rejected,
             reject_reason: None,
+            hold_reason: None,
             refund_gen: 0,
             refunds: vec![],
             unreinstated_reversals: 0,
@@ -368,6 +427,55 @@ mod tests {
                 assert_eq!(row.state, v0::ProtStoreState::Rejected);
                 assert_eq!(row.reject_reason, Some(v0::ProtStoreRejectReason::Unbound));
                 assert_eq!(row.needs_action.as_deref(), Some(PROT_STORE_NEEDS_UNBOUND));
+                row
+            }
+            ProtStoreMoveOutcome::Conflict => panic!("a first write conflicted"),
+        }
+    }
+
+    /// `seed` written as the engine writes a purchase held over the wallet
+    /// cap for `buyer` (R63: Held, hold reason `over_cap`, work item
+    /// `over_cap_review`), through a fresh Open intent of the buyer
+    async fn over_cap(
+        harness: &TestHarness,
+        seed: &ProtStorePurchase,
+        buyer: &str,
+    ) -> ProtStorePurchase {
+        let now = now_ms();
+        let intent = ProtStoreIntent {
+            id: Ulid::new().to_string(),
+            user_id: Some(buyer.to_string()),
+            store: seed.store,
+            product_id: seed.product_id.clone(),
+            prot: seed.prot,
+            token: format!("r63-intent.{}", Ulid::new()),
+            state: v0::ProtStoreIntentState::Open,
+            purchase_id: None,
+            created_at: now,
+            expires_at: now + 86_400_000,
+        };
+        harness
+            .db
+            .insert_prot_store_intent(&intent)
+            .await
+            .expect("intent");
+        let event = ProtStoreEvent::Seen(ProtStoreVerdict::Hold {
+            user_id: buyer.to_string(),
+            intent_id: intent.id.clone(),
+            reason: v0::ProtStoreHoldReason::OverCap,
+        });
+        let plan = plan_store_move(None, &event, 0);
+        let m = build_store_move(None, seed, &event, &plan, 0, now).expect("a move");
+        match harness
+            .db
+            .apply_store_purchase_move(&m)
+            .await
+            .expect("store move")
+        {
+            ProtStoreMoveOutcome::Applied { row, .. } => {
+                assert_eq!(row.state, v0::ProtStoreState::Held);
+                assert_eq!(row.hold_reason, Some(v0::ProtStoreHoldReason::OverCap));
+                assert_eq!(row.needs_action.as_deref(), Some(PROT_STORE_NEEDS_OVER_CAP));
                 row
             }
             ProtStoreMoveOutcome::Conflict => panic!("a first write conflicted"),
@@ -497,6 +605,21 @@ mod tests {
             Some("handled"),
             &format!("/admin/prot/store/{}/resolve", id),
             json!({ "kind": kind }),
+        )
+        .await
+    }
+
+    async fn release<'c>(
+        harness: &'c TestHarness,
+        session: &Session,
+        id: &str,
+    ) -> LocalResponse<'c> {
+        post(
+            harness,
+            session,
+            Some("over%20cap%20ticket%2077"),
+            &format!("/admin/prot/store/{}/release", id),
+            json!({}),
         )
         .await
     }
@@ -1161,9 +1284,224 @@ mod tests {
         }
     }
 
+    #[test]
+    fn release_credits_an_over_cap_hold() {
+        crate::util::test::rt().block_on(release_credits_an_over_cap_hold_case())
+    }
+
+    /// R63: staff release a purchase held over the cap: credited to its
+    /// buyer, looked up fresh, then consumed; the work item is cleared; a
+    /// second release credits nothing
+    async fn release_credits_an_over_cap_hold_case() {
+        let harness = TestHarness::new().await;
+        let (session, _) = new_staff(&harness).await;
+        let (_, _, buyer) = harness.new_user().await;
+
+        let token = token();
+        let row = over_cap(
+            &harness,
+            &play_seed(&token, v0::ProtStoreEnvironment::Production),
+            &buyer.id,
+        )
+        .await;
+        harness
+            .play
+            .set_purchase(&token, Ok(at_play(PLAY_PURCHASE_STATE_PURCHASED)));
+
+        let released = purchase_of(release(&harness, &session, &row.id).await).await;
+        assert_eq!(released.purchase.state, v0::ProtStoreState::Credited);
+        assert_eq!(released.purchase.hold_reason, None);
+        assert_eq!(released.purchase.needs_action, None);
+        assert_eq!(
+            released.purchase.user_id.as_deref(),
+            Some(buyer.id.as_str())
+        );
+        assert_eq!(released.purchase.consumed, Some(true));
+        assert_eq!(released.ledger.len(), 1, "{:?}", released.ledger);
+        assert_eq!(released.ledger[0].amount, P5_PROT);
+        assert_eq!(released.unspent, Some(P5_PROT));
+        assert_eq!(balance(&harness, &buyer.id).await, Some(P5_PROT));
+
+        let lookup = format!("product_purchase {}", &row.id["play:".len()..]);
+        let consume = format!("consume {} {}", P5, &row.id["play:".len()..]);
+        assert_eq!(harness.play.calls(), vec![lookup, consume]);
+
+        let response = release(&harness, &session, &row.id).await;
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(error_type(response).await, "InvalidOperation");
+        assert_eq!(balance(&harness, &buyer.id).await, Some(P5_PROT));
+    }
+
+    #[test]
+    fn release_needs_staff_a_ticket_and_a_reason() {
+        crate::util::test::rt().block_on(release_needs_staff_a_ticket_and_a_reason_case())
+    }
+
+    /// The S5 staff guards: a non-privileged buyer cannot release their own
+    /// hold; no ticket → 401; no reason, or one that sanitizes to nothing →
+    /// 400. Nothing moves and the store is never asked.
+    async fn release_needs_staff_a_ticket_and_a_reason_case() {
+        let harness = TestHarness::new().await;
+        let (staff_session, _) = new_staff(&harness).await;
+        let (_, buyer_session, buyer) = harness.new_user().await;
+        assert!(!buyer.privileged);
+
+        let token = token();
+        let row = over_cap(
+            &harness,
+            &play_seed(&token, v0::ProtStoreEnvironment::Production),
+            &buyer.id,
+        )
+        .await;
+        harness
+            .play
+            .set_purchase(&token, Ok(at_play(PLAY_PURCHASE_STATE_PURCHASED)));
+        let path = format!("/admin/prot/store/{}/release", row.id);
+
+        let response = release(&harness, &buyer_session, &row.id).await;
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(error_type(response).await, "NotPrivileged");
+
+        let response = harness
+            .client
+            .post(path.clone())
+            .header(Header::new("x-session-token", staff_session.token.clone()))
+            .header(Header::new("X-Audit-Log-Reason", "check"))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Unauthorized, "no ticket");
+
+        for reason in [None, Some("%20%E2%80%8B%0A")] {
+            let response = post(&harness, &staff_session, reason, &path, json!({})).await;
+            assert_eq!(response.status(), Status::BadRequest, "reason {:?}", reason);
+            let body = response.into_string().await.expect("body");
+            assert!(body.contains("AuditLogReasonRequired"), "{}", body);
+        }
+
+        assert_untouched(&harness, &row).await;
+        assert_eq!(balance(&harness, &buyer.id).await, None);
+        assert!(harness.play.calls().is_empty(), "the store was asked");
+    }
+
+    #[test]
+    fn release_refuses_self_and_a_bot_or_deleted_buyer() {
+        crate::util::test::rt().block_on(release_refuses_self_and_a_bot_or_deleted_buyer_case())
+    }
+
+    /// Staff never release their own hold; a bot's or a deleted account's
+    /// hold is never released. Each refusal comes before any store lookup.
+    async fn release_refuses_self_and_a_bot_or_deleted_buyer_case() {
+        let harness = TestHarness::new().await;
+        let (session, staff) = new_staff(&harness).await;
+
+        let (_, _, mut bot) = harness.new_user().await;
+        bot.update(
+            &harness.db,
+            PartialUser {
+                bot: Some(BotInformation {
+                    owner: staff.id.clone(),
+                }),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("flag the bot");
+        let (_, _, mut deleted) = harness.new_user().await;
+
+        let mut rows = Vec::new();
+        for buyer in [&staff.id, &bot.id, &deleted.id] {
+            let token = token();
+            harness
+                .play
+                .set_purchase(&token, Ok(at_play(PLAY_PURCHASE_STATE_PURCHASED)));
+            rows.push(
+                over_cap(
+                    &harness,
+                    &play_seed(&token, v0::ProtStoreEnvironment::Production),
+                    buyer,
+                )
+                .await,
+            );
+        }
+        deleted
+            .update(
+                &harness.db,
+                PartialUser {
+                    flags: Some(UserFlags::Deleted as i32),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("mark deleted");
+
+        for row in &rows {
+            let response = release(&harness, &session, &row.id).await;
+            assert_eq!(response.status(), Status::BadRequest, "{:?}", row.user_id);
+            assert_eq!(error_type(response).await, "InvalidOperation");
+            assert_untouched(&harness, row).await;
+        }
+        for user_id in [&staff.id, &bot.id, &deleted.id] {
+            assert_eq!(balance(&harness, user_id).await, None);
+        }
+        assert!(harness.play.calls().is_empty(), "the store was asked");
+    }
+
+    #[test]
+    fn release_refuses_anything_but_an_over_cap_hold() {
+        crate::util::test::rt().block_on(release_refuses_anything_but_an_over_cap_hold_case())
+    }
+
+    /// An unbound purchase is not releasable (400, no lookup); an id that
+    /// names no purchase is 404
+    async fn release_refuses_anything_but_an_over_cap_hold_case() {
+        let harness = TestHarness::new().await;
+        let (session, _) = new_staff(&harness).await;
+
+        let token = token();
+        let row = unbound(
+            &harness,
+            &play_seed(&token, v0::ProtStoreEnvironment::Production),
+        )
+        .await;
+        harness
+            .play
+            .set_purchase(&token, Ok(at_play(PLAY_PURCHASE_STATE_PURCHASED)));
+        let response = release(&harness, &session, &row.id).await;
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(error_type(response).await, "InvalidOperation");
+        assert_untouched(&harness, &row).await;
+        assert!(harness.play.calls().is_empty(), "the store was asked");
+
+        for path_id in [
+            format!("play:{}", "0".repeat(64)),
+            Ulid::new().to_string(),
+            "apple:prod:1%0AAUDIT%20forged".to_string(),
+        ] {
+            let response = release(&harness, &session, &path_id).await;
+            assert_eq!(response.status(), Status::NotFound, "{}", path_id);
+        }
+    }
+
+    /// The release writes its AUDIT line, as every staff route does
+    #[test]
+    fn release_route_logs_its_audit_line() {
+        let source = include_str!("prot_store.rs");
+        let route = source.split("#[cfg(test)]").next().expect("route code");
+        let release = route
+            .split("pub async fn release_prot_store_purchase")
+            .nth(1)
+            .expect("release");
+        assert!(release.contains("\"AUDIT prot_store_release: actor={} id={} reason={:?}\""));
+        assert!(release.contains("staff_reason(&user, &ticket, reason)?"));
+        assert!(release.contains("check_purchase_id(&id)?"));
+    }
+
     /// Support must reach store purchases while Prot and the stores are
-    /// closed for sale: no route reads an open flag, and only assign reads
-    /// the settings at all (for the credit pause and the credentials)
+    /// closed for sale: no route reads an open flag, and only assign and
+    /// release read the settings at all (for the credit pause and the
+    /// credentials)
     #[test]
     fn store_admin_routes_are_not_gated_on_the_flags() {
         let source = include_str!("prot_store.rs");
@@ -1196,15 +1534,38 @@ mod tests {
             );
         }
 
-        // The settings are loaded once each, inside assign only
-        let assign = code
-            .split("pub async fn assign_prot_store_purchase")
-            .nth(1)
-            .and_then(|rest| rest.split("pub async fn").next())
-            .expect("assign");
-        for load in ["ProtSalesSettings::load()", "ProtStoreSettings::load()"] {
-            assert_eq!(code.matches(load).count(), 1, "{}", load);
-            assert!(assign.contains(load), "{} outside assign", load);
+        // R64: the store settings are loaded exactly twice, once in assign
+        // and once in release, each after the privileged + MFA checks; the
+        // sales settings once, in assign
+        let body_of = |name: &str| {
+            code.split(&format!("pub async fn {}", name))
+                .nth(1)
+                .and_then(|rest| rest.split("pub async fn").next())
+                .expect(name)
+                .to_string()
+        };
+        let assign = body_of("assign_prot_store_purchase");
+        let release = body_of("release_prot_store_purchase");
+        assert_eq!(code.matches("ProtSalesSettings::load()").count(), 1);
+        assert!(
+            assign.contains("ProtSalesSettings::load()"),
+            "ProtSalesSettings::load() outside assign"
+        );
+        assert_eq!(code.matches("ProtStoreSettings::load()").count(), 2);
+        for (name, body) in [("assign", &assign), ("release", &release)] {
+            assert_eq!(
+                body.matches("ProtStoreSettings::load()").count(),
+                1,
+                "{}",
+                name
+            );
+            let guards = body.find("staff_reason(").expect(name);
+            let load = body.find("ProtStoreSettings::load()").expect(name);
+            assert!(
+                guards < load,
+                "{} loads the settings before the staff guards",
+                name
+            );
         }
     }
 }

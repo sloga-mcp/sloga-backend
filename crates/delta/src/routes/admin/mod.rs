@@ -23,6 +23,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         prot_store::list_prot_store_needs_action,
         prot_store::assign_prot_store_purchase,
         prot_store::resolve_prot_store_purchase,
+        prot_store::release_prot_store_purchase,
     ]
 }
 
