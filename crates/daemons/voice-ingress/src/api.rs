@@ -1,22 +1,27 @@
 use livekit_api::{access_token::TokenVerifier, webhooks::WebhookReceiver};
 use livekit_protocol::{ParticipantInfo, TrackType};
 use revolt_database::{
-    events::client::EventV1,
+    events::{
+        client::EventV1,
+        rabbit::{CALL_REASON_ANSWERED_ELSEWHERE, CALL_REASON_CANCELLED, CALL_REASON_ENDED},
+    },
     iso8601_timestamp::{Duration, Timestamp},
     util::{permissions::DatabasePermissionQuery, reference::Reference},
     voice::{
         clear_voice_participant_identities, create_voice_state, delete_channel_voice_state,
-        delete_screen_leg, delete_voice_connection, delete_voice_connections, get_screen_leg_sid,
-        get_user_moved_to_voice, get_user_voice_channels, get_voice_channel_members,
-        get_voice_state, is_in_voice_channel, is_screen_leg, is_screenshare_video, is_video_source,
-        mls_cap_would_refuse, participant_leg, record_screen_leg, record_voice_connection,
-        recorded_voice_connections, remove_user_from_voice_channel, screen_leg_identity,
-        screen_leg_left, set_voice_participant_identity, update_voice_state,
-        update_voice_state_tracks, user_id_from_participant_identity, video_roster_over_cap,
-        voice_connect_still_allowed, AfkGate, ConnectionLeave, RoomMetadata, UserVoiceChannel,
-        VoiceClient, MAX_VIDEO_PARTICIPANTS,
+        delete_screen_leg, delete_voice_connection, delete_voice_connections, get_call_ring,
+        get_screen_leg_sid, get_user_moved_to_voice, get_user_voice_channels,
+        get_voice_channel_members, get_voice_state, is_in_voice_channel, is_screen_leg,
+        is_screenshare_video, is_video_source, mark_call_ring_answered, mls_cap_would_refuse,
+        participant_leg, record_screen_leg, record_voice_connection, recorded_voice_connections,
+        remove_user_from_voice_channel, ring_mint_decision, ring_window_open, screen_leg_identity,
+        screen_leg_left, set_call_ring, set_voice_participant_identity, take_call_answer_marker,
+        take_call_ring, take_call_video_hint, update_voice_state, update_voice_state_tracks,
+        user_id_from_participant_identity, video_roster_over_cap, voice_connect_still_allowed,
+        AfkGate, CallRing, ConnectionLeave, RingMint, RoomMetadata, UserVoiceChannel, VoiceClient,
+        MAX_VIDEO_PARTICIPANTS,
     },
-    Database, AMQP,
+    Database, DmCallSignal, AMQP,
 };
 use revolt_models::v0::{PartialUserVoiceState, UserVoiceState};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -524,6 +529,15 @@ pub async fn ingress(
 
             let joined_at = event_joined_at(event.created_at);
 
+            // The one switch for everything the ring signals add to this
+            // arm: the answer marker and the video hint, the ring record
+            // with its call id, and the "answered elsewhere" signal. They
+            // exist for a direct message or a group only (a channel with no
+            // server), and only while the feature is on. With the switch
+            // off no marker is read, no record is read or written, and the
+            // ring below is the push it has always been.
+            let ring_signals = config.features.call_signals && channel.server_id.is_none();
+
             // Connect re-check (AFK S-3 D-3), FIRST, before anything is
             // written. A join token lives for seconds, so a ban, kick or
             // Connect denial that lands between the mint and the SFU join is
@@ -564,6 +578,11 @@ pub async fn ingress(
                 // mis-announced as a move.
                 let _ = get_user_moved_to_voice(channel_id, user_id).await;
                 log::info!("Evicted {identity} from {channel_id}: not confirmed allowed to connect.");
+                // The answer marker and the video hint are drained for the
+                // same reason as the move marker: this join is over, and one
+                // left behind would be read by this user's next join here,
+                // which could then start a call that rings nobody.
+                take_join_markers(ring_signals, channel_id, user_id).await;
                 return Ok(EmptyResponse);
             }
 
@@ -590,6 +609,8 @@ pub async fn ingress(
                 log::info!(
                     "Evicted a connection from {channel_id}: its device is no longer registered."
                 );
+                // Drained as on the refusal above.
+                take_join_markers(ring_signals, channel_id, user_id).await;
                 return Ok(EmptyResponse);
             }
 
@@ -652,6 +673,12 @@ pub async fn ingress(
                 let recorded = recorded_voice_connections(&channel, user_id).await?;
                 let state = get_voice_state(&channel, user_id).await?;
                 if !retried_join(state.as_ref(), joined_at, &recorded, sid) {
+                    // A second connection goes no further, so the markers
+                    // its join left are drained here. This is the exit an
+                    // answer pressed on two devices takes for the second
+                    // one: its marker would otherwise outlive the call and
+                    // keep this user's own next call from ringing.
+                    take_join_markers(ring_signals, channel_id, user_id).await;
                     return Ok(EmptyResponse);
                 }
                 state
@@ -706,6 +733,9 @@ pub async fn ingress(
                 // within its TTL isn't mis-announced as a VoiceChannelMove from
                 // the old channel.
                 let _ = get_user_moved_to_voice(channel_id, user_id).await;
+                // The answer marker and the video hint, drained for the same
+                // reason: an evicted join must not leave them for the next.
+                take_join_markers(ring_signals, channel_id, user_id).await;
                 return Ok(EmptyResponse);
             }
 
@@ -741,15 +771,124 @@ pub async fn ingress(
             // read is reported (ERROR + Sentry) and the ring is skipped: with
             // the roster unknown, ringing could repeat on every join, and a
             // missed ring costs less.
+            //
+            // Everything the ring signals add from here on obeys the same
+            // rule. Each marker read, each read or write of the ring record
+            // and each publish sits behind a helper that cannot return an
+            // error: it logs its own failure and answers as if nothing were
+            // stored. So a failing store or broker costs a signal its call
+            // id, or costs a stop-ringing signal altogether, and never
+            // costs the ring or the webhook its answer.
+            //
+            // The answer marker and the video hint are collected here, ahead
+            // of the roster read and whatever it says. A join that answers a
+            // ring normally finds the caller there and never reaches the
+            // ring; a marker collected only on the way to the ring would
+            // outlive the call it answered and keep this user's own next
+            // call from ringing anybody. And they are collected only now
+            // that the join can no longer be retried: a retry of a join
+            // that had already used them up would read an answer as a new
+            // call. The exits above, which end the join for good, drain
+            // them instead.
+            let markers = take_join_markers(ring_signals, channel_id, user_id).await;
             match get_voice_channel_members(&channel).await {
                 Ok(members) => {
-                    if members.map_or(0, |m| m.len()) <= 1 {
-                        let now = joined_at.to_string();
-                        if let Err(e) = amqp
-                            .dm_call_updated(user_id, channel_id, Some(&now), false, None)
-                            .await
-                        {
-                            log::error!("failed to publish call ring push: {e:?}");
+                    let alone = members.map_or(0, |m| m.len()) <= 1;
+                    if !ring_signals {
+                        // Ring signals are off, or this is a channel of a
+                        // server: the ring exactly as it was before them.
+                        if alone {
+                            let now = joined_at.to_string();
+                            if let Err(e) = amqp
+                                .dm_call_updated(user_id, channel_id, Some(&now), false, None)
+                                .await
+                            {
+                                log::error!("failed to publish call ring push: {e:?}");
+                            }
+                        }
+                    } else {
+                        // Every app rings for the same length of time, and
+                        // this is the one rule they all read it through.
+                        let ring_secs = revolt_config::effective_call_ring_secs(
+                            config.api.livekit.call_ring_duration,
+                        );
+
+                        if alone {
+                            // Nobody else is here, so this join starts a
+                            // call, unless it answered one whose caller has
+                            // left since (`lone_join`). "Now" is the moment
+                            // of the join as the media server stamped it,
+                            // the same on every retry of this event.
+                            let stored = stored_call_ring(channel_id).await;
+                            match lone_join(
+                                markers,
+                                stored.as_ref(),
+                                user_id,
+                                ulid::Ulid::new().to_string(),
+                                joined_at.to_string(),
+                                event.created_at,
+                                ring_secs,
+                            ) {
+                                LoneJoin::Silent => {}
+                                // The ring already stored is this very ring
+                                // (a retry, or the lone caller reconnecting
+                                // while it still rings): it goes out again
+                                // as it was, and nothing is stored.
+                                LoneJoin::RingAgain(ring) => {
+                                    publish_call_signal(
+                                        amqp,
+                                        ring_signal(&ring, channel_id),
+                                        "ring",
+                                    )
+                                    .await;
+                                }
+                                // A new ring. The record is stored before
+                                // the ring goes out, so a decline that
+                                // comes straight back finds it, and storing
+                                // it is what replaces a record left over
+                                // from an earlier call.
+                                LoneJoin::RingNew(ring) => {
+                                    store_call_ring(channel_id, &ring).await;
+                                    publish_call_signal(
+                                        amqp,
+                                        ring_signal(&ring, channel_id),
+                                        "ring",
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else if let Some(ring) = stored_call_ring(channel_id).await {
+                            // Somebody else is already in the call. Anyone
+                            // but the caller joining it has answered the
+                            // ring, whenever they do it: that is what the
+                            // end of the call reports as "ended" and not
+                            // "cancelled". It is marked on a key of its
+                            // own, never by writing the record back, which
+                            // could overwrite a newer ring.
+                            if answers_call_ring(&ring, user_id) {
+                                note_call_ring_answered(channel_id, &ring).await;
+                            }
+
+                            // And while the ring may still be ringing, the
+                            // joiner's other devices are told to stop. The
+                            // signal names the CALLER as its initiator and
+                            // the joiner as its only recipient: the push
+                            // daemon never delivers to the initiator, and
+                            // delivers this signal to nobody it does not
+                            // name.
+                            if answered_elsewhere_applies(
+                                &ring,
+                                user_id,
+                                event.created_at,
+                                ring_secs,
+                            ) {
+                                publish_call_signal(
+                                    amqp,
+                                    answered_elsewhere_signal(&ring, channel_id, user_id),
+                                    "answered elsewhere",
+                                )
+                                .await;
+                            }
                         }
                     }
                 }
@@ -758,6 +897,19 @@ pub async fn ingress(
                     // ERROR + Sentry with the cause; the join is already
                     // announced, so the converted error is discarded.
                     let _ = Err::<(), _>(error).to_internal_error();
+
+                    // With the roster unknown, nobody can say whose ring the
+                    // stored record is. If this join started a call, no
+                    // ring went out and no record was stored for it, so the
+                    // record is an earlier call's, and left in place it
+                    // would speak for this one when it ends: the end push
+                    // would name the wrong caller and the wrong ring. So it
+                    // is removed. If the record was this call's own after
+                    // all, the cost is that its end is announced the way it
+                    // was before ring records existed.
+                    if ring_signals {
+                        take_stored_call_ring(channel_id).await;
+                    }
                 }
             }
 
@@ -818,6 +970,12 @@ pub async fn ingress(
             };
             let identity = identity.to_internal_error()?;
             let sid = &event.participant.as_ref().to_internal_error()?.sid;
+
+            // The one switch for the ring record in this arm, the same as in
+            // the join: a direct message or a group, with the feature on.
+            // With it off the end of a call reads nothing and publishes the
+            // end push it always did.
+            let ring_signals = config.features.call_signals && channel.server_id.is_none();
 
             // Remote-control release hook (plan §1), scoped to THIS
             // connection (S-3 D-7): a sharer grant ends, with a revoke, on
@@ -956,11 +1114,41 @@ pub async fn ingress(
                 // Everyone left — dismiss the ring notification on recipients
                 let members = get_voice_channel_members(&channel).await?;
                 if members.is_none_or(|m| m.is_empty()) {
-                    if let Err(e) = amqp
-                        .dm_call_updated(user_id, channel_id, None, true, None)
-                        .await
-                    {
-                        log::error!("failed to publish call end push: {e:?}");
+                    // The call is over, and its ring record goes with it:
+                    // taken, not read, so the record cannot speak for the
+                    // next call here, and of two leaves racing to end the
+                    // call only one is handed it. Only a direct message or
+                    // a group has one, and only while ring signals are on;
+                    // otherwise nothing is read. Best effort: a record
+                    // that cannot be taken is logged and the end push goes
+                    // out as it always did.
+                    let ring = if ring_signals {
+                        take_stored_call_ring(channel_id).await
+                    } else {
+                        None
+                    };
+                    match ring {
+                        // The push daemon tells everyone in the
+                        // conversation except the user named as initiator,
+                        // so that has to be the caller, whose devices are
+                        // not the ones ringing. The record knows who rang;
+                        // whoever happens to leave last may be anyone. It
+                        // also says whether the ring was ever answered.
+                        Some(ring) => {
+                            publish_call_signal(amqp, call_ended_signal(&ring, channel_id), "end")
+                                .await;
+                        }
+                        // No record (ring signals off, a channel of a
+                        // server, or a record that was lost): the end push
+                        // exactly as it was before ring records existed.
+                        None => {
+                            if let Err(e) = amqp
+                                .dm_call_updated(user_id, channel_id, None, true, None)
+                                .await
+                            {
+                                log::error!("failed to publish call end push: {e:?}");
+                            }
+                        }
                     }
                 }
 
@@ -1273,6 +1461,18 @@ pub async fn ingress(
             delete_channel_voice_state(&channel, &[]).await?;
             clear_voice_participant_identities(channel_id).await?;
 
+            // The roster was just cleared, so no leave is left to end this
+            // call and collect its ring record: a record still stored (the
+            // leaves were missed) would otherwise stay behind and speak for
+            // the next call in this channel. Removed here, best effort, for
+            // a direct message or a group with ring signals on; nothing is
+            // read otherwise. No end push is sent from here, as none ever
+            // was.
+            let ring_signals = config.features.call_signals && channel.server_id.is_none();
+            if ring_signals {
+                take_stored_call_ring(channel_id).await;
+            }
+
             // Media E2EE: the call ended — close the channel's open MLS
             // group so members wipe state and the crond sweep reclaims it
             // (plan §1.4 end-of-call / §2.5)
@@ -1563,6 +1763,264 @@ fn survivor_track_flags(
         screensharing: Some(screensharing),
         screen_video: Some(screen_video),
         ..Default::default()
+    }
+}
+
+/// What the join route left waiting for a join of a direct message or group:
+/// whether the join answers a ring, and whether the caller pressed the video
+/// button.
+///
+/// CLIENT-CLAIMED, both of them: the join route wrote them down from what
+/// the app said about its own join. They grant nothing. `answer` can only
+/// keep a join from ringing anybody, and `video` only says how the ring
+/// should look.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct JoinMarkers {
+    answer: bool,
+    video: bool,
+}
+
+/// Collect the answer marker and the video hint waiting for `user_id`'s join
+/// of `channel_id`, removing both, so each is acted on at most once and
+/// neither is left for a later join to pick up.
+///
+/// With `ring_signals` off (the feature is off, or the channel belongs to a
+/// server) nothing is read and both answer `false`.
+///
+/// Best effort, and it cannot return an error: a marker that could not be
+/// read is logged and reads as absent. A failing store can so cost a ring
+/// its video look, or let an answer that arrived after the caller left ring
+/// as a new call, but it can never stop a ring or fail the webhook.
+async fn take_join_markers(ring_signals: bool, channel_id: &str, user_id: &str) -> JoinMarkers {
+    if !ring_signals {
+        return JoinMarkers::default();
+    }
+
+    let answer = match take_call_answer_marker(channel_id, user_id).await {
+        Ok(answer) => answer,
+        Err(error) => {
+            log::error!("Reading the answer marker of a join in {channel_id} failed ({error}); it is read as absent.");
+            false
+        }
+    };
+    let video = match take_call_video_hint(channel_id, user_id).await {
+        Ok(video) => video,
+        Err(error) => {
+            log::error!("Reading the video hint of a join in {channel_id} failed ({error}); it is read as absent.");
+            false
+        }
+    };
+
+    JoinMarkers { answer, video }
+}
+
+/// The ring record stored for `channel_id`, left in place. Best effort, and
+/// it cannot return an error: a failed read is logged and answers `None`, as
+/// if no ring were stored.
+async fn stored_call_ring(channel_id: &str) -> Option<CallRing> {
+    match get_call_ring(channel_id).await {
+        Ok(ring) => ring,
+        Err(error) => {
+            log::error!("Reading the call ring of {channel_id} failed ({error}); it is read as absent.");
+            None
+        }
+    }
+}
+
+/// The ring record stored for `channel_id`, removed in the same step: for a
+/// call that is over, or a record that belongs to an earlier call. Best
+/// effort, and it cannot return an error: a failed removal is logged and
+/// answers `None`. A record that could not be removed expires on its own.
+async fn take_stored_call_ring(channel_id: &str) -> Option<CallRing> {
+    match take_call_ring(channel_id).await {
+        Ok(ring) => ring,
+        Err(error) => {
+            log::error!("Removing the call ring of {channel_id} failed ({error}); it is left to expire.");
+            None
+        }
+    }
+}
+
+/// Store `ring` as the ring record of `channel_id`, replacing whatever was
+/// there. Best effort, and it cannot return an error: a failed write is
+/// logged, and the ring still goes out. Without its record that ring cannot
+/// be declined, and the end of its call is announced as it was before ring
+/// records existed.
+async fn store_call_ring(channel_id: &str, ring: &CallRing) {
+    if let Err(error) = set_call_ring(channel_id, ring).await {
+        log::error!("Storing the call ring of {channel_id} failed ({error}); the ring goes out without a record.");
+    }
+}
+
+/// Note that somebody other than its caller has joined the call `ring`
+/// started. The mark is a key of its own, named by the call id, and never
+/// the record written back: a write-back could overwrite a newer ring, or
+/// bring back a record that was just taken. Best effort, and it cannot
+/// return an error: a failed write is logged, and the end of the call then
+/// reports a ring nobody answered.
+async fn note_call_ring_answered(channel_id: &str, ring: &CallRing) {
+    if let Err(error) = mark_call_ring_answered(&ring.call_id).await {
+        log::error!("Marking the call ring of {channel_id} as answered failed ({error}).");
+    }
+}
+
+/// Hand one call signal to the push daemon. Best effort, and it cannot
+/// return an error: a failed publish is logged, with `what` naming the
+/// signal, and nothing else follows from it.
+async fn publish_call_signal(amqp: &AMQP, signal: DmCallSignal, what: &str) {
+    if let Err(e) = amqp.dm_call_signal(signal).await {
+        log::error!("failed to publish call {what} push: {e:?}");
+    }
+}
+
+/// What a join that leaves the joiner alone in a direct message or group
+/// does about ringing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoneJoin {
+    /// The join answered a ring, and its caller has left since. An answer
+    /// never starts a call: nobody is rung and nothing is stored.
+    Silent,
+    /// The ring already stored is this joiner's own and still ringing. It
+    /// goes out again exactly as stored, and nothing is stored.
+    RingAgain(CallRing),
+    /// A new ring: this record is stored, then the ring goes out with it.
+    RingNew(CallRing),
+}
+
+/// What the join of `joiner_id`, which leaves them alone in the call, does
+/// about ringing. Pure.
+///
+/// `markers` are what the join route left for this join, `stored` the ring
+/// record the channel has now, and `now_unix` the moment of the join.
+/// `new_call_id` and `started_at` (that same moment, as the ring push
+/// carries it) are used only if a new ring is started.
+///
+/// - An answer rings nobody, whatever is stored.
+/// - Otherwise the stored ring is sent again only when it is this joiner's
+///   own, unanswered, and still ringing (`ring_mint_decision`): a webhook
+///   delivered twice, or the lone caller reconnecting. It keeps the call id
+///   and start time it had, so every device still counts the same ring down
+///   from the same moment, and it keeps the video look it had: the hint for
+///   it was used up when it was first sent.
+/// - Anything else stored is left over from an earlier call, and a new ring
+///   replaces it.
+fn lone_join(
+    markers: JoinMarkers,
+    stored: Option<&CallRing>,
+    joiner_id: &str,
+    new_call_id: String,
+    started_at: String,
+    now_unix: i64,
+    ring_secs: usize,
+) -> LoneJoin {
+    if markers.answer {
+        return LoneJoin::Silent;
+    }
+
+    match ring_mint_decision(stored, joiner_id, now_unix, ring_secs) {
+        RingMint::Reuse(ring) => LoneJoin::RingAgain(ring),
+        RingMint::Mint => LoneJoin::RingNew(CallRing {
+            call_id: new_call_id,
+            initiator_id: joiner_id.to_string(),
+            started_at,
+            started_unix: now_unix,
+            video: markers.video,
+            answered: false,
+        }),
+    }
+}
+
+/// Whether the join of `joiner_id`, into a call somebody else is already in,
+/// is the first answer to `ring`: the joiner is not its caller, and nobody
+/// has answered it yet. Pure.
+///
+/// How long ago the ring started plays no part. A call whose ring ran out
+/// and was joined later was still answered, and its end must say so.
+fn answers_call_ring(ring: &CallRing, joiner_id: &str) -> bool {
+    ring.initiator_id != joiner_id && !ring.answered
+}
+
+/// Whether the join of `joiner_id`, into a call somebody else is already in,
+/// tells the joiner's other devices to stop ringing: the joiner is not the
+/// caller of `ring`, and the ring may still be ringing somewhere, which it
+/// may until its length and the grace for slow devices have both run out.
+/// Pure.
+///
+/// Whether somebody has already answered plays no part. In a group, a third
+/// member who answers after the second still has other devices ringing. So
+/// the window is asked about the ring as if nobody had answered it.
+fn answered_elsewhere_applies(
+    ring: &CallRing,
+    joiner_id: &str,
+    now_unix: i64,
+    ring_secs: usize,
+) -> bool {
+    let unanswered = CallRing {
+        answered: false,
+        ..ring.clone()
+    };
+
+    ring.initiator_id != joiner_id && ring_window_open(&unanswered, now_unix, ring_secs)
+}
+
+/// The ring push for `ring`, sent to everyone in the conversation but its
+/// caller. It carries the record's own call id and start time, never "now",
+/// so a ring sent a second time is the same ring to every device. Pure.
+fn ring_signal(ring: &CallRing, channel_id: &str) -> DmCallSignal {
+    DmCallSignal {
+        initiator_id: ring.initiator_id.clone(),
+        channel_id: channel_id.to_string(),
+        started_at: Some(ring.started_at.clone()),
+        ended: false,
+        recipients: None,
+        call_id: Some(ring.call_id.clone()),
+        reason: None,
+        video: ring.video.then_some(true),
+    }
+}
+
+/// The signal that stops `ring` ringing on the other devices of `joiner_id`,
+/// who has just joined the call. Pure.
+///
+/// The push daemon never delivers a call signal to the user named as its
+/// initiator, and delivers this one only to the users it names. So the
+/// initiator stays the ring's caller, and the joiner is the one recipient:
+/// named as initiator, the joiner would be the one user it cannot reach.
+fn answered_elsewhere_signal(ring: &CallRing, channel_id: &str, joiner_id: &str) -> DmCallSignal {
+    DmCallSignal {
+        initiator_id: ring.initiator_id.clone(),
+        channel_id: channel_id.to_string(),
+        started_at: None,
+        ended: true,
+        recipients: Some(vec![joiner_id.to_string()]),
+        call_id: Some(ring.call_id.clone()),
+        reason: Some(CALL_REASON_ANSWERED_ELSEWHERE.to_string()),
+        video: None,
+    }
+}
+
+/// The end push for the call `ring` started, sent to everyone in the
+/// conversation but its caller. Pure.
+///
+/// It is addressed from the ring's caller, whoever was the last to leave,
+/// and names the ring. A ring nobody but the caller ever joined was
+/// cancelled; anything else ended.
+fn call_ended_signal(ring: &CallRing, channel_id: &str) -> DmCallSignal {
+    let reason = if ring.answered {
+        CALL_REASON_ENDED
+    } else {
+        CALL_REASON_CANCELLED
+    };
+
+    DmCallSignal {
+        initiator_id: ring.initiator_id.clone(),
+        channel_id: channel_id.to_string(),
+        started_at: None,
+        ended: true,
+        recipients: None,
+        call_id: Some(ring.call_id.clone()),
+        reason: Some(reason.to_string()),
+        video: None,
     }
 }
 
@@ -2229,6 +2687,15 @@ mod tests {
     /// `retried_first_connection` alone, which reads a retry with anything
     /// else recorded as a sibling (the re-audit's residuals a, b and c-prime)
     /// and a legacy or ghost state as a retry (residual c).
+    ///
+    /// The pinned decision gained one statement, ahead of the sibling's
+    /// return and changing nothing about when it returns: the second
+    /// connection drains the answer marker and the video hint its join
+    /// left. This exit is the one an answer pressed on a second device
+    /// takes, and without the drain its marker would outlive the call and
+    /// keep that user's own next call from ringing (pinned for every exit in
+    /// `every_exit_of_the_member_join_drains_the_markers`). It is still the
+    /// only `return` between the record and the backstop.
     #[test]
     fn a_retried_first_join_is_announced_and_runs_the_backstop() {
         let body = member_arm("participant_joined");
@@ -2244,6 +2711,7 @@ mod tests {
              let recorded = recorded_voice_connections(&channel, user_id).await?; \
              let state = get_voice_state(&channel, user_id).await?; \
              if !retried_join(state.as_ref(), joined_at, &recorded, sid) \u{7b} \
+             take_join_markers(ring_signals, channel_id, user_id).await; \
              return Ok(EmptyResponse); \u{7d} \
              state \u{7d};",
         );
@@ -3444,5 +3912,812 @@ mod tests {
                 );
             }
         });
+    }
+
+    use super::{
+        answered_elsewhere_applies, answered_elsewhere_signal, answers_call_ring,
+        call_ended_signal, lone_join, ring_signal, CallRing, DmCallSignal, JoinMarkers, LoneJoin,
+        CALL_REASON_ANSWERED_ELSEWHERE, CALL_REASON_CANCELLED, CALL_REASON_ENDED,
+    };
+    use revolt_database::voice::CALL_RING_GRACE_SECS;
+
+    /// `text` with all whitespace removed and the trailing comma of a wrapped
+    /// argument list dropped, so a pin reads the same however the call it is
+    /// about is wrapped.
+    fn squeezed(text: &str) -> String {
+        text.split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")")
+    }
+
+    /// The position, in the squeezed `text`, of the ONE place it reads
+    /// `shape` (squeezed the same way).
+    fn once_squeezed(text: &str, shape: &str) -> usize {
+        once(&squeezed(text), &squeezed(shape))
+    }
+
+    /// The member join from its announce to its end: everything that runs
+    /// once the join has gone out, when the webhook may no longer fail.
+    fn after_the_join_announce() -> String {
+        let body = member_arm("participant_joined");
+        let announce = once(
+            &body,
+            "if let Some(source_channel) = get_user_moved_to_voice(channel_id, user_id).await? \u{7b}",
+        );
+        let after = &body[announce..];
+        after[after.find('\u{7b}').unwrap()..].to_string()
+    }
+
+    /// With ring signals off this file reads no marker, keeps no ring record
+    /// and publishes the pushes it always did. Each arm that does anything
+    /// about a ring derives ONE switch, the feature flag together with "the
+    /// channel has no server", and the flag is read nowhere else. With the
+    /// switch off the join's ring is the old publish to the letter, and
+    /// everything new sits in the branch after it. Mutations this catches:
+    /// the join's switch reduced to `channel.server_id.is_none()` (the flag
+    /// no longer turns anything off) or to the flag alone (a server voice
+    /// channel gets a ring record), and the old ring changed, dropped, or
+    /// moved in with the new code.
+    #[test]
+    fn the_ring_signals_hang_off_one_switch_in_each_arm() {
+        let dense = dense();
+        assert_eq!(
+            dense
+                .matches(
+                    "letring_signals=config.features.call_signals&&channel.server_id.is_none();"
+                )
+                .count(),
+            3,
+            "the join, the leave and room_finished each derive the same switch"
+        );
+        assert_eq!(dense.matches("letring_signals").count(), 3);
+        assert_eq!(
+            dense.matches("call_signals").count(),
+            3,
+            "the flag is read through the switch and nowhere else"
+        );
+        for arm in ["participant_joined", "participant_left", "room_finished"] {
+            once(
+                &member_arm(arm),
+                "let ring_signals = config.features.call_signals && channel.server_id.is_none();",
+            );
+        }
+
+        let after = squeezed(&after_the_join_announce());
+        let old_ring = squeezed(
+            "let alone = members.map_or(0, |m| m.len()) <= 1; \
+             if !ring_signals \u{7b} if alone \u{7b} let now = joined_at.to_string(); \
+             if let Err(e) = amqp.dm_call_updated(user_id, channel_id, Some(&now), false, None).await \u{7b} \
+             log::error!(\"failed to publish call ring push: \u{7b}e:?\u{7d}\"); \
+             \u{7d} \u{7d} \u{7d} else \u{7b}",
+        );
+        let behind_the_switch = once(&after, &old_ring) + old_ring.len();
+        for added in [
+            "effective_call_ring_secs(",
+            "stored_call_ring(",
+            "lone_join(",
+            "store_call_ring(",
+            "note_call_ring_answered(",
+            "answered_elsewhere_applies(",
+            "publish_call_signal(",
+        ] {
+            let first = after
+                .find(added)
+                .unwrap_or_else(|| panic!("`{added}` is gone from the join: {after}"));
+            assert!(
+                behind_the_switch <= first,
+                "`{added}` must sit behind the switch: {after}"
+            );
+        }
+    }
+
+    /// The answer marker and the video hint are collected on every announced
+    /// join of a direct message or group, ahead of the roster read and under
+    /// no condition, and both values are carried to the ring decision. A join
+    /// that answers a ring finds the caller there and never reaches the ring,
+    /// so a marker collected only on the way to the ring would outlive the
+    /// call it answered and keep that user's own next call from ringing.
+    /// Mutation this catches: the `let markers = ...` line moved from above
+    /// the roster `match` into its `Ok(members)` arm, or into the branch
+    /// that rings.
+    #[test]
+    fn the_join_markers_are_collected_before_the_roster_is_read() {
+        let after = after_the_join_announce();
+        let take = once(
+            &after,
+            "let markers = take_join_markers(ring_signals, channel_id, user_id).await;",
+        );
+        let roster = once(
+            &after,
+            "match get_voice_channel_members(&channel).await \u{7b}",
+        );
+        assert!(
+            take < roster,
+            "the markers are collected before the roster is read: {after}"
+        );
+        let before = &after[..take];
+        assert_eq!(
+            before.matches('\u{7b}').count(),
+            before.matches('\u{7d}').count(),
+            "the markers are collected under no condition: {after}"
+        );
+        once_squeezed(&after, "match lone_join(markers, stored.as_ref(), user_id,");
+    }
+
+    /// No exit of the member join leaves a marker behind: each of its four
+    /// early returns (the refused connection, the unregistered device, the
+    /// second connection, the cap backstop) drains the markers right before
+    /// it returns, and the announced join collects them. One left behind
+    /// would be read by that user's next join of the channel, up to two
+    /// minutes later, and an answer marker read by a join that starts a call
+    /// makes it ring nobody. Mutation this catches: any one of the four
+    /// drains deleted.
+    #[test]
+    fn every_exit_of_the_member_join_drains_the_markers() {
+        let body = member_arm("participant_joined");
+        let drain = "take_join_markers(ring_signals, channel_id, user_id).await;";
+        let exits = body.matches("return Ok(EmptyResponse);").count();
+        assert_eq!(
+            exits, 4,
+            "the refusal, the registration check, the second connection and the cap backstop: {body}"
+        );
+        assert_eq!(
+            body.matches(&format!("{drain} return Ok(EmptyResponse);"))
+                .count(),
+            exits,
+            "every early return drains the markers first: {body}"
+        );
+        assert_eq!(
+            body.matches("take_join_markers(").count(),
+            exits + 1,
+            "the four exits, and the announced join: {body}"
+        );
+        assert!(
+            body.rfind("return Ok(EmptyResponse);").unwrap()
+                < once(&body, "EventV1::VoiceChannelJoin"),
+            "{body}"
+        );
+        assert_eq!(
+            dense().matches("take_join_markers(").count(),
+            exits + 2,
+            "no other arm reads a marker (the definition is the sixth)"
+        );
+    }
+
+    /// The marker take reads nothing with the switch off, takes BOTH markers
+    /// with it on (the video hint whatever the answer marker said), and
+    /// reads a marker it could not read as absent. Mutations this catches:
+    /// the `if !ring_signals` guard deleted (markers read with the feature
+    /// off, and in server channels), and the answer marker's failure arm
+    /// answering `true` (a failing store would then stop every ring).
+    #[test]
+    fn the_marker_take_reads_nothing_with_the_switch_off_and_fails_open() {
+        let helper = fn_body("async fn take_join_markers(");
+        assert!(
+            helper.starts_with(
+                "if !ring_signals \u{7b} return JoinMarkers::default(); \u{7d} let answer = "
+            ),
+            "nothing is read before the switch is checked: {helper}"
+        );
+        let answer = once(
+            &helper,
+            "let answer = match take_call_answer_marker(channel_id, user_id).await \u{7b} \
+             Ok(answer) => answer, Err(error) => \u{7b}",
+        );
+        let video = once(
+            &helper,
+            "\u{7d}; let video = match take_call_video_hint(channel_id, user_id).await \u{7b} \
+             Ok(video) => video, Err(error) => \u{7b}",
+        );
+        assert!(answer < video, "{helper}");
+        assert_eq!(
+            helper.matches("false \u{7d} \u{7d};").count(),
+            2,
+            "a marker that could not be read is read as absent: {helper}"
+        );
+        assert!(
+            helper.ends_with("JoinMarkers \u{7b} answer, video \u{7d}"),
+            "{helper}"
+        );
+        assert_eq!(
+            JoinMarkers::default(),
+            JoinMarkers {
+                answer: false,
+                video: false
+            }
+        );
+    }
+
+    /// Once the join is announced, nothing the ring signals add can fail the
+    /// webhook or cut the arm short (a 500 there makes the media server
+    /// retry, and the retry announces the join a second time). The arm calls
+    /// none of the store's or the broker's fallible functions itself: each
+    /// has exactly one home, a helper whose signature cannot return an error
+    /// and whose body logs the failure and carries on. Mutations this
+    /// catches: `stored_call_ring(channel_id).await` in the arm swapped for
+    /// `get_call_ring(channel_id).await?` (or any other direct call), a
+    /// `return` added after the announce, and a helper given a `Result` to
+    /// return.
+    #[test]
+    fn nothing_the_ring_signals_add_can_fail_the_webhook() {
+        let after = after_the_join_announce();
+        assert!(
+            !after.contains("return"),
+            "nothing after the announce may cut the join short: {after}"
+        );
+
+        let dense = dense();
+        for (call, home) in [
+            ("take_call_answer_marker(", "take_join_markers"),
+            ("take_call_video_hint(", "take_join_markers"),
+            ("get_call_ring(", "stored_call_ring"),
+            ("take_call_ring(", "take_stored_call_ring"),
+            ("set_call_ring(", "store_call_ring"),
+            ("mark_call_ring_answered(", "note_call_ring_answered"),
+            (".dm_call_signal(", "publish_call_signal"),
+        ] {
+            assert!(
+                !after.contains(call),
+                "the join calls `{call}` directly: {after}"
+            );
+            assert_eq!(
+                dense.matches(call).count(),
+                1,
+                "`{call}` is called in one place only, `{home}`"
+            );
+            once(&fn_body(&format!("async fn {home}(")), call);
+        }
+
+        for (name, signature) in [
+            (
+                "take_join_markers",
+                "asyncfntake_join_markers(ring_signals:bool,channel_id:&str,user_id:&str)->JoinMarkers\u{7b}",
+            ),
+            (
+                "stored_call_ring",
+                "asyncfnstored_call_ring(channel_id:&str)->Option<CallRing>\u{7b}",
+            ),
+            (
+                "take_stored_call_ring",
+                "asyncfntake_stored_call_ring(channel_id:&str)->Option<CallRing>\u{7b}",
+            ),
+            (
+                "store_call_ring",
+                "asyncfnstore_call_ring(channel_id:&str,ring:&CallRing)\u{7b}",
+            ),
+            (
+                "note_call_ring_answered",
+                "asyncfnnote_call_ring_answered(channel_id:&str,ring:&CallRing)\u{7b}",
+            ),
+            (
+                "publish_call_signal",
+                "asyncfnpublish_call_signal(amqp:&AMQP,signal:DmCallSignal,what:&str)\u{7b}",
+            ),
+        ] {
+            assert_eq!(
+                dense.matches(signature).count(),
+                1,
+                "`{name}` must not be able to return an error"
+            );
+            let body = fn_body(&format!("async fn {name}("));
+            for banned in [".await?", ")?", "return Err", "unwrap(", "expect(", "panic!"] {
+                assert!(
+                    !body.contains(banned),
+                    "`{name}` must log a failure and carry on (`{banned}`): {body}"
+                );
+            }
+        }
+    }
+
+    /// A join that leaves the joiner alone reads the stored ring, decides
+    /// through `lone_join` (handed the markers, the stored ring, the joiner,
+    /// and the join's own moment both as the push carries it and in unix
+    /// seconds), and then: an answer does nothing; a repeated ring is sent
+    /// as stored and NOT stored again; a new ring is stored first and then
+    /// sent. Mutations this catches: `stored.as_ref()` swapped for `None`
+    /// (every retry mints a new call id), a `store_call_ring` added to the
+    /// repeated ring (its record rewritten on every retry), and the new
+    /// ring's store dropped (a ring nobody can decline, ended as an old one).
+    #[test]
+    fn a_lone_join_stores_a_new_ring_only_and_sends_the_ring_it_decided_on() {
+        let after = after_the_join_announce();
+        let read = once_squeezed(&after, "let stored = stored_call_ring(channel_id).await;");
+        let decide = once_squeezed(
+            &after,
+            "match lone_join(markers, stored.as_ref(), user_id, ulid::Ulid::new().to_string(), \
+             joined_at.to_string(), event.created_at, ring_secs) \u{7b} \
+             LoneJoin::Silent => \u{7b}\u{7d}",
+        );
+        let again = once_squeezed(
+            &after,
+            "LoneJoin::RingAgain(ring) => \u{7b} \
+             publish_call_signal(amqp, ring_signal(&ring, channel_id), \"ring\").await; \u{7d}",
+        );
+        let new = once_squeezed(
+            &after,
+            "LoneJoin::RingNew(ring) => \u{7b} store_call_ring(channel_id, &ring).await; \
+             publish_call_signal(amqp, ring_signal(&ring, channel_id), \"ring\").await; \u{7d}",
+        );
+        assert!(read < decide && decide < again && again < new, "{after}");
+        assert_eq!(after.matches("store_call_ring(").count(), 1, "{after}");
+        assert_eq!(after.matches("ring_signal(").count(), 2, "{after}");
+    }
+
+    /// A join into a call somebody else is already in reads the stored ring
+    /// and does two separate things with it. It marks the ring answered when
+    /// `answers_call_ring` says so, through the mark helper and never by
+    /// writing the record back. And it publishes "answered elsewhere" only
+    /// when `answered_elsewhere_applies` says so, handed the join's own
+    /// moment and the ring length. Mutations this catches: the
+    /// `answered_elsewhere_applies` condition dropped (every join silences,
+    /// the caller's own and one long after the ring included), the mark made
+    /// conditional on it, and the mark swapped for a `set_call_ring` of the
+    /// record.
+    #[test]
+    fn a_join_into_a_live_call_marks_the_ring_and_silences_only_when_it_applies() {
+        let after = after_the_join_announce();
+        once_squeezed(
+            &after,
+            "\u{7d} else if let Some(ring) = stored_call_ring(channel_id).await \u{7b} \
+             if answers_call_ring(&ring, user_id) \u{7b} \
+             note_call_ring_answered(channel_id, &ring).await; \u{7d} \
+             if answered_elsewhere_applies(&ring, user_id, event.created_at, ring_secs) \u{7b} \
+             publish_call_signal(amqp, answered_elsewhere_signal(&ring, channel_id, user_id), \
+             \"answered elsewhere\").await; \
+             \u{7d} \u{7d} \u{7d} \u{7d} Err(error) => \u{7b}",
+        );
+
+        let mark = fn_body("async fn note_call_ring_answered(");
+        assert!(
+            mark.starts_with(
+                "if let Err(error) = mark_call_ring_answered(&ring.call_id).await \u{7b}"
+            ),
+            "{mark}"
+        );
+        assert!(
+            !mark.contains("set_call_ring") && !mark.contains("store_call_ring"),
+            "the ring is marked answered on its own key, never by rewriting the record: {mark}"
+        );
+    }
+
+    /// A ring skipped because the roster could not be read stores no record,
+    /// so a record still stored belongs to an earlier call, and it is
+    /// removed: left in place, the end push of THIS call would name the
+    /// earlier call's caller and ring. Under the switch, and after the
+    /// failure is reported. Mutation this catches: the
+    /// `take_stored_call_ring(channel_id).await;` in the failure arm deleted.
+    #[test]
+    fn a_ring_skipped_on_a_failed_roster_read_removes_the_record_left_behind() {
+        let after = after_the_join_announce();
+        assert!(
+            after.ends_with(
+                "let _ = Err::<(), _>(error).to_internal_error(); \
+                 if ring_signals \u{7b} take_stored_call_ring(channel_id).await; \u{7d} \u{7d} \u{7d}"
+            ),
+            "{after}"
+        );
+    }
+
+    /// The end of a call: once the last connection has left and the roster
+    /// is read as empty, the ring record is TAKEN (under the switch; nothing
+    /// is read with it off), and with a record the end push is built from
+    /// the record alone, by a function that is not handed the leaver at all.
+    /// Without one it is the old end push to the letter. Mutations this
+    /// catches: the `Some(ring)` arm publishing the old
+    /// `dm_call_updated(user_id, ...)` (the push addressed from whoever left
+    /// last, so the caller's own devices are told and the last leaver's are
+    /// not), the take swapped for a read that leaves the record behind, the
+    /// switch dropped from the take, and the take moved ahead of the roster
+    /// read.
+    #[test]
+    fn the_end_of_a_call_takes_its_ring_and_is_addressed_from_it() {
+        let body = member_arm("participant_left");
+        once_squeezed(
+            &body,
+            "if leave == ConnectionLeave::Last \u{7b} \
+             let members = get_voice_channel_members(&channel).await?; \
+             if members.is_none_or(|m| m.is_empty()) \u{7b} \
+             let ring = if ring_signals \u{7b} take_stored_call_ring(channel_id).await \u{7d} \
+             else \u{7b} None \u{7d}; \
+             match ring \u{7b} \
+             Some(ring) => \u{7b} \
+             publish_call_signal(amqp, call_ended_signal(&ring, channel_id), \"end\").await; \u{7d} \
+             None => \u{7b} \
+             if let Err(e) = amqp.dm_call_updated(user_id, channel_id, None, true, None).await \u{7b} \
+             log::error!(\"failed to publish call end push: \u{7b}e:?\u{7d}\"); \
+             \u{7d} \u{7d} \u{7d} \u{7d} EventV1::VoiceChannelLeave",
+        );
+        assert_eq!(body.matches("take_stored_call_ring(").count(), 1, "{body}");
+        assert_eq!(body.matches("call_ended_signal(").count(), 1, "{body}");
+        assert!(
+            !body.contains("stored_call_ring(channel_id).await;"),
+            "the record is taken, never read and left: {body}"
+        );
+        assert_eq!(
+            dense()
+                .matches("fncall_ended_signal(ring:&CallRing,channel_id:&str)->DmCallSignal\u{7b}")
+                .count(),
+            1,
+            "the end push is built from the record and the channel, and cannot name the leaver"
+        );
+    }
+
+    /// `room_finished` clears the roster without any leave, so it removes
+    /// the ring record too, under the switch, and sends nothing (it never
+    /// sent an end push). With the leave's end of call and the skipped ring,
+    /// these are the only places this file removes a record. Mutation this
+    /// catches: the `take_stored_call_ring(channel_id).await;` in
+    /// `room_finished` deleted.
+    #[test]
+    fn a_finished_room_leaves_no_ring_record_behind() {
+        let body = member_arm("room_finished");
+        let cleared = once(&body, "delete_channel_voice_state(&channel, &[]).await?;");
+        let removed = once(
+            &body,
+            "let ring_signals = config.features.call_signals && channel.server_id.is_none(); \
+             if ring_signals \u{7b} take_stored_call_ring(channel_id).await; \u{7d}",
+        );
+        assert!(cleared < removed, "{body}");
+        assert!(
+            !body.contains("publish_call_signal(") && !body.contains("dm_call_"),
+            "room_finished publishes no call push: {body}"
+        );
+        assert_eq!(
+            dense().matches("take_stored_call_ring(").count(),
+            4,
+            "the definition, the leave's end of call, the skipped ring and room_finished"
+        );
+    }
+
+    /// Every app rings for the same length of time, so the ring length is
+    /// read in one place and only through the rule they all share (zero
+    /// reads as 45 seconds, anything else is brought into range). Mutation
+    /// this catches: `let ring_secs = config.api.livekit.call_ring_duration;`.
+    #[test]
+    fn the_ring_length_is_read_through_the_shared_rule() {
+        let code = squeezed(&code());
+        assert_eq!(code.matches("call_ring_duration").count(), 1);
+        assert_eq!(code.matches("letring_secs").count(), 1);
+        once(
+            &code,
+            "letring_secs=revolt_config::effective_call_ring_secs(config.api.livekit.call_ring_duration);",
+        );
+    }
+
+    const CALLER: &str = "01CALLER";
+    const CALLEE: &str = "01CALLEE";
+    const RING_CHANNEL: &str = "01CHANNEL";
+    const STORED_CALL: &str = "01STOREDCALL";
+    const STORED_START: &str = "the start the stored ring carries";
+    const NEW_CALL: &str = "01NEWCALL";
+    const NEW_START: &str = "the start a new ring would carry";
+
+    const RING_SECS: usize = 45;
+    /// When the stored ring started, the last second it rings, and the last
+    /// second of the grace after that.
+    const RANG_AT: i64 = 1_790_000_000;
+    const RING_END: i64 = RANG_AT + RING_SECS as i64;
+    const GRACE_END: i64 = RING_END + CALL_RING_GRACE_SECS;
+
+    /// The ring record of a voice call `caller` started at `RANG_AT`, which
+    /// nobody has answered.
+    fn stored_ring(caller: &str) -> CallRing {
+        CallRing {
+            call_id: STORED_CALL.to_string(),
+            initiator_id: caller.to_string(),
+            started_at: STORED_START.to_string(),
+            started_unix: RANG_AT,
+            video: false,
+            answered: false,
+        }
+    }
+
+    fn picked_up(ring: CallRing) -> CallRing {
+        CallRing {
+            answered: true,
+            ..ring
+        }
+    }
+
+    /// The record a new ring by `caller` at `now` would store.
+    fn new_ring(caller: &str, now: i64, video: bool) -> CallRing {
+        CallRing {
+            call_id: NEW_CALL.to_string(),
+            initiator_id: caller.to_string(),
+            started_at: NEW_START.to_string(),
+            started_unix: now,
+            video,
+            answered: false,
+        }
+    }
+
+    /// `lone_join` for a join by `joiner` at `now`, with the id and start a
+    /// new ring would get.
+    fn lone(
+        markers: JoinMarkers,
+        stored: Option<&CallRing>,
+        joiner: &str,
+        now: i64,
+    ) -> LoneJoin {
+        lone_join(
+            markers,
+            stored,
+            joiner,
+            NEW_CALL.to_string(),
+            NEW_START.to_string(),
+            now,
+            RING_SECS,
+        )
+    }
+
+    /// Every field of the two signals, by way of `Debug`: a field added to
+    /// the signal later is compared without this helper having to learn it.
+    fn assert_same_signal(got: &DmCallSignal, want: &DmCallSignal) {
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
+
+    /// An answer never starts a call and never rings anybody: a join that
+    /// carries the answer marker and finds nobody rings nobody and stores
+    /// nothing, whatever ring is stored, whenever it happens, video or not.
+    /// Mutation this catches: `if markers.answer` in `lone_join` made
+    /// `if false` (an answer whose caller just left rings everybody back as
+    /// a new call).
+    #[test]
+    fn an_answer_that_finds_nobody_rings_nobody() {
+        let own = stored_ring(CALLEE);
+        let other = stored_ring(CALLER);
+        let answered = picked_up(stored_ring(CALLER));
+        for stored in [None, Some(&own), Some(&other), Some(&answered)] {
+            for video in [false, true] {
+                for now in [RANG_AT, RING_END, GRACE_END + 1] {
+                    assert_eq!(
+                        lone(
+                            JoinMarkers {
+                                answer: true,
+                                video
+                            },
+                            stored,
+                            CALLEE,
+                            now
+                        ),
+                        LoneJoin::Silent,
+                        "stored {stored:?}, video {video}, now {now}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Without an answer marker a lone join rings. It sends the stored ring
+    /// again only when that ring is the joiner's own, unanswered, and still
+    /// inside its ring length (no grace: a ring older than its length is
+    /// dropped before it reaches a device); the repeated ring is the stored
+    /// record to the letter, call id and start time included. Anything else
+    /// starts a new ring, made by the joiner at the join's own moment.
+    /// Mutations this catches: `ring_mint_decision(stored, ...)` handed
+    /// `None` (a retry mints a second call id), and the new record's
+    /// `initiator_id` or `started_unix` taken from anywhere but the join.
+    #[test]
+    fn a_lone_join_repeats_its_own_live_ring_and_replaces_anything_else() {
+        let plain = JoinMarkers::default();
+        let own = stored_ring(CALLER);
+        let answered = picked_up(stored_ring(CALLER));
+        let again = LoneJoin::RingAgain(own.clone());
+        let new = |joiner: &str, now: i64| LoneJoin::RingNew(new_ring(joiner, now, false));
+
+        for (stored, joiner, now, want) in [
+            (None, CALLER, RANG_AT, new(CALLER, RANG_AT)),
+            (Some(&own), CALLER, RANG_AT, again.clone()),
+            (Some(&own), CALLER, RING_END, again.clone()),
+            (Some(&own), CALLER, RING_END + 1, new(CALLER, RING_END + 1)),
+            (Some(&own), CALLER, GRACE_END, new(CALLER, GRACE_END)),
+            (Some(&own), CALLEE, RANG_AT, new(CALLEE, RANG_AT)),
+            (Some(&own), CALLEE, RING_END, new(CALLEE, RING_END)),
+            (Some(&answered), CALLER, RANG_AT, new(CALLER, RANG_AT)),
+            (Some(&answered), CALLEE, RANG_AT, new(CALLEE, RANG_AT)),
+        ] {
+            assert_eq!(
+                lone(plain, stored, joiner, now),
+                want,
+                "stored {stored:?}, joiner {joiner}, now {now}"
+            );
+        }
+
+        let LoneJoin::RingAgain(ring) = lone(plain, Some(&own), CALLER, RING_END) else {
+            panic!("the caller's own live ring is sent again");
+        };
+        assert_eq!(ring.call_id, STORED_CALL);
+        assert_eq!(ring.started_at, STORED_START);
+        assert_eq!(ring.started_unix, RANG_AT);
+    }
+
+    /// The video hint decides how a NEW ring looks, and nothing else: a ring
+    /// sent again keeps the look it was stored with, because the hint for it
+    /// was used up when it was first sent. Mutations this catches:
+    /// `video: markers.video` in `lone_join` made `video: false` (no ring is
+    /// ever shown as a video call), and a repeated ring rebuilt from the
+    /// markers (a retried video ring turns into a voice one).
+    #[test]
+    fn the_video_hint_marks_a_new_ring_and_never_a_repeated_one() {
+        let plain = JoinMarkers::default();
+        let hint = JoinMarkers {
+            answer: false,
+            video: true,
+        };
+        assert_eq!(
+            lone(hint, None, CALLER, RANG_AT),
+            LoneJoin::RingNew(new_ring(CALLER, RANG_AT, true))
+        );
+        assert_eq!(
+            lone(plain, None, CALLER, RANG_AT),
+            LoneJoin::RingNew(new_ring(CALLER, RANG_AT, false))
+        );
+
+        let voice = stored_ring(CALLER);
+        let video = CallRing {
+            video: true,
+            ..stored_ring(CALLER)
+        };
+        assert_eq!(
+            lone(hint, Some(&voice), CALLER, RING_END),
+            LoneJoin::RingAgain(voice.clone())
+        );
+        assert_eq!(
+            lone(plain, Some(&video), CALLER, RING_END),
+            LoneJoin::RingAgain(video.clone())
+        );
+    }
+
+    /// The ring push is the record as stored: its caller, its call id, its
+    /// start time, for everyone in the conversation (no recipient list), and
+    /// `video` only when the record says video. Mutations this catches:
+    /// `video: ring.video.then_some(true)` made `Some(ring.video)` (a voice
+    /// ring gains a `video` key), and `started_at` or `call_id` taken from
+    /// anywhere but the record.
+    #[test]
+    fn the_ring_push_carries_the_record_as_it_is_stored() {
+        let voice = stored_ring(CALLER);
+        assert_same_signal(
+            &ring_signal(&voice, RING_CHANNEL),
+            &DmCallSignal {
+                initiator_id: CALLER.to_string(),
+                channel_id: RING_CHANNEL.to_string(),
+                started_at: Some(STORED_START.to_string()),
+                ended: false,
+                recipients: None,
+                call_id: Some(STORED_CALL.to_string()),
+                reason: None,
+                video: None,
+            },
+        );
+
+        let video = CallRing {
+            video: true,
+            ..stored_ring(CALLER)
+        };
+        assert_eq!(ring_signal(&video, RING_CHANNEL).video, Some(true));
+    }
+
+    /// Anyone but the caller joining a call somebody is in has answered its
+    /// ring, once: the caller's own join never does, and a ring already
+    /// answered is not marked again. Time plays no part, so there is none to
+    /// hand in: a call joined after its ring ran out was still answered.
+    /// Mutations this catches: `ring.initiator_id != joiner_id` dropped (the
+    /// caller reconnecting marks their own unanswered ring answered, and its
+    /// end reads "ended" instead of "cancelled"), and `!ring.answered`
+    /// dropped (the mark is written again on every join).
+    #[test]
+    fn anyone_but_the_caller_joining_is_the_first_answer_once() {
+        let ring = stored_ring(CALLER);
+        let answered = picked_up(stored_ring(CALLER));
+        for (record, joiner, want) in [
+            (&ring, CALLER, false),
+            (&ring, CALLEE, true),
+            (&ring, "01THIRD", true),
+            (&answered, CALLER, false),
+            (&answered, CALLEE, false),
+        ] {
+            assert_eq!(
+                answers_call_ring(record, joiner),
+                want,
+                "answered {}, joiner {joiner}",
+                record.answered
+            );
+        }
+    }
+
+    /// "Answered elsewhere" is sent only for somebody other than the caller,
+    /// and only while the ring may still be ringing: up to the ring length
+    /// plus the grace for slow devices, to the second. Whether the ring was
+    /// already answered plays no part: in a group, a third member answering
+    /// after the second still has other devices ringing. Mutations this
+    /// catches: `ring.initiator_id != joiner_id` dropped (the caller's own
+    /// join publishes a signal addressed from and to the caller, which
+    /// reaches nobody), the window dropped (a join an hour into a call tells
+    /// devices to stop a ring long over), and the window asked of the ring
+    /// as it is (`ring_window_open(ring, ...)`: the third member's other
+    /// devices keep ringing).
+    #[test]
+    fn only_a_callee_inside_the_ring_window_is_answered_elsewhere() {
+        let ring = stored_ring(CALLER);
+        let answered = picked_up(stored_ring(CALLER));
+        for (record, joiner, now, want) in [
+            (&ring, CALLER, RANG_AT, false),
+            (&ring, CALLER, RING_END, false),
+            (&ring, CALLER, GRACE_END + 1, false),
+            (&answered, CALLER, RANG_AT, false),
+            (&ring, CALLEE, RANG_AT, true),
+            (&ring, CALLEE, RING_END, true),
+            (&ring, CALLEE, RING_END + 1, true),
+            (&ring, CALLEE, GRACE_END, true),
+            (&ring, CALLEE, GRACE_END + 1, false),
+            (&answered, CALLEE, RANG_AT, true),
+            (&answered, CALLEE, GRACE_END, true),
+            (&answered, CALLEE, GRACE_END + 1, false),
+        ] {
+            assert_eq!(
+                answered_elsewhere_applies(record, joiner, now, RING_SECS),
+                want,
+                "answered {}, joiner {joiner}, now {now}",
+                record.answered
+            );
+        }
+    }
+
+    /// The "answered elsewhere" signal names the ring's CALLER as its
+    /// initiator and the joiner as its ONE recipient. The push daemon never
+    /// delivers a call signal to its initiator, and delivers this one to
+    /// nobody it does not name: with the joiner as initiator it would reach
+    /// nobody, and with no list it is dropped. It repeats the ring's call id
+    /// and carries no start time and no video. Mutations this catches:
+    /// `initiator_id` made the joiner, and `recipients` made `None`.
+    #[test]
+    fn the_answered_elsewhere_signal_names_the_caller_and_reaches_only_the_joiner() {
+        assert_same_signal(
+            &answered_elsewhere_signal(&stored_ring(CALLER), RING_CHANNEL, CALLEE),
+            &DmCallSignal {
+                initiator_id: CALLER.to_string(),
+                channel_id: RING_CHANNEL.to_string(),
+                started_at: None,
+                ended: true,
+                recipients: Some(vec![CALLEE.to_string()]),
+                call_id: Some(STORED_CALL.to_string()),
+                reason: Some(CALL_REASON_ANSWERED_ELSEWHERE.to_string()),
+                video: None,
+            },
+        );
+    }
+
+    /// The end push comes from the ring's caller and names the ring, for
+    /// everyone in the conversation (no recipient list). A ring nobody but
+    /// the caller ever joined was cancelled; one somebody answered ended.
+    /// Mutations this catches: the two reasons swapped (`if !ring.answered`),
+    /// and `call_id` dropped from the push.
+    #[test]
+    fn the_end_push_comes_from_the_ring_caller_and_says_how_the_ring_went() {
+        let ended = |reason: &str| DmCallSignal {
+            initiator_id: CALLER.to_string(),
+            channel_id: RING_CHANNEL.to_string(),
+            started_at: None,
+            ended: true,
+            recipients: None,
+            call_id: Some(STORED_CALL.to_string()),
+            reason: Some(reason.to_string()),
+            video: None,
+        };
+        assert_same_signal(
+            &call_ended_signal(&stored_ring(CALLER), RING_CHANNEL),
+            &ended(CALL_REASON_CANCELLED),
+        );
+        assert_same_signal(
+            &call_ended_signal(&picked_up(stored_ring(CALLER)), RING_CHANNEL),
+            &ended(CALL_REASON_ENDED),
+        );
+        // A video ring's end carries no `video`: only a ring does.
+        let video = CallRing {
+            video: true,
+            ..stored_ring(CALLER)
+        };
+        assert_eq!(call_ended_signal(&video, RING_CHANNEL).video, None);
     }
 }

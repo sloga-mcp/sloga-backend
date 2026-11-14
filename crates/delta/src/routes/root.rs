@@ -44,6 +44,10 @@ pub struct VoiceFeature {
     pub enabled: bool,
     /// All livekit nodes
     pub nodes: Vec<VoiceNode>,
+    /// How long a call rings before it gives up, in seconds. This is the
+    /// length the server itself applies, so a client that rings for it
+    /// stops at the moment the server stops letting the ring live
+    pub call_ring_duration: usize,
 }
 
 /// # Server Boost Configuration
@@ -509,6 +513,11 @@ pub fn root_config(config: Settings) -> RevoltConfig {
                             .clone(),
                     })
                     .collect(),
+                // The length after the shared rule, never the raw setting: a
+                // zero there would tell every client to stop ringing at once
+                call_ring_duration: revolt_config::effective_call_ring_secs(
+                    config.api.livekit.call_ring_duration,
+                ),
             },
             limits: LimitsConfig {
                 global: GlobalLimits {
@@ -1091,5 +1100,76 @@ mod test {
         let required = schema["required"].as_array().expect("required list");
         assert!(required.contains(&serde_json::json!("remote_control")));
         assert!(!required.contains(&serde_json::json!("ios_call_e2ee")));
+    }
+
+    fn livekit_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["livekit"].clone()
+    }
+
+    /// The ring length is on the wire under
+    /// `features.livekit.call_ring_duration`, in seconds, as the length the
+    /// server itself applies: a zero reads as 45 and anything else is
+    /// brought into 5 to 120. A client that rang for the raw setting would
+    /// keep ringing after the server had given the ring up, or never ring
+    #[test]
+    fn root_advertises_the_effective_call_ring_duration() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+
+        // (configured, advertised)
+        let table: [(usize, u64); 7] = [
+            (0, 45),
+            (1, 5),
+            (5, 5),
+            (30, 30),
+            (45, 45),
+            (120, 120),
+            (usize::MAX, 120),
+        ];
+        for (configured, advertised) in table {
+            let mut config = config.clone();
+            config.api.livekit.call_ring_duration = configured;
+            assert_eq!(
+                livekit_json(config)["call_ring_duration"],
+                serde_json::json!(advertised),
+                "configured {configured}"
+            );
+        }
+    }
+
+    /// `GET /` carries the ring length of the node's own config, and the
+    /// voice advert holds nothing besides it and the two older fields
+    #[test]
+    fn root_serves_call_ring_duration() {
+        crate::util::test::rt().block_on(root_serves_call_ring_duration_case())
+    }
+
+    async fn root_serves_call_ring_duration_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let advert = body["features"]["livekit"]
+            .as_object()
+            .expect("livekit object");
+
+        let mut keys: Vec<&str> = advert.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["call_ring_duration", "enabled", "nodes"]);
+
+        let config = revolt_config::config().await;
+        let advertised = advert["call_ring_duration"]
+            .as_u64()
+            .expect("call_ring_duration is a number");
+        assert_eq!(
+            advertised,
+            revolt_config::effective_call_ring_secs(config.api.livekit.call_ring_duration) as u64
+        );
+        assert!(
+            (5..=120).contains(&advertised),
+            "a ring of {advertised} seconds is outside what any service honors"
+        );
     }
 }

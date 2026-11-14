@@ -6,9 +6,9 @@ use base64::{
     },
     Engine,
 };
-use revolt_database::{Database, Session};
+use revolt_database::{is_invalid_session, Database, Session, User};
 use revolt_models::v0;
-use revolt_result::{create_database_error, create_error, Result};
+use revolt_result::{create_database_error, create_error, Error, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 
@@ -87,6 +87,42 @@ fn validate_unifiedpush(data: &v0::WebPushSubscription) -> Result<()> {
     Ok(())
 }
 
+/// Tidy the two per-session preferences before they are stored.
+///
+/// Only an explicit `true` turns a preference on. `false` says the same as
+/// leaving the field out, so it is stored as absent and a saved subscription
+/// never carries a `false` that some later reader could take for a choice.
+///
+/// `privileged` drops `chats_only`: a staff account must always receive
+/// server notifications, because moderation depends on them. `no_ring` is
+/// left to staff like to anyone else. Nothing else in the subscription is
+/// touched.
+fn sanitize_push_preferences(
+    mut data: v0::WebPushSubscription,
+    privileged: bool,
+) -> v0::WebPushSubscription {
+    data.chats_only = data.chats_only.filter(|on| *on);
+    data.no_ring = data.no_ring.filter(|on| *on);
+
+    if privileged {
+        data.chats_only = None;
+    }
+
+    data
+}
+
+/// Whether `chats_only` has to be dropped for this request. It is kept only
+/// when the user that was resolved is the owner of the session and is not
+/// staff.
+///
+/// The `User` guard prefers an `x-bot-token` header over the session, so the
+/// user it hands over is not always the session's owner. Such a user says
+/// nothing about the owner, and reading it as "not staff" would let a staff
+/// account keep the preference by sending a bot token along.
+fn must_drop_chats_only(user: &User, session: &Session) -> bool {
+    user.privileged || user.id != session.user_id
+}
+
 /// # Push Subscribe
 ///
 /// Create a new Web Push subscription.
@@ -96,12 +132,18 @@ fn validate_unifiedpush(data: &v0::WebPushSubscription) -> Result<()> {
 /// endpoint's address before every send. Any other subscription must be
 /// "fcm", "apn" or an https endpoint on a browser's push service.
 ///
-/// If an existing subscription exists on this session, it will be removed.
+/// `chats_only` (direct messages, groups, friend requests and calls only) and
+/// `no_ring` (never ring this session for a call) are optional and count only
+/// when `true`. `chats_only` is not kept for a staff account.
+///
+/// If an existing subscription exists on this session, it will be removed,
+/// together with the preferences it carried.
 #[openapi(tag = "Web Push")]
 #[post("/subscribe", data = "<data>")]
 pub async fn subscribe(
     db: &State<Database>,
     mut session: Session,
+    user: std::result::Result<User, Error>,
     data: Json<v0::WebPushSubscription>,
 ) -> Result<EmptyResponse> {
     let data = data.into_inner();
@@ -113,7 +155,21 @@ pub async fn subscribe(
         }));
     }
 
-    session.subscription = Some(data.into());
+    // The user is looked at only for the staff rule; the session alone still
+    // decides who may subscribe, as it did before the preferences existed
+    let drop_chats_only = match user {
+        Ok(user) => must_drop_chats_only(&user, &session),
+        // No user behind this request (onboarding has not run yet, or an
+        // unknown bot token came along): nobody can say the account is not
+        // staff, so the preference is not kept. The subscription itself is
+        // still saved, as it always was for such a session
+        Err(error) if is_invalid_session(&error) => true,
+        // A failed lookup is reported instead of guessed around, so the app
+        // retries rather than believing a preference was saved
+        Err(error) => return Err(error),
+    };
+
+    session.subscription = Some(sanitize_push_preferences(data, drop_chats_only).into());
     session
         .save(db)
         .await
@@ -123,11 +179,12 @@ pub async fn subscribe(
 
 #[cfg(test)]
 mod tests {
-    use super::{push_endpoint_allowed, validate_unifiedpush};
+    use super::{push_endpoint_allowed, sanitize_push_preferences, validate_unifiedpush};
     use base64::{
         engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
         Engine,
     };
+    use revolt_database::{Bot, PartialUser, Session};
     use revolt_models::v0;
     use revolt_result::ErrorType;
 
@@ -498,5 +555,273 @@ mod tests {
             .expect("subscription should be stored");
         assert_eq!(stored.endpoint, BROWSER_ENDPOINT);
         assert_eq!(stored.kind, None);
+    }
+
+    const ON: Option<bool> = Some(true);
+    const OFF: Option<bool> = Some(false);
+
+    /// Every combination of the two preferences, for a plain account and for
+    /// a staff one. Only `Some(true)` survives, staff never keep
+    /// `chats_only`, staff do keep `no_ring`, and the rest of the
+    /// subscription comes back as it went in
+    #[test]
+    fn sanitize_push_preferences_truth_table() {
+        // ((chats_only, no_ring, privileged), (chats_only, no_ring))
+        type Row = ((Option<bool>, Option<bool>, bool), (Option<bool>, Option<bool>));
+        let table: [Row; 18] = [
+            ((None, None, false), (None, None)),
+            ((None, OFF, false), (None, None)),
+            ((None, ON, false), (None, ON)),
+            ((OFF, None, false), (None, None)),
+            ((OFF, OFF, false), (None, None)),
+            ((OFF, ON, false), (None, ON)),
+            ((ON, None, false), (ON, None)),
+            ((ON, OFF, false), (ON, None)),
+            ((ON, ON, false), (ON, ON)),
+            ((None, None, true), (None, None)),
+            ((None, OFF, true), (None, None)),
+            ((None, ON, true), (None, ON)),
+            ((OFF, None, true), (None, None)),
+            ((OFF, OFF, true), (None, None)),
+            ((OFF, ON, true), (None, ON)),
+            ((ON, None, true), (None, None)),
+            ((ON, OFF, true), (None, None)),
+            ((ON, ON, true), (None, ON)),
+        ];
+
+        for ((chats_only, no_ring, privileged), (kept_chats_only, kept_no_ring)) in table {
+            let sanitized = sanitize_push_preferences(
+                v0::WebPushSubscription {
+                    chats_only,
+                    no_ring,
+                    ..valid()
+                },
+                privileged,
+            );
+            assert_eq!(
+                sanitized,
+                v0::WebPushSubscription {
+                    chats_only: kept_chats_only,
+                    no_ring: kept_no_ring,
+                    ..valid()
+                },
+                "chats_only {chats_only:?}, no_ring {no_ring:?}, privileged {privileged}"
+            );
+        }
+    }
+
+    /// A browser subscription body carrying whichever preferences are given;
+    /// `None` leaves the key out of the JSON altogether
+    fn preferences_body(chats_only: Option<bool>, no_ring: Option<bool>) -> serde_json::Value {
+        let mut body = subscribe_body(BROWSER_ENDPOINT, None);
+        if let Some(chats_only) = chats_only {
+            body["chats_only"] = json!(chats_only);
+        }
+        if let Some(no_ring) = no_ring {
+            body["no_ring"] = json!(no_ring);
+        }
+        body
+    }
+
+    /// Subscribe `session` with the given preferences and return the two as
+    /// they were stored: `(chats_only, no_ring)`
+    async fn stored_preferences(
+        harness: &TestHarness,
+        session: &Session,
+        chats_only: Option<bool>,
+        no_ring: Option<bool>,
+    ) -> (Option<bool>, Option<bool>) {
+        let (status, body) = post_subscribe(
+            harness,
+            &session.token,
+            preferences_body(chats_only, no_ring),
+        )
+        .await;
+        assert_eq!(status, Status::NoContent, "unexpected response: {}", body);
+
+        let stored = stored_subscription(harness, &session.id)
+            .await
+            .expect("subscription should be stored");
+        assert_eq!(stored.endpoint, BROWSER_ENDPOINT);
+        (stored.chats_only, stored.no_ring)
+    }
+
+    /// The session of a fresh user promoted to staff
+    async fn new_staff_session(harness: &TestHarness) -> Session {
+        let (_, session, mut staff) = harness.new_user().await;
+        staff
+            .update(
+                &harness.db,
+                PartialUser {
+                    privileged: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("promote staff");
+        assert!(
+            harness
+                .db
+                .fetch_user(&session.user_id)
+                .await
+                .expect("staff user")
+                .privileged
+        );
+        session
+    }
+
+    #[test]
+    fn preferences_round_trip_for_a_plain_account() {
+        crate::util::test::rt().block_on(preferences_round_trip_for_a_plain_account_case())
+    }
+
+    async fn preferences_round_trip_for_a_plain_account_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        // Each subscribe replaces the one before it on the same session
+        for (chats_only, no_ring) in [(ON, ON), (ON, None), (None, ON)] {
+            assert_eq!(
+                stored_preferences(&harness, &session, chats_only, no_ring).await,
+                (chats_only, no_ring)
+            );
+        }
+    }
+
+    /// A `false` is the same as leaving the field out, and is stored that way
+    #[test]
+    fn false_preferences_are_stored_as_absent() {
+        crate::util::test::rt().block_on(false_preferences_are_stored_as_absent_case())
+    }
+
+    async fn false_preferences_are_stored_as_absent_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+
+        assert_eq!(
+            stored_preferences(&harness, &session, OFF, OFF).await,
+            (None, None)
+        );
+        assert_eq!(
+            stored_preferences(&harness, &session, OFF, ON).await,
+            (None, ON)
+        );
+        assert_eq!(
+            stored_preferences(&harness, &session, ON, OFF).await,
+            (ON, None)
+        );
+    }
+
+    /// Staff must keep getting server notifications, so their `chats_only`
+    /// never reaches the session. Whether a call rings is still theirs to
+    /// choose
+    #[test]
+    fn staff_chats_only_is_dropped_and_no_ring_kept() {
+        crate::util::test::rt().block_on(staff_chats_only_is_dropped_and_no_ring_kept_case())
+    }
+
+    async fn staff_chats_only_is_dropped_and_no_ring_kept_case() {
+        let harness = TestHarness::new().await;
+        let session = new_staff_session(&harness).await;
+
+        assert_eq!(
+            stored_preferences(&harness, &session, ON, ON).await,
+            (None, ON)
+        );
+        assert_eq!(
+            stored_preferences(&harness, &session, ON, None).await,
+            (None, None)
+        );
+    }
+
+    /// An app that knows nothing of the preferences stores none, and its
+    /// subscribe clears whatever an earlier one had set
+    #[test]
+    fn a_body_without_preferences_stores_neither() {
+        crate::util::test::rt().block_on(a_body_without_preferences_stores_neither_case())
+    }
+
+    async fn a_body_without_preferences_stores_neither_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, _) = harness.new_user().await;
+        assert!(preferences_body(None, None).get("chats_only").is_none());
+        assert!(preferences_body(None, None).get("no_ring").is_none());
+
+        assert_eq!(
+            stored_preferences(&harness, &session, None, None).await,
+            (None, None)
+        );
+
+        assert_eq!(
+            stored_preferences(&harness, &session, ON, ON).await,
+            (ON, ON)
+        );
+        assert_eq!(
+            stored_preferences(&harness, &session, None, None).await,
+            (None, None)
+        );
+
+        let staff = new_staff_session(&harness).await;
+        assert_eq!(
+            stored_preferences(&harness, &staff, None, None).await,
+            (None, None)
+        );
+    }
+
+    /// The `User` guard answers with the bot when a bot token is sent along,
+    /// and a bot is never staff. The staff rule follows the owner of the
+    /// session, so the extra header does not let a staff session keep
+    /// `chats_only`
+    #[test]
+    fn a_bot_token_does_not_keep_chats_only_for_staff() {
+        crate::util::test::rt().block_on(a_bot_token_does_not_keep_chats_only_for_staff_case())
+    }
+
+    async fn a_bot_token_does_not_keep_chats_only_for_staff_case() {
+        let harness = TestHarness::new().await;
+        let session = new_staff_session(&harness).await;
+
+        let (_, _, owner) = harness.new_user().await;
+        let (bot, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &owner, None)
+            .await
+            .expect("bot");
+        assert!(!bot_user.privileged);
+
+        let res = harness
+            .client
+            .post("/push/subscribe")
+            .header(ContentType::JSON)
+            .header(Header::new("X-Session-Token", session.token.to_string()))
+            .header(Header::new("x-bot-token", bot.token.to_string()))
+            .body(preferences_body(ON, ON).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(res.status(), Status::NoContent);
+
+        let stored = stored_subscription(&harness, &session.id)
+            .await
+            .expect("subscription should be stored");
+        assert_eq!((stored.chats_only, stored.no_ring), (None, ON));
+    }
+
+    /// A session whose user does not exist yet (onboarding has not run)
+    /// could always subscribe, and still can. Nobody can vouch that it is
+    /// not staff, so `chats_only` is not kept for it
+    #[test]
+    fn a_session_without_a_user_still_subscribes() {
+        crate::util::test::rt().block_on(a_session_without_a_user_still_subscribes_case())
+    }
+
+    async fn a_session_without_a_user_still_subscribes_case() {
+        let harness = TestHarness::new().await;
+        let id = ulid::Ulid::new().to_string();
+        let (_, session) = harness.account_from_user(id.clone()).await;
+        assert!(harness.db.fetch_user(&id).await.is_err());
+
+        assert_eq!(
+            stored_preferences(&harness, &session, ON, ON).await,
+            (None, ON)
+        );
     }
 }
