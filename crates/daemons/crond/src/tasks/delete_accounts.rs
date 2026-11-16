@@ -1,4 +1,14 @@
-//! Hourly sweep that deletes the accounts whose scheduled deletion is due.
+//! Sweep, every minute, that deletes the accounts whose scheduled deletion
+//! is due.
+//!
+//! An account confirmed for deletion is purged within a minute. Its sessions
+//! are deleted first (best-effort: the confirm route has already revoked them,
+//! this covers a revoke that failed there and older scheduled rows), before
+//! anything else runs for it.
+//!
+//! An account whose deletion fails at any step is not tried again for an
+//! hour ([`RetryBackoff`]), so a failing Stripe cascade or a corrupt row is
+//! not retried, and reported to Sentry, every minute.
 //!
 //! Each account goes through the payments cascade
 //! (`revolt_payments::engine::on_account_deleted`) before `User::delete`
@@ -17,7 +27,7 @@
 //! Unlinking the orders and deleting the membership must succeed
 //! (`engine::unlink_account_payments`, run even without a payments config):
 //! when either fails, the account is NOT deleted this run. It stays due, so
-//! the next hourly run tries the whole cascade again; once the account is
+//! a later run (an hour on) tries the whole cascade again; once the account is
 //! marked deleted nothing would ever unlink its orders. Any other failed
 //! step of one account (reading its user, `User::delete`, marking it
 //! deleted) is handled the same way, so it never stops the rest of the run.
@@ -33,9 +43,9 @@
 //!
 //! The Stripe secret key is only handed to the client; it is never logged.
 
-use std::time::Duration;
-
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use revolt_database::{Account, Database};
 use revolt_payments::{
@@ -50,14 +60,24 @@ use tokio::time::sleep;
 /// the cascade
 type Payments<'a> = Option<(&'a PaymentsSettings, &'a dyn StripeApi)>;
 
+/// How often the sweep runs: a confirmed deletion is purged within this
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// How long an account whose deletion failed waits before it is tried again
+const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
 pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
+    // Owned by this loop: a restart of the task (the wrapper in `main.rs`
+    // restarts it after an error) or of crond starts it empty, so a failing
+    // account can then be tried once before its hour is up
+    let mut backoff = RetryBackoff::default();
+
     loop {
-        let accounts = db.fetch_accounts_due_for_deletion().await?;
+        let due = db.fetch_accounts_due_for_deletion().await?;
+        let accounts = backoff.ready(due, Instant::now());
         let count = accounts.len();
 
-        let deleted = if accounts.is_empty() {
-            0
-        } else {
+        if !accounts.is_empty() {
             let payments = payments_settings().await.map(|s| {
                 let stripe = ReqwestStripe::new(s.secret_key.clone());
                 (s, stripe)
@@ -66,12 +86,72 @@ pub async fn task(db: Database, _: revolt_database::AMQP) -> Result<()> {
                 .as_ref()
                 .map(|(s, stripe)| (s, stripe as &dyn StripeApi));
 
-            delete_accounts(&db, payments, accounts).await?
-        };
+            let swept = delete_accounts(&db, payments, accounts).await?;
+            backoff.record(&swept, Instant::now());
 
-        log::info!("Deleted {deleted} of {count} accounts due for deletion.");
+            // Only when something was due: this runs every minute
+            log::info!(
+                "Deleted {} of {count} accounts due for deletion ({} waiting to be retried).",
+                swept.deleted.len(),
+                backoff.waiting()
+            );
+        }
 
-        sleep(Duration::from_hours(1)).await
+        sleep(SWEEP_EVERY).await
+    }
+}
+
+/// The outcome of one run over the accounts it was given: the ids deleted
+/// and the ids skipped (any step failed; still due)
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Swept {
+    deleted: Vec<String>,
+    failed: Vec<String>,
+}
+
+/// When each account whose deletion failed may be tried again
+///
+/// In memory, owned by the task loop. An account whose deletion failed or
+/// was skipped is not tried again until [`RETRY_AFTER`] after that run
+/// ended; one deleted is forgotten, and so is one no longer due (cancelled
+/// or deleted by other means).
+#[derive(Debug, Default)]
+struct RetryBackoff {
+    next_attempt: HashMap<String, Instant>,
+}
+
+impl RetryBackoff {
+    /// The accounts of `due` to try at `now`: those without a pending
+    /// retry time, or whose retry time has come. Forgets every account
+    /// that is no longer due.
+    fn ready(&mut self, due: Vec<Account>, now: Instant) -> Vec<Account> {
+        let due_ids: HashSet<&str> = due.iter().map(|account| account.id.as_str()).collect();
+        self.next_attempt
+            .retain(|id, _| due_ids.contains(id.as_str()));
+
+        due.into_iter()
+            .filter(|account| {
+                self.next_attempt
+                    .get(&account.id)
+                    .is_none_or(|next| *next <= now)
+            })
+            .collect()
+    }
+
+    /// Record a run that ended at `now`: the deleted accounts are
+    /// forgotten, the failed ones wait [`RETRY_AFTER`] from `now`
+    fn record(&mut self, swept: &Swept, now: Instant) {
+        for id in &swept.deleted {
+            self.next_attempt.remove(id);
+        }
+        for id in &swept.failed {
+            self.next_attempt.insert(id.clone(), now + RETRY_AFTER);
+        }
+    }
+
+    /// How many accounts have a retry time recorded
+    fn waiting(&self) -> usize {
+        self.next_attempt.len()
     }
 }
 
@@ -108,13 +188,14 @@ async fn payments_settings() -> Option<PaymentsSettings> {
     }
 }
 
-/// Delete `accounts`: the payments cascade first, then the user, then the
-/// account. The number deleted (see [`delete_accounts_with`])
+/// Delete `accounts`: their sessions first, then the payments cascade, then
+/// the user, then the account. Which were deleted and which were skipped
+/// (see [`delete_accounts_with`])
 async fn delete_accounts(
     db: &Database,
     payments: Payments<'_>,
     accounts: Vec<Account>,
-) -> Result<usize> {
+) -> Result<Swept> {
     delete_accounts_with(db, accounts, |user_id| async move {
         payments_cascade(db, payments, &user_id).await
     })
@@ -122,96 +203,128 @@ async fn delete_accounts(
 }
 
 /// [`delete_accounts`] with the payments cascade passed in (tests inject a
-/// failing one). The number of accounts deleted.
+/// failing one). Which accounts were deleted and which were skipped.
 ///
 /// Each account is isolated: when any of its steps fails (reading the user,
 /// the cascade, `User::delete`, marking the account deleted), the failure is
 /// logged and reported with the account id only, the account is skipped, not
-/// marked deleted, and stays due, so the next run tries it again from the
-/// start; the accounts after it still go ahead. One account that cannot be
-/// deleted (for example one whose protected-channel seat release fails on an
-/// undecodable seat row, design 6.3) must not hold up every deletion queued
-/// behind it. Every step is safe to run again on that retry.
+/// marked deleted, and stays due, so a later run (an hour on) tries it again
+/// from the start; the accounts after it still go ahead. One account that
+/// cannot be deleted (for example one whose protected-channel seat release
+/// fails on an undecodable seat row, design 6.3) must not hold up every
+/// deletion queued behind it. Every step is safe to run again on that retry.
 ///
 /// The Prot wallet is forfeited after `User::delete` and before the
 /// account is marked deleted; when the forfeit fails the account is
 /// skipped the same way (that run has already anonymised the user).
+///
+/// The account's sessions are deleted before any of that (see
+/// [`delete_account`]); the task loop holds a skipped account back for
+/// [`RETRY_AFTER`] before the next try.
 async fn delete_accounts_with<F, Fut>(
     db: &Database,
     accounts: Vec<Account>,
     cascade: F,
-) -> Result<usize>
+) -> Result<Swept>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let mut deleted = 0;
+    let mut swept = Swept::default();
 
-    for mut account in accounts {
-        let mut user = match db.fetch_user(&account.id).await {
-            Ok(user) => user,
-            Err(err) => {
-                skip_account(&account.id, "its user could not be read", &err);
-                continue;
-            }
-        };
-
-        // Before `User::delete`: the open orders are still linked to the
-        // user, so they can be found, voided and refunded
-        if let Err(err) = cascade(user.id.clone()).await {
-            log::error!(
-                "Account deletion of {}: its payment orders could not be unlinked or its \
-                 membership deleted; not deleting the account this run, retrying next run: \
-                 {err:?}",
-                user.id
-            );
-            report_skip(
-                &account.id,
-                "its payment orders could not be unlinked or its membership deleted",
-                &err,
-            );
-            continue;
+    for account in accounts {
+        let id = account.id.clone();
+        if delete_account(db, account, &cascade).await {
+            swept.deleted.push(id);
+        } else {
+            swept.failed.push(id);
         }
-
-        // A failure part way through can leave the user partly deleted (its
-        // bots and owned servers gone, say); the retry runs it again
-        if let Err(err) = user.delete(db).await {
-            skip_account(&account.id, "deleting its user failed", &err);
-            continue;
-        }
-
-        // Prot (D11): the wallet is forfeited AFTER the delete cascade (S5b: settlements and
-        // goal cancellations pay the owner's own share into the wallet first). Must succeed: on
-        // failure the account stays due and the next run repeats the cascade (as a failed
-        // mark_deleted does).
-        if let Err(err) =
-            engine::prot::forfeit_wallet_on_deletion(db, &user.id, revolt_database::now_ms()).await
-        {
-            skip_account(&account.id, "its Prot wallet could not be forfeited", &err);
-            continue;
-        }
-
-        if let Err(err) = account.mark_deleted(db).await {
-            skip_account(
-                &account.id,
-                "its user was deleted but the account could not be marked deleted",
-                &err,
-            );
-            continue;
-        }
-
-        deleted += 1;
     }
 
-    Ok(deleted)
+    Ok(swept)
+}
+
+/// Delete one account (see [`delete_accounts_with`]). True if it was
+/// deleted; false if a step failed, which has been logged and reported.
+async fn delete_account<F, Fut>(db: &Database, mut account: Account, cascade: &F) -> bool
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    // First, once per try, before `User::delete` (which leaves sessions in
+    // place) and before any step that can fail: the account is gone for
+    // good, so its sessions die even when the rest of its deletion has to
+    // wait for a retry. Best-effort: a failure is logged and the deletion
+    // goes ahead (the confirm route has already revoked them once).
+    if let Err(err) = account.delete_all_sessions(db, None).await {
+        log::error!(
+            "Account deletion of {}: its sessions could not be deleted; deleting the account \
+             anyway: {err:?}",
+            account.id
+        );
+    }
+
+    let mut user = match db.fetch_user(&account.id).await {
+        Ok(user) => user,
+        Err(err) => {
+            skip_account(&account.id, "its user could not be read", &err);
+            return false;
+        }
+    };
+
+    // Before `User::delete`: the open orders are still linked to the
+    // user, so they can be found, voided and refunded
+    if let Err(err) = cascade(user.id.clone()).await {
+        log::error!(
+            "Account deletion of {}: its payment orders could not be unlinked or its \
+             membership deleted; not deleting the account this run, retrying in an hour: \
+             {err:?}",
+            user.id
+        );
+        report_skip(
+            &account.id,
+            "its payment orders could not be unlinked or its membership deleted",
+            &err,
+        );
+        return false;
+    }
+
+    // A failure part way through can leave the user partly deleted (its
+    // bots and owned servers gone, say); the retry runs it again
+    if let Err(err) = user.delete(db).await {
+        skip_account(&account.id, "deleting its user failed", &err);
+        return false;
+    }
+
+    // Prot (D11): the wallet is forfeited AFTER the delete cascade (S5b: settlements and
+    // goal cancellations pay the owner's own share into the wallet first). Must succeed: on
+    // failure the account stays due and the next run repeats the cascade (as a failed
+    // mark_deleted does).
+    if let Err(err) =
+        engine::prot::forfeit_wallet_on_deletion(db, &user.id, revolt_database::now_ms()).await
+    {
+        skip_account(&account.id, "its Prot wallet could not be forfeited", &err);
+        return false;
+    }
+
+    if let Err(err) = account.mark_deleted(db).await {
+        skip_account(
+            &account.id,
+            "its user was deleted but the account could not be marked deleted",
+            &err,
+        );
+        return false;
+    }
+
+    true
 }
 
 /// Log and report (account id only, never account content) that the
-/// deletion of `account_id` failed at `step` and is retried next run
+/// deletion of `account_id` failed at `step` and is retried in an hour
 fn skip_account(account_id: &str, step: &str, err: &revolt_result::Error) {
     log::error!(
         "Account deletion of {account_id}: {step}; not marking the account deleted this run, \
-         retrying next run: {err:?}"
+         retrying in an hour: {err:?}"
     );
     report_skip(account_id, step, err);
 }
@@ -220,7 +333,8 @@ fn skip_account(account_id: &str, step: &str, err: &revolt_result::Error) {
 /// `step`. The event carries the account id (audit C11: the error alone
 /// does not say which account to look at) and the error, and nothing else
 /// of the account. crond has no Sentry scope API of its own, so the id goes
-/// in the message; one account failing hourly reports once an hour.
+/// in the message; with the retry backoff, one account that keeps failing
+/// reports about once an hour, not every minute.
 fn report_skip(account_id: &str, step: &str, err: &revolt_result::Error) {
     revolt_config::capture_message(
         &skip_report(account_id, step, err),
@@ -230,7 +344,7 @@ fn report_skip(account_id: &str, step: &str, err: &revolt_result::Error) {
 
 /// The Sentry message of [`report_skip`]
 fn skip_report(account_id: &str, step: &str, err: &revolt_result::Error) -> String {
-    format!("Account deletion of {account_id} skipped, retried next run: {step}: {err:?}")
+    format!("Account deletion of {account_id} skipped, retried in an hour: {step}: {err:?}")
 }
 
 /// The payments cascade for `user_id`. The voids are best-effort (logged by
@@ -256,7 +370,8 @@ mod tests {
     use revolt_config::{ApiStripe, FeaturePayments};
     use revolt_database::test_teardown::TestDatabaseGuard;
     use revolt_database::{
-        DatabaseInfo, DeletionInfo, EmailVerification, OrderState, PaymentOrder, User, VoidReason,
+        DatabaseInfo, DeletionInfo, EmailVerification, OrderState, PaymentOrder, Session, User,
+        VoidReason,
     };
     use revolt_models::v0::{CipherReturnTo, CipherTier, UserFlags};
     use revolt_payments::{
@@ -303,9 +418,9 @@ mod tests {
         .unwrap();
     }
 
-    /// An account whose deletion is due now
-    async fn schedule_deletion(db: &Database, id: &str) {
-        db.save_account(&Account {
+    /// A disabled account `id` with no deletion state
+    fn disabled_account(id: &str) -> Account {
+        Account {
             id: id.to_string(),
             email: format!("{id}@example.com"),
             email_normalised: format!("{id}@example.com"),
@@ -313,16 +428,41 @@ mod tests {
             disabled: true,
             verification: EmailVerification::Verified,
             password_reset: None,
-            deletion: Some(DeletionInfo::Scheduled {
-                after: Timestamp::now_utc(),
-            }),
+            deletion: None,
             lockout: None,
             mfa: Default::default(),
             google_id: None,
             apple_id: None,
-        })
+        }
+    }
+
+    /// An account whose deletion is due now. `save_account` never writes
+    /// `deletion`, so the schedule goes through its own op after the save.
+    async fn schedule_deletion(db: &Database, id: &str) {
+        db.save_account(&disabled_account(id)).await.unwrap();
+        db.set_account_deletion(
+            id,
+            Some(DeletionInfo::Scheduled {
+                after: Timestamp::now_utc(),
+            }),
+        )
         .await
         .unwrap();
+        assert!(
+            matches!(
+                db.fetch_account(id).await.unwrap().deletion,
+                Some(DeletionInfo::Scheduled { .. })
+            ),
+            "{id} is scheduled for deletion"
+        );
+    }
+
+    /// The outcome of a run that deleted `deleted` and skipped `failed`
+    fn swept(deleted: &[&str], failed: &[&str]) -> Swept {
+        Swept {
+            deleted: deleted.iter().map(|id| id.to_string()).collect(),
+            failed: failed.iter().map(|id| id.to_string()).collect(),
+        }
     }
 
     /// The sweep body over the accounts that are due, with `stripe`
@@ -696,13 +836,17 @@ mod tests {
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
 
         assert_deleted(&db, "u2").await;
-        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_eq!(
+            deleted.unwrap(),
+            swept(&["u2"], &["u1"]),
+            "only u2 was deleted"
+        );
         assert_still_due(&db, "u1").await;
 
         insert_user(&db, "u1").await;
         let due = due_in_order(&db, &["u1"]).await;
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
-        assert_eq!(deleted.unwrap(), 1);
+        assert_eq!(deleted.unwrap(), swept(&["u1"], &[]));
         assert_deleted(&db, "u1").await;
     }
 
@@ -759,14 +903,18 @@ mod tests {
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
 
         assert_deleted(&db, "u2").await;
-        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_eq!(
+            deleted.unwrap(),
+            swept(&["u2"], &["u1"]),
+            "only u2 was deleted"
+        );
         assert_not_anonymised(&db, "u1").await;
         assert_still_due(&db, "u1").await;
 
         // Retried next run; the row is still corrupt, so it is kept again
         let due = due_in_order(&db, &["u1"]).await;
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
-        assert_eq!(deleted.unwrap(), 0);
+        assert_eq!(deleted.unwrap(), swept(&[], &["u1"]));
         assert_not_anonymised(&db, "u1").await;
         assert_still_due(&db, "u1").await;
 
@@ -777,7 +925,7 @@ mod tests {
             .expect("delete the corrupt seat row");
         let due = due_in_order(&db, &["u1"]).await;
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
-        assert_eq!(deleted.unwrap(), 1);
+        assert_eq!(deleted.unwrap(), swept(&["u1"], &[]));
         assert_deleted(&db, "u1").await;
     }
 
@@ -828,7 +976,11 @@ mod tests {
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
 
         assert_deleted(&db, "u2").await;
-        assert_eq!(deleted.unwrap(), 1, "only u2 was deleted");
+        assert_eq!(
+            deleted.unwrap(),
+            swept(&["u2"], &["u1"]),
+            "only u2 was deleted"
+        );
         assert_still_due(&db, "u1").await;
 
         accounts
@@ -837,7 +989,7 @@ mod tests {
             .expect("delete the decoy account");
         let due = due_in_order(&db, &["u1"]).await;
         let deleted = delete_accounts_with(&db, due, |_| async { Ok(()) }).await;
-        assert_eq!(deleted.unwrap(), 1);
+        assert_eq!(deleted.unwrap(), swept(&["u1"], &[]));
         assert_deleted(&db, "u1").await;
     }
 
@@ -1122,5 +1274,148 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// The ids of `accounts`, in order
+    fn ids(accounts: &[Account]) -> Vec<String> {
+        accounts.iter().map(|account| account.id.clone()).collect()
+    }
+
+    /// The retry backoff, on an explicit clock: an account whose deletion
+    /// failed is held back until `RETRY_AFTER` after that run ended (the
+    /// next minute's sweep skips it), then tried again; a deleted one is
+    /// forgotten, and so is one no longer due. Mutations: `ready` ignoring
+    /// the map, `record` not inserting the failures, the prune dropped.
+    #[test]
+    fn a_failed_account_waits_an_hour_before_it_is_tried_again() {
+        let one = |id: &str| vec![disabled_account(id)];
+        let start = Instant::now();
+        let mut backoff = RetryBackoff::default();
+
+        // Nothing recorded: every due account is tried
+        let first = backoff.ready(vec![disabled_account("u1"), disabled_account("u2")], start);
+        assert_eq!(ids(&first), ["u1", "u2"]);
+
+        // u1 failed, u2 was deleted
+        let ended = start + Duration::from_secs(5);
+        backoff.record(&swept(&["u2"], &["u1"]), ended);
+        assert_eq!(backoff.waiting(), 1, "only the failed account waits");
+
+        // The next sweep a minute on, and one a second before the hour,
+        // leave u1 out; an account newly due is not held back by it
+        assert!(backoff.ready(one("u1"), ended + SWEEP_EVERY).is_empty());
+        let almost = ended + RETRY_AFTER - Duration::from_secs(1);
+        assert!(backoff.ready(one("u1"), almost).is_empty());
+        let mixed = backoff.ready(vec![disabled_account("u1"), disabled_account("u3")], almost);
+        assert_eq!(ids(&mixed), ["u3"]);
+
+        // At the hour it is tried again
+        let retry = ended + RETRY_AFTER;
+        assert_eq!(ids(&backoff.ready(one("u1"), retry)), ["u1"]);
+
+        // It fails again: another hour from the end of that run
+        let ended_again = retry + Duration::from_secs(5);
+        backoff.record(&swept(&[], &["u1"]), ended_again);
+        assert!(backoff.ready(one("u1"), retry + SWEEP_EVERY).is_empty());
+        let next = ended_again + RETRY_AFTER;
+        assert_eq!(ids(&backoff.ready(one("u1"), next)), ["u1"]);
+
+        // Deleted: forgotten
+        backoff.record(&swept(&["u1"], &[]), next);
+        assert_eq!(backoff.waiting(), 0, "a deleted account is forgotten");
+
+        // An account that fails and then stops being due is forgotten, so
+        // a fresh schedule for it later is tried at once
+        backoff.record(&swept(&[], &["u4"]), next);
+        assert_eq!(backoff.waiting(), 1);
+        assert!(backoff.ready(Vec::new(), next + SWEEP_EVERY).is_empty());
+        assert_eq!(
+            backoff.waiting(),
+            0,
+            "an account no longer due is forgotten"
+        );
+        let rescheduled = backoff.ready(one("u4"), next + SWEEP_EVERY * 2);
+        assert_eq!(ids(&rescheduled), ["u4"]);
+    }
+
+    /// A session of `user_id` with the token `token-{id}`
+    fn session(id: &str, user_id: &str) -> Session {
+        Session {
+            id: id.to_string(),
+            user_id: user_id.to_string(),
+            token: format!("token-{id}"),
+            name: "test".to_string(),
+            last_seen: Timestamp::now_utc(),
+            origin: None,
+            subscription: None,
+        }
+    }
+
+    /// The ids of the sessions of `user_id`, sorted
+    async fn session_ids(db: &Database, user_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .fetch_sessions(user_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The sweep deletes every session of each account it tries, before
+    /// any step that can fail: the account deleted and the account whose
+    /// payments cascade failed (still due) both lose all their sessions,
+    /// and a deleted session's token no longer resolves. Another user's
+    /// session is kept. Both drivers. Mutation: the `delete_all_sessions`
+    /// call dropped, or moved after the cascade.
+    #[tokio::test]
+    async fn the_sweep_deletes_the_sessions_of_the_accounts_it_tries() {
+        let (db, _guard) = test_db().await;
+        for id in ["u1", "u2", "u3"] {
+            insert_user(&db, id).await;
+        }
+        schedule_deletion(&db, "u1").await;
+        schedule_deletion(&db, "u2").await;
+        db.save_account(&Account {
+            disabled: false,
+            ..disabled_account("u3")
+        })
+        .await
+        .unwrap();
+        for (id, user_id) in [("s1a", "u1"), ("s1b", "u1"), ("s2", "u2"), ("s3", "u3")] {
+            db.save_session(&session(id, user_id)).await.unwrap();
+        }
+        assert_eq!(session_ids(&db, "u1").await, ["s1a", "s1b"]);
+        assert_eq!(session_ids(&db, "u2").await, ["s2"]);
+
+        // u2's payments cascade fails this run
+        let due = due_in_order(&db, &["u1", "u2"]).await;
+        let outcome = delete_accounts_with(&db, due, |user_id| async move {
+            if user_id == "u2" {
+                Err(create_error!(InternalError))
+            } else {
+                Ok(())
+            }
+        })
+        .await;
+        assert_eq!(outcome.unwrap(), swept(&["u1"], &["u2"]));
+
+        assert_deleted(&db, "u1").await;
+        assert!(
+            session_ids(&db, "u1").await.is_empty(),
+            "the deleted account has no session left"
+        );
+        assert!(db.fetch_session_by_token("token-s1a").await.is_err());
+
+        assert_not_anonymised(&db, "u2").await;
+        assert_still_due(&db, "u2").await;
+        assert!(
+            session_ids(&db, "u2").await.is_empty(),
+            "the account whose deletion waits for a retry has no session left"
+        );
+
+        assert_eq!(session_ids(&db, "u3").await, ["s3"], "u3 keeps its session");
     }
 }

@@ -67,6 +67,10 @@ pub struct Templates {
     pub reset_existing: Template,
     /// Template for account deletion
     pub deletion: Template,
+    /// Template sent when signing in cancels a pending account deletion
+    ///
+    /// Carries no token: its `url` is used as-is.
+    pub deletion_cancelled: Template,
     /// Template for suspention
     pub suspension: Template,
 }
@@ -74,7 +78,18 @@ pub struct Templates {
 pub async fn email_templates() -> Templates {
     let config = config().await;
 
-    if std::env::var("TEST_DB").is_ok() {
+    build_templates(
+        std::env::var("TEST_DB").is_ok(),
+        config.production,
+        &config.hosts.app,
+    )
+}
+
+/// Pick the template set: the test stubs when `TEST_DB` is set, otherwise the
+/// production or whitelabel set. `app` is `hosts.app`. Split out of
+/// `email_templates` so every branch can be unit tested without the config.
+fn build_templates(test: bool, production: bool, app: &str) -> Templates {
+    if test {
         Templates {
             verify: Template {
                 title: "verify".into(),
@@ -94,8 +109,18 @@ pub async fn email_templates() -> Templates {
                 url: "".into(),
                 html: None,
             },
+            // Test urls stay empty: `TestHarness::assert_email` pulls the
+            // token out of `[[...]]` and only accepts `[A-Za-z0-9_-]`, so a
+            // host prefix would break every token-reading test.
             deletion: Template {
                 title: "deletion".into(),
+                text: "[[{{url}}]]".into(),
+                url: "".into(),
+                html: None,
+            },
+            // No token, so the mail body renders as `[[]]` (an empty code).
+            deletion_cancelled: Template {
+                title: "deletion_cancelled".into(),
                 text: "[[{{url}}]]".into(),
                 url: "".into(),
                 html: None,
@@ -107,31 +132,37 @@ pub async fn email_templates() -> Templates {
                 html: None,
             },
         }
-    } else if config.production {
+    } else if production {
         Templates {
             verify: Template {
                 title: "Verify your Sloga account.".into(),
                 text: include_str!("../../templates/verify.txt").into(),
-                url: format!("{}/login/verify/", config.hosts.app),
+                url: format!("{}/login/verify/", app),
                 html: Some(include_str!("../../templates/verify.html").into()),
             },
             reset: Template {
                 title: "Reset your Sloga password.".into(),
                 text: include_str!("../../templates/reset.txt").into(),
-                url: format!("{}/login/reset/", config.hosts.app),
+                url: format!("{}/login/reset/", app),
                 html: Some(include_str!("../../templates/reset.html").into()),
             },
             reset_existing: Template {
                 title: "You already have a Sloga account, reset your password.".into(),
                 text: include_str!("../../templates/reset-existing.txt").into(),
-                url: format!("{}/login/reset/", config.hosts.app),
+                url: format!("{}/login/reset/", app),
                 html: Some(include_str!("../../templates/reset-existing.html").into()),
             },
             deletion: Template {
-                title: "Confirm account deletion.".into(),
+                title: "Confirm your Sloga account deletion".into(),
                 text: include_str!("../../templates/deletion.txt").into(),
-                url: format!("{}/delete/", config.hosts.app),
+                url: format!("{}/login/delete/", app),
                 html: Some(include_str!("../../templates/deletion.html").into()),
+            },
+            deletion_cancelled: Template {
+                title: "Your Sloga account was restored".into(),
+                text: include_str!("../../templates/deletion-cancelled.txt").into(),
+                url: format!("{}/login", app),
+                html: Some(include_str!("../../templates/deletion-cancelled.html").into()),
             },
             suspension: Template {
                 title: "Account Suspension".to_string(),
@@ -145,31 +176,38 @@ pub async fn email_templates() -> Templates {
             verify: Template {
                 title: "Verify your account.".into(),
                 text: include_str!("../../templates/verify.whitelabel.txt").into(),
-                url: format!("{}/login/verify/", config.hosts.app),
+                url: format!("{}/login/verify/", app),
                 // The .whitelabel.txt above stays the plain-text alternative; the
                 // HTML part carries the Sloga logo. Both templates are branded and
-                // their legal footer names Sloga Technologies LLC. deletion and
-                // suspension stay text-only -- their .html still carries the
-                // upstream Revolt Platforms Ltd. footer, so do NOT wire them up
-                // without fixing that first.
+                // their legal footer names Sloga Technologies LLC. suspension
+                // stays text-only -- its .html still carries the upstream Revolt
+                // Platforms Ltd. footer, so do NOT wire it up without fixing that
+                // first. deletion and deletion_cancelled are also text-only here;
+                // their .html is Sloga-branded and could be wired up later.
                 html: Some(include_str!("../../templates/verify.html").into()),
             },
             reset: Template {
                 title: "Reset your password.".into(),
                 text: include_str!("../../templates/reset.whitelabel.txt").into(),
-                url: format!("{}/login/reset/", config.hosts.app),
+                url: format!("{}/login/reset/", app),
                 html: Some(include_str!("../../templates/reset.html").into()),
             },
             reset_existing: Template {
                 title: "Reset your password.".into(),
                 text: include_str!("../../templates/reset.whitelabel.txt").into(),
-                url: format!("{}/login/reset/", config.hosts.app),
+                url: format!("{}/login/reset/", app),
                 html: Some(include_str!("../../templates/reset-existing.html").into()),
             },
             deletion: Template {
-                title: "Confirm account deletion.".into(),
+                title: "Confirm your Sloga account deletion".into(),
                 text: include_str!("../../templates/deletion.whitelabel.txt").into(),
-                url: format!("{}/delete/", config.hosts.app),
+                url: format!("{}/login/delete/", app),
+                html: None,
+            },
+            deletion_cancelled: Template {
+                title: "Your Sloga account was restored".into(),
+                text: include_str!("../../templates/deletion-cancelled.whitelabel.txt").into(),
+                url: format!("{}/login", app),
                 html: None,
             },
             suspension: Template {
@@ -285,10 +323,109 @@ pub fn validate_email(email: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::render_template;
+    use super::{build_templates, render_template};
     use serde_json::json;
 
     const SUSPENSION: &str = include_str!("../../templates/suspension.whitelabel.txt");
+    const APP: &str = "https://app.example.test";
+
+    #[test]
+    fn deletion_emails_link_to_the_login_confirm_page() {
+        // production, then whitelabel
+        for production in [true, false] {
+            let templates = build_templates(false, production, APP);
+
+            // The frontend route is /login/delete/:token; the bare /delete/
+            // the upstream template built never resolved.
+            assert_eq!(
+                templates.deletion.url,
+                format!("{APP}/login/delete/"),
+                "production = {production}"
+            );
+            assert_eq!(
+                templates.deletion_cancelled.url,
+                format!("{APP}/login"),
+                "production = {production}"
+            );
+
+            for template in [&templates.deletion, &templates.deletion_cancelled] {
+                assert!(template.text.contains("{{url}}"), "production = {production}");
+                assert!(template.text.contains("{{email}}"), "production = {production}");
+                assert!(!template.text.contains("Revolt"), "production = {production}");
+                if let Some(html) = &template.html {
+                    assert!(html.contains("href=\"{{url}}\""), "production = {production}");
+                    assert!(!html.contains("Revolt"), "production = {production}");
+                }
+            }
+
+            // html only where the deletion email already had it
+            assert_eq!(
+                templates.deletion.html.is_some(),
+                templates.deletion_cancelled.html.is_some()
+            );
+            assert_eq!(templates.deletion.html.is_some(), production);
+        }
+    }
+
+    #[test]
+    fn deletion_email_copy_states_it_is_final_and_how_to_cancel() {
+        for production in [true, false] {
+            let templates = build_templates(false, production, APP);
+            let token_url = format!("{}TOKEN", templates.deletion.url);
+            let vars = json!({ "email": "a@example.com", "url": token_url });
+
+            let mut bodies = vec![render_template(&templates.deletion.text, &vars).unwrap()];
+            if let Some(html) = &templates.deletion.html {
+                bodies.push(render_template(html, &vars).unwrap());
+            }
+
+            for body in bodies {
+                assert!(body.contains("/login/delete/TOKEN"), "{body}");
+                assert!(body.contains("a@example.com"), "{body}");
+                assert!(body.contains("Delete permanently"), "{body}");
+                assert!(body.contains("no going back"), "{body}");
+                assert!(body.contains("24 hours"), "{body}");
+                assert!(body.contains("sign in to Sloga before you use the link"), "{body}");
+                assert!(body.contains("change your password"), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn deletion_cancelled_email_renders_with_email_and_url_only() {
+        for production in [true, false] {
+            let templates = build_templates(false, production, APP);
+            let template = &templates.deletion_cancelled;
+            let vars = json!({ "email": "a@example.com", "url": template.url });
+
+            let mut bodies = vec![render_template(&template.text, &vars).unwrap()];
+            if let Some(html) = &template.html {
+                bodies.push(render_template(html, &vars).unwrap());
+            }
+
+            for body in bodies {
+                assert!(body.contains("restored"), "{body}");
+                assert!(body.contains("Nothing was deleted."), "{body}");
+                assert!(body.contains("change your password right away"), "{body}");
+                assert!(body.contains("Open Sloga"), "{body}");
+                assert!(body.contains("https:&#x2F;&#x2F;app.example.test&#x2F;login")
+                    || body.contains("https://app.example.test/login"), "{body}");
+                assert!(body.contains("a@example.com"), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_db_templates_keep_token_only_urls() {
+        // `TestHarness::assert_email` reads the token out of `[[...]]` and only
+        // accepts `[A-Za-z0-9_-]`, so the TEST_DB urls must stay empty.
+        let templates = build_templates(true, false, APP);
+
+        assert_eq!(templates.deletion.url, "");
+        assert_eq!(templates.deletion_cancelled.url, "");
+        assert_eq!(templates.deletion_cancelled.text, "[[{{url}}]]");
+        assert_eq!(templates.deletion_cancelled.title, "deletion_cancelled");
+    }
 
     #[test]
     fn suspension_email_states_duration_and_how_to_appeal() {
