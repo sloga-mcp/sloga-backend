@@ -32,13 +32,16 @@ use std::time::Duration;
 
 use redis_kiss::{get_connection as _get_connection, AsyncCommands, Conn};
 use revolt_database::{
-    events::client::EventV1,
+    events::{
+        client::EventV1,
+        rabbit::{CALL_REASON_CANCELLED, CALL_REASON_ENDED},
+    },
     voice::{
         clear_voice_participant_identities, delete_channel_voice_state,
         delete_voice_participant_identity, delete_voice_state, get_channel_node,
-        get_user_voice_channels, voice_session_key, UserVoiceChannel,
+        get_user_voice_channels, take_call_ring, voice_session_key, CallRing, UserVoiceChannel,
     },
-    Database, AMQP,
+    Database, DmCallSignal, AMQP,
 };
 use revolt_result::{create_error, Result, ToRevoltError};
 
@@ -378,6 +381,54 @@ async fn sweep(
     Ok(liveness.suspects)
 }
 
+/// Whether a ghost call's end push looks for the channel's ring record. Only
+/// a direct message or group ever rings, so a channel that belongs to a
+/// server has no record to look for, and with call signals switched off no
+/// record is read at all.
+fn ring_record_applies(call_signals: bool, channel: &UserVoiceChannel) -> bool {
+    call_signals && channel.server_id.is_none()
+}
+
+/// The end push for a ghost call that was just torn down.
+///
+/// With the call's ring record, the push comes from the ring's caller and
+/// names the ring, and says whether anyone ever answered it: a ring nobody
+/// answered was cancelled, anything else ended. Without a record (a call
+/// older than ring records, or one whose record was lost) it is the push
+/// this sweep has always sent, from the first ghost on the roster.
+fn ghost_end_signal(ring: Option<CallRing>, first_member: &str, channel_id: &str) -> DmCallSignal {
+    match ring {
+        Some(ring) => {
+            let reason = if ring.answered {
+                CALL_REASON_ENDED
+            } else {
+                CALL_REASON_CANCELLED
+            };
+
+            DmCallSignal {
+                initiator_id: ring.initiator_id,
+                channel_id: channel_id.to_string(),
+                started_at: None,
+                ended: true,
+                recipients: None,
+                call_id: Some(ring.call_id),
+                reason: Some(reason.to_string()),
+                video: None,
+            }
+        }
+        None => DmCallSignal {
+            initiator_id: first_member.to_string(),
+            channel_id: channel_id.to_string(),
+            started_at: None,
+            ended: true,
+            recipients: None,
+            call_id: None,
+            reason: None,
+            video: None,
+        },
+    }
+}
+
 /// Tear one ghost channel down the way the missed webhooks would have:
 /// per-member `participant_left` (state delete + VoiceChannelLeave), then
 /// `room_finished` (channel-level keys, identities, ring dismissal, MLS
@@ -436,12 +487,31 @@ async fn reconcile_channel(
     clear_voice_participant_identities(channel_id).await?;
 
     // Dismiss any outstanding ring notification (participant_left does this
-    // when the roster empties; the initiator id only labels the push).
+    // when the roster empties). The push daemon tells everyone in the
+    // conversation except the user named as initiator, so that name has to
+    // be the caller, whose devices are not the ones ringing. The ring record
+    // knows who that was; the first ghost on the roster may be anyone.
     if let Some(user_id) = members.first() {
-        if let Err(e) = amqp
-            .dm_call_updated(user_id, channel_id, None, true, None)
-            .await
-        {
+        let config = revolt_config::config().await;
+        let published = if ring_record_applies(config.features.call_signals, &channel) {
+            // Taken, not read: the call is over, and a record left behind
+            // would speak for the next call in this channel. A Redis failure
+            // costs the push its caller and call id and nothing else, so it
+            // is logged and the teardown carries on.
+            let ring = match take_call_ring(channel_id).await {
+                Ok(ring) => ring,
+                Err(e) => {
+                    log::error!("failed to take the ring record of ghost {channel_id}: {e:?}");
+                    None
+                }
+            };
+            amqp.dm_call_signal(ghost_end_signal(ring, user_id, channel_id))
+                .await
+        } else {
+            amqp.dm_call_updated(user_id, channel_id, None, true, None)
+                .await
+        };
+        if let Err(e) = published {
             log::error!("failed to publish call end push for ghost {channel_id}: {e:?}");
         }
     }
@@ -465,6 +535,8 @@ async fn reconcile_channel(
 
 #[cfg(test)]
 mod test {
+    use super::{ghost_end_signal, ring_record_applies, CallRing, DmCallSignal, UserVoiceChannel};
+
     /// This file's shipping source, line comments cut and whitespace removed.
     /// Each line is cut at its first `//`, in a string or not: that only ever
     /// removes text, so a pin that requires code can fail on a `//` inside a
@@ -524,6 +596,187 @@ mod test {
         assert!(
             livekit_ghost.contains("voice_session_key(room)"),
             "step 4 (LiveKit's ghost rooms) must drop the session records: {livekit_ghost}"
+        );
+    }
+
+    const CALLER: &str = "01CALLER";
+    const GHOST: &str = "01GHOST";
+    const CHANNEL: &str = "01CHANNEL";
+    const CALL: &str = "01CALL";
+
+    /// A ring record whose caller is NOT the ghost the sweep found first.
+    fn ring(answered: bool) -> CallRing {
+        CallRing {
+            call_id: CALL.to_string(),
+            initiator_id: CALLER.to_string(),
+            started_at: "2026-01-01 00:00:00 UTC".to_string(),
+            started_unix: 1_767_225_600,
+            video: true,
+            answered,
+        }
+    }
+
+    /// Every field of the two signals, by way of `Debug`: a field added to
+    /// the signal later is compared without this helper having to learn it.
+    fn assert_same_signal(got: &DmCallSignal, want: &DmCallSignal) {
+        assert_eq!(format!("{got:?}"), format!("{want:?}"));
+    }
+
+    /// The push daemon tells everyone but the named initiator, so a ghost
+    /// call's end push has to come from whoever rang, not from whichever
+    /// stranded member the roster lists first.
+    #[test]
+    fn a_ring_record_names_the_caller_not_the_ghost() {
+        let signal = ghost_end_signal(Some(ring(true)), GHOST, CHANNEL);
+
+        assert_eq!(signal.initiator_id, CALLER);
+        assert_same_signal(
+            &signal,
+            &DmCallSignal {
+                initiator_id: CALLER.to_string(),
+                channel_id: CHANNEL.to_string(),
+                started_at: None,
+                ended: true,
+                recipients: None,
+                call_id: Some(CALL.to_string()),
+                reason: Some("ended".to_string()),
+                video: None,
+            },
+        );
+    }
+
+    /// The reason is spelled out here and not taken from the constants: these
+    /// are the words installed apps read.
+    #[test]
+    fn an_unanswered_ring_is_cancelled_and_an_answered_one_ended() {
+        let unanswered = ghost_end_signal(Some(ring(false)), GHOST, CHANNEL);
+        assert_eq!(unanswered.reason.as_deref(), Some("cancelled"));
+        assert_eq!(unanswered.initiator_id, CALLER);
+        assert_eq!(unanswered.call_id.as_deref(), Some(CALL));
+
+        let answered = ghost_end_signal(Some(ring(true)), GHOST, CHANNEL);
+        assert_eq!(answered.reason.as_deref(), Some("ended"));
+    }
+
+    /// With no record the signal is the one `dm_call_updated(first_member,
+    /// channel_id, None, true, None)` builds, which is what this sweep sent
+    /// before ring records existed: the expected value below is that
+    /// wrapper's own literal.
+    #[test]
+    fn no_ring_record_publishes_what_the_sweep_always_did() {
+        let signal = ghost_end_signal(None, GHOST, CHANNEL);
+
+        assert_same_signal(
+            &signal,
+            &DmCallSignal {
+                initiator_id: GHOST.to_string(),
+                channel_id: CHANNEL.to_string(),
+                started_at: None,
+                ended: true,
+                recipients: None,
+                ..Default::default()
+            },
+        );
+        assert_eq!(signal.call_id, None);
+        assert_eq!(signal.reason, None);
+        assert_eq!(signal.video, None);
+    }
+
+    #[test]
+    fn the_ring_record_is_only_for_a_call_outside_a_server_with_signals_on() {
+        let direct = UserVoiceChannel {
+            id: CHANNEL.to_string(),
+            server_id: None,
+        };
+        let in_server = UserVoiceChannel {
+            id: CHANNEL.to_string(),
+            server_id: Some("01SERVER".to_string()),
+        };
+
+        assert!(ring_record_applies(true, &direct));
+        assert!(!ring_record_applies(false, &direct));
+        assert!(!ring_record_applies(true, &in_server));
+        assert!(!ring_record_applies(false, &in_server));
+    }
+
+    /// `reconcile_channel`, as `shipping` renders it. It is the last function
+    /// before the tests.
+    fn teardown(code: &str) -> &str {
+        let start = code.find("asyncfnreconcile_channel(");
+        &code[start.expect("reconcile_channel")..]
+    }
+
+    /// The part of `reconcile_channel` that publishes the end push: from the
+    /// roster check that guards it to the MLS group close that follows it.
+    fn end_push(code: &str) -> &str {
+        let teardown = teardown(code);
+        let open = teardown
+            .find("ifletSome(user_id)=members.first(){")
+            .expect("the end push is only sent when the ghost roster had someone on it");
+        let close = teardown.find("ifletSome(group)=db").expect("the MLS close");
+        assert!(open < close, "the end push must come before the MLS close");
+        &teardown[open..close]
+    }
+
+    /// With call signals off the sweep must do what it did before ring
+    /// records existed. That is one branch: the `else` of the gate is the old
+    /// `dm_call_updated` call and nothing more, and it is the only place the
+    /// file still makes that call.
+    #[test]
+    fn signals_off_is_the_old_end_push_and_nothing_else() {
+        let code = shipping();
+        let push = end_push(&code);
+        let at = |needle: &str| {
+            push.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` is missing from the end push: {push}"))
+        };
+
+        let gate = at("ifring_record_applies(config.features.call_signals,&channel){");
+        let take = at("take_call_ring(channel_id).await");
+        let signal = at("amqp.dm_call_signal(ghost_end_signal(ring,user_id,channel_id)).await");
+        let old_call = at("}else{amqp.dm_call_updated(user_id,channel_id,None,true,None).await};");
+        assert!(
+            gate < take && take < signal && signal < old_call,
+            "the record is taken and used inside the gate, the old call is its else: {push}"
+        );
+
+        assert_eq!(code.matches(".dm_call_updated(").count(), 1);
+        assert_eq!(code.matches(".dm_call_signal(").count(), 1);
+    }
+
+    /// Everything about the end push is best effort. The teardown that
+    /// follows it (the MLS group close) ran after a failed publish before,
+    /// and must still run after a failed record read: nothing in this stretch
+    /// may hand an error up or leave the function.
+    #[test]
+    fn the_ring_record_cannot_fail_the_teardown() {
+        let code = shipping();
+        // `{e:?}` in a log line is the one `?` that is not an early return.
+        let push = end_push(&code).replace(":?}", "");
+
+        assert!(!push.contains('?'), "a `?` in the end push: {push}");
+        assert!(!push.contains("return"), "a return in the end push: {push}");
+    }
+
+    /// The record is taken in exactly one place, after the whole roster is
+    /// gone. The sweep's other steps clear one user's stale entries without
+    /// ending a call anyone can see, so they publish nothing and must leave
+    /// the record alone.
+    #[test]
+    fn the_ring_record_is_taken_once_after_the_roster_is_gone() {
+        let code = shipping();
+        assert_eq!(code.matches("take_call_ring(").count(), 1);
+
+        let teardown = teardown(&code);
+        let roster_gone = teardown
+            .find("clear_voice_participant_identities(channel_id).await?;")
+            .expect("the roster clear");
+        let take = teardown
+            .find("take_call_ring(")
+            .expect("the record is taken in reconcile_channel");
+        assert!(
+            roster_gone < take,
+            "the record must outlive a teardown that fails before the call is over"
         );
     }
 }

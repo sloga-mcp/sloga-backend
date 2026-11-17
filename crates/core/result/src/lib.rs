@@ -288,6 +288,10 @@ pub enum ErrorType {
     AlreadyConnected,
     NotConnected,
     UnknownNode,
+    /// An Answer reached a direct message or group call that nobody is in
+    /// any more; the client shows "Call ended" instead of starting a new
+    /// call
+    CallEnded,
     // ? Remote control errors
     /// The sharer already has a pending control offer in this channel — a
     /// second offer must not silently overwrite the first while the target's
@@ -591,6 +595,14 @@ mod tests {
     fn device_held_elsewhere_error_serializes_by_name() {
         let value = serde_json::to_value(create_error!(E2EEDeviceHeldElsewhere)).unwrap();
         assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceHeldElsewhere" }));
+    }
+
+    /// The type the client keys its "Call ended" notice on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn call_ended_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(CallEnded)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "CallEnded" }));
     }
 
     #[cfg(feature = "serde")]

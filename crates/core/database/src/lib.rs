@@ -132,7 +132,7 @@ pub mod e2ee_claim_lock;
 pub mod tasks;
 
 mod amqp;
-pub use amqp::amqp::AMQP;
+pub use amqp::amqp::{dm_call_expiration_ms, DmCallSignal, AMQP};
 
 #[cfg(feature = "voice")]
 pub mod voice;

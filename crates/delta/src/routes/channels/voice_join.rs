@@ -5,10 +5,12 @@ use revolt_database::{
         assert_call_caps_admit, drop_voice_participant_session, get_channel_node,
         get_user_voice_channel_in_server, get_user_voice_channels, get_voice_channel_members,
         join_call_occupancy_refuses, raise_if_in_voice, recorded_voice_connections,
-        set_call_notification_recipients, set_channel_node, set_voice_participant_session,
-        tear_down_removed_connections, EvictionFailure, UserVoiceChannel, VoiceClient,
+        set_call_answer_marker, set_call_notification_recipients, set_call_video_hint,
+        set_channel_node, set_voice_participant_session, take_call_answer_marker,
+        take_call_video_hint, tear_down_removed_connections, EvictionFailure, UserVoiceChannel,
+        VoiceClient,
     },
-    Database, Session, User,
+    Channel, Database, Session, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -71,6 +73,8 @@ pub async fn call(
         recipients,
         device_id,
         rejoin,
+        answer,
+        video,
     } = data.into_inner();
 
     if user.bot.is_some() && force_disconnect == Some(true) {
@@ -181,6 +185,39 @@ pub async fn call(
         if rejoin_conflict(&previous, channel.id()) {
             return Err(create_error!(AlreadyConnected));
         }
+    }
+
+    // CLIENT-CLAIMED: `answer` and `video` are only the app's word for which
+    // button its user pressed. They grant nothing. Every refusal above has
+    // already run for this join as for any other, the token below is minted
+    // from the permissions alone, and all `answer` can do is add one more
+    // refusal. Both count only where a call rings, a direct message or a
+    // group, never a channel of a server, and only while `call_signals` is
+    // on: otherwise this is the join it always was. Whether a join answers
+    // in the sense the voice server and a decline care about (it lands in a
+    // call somebody else is in) is read from the roster, not from `answer`:
+    // an older app, or a plain "Join" button, never sends it.
+    let rings = config.features.call_signals
+        && matches!(
+            channel,
+            Channel::DirectMessage { .. } | Channel::Group { .. }
+        );
+    let answering = join_answers_a_ring(rings, answer, rejoin);
+    let video_ring = rings && video == Some(true);
+    // A join its user asked for, where calls ring: not the app putting a
+    // dropped connection back.
+    let fresh_join = rings && rejoin != Some(true);
+    // Such a join into a call somebody else is already in: it takes the call,
+    // whether or not the app said it answers.
+    let joins_somebody = fresh_join && !answer_finds_nobody(members.as_deref(), &user.id);
+
+    // Answering a call that nobody is in any more must not start a new one
+    // and ring everybody back. The roster is the one the occupancy rule read
+    // above. Refused here, before the force-disconnect, the token, the room
+    // and the session record, so a refused answer leaves the user's other
+    // call, and everything else, exactly as it was.
+    if answering && answer_finds_nobody(members.as_deref(), &user.id) {
+        return Err(create_error!(CallEnded));
     }
 
     if force_disconnect == Some(true) {
@@ -373,6 +410,66 @@ pub async fn call(
         }
     }
 
+    // Two notes for the voice server, which hears of this join only when the
+    // media server reports it. The answer marker: if the caller hangs up
+    // before then, the answerer arrives in an empty call, and without the
+    // marker that would ring everybody as a new call; and until then it
+    // tells a decline from this user's other device that the call is being
+    // taken, so the caller is not told "declined" while the callee is still
+    // connecting. It is left by every fresh join that finds somebody else
+    // there, an answer or not (an `answer` that finds nobody was refused
+    // above, so every answer that got here is one of them). The video hint: the
+    // ring this join sends is shown as a video call. Both are written only
+    // here, once every check has passed and the room exists, so a join that
+    // was refused or failed above leaves neither behind for a later call to
+    // pick up. Both are best-effort: a note that could not be written costs
+    // at worst a wrong ring in that narrow case, never the join.
+    //
+    // A note can still be left over: its join got this far and then never
+    // reached the media server, so nobody collected it. A fresh join that
+    // does not leave the note therefore removes one (for the marker: a join
+    // into a call nobody else is in, which starts it), or the leftover
+    // marker would silence the ring of this user's own call back, and the
+    // leftover hint would show a voice call as video. A rejoin neither
+    // leaves nor removes anything: the report of the connection it puts
+    // back may still be on its way, and must still find the notes that
+    // connection left.
+    if joins_somebody {
+        if let Err(error) = set_call_answer_marker(channel.id(), &user.id).await {
+            log::warn!(
+                "join of {} by {}: the answer marker could not be left: {error:?}",
+                channel.id(),
+                user.id
+            );
+        }
+    } else if fresh_join {
+        if let Err(error) = take_call_answer_marker(channel.id(), &user.id).await {
+            log::warn!(
+                "join of {} by {}: a leftover answer marker could not be removed: {error:?}",
+                channel.id(),
+                user.id
+            );
+        }
+    }
+
+    if video_ring {
+        if let Err(error) = set_call_video_hint(channel.id(), &user.id).await {
+            log::warn!(
+                "join of {} by {}: the video hint could not be left: {error:?}",
+                channel.id(),
+                user.id
+            );
+        }
+    } else if fresh_join {
+        if let Err(error) = take_call_video_hint(channel.id(), &user.id).await {
+            log::warn!(
+                "join of {} by {}: a leftover video hint could not be removed: {error:?}",
+                channel.id(),
+                user.id
+            );
+        }
+    }
+
     // This session now owns the user's participant in this channel. A move
     // event goes to it alone, so a session this join kicked above cannot be
     // told to rejoin somewhere (media-e2ee final audit F1). The record also
@@ -400,6 +497,26 @@ fn rejoin_conflict(prev: &[(String, Option<String>)], target: &str) -> bool {
     prev.iter().any(|(channel_id, pointer)| {
         channel_id != target && pointer.as_deref() == Some(channel_id.as_str())
     })
+}
+
+/// Whether a join is taken as the answer to a ring. `rings` is whether a
+/// call in this channel rings at all (a direct message or group, with call
+/// signals on). The app's own automatic rejoin is never an answer, whatever
+/// it sends: it puts back a connection that dropped, and refusing it would
+/// leave a user who was in the call out of it.
+fn join_answers_a_ring(rings: bool, answer: Option<bool>, rejoin: Option<bool>) -> bool {
+    rings && answer == Some(true) && rejoin != Some(true)
+}
+
+/// Whether an answer would land in a call nobody is in: no roster, or a
+/// roster of nobody but the answerer. Their own entry never counts as
+/// somebody to talk to. It is either the leftover of a leave that was never
+/// seen, or another of their own devices sitting alone in the call.
+fn answer_finds_nobody(members: Option<&[String]>, self_id: &str) -> bool {
+    members
+        .unwrap_or_default()
+        .iter()
+        .all(|member| member == self_id)
 }
 
 /// Which LiveKit node a join lands on, in priority order:
@@ -498,6 +615,8 @@ mod test {
                     recipients: None,
                     device_id: None,
                     rejoin: None,
+                    answer: None,
+                    video: None,
                 })
                 .unwrap(),
             )
@@ -849,8 +968,11 @@ mod test {
 
         // The force-disconnect's side effects (AFK S-3 B5): the session
         // record's drop, the record read, the eviction and the set teardown
-        // all come after the refusal.
-        for effect in [
+        // all come after the refusal. The session record and the ring notes
+        // (their writes and their removals) joined the list with the answer
+        // refusal below, which must come before them; the rejoin refusal
+        // always did.
+        const EFFECTS: [&str; 15] = [
             "if force_disconnect == Some(true)",
             "drop_voice_participant_session(",
             "release_remote_control_for_user(",
@@ -861,10 +983,53 @@ mod test {
             "create_room(",
             "set_channel_node(",
             "set_call_notification_recipients(",
-        ] {
+            "set_call_answer_marker(",
+            "take_call_answer_marker(",
+            "set_call_video_hint(",
+            "take_call_video_hint(",
+            "set_voice_participant_session(",
+        ];
+        for effect in EFFECTS {
             assert!(
                 refuse < at(effect),
                 "`{}` runs before the rejoin refusal: {}",
+                effect,
+                body
+            );
+        }
+
+        // The answer to a call nobody is in any more is refused at the same
+        // place, for the same reason: a refused answer must change nothing.
+        // Refused any later, it would already have kicked the user out of the
+        // call they are in elsewhere, or opened a room and recorded a session
+        // for a call that then never starts, or left a note that silences
+        // their own next ring. It stands after the rejoin refusal, whose
+        // `AlreadyConnected` an automatic rejoin keeps getting first, and its
+        // whole refusal, the `CallEnded` return included, before the first
+        // side effect. The flag is read once, into `answering`, and that is
+        // what the refusal asks.
+        let answering = at("let answering = join_answers_a_ring(rings, answer, rejoin);");
+        let ended = at(
+            "if answering && answer_finds_nobody(members.as_deref(), &user.id) \u{7b} \
+             return Err(create_error!(CallEnded)); \u{7d}",
+        );
+        let ended_end = at("return Err(create_error!(CallEnded));")
+            + "return Err(create_error!(CallEnded));".len();
+        assert_eq!(
+            body.matches("create_error!(CallEnded)").count(),
+            1,
+            "`CallEnded` has one cause: {}",
+            body
+        );
+        assert!(
+            refuse < answering && answering < ended && ended < ended_end,
+            "{}",
+            body
+        );
+        for effect in EFFECTS {
+            assert!(
+                ended_end < at(effect),
+                "`{}` runs before the answer refusal: {}",
                 effect,
                 body
             );
@@ -1688,7 +1853,7 @@ mod test {
         let body = join_call_body();
         statement_at(
             &body,
-            "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,rejoin,\u{7d}=data.into_inner();",
+            "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,rejoin,answer,video,\u{7d}=data.into_inner();",
         );
         assert_eq!(
             body.matches(SEAT).count(),
@@ -2293,5 +2458,1269 @@ mod test {
                 refused.1
             );
         }
+    }
+
+    // ---- answering a ring -------------------------------------------------
+
+    /// Who an answer would find in the call. The answerer's own entry is
+    /// never somebody to talk to: it is the leftover of a leave nobody saw,
+    /// or another of their own devices alone in the call. Controls: `.all(`
+    /// turned `.any(` (an empty call is no longer nobody); `member ==
+    /// self_id` turned `false` (the answerer's own entry counts as somebody).
+    #[test]
+    fn an_answer_finds_nobody_when_only_the_answerer_is_on_the_roster() {
+        use super::answer_finds_nobody;
+        let roster = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+
+        // No roster recorded: the call is over.
+        assert!(answer_finds_nobody(None, "ME"));
+        // A roster with nobody on it.
+        assert!(answer_finds_nobody(Some(roster(&[]).as_slice()), "ME"));
+        // Only the answerer's own entry.
+        assert!(answer_finds_nobody(Some(roster(&["ME"]).as_slice()), "ME"));
+        // The answerer's own entry and somebody else, in either order.
+        assert!(!answer_finds_nobody(
+            Some(roster(&["ME", "CALLER"]).as_slice()),
+            "ME"
+        ));
+        assert!(!answer_finds_nobody(
+            Some(roster(&["CALLER", "ME"]).as_slice()),
+            "ME"
+        ));
+        // Somebody else only: the ordinary answer.
+        assert!(!answer_finds_nobody(
+            Some(roster(&["CALLER"]).as_slice()),
+            "ME"
+        ));
+    }
+
+    /// The whole question `call` asks before it answers `CallEnded`, as a
+    /// truth table. Only a join that says it answers, where calls ring, and
+    /// that is not the app's own rejoin can be refused, and only when nobody
+    /// else is there. Where calls do not ring (a channel of a server, or the
+    /// call signals switched off) no combination of flags and roster is
+    /// ever refused on this ground. Controls: `rings &&` dropped from
+    /// `join_answers_a_ring`; `answer == Some(true)` turned `answer !=
+    /// Some(false)` (a plain join can no longer start a call); `&& rejoin !=
+    /// Some(true)` dropped.
+    #[test]
+    fn only_an_answer_where_calls_ring_can_be_refused() {
+        use super::{answer_finds_nobody, join_answers_a_ring};
+
+        let refused = |rings: bool,
+                       answer: Option<bool>,
+                       rejoin: Option<bool>,
+                       members: Option<&[String]>| {
+            join_answers_a_ring(rings, answer, rejoin) && answer_finds_nobody(members, "ME")
+        };
+        let alone = vec!["ME".to_string()];
+        let with_caller = vec!["ME".to_string(), "CALLER".to_string()];
+        let rosters = [None, Some(alone.as_slice()), Some(with_caller.as_slice())];
+        let flags = [None, Some(false), Some(true)];
+
+        // The one refusal: an answer that finds nobody.
+        assert!(refused(true, Some(true), None, None));
+        assert!(refused(
+            true,
+            Some(true),
+            Some(false),
+            Some(alone.as_slice())
+        ));
+        // Somebody is there: the answer joins them.
+        assert!(!refused(
+            true,
+            Some(true),
+            None,
+            Some(with_caller.as_slice())
+        ));
+
+        for members in rosters {
+            // Not an answer: a call can still be started, into any roster.
+            for answer in [None, Some(false)] {
+                for rejoin in flags {
+                    assert!(
+                        !refused(true, answer, rejoin, members),
+                        "a join that does not answer was refused: {answer:?} {rejoin:?} {members:?}"
+                    );
+                }
+            }
+            // The app's own rejoin is never an answer.
+            assert!(!refused(true, Some(true), Some(true), members));
+            // Where calls do not ring, nothing is refused on this ground.
+            for answer in flags {
+                for rejoin in flags {
+                    assert!(
+                        !refused(false, answer, rejoin, members),
+                        "a join where calls do not ring was refused: {answer:?} {rejoin:?} \
+                         {members:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `answer` and `video` are the app's own claim, so they must be able to
+    /// add a refusal and nothing else. Pinned on `call`'s text: each is read
+    /// in ONE statement, behind `rings` (the call signals switch, and a
+    /// direct message or group only: a channel of a server never rings), and
+    /// those statements stand after every refusal an ordinary join meets on
+    /// its way there, with neither flag named anywhere before them. So no
+    /// check above can be skipped, softened or reordered by a flag. What
+    /// they are folded into, `answering` and `video_ring`, is used exactly
+    /// where it should be: `answering` the one refusal, `video_ring` the
+    /// hint. Beside them stands `fresh_join`, the fold that lets a join
+    /// remove a leftover note: behind `rings` too, so nothing is removed
+    /// where calls do not ring, and never for a rejoin. It counts as
+    /// `rings`' third fold, which is why `rings` has four uses. The answer
+    /// marker is left on `joins_somebody`, `fresh_join` plus the roster (a
+    /// join that takes the call, `answer` sent or not, since an older app or
+    /// a plain "Join" button never sends it), so `answering` is no longer
+    /// read past the refusal. The token's
+    /// arguments are pinned whole in
+    /// `the_record_names_the_seat_the_join_minted`, so neither reaches a
+    /// grant. Controls: `config.features.call_signals &&` dropped;
+    /// `| Channel::Group { .. }` widened to `| Channel::TextChannel { .. }`;
+    /// `if answer == Some(true) && voice_info.max_users.is_some()` put
+    /// around the occupancy refusal; the statements moved above the Connect
+    /// check; `rings &&` dropped from `fresh_join`; `fresh_join &&` dropped
+    /// from `joins_somebody` (a rejoin would leave the marker).
+    #[test]
+    fn the_ring_flags_are_read_after_every_refusal_and_only_where_calls_ring() {
+        use crate::util::test::statement_at;
+
+        const BOUND: &str = "letv0::DataJoinCall\u{7b}node,force_disconnect,recipients,device_id,\
+             rejoin,answer,video,\u{7d}=data.into_inner();";
+        const RINGS: &str = "letrings=config.features.call_signals&&matches!(channel,\
+             Channel::DirectMessage\u{7b}..\u{7d}|Channel::Group\u{7b}..\u{7d});";
+        const ANSWERING: &str = "letanswering=join_answers_a_ring(rings,answer,rejoin);";
+        const VIDEO_RING: &str = "letvideo_ring=rings&&video==Some(true);";
+        const FRESH_JOIN: &str = "letfresh_join=rings&&rejoin!=Some(true);";
+        const JOINS_SOMEBODY: &str = "letjoins_somebody=fresh_join\
+             &&!answer_finds_nobody(members.as_deref(),&user.id);";
+
+        let body = join_call_body();
+        let call = &body[..body
+            .find("fnrejoin_conflict(")
+            .expect("the fn after `call`")];
+
+        let bound_end = statement_at(call, BOUND) + BOUND.len();
+        let rings_at = statement_at(call, RINGS);
+        let answering_at = statement_at(call, ANSWERING);
+        let video_ring_at = statement_at(call, VIDEO_RING);
+        assert!(
+            call[rings_at + RINGS.len()..].starts_with(ANSWERING)
+                && call[answering_at + ANSWERING.len()..].starts_with(VIDEO_RING)
+                && call[video_ring_at + VIDEO_RING.len()..].starts_with(FRESH_JOIN),
+            "the flags are folded side by side, right behind `rings`: {}",
+            call
+        );
+        let fresh_join_at = statement_at(call, FRESH_JOIN);
+        assert!(
+            call[fresh_join_at + FRESH_JOIN.len()..].starts_with(JOINS_SOMEBODY),
+            "`joins_somebody` is folded right behind `fresh_join`: {}",
+            call
+        );
+        statement_at(call, JOINS_SOMEBODY);
+
+        let unread = &call[bound_end..rings_at];
+        assert!(
+            !unread.contains("answer") && !unread.contains("video"),
+            "nothing before `rings` may name either flag: {}",
+            unread
+        );
+        for refusal in [
+            "returnErr(create_error!(IsBot));",
+            "assert_device_bound_session(db,&user,&session,device_id.as_deref()).await?;",
+            "current_permissions.throw_if_lacking_channel_permission(ChannelPermission::Connect)?;",
+            "returnErr(create_error!(ChannelProtected));",
+            "returnErr(create_error!(NotAVoiceChannel));",
+            "returnErr(create_error!(CannotJoinCall));",
+            "assert_call_caps_admit(db,&user_voice_channel,&user.id).await?;",
+            "returnErr(create_error!(AlreadyConnected));",
+        ] {
+            assert!(
+                statement_at(call, refusal) < rings_at,
+                "`{}` must already have run when the flags are read",
+                refusal
+            );
+        }
+        assert!(
+            call.rfind("create_error!(UnknownNode)")
+                .expect("join_call's node resolution")
+                < rings_at,
+            "the node is resolved before the flags are read"
+        );
+
+        // Past their one read, the raw flags are never asked again, and what
+        // they were folded into has exactly its known uses.
+        let folded = &call[video_ring_at + VIDEO_RING.len()..];
+        for raw in ["answer==", "answer!=", "video==", "video!="] {
+            assert!(
+                !folded.contains(raw),
+                "`{}` reads a raw flag a second time: {}",
+                raw,
+                folded
+            );
+        }
+        for (name, uses, what) in [
+            ("rings", 4, "its binding and the three folds"),
+            ("answering", 2, "its binding and the refusal"),
+            ("video_ring", 2, "its binding and the hint"),
+            (
+                "fresh_join",
+                4,
+                "its binding, `joins_somebody` and the two removals",
+            ),
+            ("joins_somebody", 2, "its binding and the marker"),
+        ] {
+            assert_eq!(
+                call.matches(name).count(),
+                uses,
+                "`{}` appears as {} and nowhere else: {}",
+                name,
+                what,
+                call
+            );
+        }
+    }
+
+    /// The answer marker and the video hint are for the voice server, which
+    /// collects them when the join is reported to it. One left by a join
+    /// that never happened would be collected by the user's NEXT join of the
+    /// channel: a stale answer marker silences the ring of their own call
+    /// back, a stale hint shows a voice call as video. So each is written at
+    /// one site, for this channel and this user, behind its own fold of the
+    /// flags, after the answer refusal and after the room exists, and before
+    /// the session record, which stays the last statement. Each write is
+    /// best-effort: its failure is one WARN naming the error and nothing
+    /// else, never `?`, so a note can never refuse a join. The marker's gate
+    /// is `joins_somebody` (a fresh join into a call somebody else is in,
+    /// `answer` sent or not), not `answering`: a join from an app that never
+    /// sends `answer` takes the call just the same, and a decline from the
+    /// user's other device must see that. Controls: the marker's `if
+    /// joins_somebody` turned `if answering` or `if fresh_join`; either block
+    /// moved above `create_room`; `.await?;` in place of the logged arm.
+    ///
+    /// Extended for the leftover a join can still leave (it got its room,
+    /// then never reached the media server, so nobody collected its note):
+    /// the join that does NOT ask for a note removes one, in the `else` arm
+    /// of that note's own write, behind `fresh_join` (where calls ring, and
+    /// never a rejoin, whose first connection's report may still be on its
+    /// way and must find the note), through the database crate's
+    /// get-and-delete, at one site, with the same arguments, the same
+    /// best-effort arm, and still before the session record. Controls:
+    /// `else if fresh_join` turned a bare `else` (a rejoin, a server
+    /// channel and the switched-off case would all remove); the marker's
+    /// removal dropped; a removal's `if let Err` arm turned `.await?;`.
+    #[test]
+    fn the_ring_notes_are_left_only_by_a_join_that_got_its_room() {
+        use crate::util::test::statement_at;
+
+        /// `block` is one call of `callee` for this channel and this user,
+        /// whose failure is one WARN naming the error, and nothing else.
+        fn assert_one_logged_call(block: &str, callee: &str) {
+            let attempt = format!("ifletErr(error)={callee}channel.id(),&user.id).await");
+            assert!(
+                block.starts_with(&attempt),
+                "`{}` is tried once, its failure handled on the spot: {}",
+                callee,
+                block
+            );
+            let (arm, arm_end) = block_from(block, attempt.len());
+            assert!(
+                arm.starts_with("log::warn!(")
+                    && arm.ends_with(");")
+                    && arm.matches(';').count() == 1
+                    && arm.contains("error:?")
+                    && !arm.contains(".await"),
+                "a failed `{}` is one WARN naming the error, and nothing else: {}",
+                callee,
+                arm
+            );
+            assert_eq!(
+                arm_end,
+                block.len(),
+                "`{}` is the block's only statement: {}",
+                callee,
+                block
+            );
+        }
+
+        const REMOVES: &str = "elseiffresh_join\u{7b}";
+
+        let body = join_call_body();
+        let refused_at = statement_at(&body, "returnErr(create_error!(CallEnded));");
+        let room_at = body.find(".create_room(").expect("join_call's room");
+        let rung_at = body
+            .find("set_call_notification_recipients(")
+            .expect("join_call's ring recipients");
+        let recorded_at = statement_at(&body, RECORD);
+        assert_eq!(
+            body.matches(REMOVES).count(),
+            2,
+            "a leftover is removed in two places, one per note: {}",
+            body
+        );
+
+        for (gate, setter, remover) in [
+            (
+                "ifjoins_somebody\u{7b}",
+                "set_call_answer_marker(",
+                "take_call_answer_marker(",
+            ),
+            (
+                "ifvideo_ring\u{7b}",
+                "set_call_video_hint(",
+                "take_call_video_hint(",
+            ),
+        ] {
+            for callee in [setter, remover] {
+                let (args, _) = only_call_args(&body, callee);
+                assert_eq!(
+                    args,
+                    ["channel.id()", "&user.id"],
+                    "`{}` is called for this channel and this user",
+                    callee
+                );
+            }
+            assert_eq!(
+                body.matches(gate).count(),
+                1,
+                "`{}` opens one block: {}",
+                gate,
+                body
+            );
+            let gate_at = body.find(gate).expect("counted above");
+            let (noted, gate_end) = block_from(&body, gate_at);
+            assert_one_logged_call(noted, setter);
+
+            assert!(
+                body[gate_end..].starts_with(REMOVES),
+                "the join that does not ask for the note removes a leftover one, and only \
+                 a fresh join does: {}",
+                &body[gate_end..]
+            );
+            let (removed, removal_end) = block_from(&body, gate_end);
+            assert_one_logged_call(removed, remover);
+            assert!(
+                !body[removal_end..].starts_with("else"),
+                "writing and removing are the only two arms: {}",
+                &body[removal_end..]
+            );
+
+            assert!(
+                refused_at < gate_at
+                    && room_at < gate_at
+                    && rung_at < gate_at
+                    && removal_end <= recorded_at,
+                "`{}` and `{}` run after the answer refusal and the room, and before the \
+                 session record: {}",
+                setter,
+                remover,
+                body
+            );
+        }
+    }
+
+    /// A loopback stand-in for the media server, so that a join can get its
+    /// room and run to its end. Without one, every join in this module dies
+    /// at `create_room`, before the ring notes and the session record. It
+    /// answers every request the way LiveKit answers a call that worked, a
+    /// Twirp 200 with an empty protobuf body (which decodes as the default
+    /// message: a room with nobody in it), and remembers the path of each.
+    /// Modeled on the stub of the sibling-close tests in
+    /// `routes::mls::join_intent`.
+    mod sfu_stub {
+        use std::{
+            io::{Read, Write},
+            net::{SocketAddr, TcpListener, TcpStream},
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex, PoisonError,
+            },
+            thread::JoinHandle,
+            time::Duration,
+        };
+
+        /// The node the stub is registered under (in no `Revolt.toml`).
+        pub(super) const NODE: &str = "answer-ring-stub-node";
+
+        /// The one SFU call of a join that kicks nothing off a live room.
+        pub(super) const CREATE_ROOM: &str = "/twirp/livekit.RoomService/CreateRoom";
+
+        pub(super) struct SfuStub {
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            seen: Arc<Mutex<Vec<String>>>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl SfuStub {
+            /// Start the stub and register it as [`NODE`] in the config this
+            /// process runs with, after `change` has made any change of its
+            /// own. `overwrite_config` works once per process and must run
+            /// before the harness primes the config cache (nextest gives
+            /// every test its own process), so a test calls this first, and
+            /// once.
+            pub(super) async fn start(
+                change: impl FnOnce(&mut revolt_config::Settings),
+            ) -> SfuStub {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+                let addr = listener.local_addr().expect("local addr");
+                let stop = Arc::new(AtomicBool::new(false));
+                let seen = Arc::new(Mutex::new(Vec::new()));
+
+                let thread = {
+                    let (stop, seen) = (stop.clone(), seen.clone());
+                    std::thread::spawn(move || {
+                        for stream in listener.incoming() {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Ok(mut stream) = stream else { continue };
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            let Some(path) = read_request_path(&mut stream) else {
+                                continue;
+                            };
+                            seen.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(path);
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: application/protobuf\r\n\
+                                  content-length: 0\r\nconnection: close\r\n\r\n",
+                            );
+                        }
+                    })
+                };
+
+                revolt_config::overwrite_config(move |settings| {
+                    change(settings);
+                    settings.api.livekit.nodes.insert(
+                        NODE.to_string(),
+                        revolt_config::LiveKitNode {
+                            url: format!("http://{addr}"),
+                            lat: 0.0,
+                            lon: 0.0,
+                            key: "stubkey".to_string(),
+                            secret: "stubsecret-stubsecret-stubsecret".to_string(),
+                            private: true,
+                            remote: false,
+                        },
+                    );
+                    settings
+                        .hosts
+                        .livekit
+                        .insert(NODE.to_string(), "ws://127.0.0.1:1".to_string());
+                })
+                .await;
+
+                SfuStub {
+                    addr,
+                    stop,
+                    seen,
+                    thread: Some(thread),
+                }
+            }
+
+            /// The path of every request read so far, in order.
+            pub(super) fn seen(&self) -> Vec<String> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }
+        }
+
+        impl Drop for SfuStub {
+            fn drop(&mut self) {
+                if let Some(thread) = self.thread.take() {
+                    self.stop.store(true, Ordering::SeqCst);
+                    // Wake the blocking accept; the loop sees `stop` and ends
+                    let _ = TcpStream::connect(self.addr);
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        /// Read one whole HTTP request (head plus `content-length` body, so
+        /// closing never resets an unread request) and return its path.
+        /// `None` if the peer closed or stalled first.
+        fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    return None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().to_string())
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    if request.len() >= end + 4 + length {
+                        return head.split_whitespace().nth(1).map(str::to_string);
+                    }
+                }
+            }
+        }
+    }
+
+    use sfu_stub::{SfuStub, CREATE_ROOM};
+
+    /// A direct message between two friends, so each holds Connect in it.
+    async fn direct_message(harness: &TestHarness, a: &User, b: &User) -> Channel {
+        use revolt_database::RelationshipStatus;
+
+        for (from, to) in [(a, b), (b, a)] {
+            harness
+                .db
+                .set_relationship(&from.id, &to.id, &RelationshipStatus::Friend, None)
+                .await
+                .expect("relationship");
+        }
+        Channel::create_dm(&harness.db, a, b)
+            .await
+            .expect("direct message")
+    }
+
+    /// POST join_call as an app sends it when its user presses a call
+    /// button: with force_disconnect, and naming the stub's node, so a join
+    /// into a call with no room yet gets past node resolution. Answers the
+    /// status and the raw body.
+    async fn press_call(
+        harness: &TestHarness,
+        session_token: &str,
+        channel_id: &str,
+        answer: Option<bool>,
+        video: Option<bool>,
+        rejoin: Option<bool>,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/join_call"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session_token.to_string()))
+            .body(
+                serde_json::to_string(&v0::DataJoinCall {
+                    node: Some(sfu_stub::NODE.to_string()),
+                    force_disconnect: Some(true),
+                    recipients: None,
+                    device_id: None,
+                    rejoin,
+                    answer,
+                    video,
+                })
+                .unwrap(),
+            )
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    fn assert_call_ended(answer: &(Status, String)) {
+        assert_eq!(answer.0, Status::BadRequest, "{}", answer.1);
+        assert!(answer.1.contains("\"type\":\"CallEnded\""), "{}", answer.1);
+    }
+
+    /// The join passed every refusal, got its room from the stub and was
+    /// handed its token.
+    fn assert_joined(answer: &(Status, String)) {
+        assert_eq!(answer.0, Status::Ok, "{}", answer.1);
+        assert!(answer.1.contains("\"token\""), "{}", answer.1);
+    }
+
+    /// The notes waiting for `user_id`'s join of `channel_id`, COLLECTED as
+    /// the voice server collects them when the join is reported to it:
+    /// (an answer marker was there, a video hint was there). Both are gone
+    /// afterwards, so each call reads what the joins since the last one left.
+    async fn ring_notes(channel_id: &str, user_id: &str) -> (bool, bool) {
+        use revolt_database::voice::{take_call_answer_marker, take_call_video_hint};
+
+        (
+            take_call_answer_marker(channel_id, user_id)
+                .await
+                .expect("marker read"),
+            take_call_video_hint(channel_id, user_id)
+                .await
+                .expect("hint read"),
+        )
+    }
+
+    /// Redis is shared: drop what a test's joins left there for `channel`
+    /// (its roster and node, and each user's session record and notes).
+    async fn forget_call(channel: &UserVoiceChannel, user_ids: &[String]) {
+        use revolt_database::voice::drop_voice_participant_session;
+
+        delete_channel_voice_state(channel, user_ids)
+            .await
+            .expect("cleanup");
+        for user_id in user_ids {
+            drop_voice_participant_session(&channel.id, user_id)
+                .await
+                .expect("cleanup");
+            ring_notes(&channel.id, user_id).await;
+        }
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn an_answer_to_a_call_nobody_is_in_is_refused_and_changes_nothing() {
+        crate::util::test::rt()
+            .block_on(an_answer_to_a_call_nobody_is_in_is_refused_and_changes_nothing_case())
+    }
+
+    /// An answer into a direct message whose call nobody is in (no roster,
+    /// then a roster of only the answerer's own leftover entry) is refused
+    /// with `CallEnded`, and the refusal comes before anything is changed:
+    /// the call the user is in elsewhere keeps its records and state and no
+    /// `VoiceChannelLeave` reaches its topic (proven against a marker
+    /// published after the joins), the answerer's own entry stays, no node
+    /// and no session record are written, neither note is left, and the SFU
+    /// is asked for nothing, a room least of all. The same press WITHOUT
+    /// `answer` then starts the call: it gets its room, kicks the other call
+    /// with its Leave and records its session, so every negative above could
+    /// have been seen. Controls: `join_answers_a_ring` returning `false`
+    /// (the answer starts a call); `member == self_id` turned `false` (the
+    /// second answer joins its own leftover); the refusal moved below the
+    /// force-disconnect block (the other call is torn down).
+    async fn an_answer_to_a_call_nobody_is_in_is_refused_and_changes_nothing_case() {
+        use revolt_database::voice::get_voice_participant_session;
+
+        let stub = SfuStub::start(|_| ()).await;
+        let mut harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        // The call the user is in elsewhere, as a force-disconnect finds it:
+        // recorded, with state, its room gone (no node), so the kick would
+        // tear it down without asking the SFU anything.
+        let elsewhere = voice_channel(&harness, &user, &[]).await;
+        let elsewhere_voice = UserVoiceChannel::from_channel(&elsewhere);
+        join_recorded(&elsewhere_voice, &user.id, "PA_answer_elsewhere", &user.id).await;
+        let before = voice_traces(&elsewhere_voice, &user.id).await;
+        assert_eq!(
+            before.0.len(),
+            1,
+            "the other call has one recorded connection"
+        );
+        assert!(before.1 && before.2 && before.3, "the other call has state");
+
+        // Nobody was ever in the call: no roster at all.
+        let refused = press_call(
+            &harness,
+            &session.token,
+            call.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_call_ended(&refused);
+
+        // The roster holds only the answerer's own entry, a leftover.
+        create_voice_state(&call_voice, &user.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let refused = press_call(
+            &harness,
+            &session.token,
+            call.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_call_ended(&refused);
+        assert_eq!(
+            get_voice_channel_members(&call_voice)
+                .await
+                .expect("members read"),
+            Some(vec![user.id.clone()]),
+            "a refused answer must not tear the answerer's own entry down"
+        );
+
+        assert_eq!(
+            voice_traces(&elsewhere_voice, &user.id).await,
+            before,
+            "a refused answer must not disconnect the user's other call"
+        );
+        assert_eq!(
+            get_voice_participant_session(call.id(), &user.id)
+                .await
+                .expect("record read"),
+            None,
+            "a refused answer records no session"
+        );
+        assert!(
+            get_channel_node(call.id())
+                .await
+                .expect("node read")
+                .is_none(),
+            "a refused answer pins no node"
+        );
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "a refused answer leaves no marker and no hint"
+        );
+        assert!(
+            stub.seen().is_empty(),
+            "a refused answer asks the SFU for nothing, a room least of all: {:?}",
+            stub.seen()
+        );
+
+        let marker = ulid::Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: elsewhere.id().to_string(),
+            user: user.id.clone(),
+            message_id: marker.clone(),
+        }
+        .p(elsewhere.id().to_string())
+        .await;
+        harness
+            .wait_for_event(elsewhere.id(), |event| {
+                matches!(event, EventV1::ChannelAck { message_id, .. } if message_id == &marker)
+            })
+            .await;
+        harness.assert_no_buffered_event(elsewhere.id(), |event| {
+            matches!(event, EventV1::VoiceChannelLeave { .. })
+        });
+
+        // The same press without `answer` starts a call.
+        let started = press_call(&harness, &session.token, call.id(), None, Some(true), None).await;
+        assert_joined(&started);
+        assert_eq!(
+            stub.seen(),
+            [CREATE_ROOM],
+            "a started call opens its room, and asks the SFU nothing else"
+        );
+        let (recorded, listed, member, pointer) = voice_traces(&elsewhere_voice, &user.id).await;
+        assert!(
+            recorded.is_empty() && !listed && !member && !pointer,
+            "a started call kicks the user's other call, left: recorded {:?}, vc {}, \
+             vc_members {}, pointer {}",
+            recorded,
+            listed,
+            member,
+            pointer
+        );
+        harness
+            .wait_for_event(elsewhere.id(), |event| {
+                matches!(
+                    event,
+                    EventV1::VoiceChannelLeave { id, user: left }
+                        if id == elsewhere.id() && left == &user.id
+                )
+            })
+            .await;
+        assert_eq!(
+            get_voice_participant_session(call.id(), &user.id)
+                .await
+                .expect("record read"),
+            Some(session.id.clone()),
+            "a started call records its session"
+        );
+        assert_eq!(
+            get_channel_node(call.id())
+                .await
+                .expect("node read")
+                .as_deref(),
+            Some(sfu_stub::NODE),
+            "a started call pins its node"
+        );
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, true),
+            "a started video call leaves its hint, and no answer marker"
+        );
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+        forget_call(&elsewhere_voice, &[user.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn an_accepted_answer_leaves_its_marker_for_the_voice_server() {
+        crate::util::test::rt()
+            .block_on(an_accepted_answer_leaves_its_marker_for_the_voice_server_case())
+    }
+
+    /// The caller is in the call, so the answer joins it: it gets its room
+    /// and token, records its session, and leaves the answer marker for the
+    /// answerer alone (the read the decline route makes sees it without
+    /// taking it), with no video hint beside it. The marker is collected
+    /// once. What the voice server then does with it is that daemon's to
+    /// test. Controls: the marker's `if joins_somebody` turned `if false`
+    /// (no marker); the hint's `if video_ring` turned `if joins_somebody` (a
+    /// hint nobody asked for).
+    async fn an_accepted_answer_leaves_its_marker_for_the_voice_server_case() {
+        use revolt_database::voice::{get_voice_participant_session, has_call_answer_marker};
+
+        let stub = SfuStub::start(|_| ()).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        // The caller is in the call, ringing.
+        create_voice_state(&call_voice, &caller.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+
+        let answered =
+            press_call(&harness, &session.token, call.id(), Some(true), None, None).await;
+        assert_joined(&answered);
+        assert_eq!(stub.seen(), [CREATE_ROOM], "the answer gets its room");
+        assert_eq!(
+            get_voice_participant_session(call.id(), &user.id)
+                .await
+                .expect("record read"),
+            Some(session.id.clone()),
+            "the answer records its session"
+        );
+        assert!(
+            has_call_answer_marker(call.id(), &user.id)
+                .await
+                .expect("marker read"),
+            "an accepted answer leaves its marker"
+        );
+        assert!(
+            !has_call_answer_marker(call.id(), &caller.id)
+                .await
+                .expect("marker read"),
+            "the marker is the answerer's alone"
+        );
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (true, false),
+            "the marker is there to be collected, with no video hint beside it"
+        );
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "collected, it is gone"
+        );
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn a_plain_join_into_a_call_somebody_is_in_leaves_the_marker_as_an_answer_does() {
+        crate::util::test::rt().block_on(
+            a_plain_join_into_a_call_somebody_is_in_leaves_the_marker_as_an_answer_does_case(),
+        )
+    }
+
+    /// An older app, or the plain "Join" button, never sends `answer`, yet
+    /// joining a call the caller is in takes it all the same. So the join
+    /// leaves the answer marker an answer leaves: until its report reaches
+    /// the voice server, a decline from the same user's phone must see that
+    /// the call is being taken, and not tell the caller "declined". The
+    /// same goes for a join that says `answer: false`, and for one whose
+    /// user also has a leftover entry of their own on the roster. The app's
+    /// own rejoin leaves nothing. No video hint is left by any of them.
+    /// Controls: the marker's `if joins_somebody` turned `if answering` (no
+    /// marker for the plain join); `!` dropped from `joins_somebody` (the
+    /// marker goes to the empty call instead); `fresh_join &&` dropped from
+    /// `joins_somebody` (the rejoin leaves one).
+    async fn a_plain_join_into_a_call_somebody_is_in_leaves_the_marker_as_an_answer_does_case() {
+        use revolt_database::voice::has_call_answer_marker;
+
+        let stub = SfuStub::start(|_| ()).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        // The caller is in the call, ringing.
+        create_voice_state(&call_voice, &caller.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+
+        for (answer, what) in [
+            (None, "a join that sends no `answer`"),
+            (Some(false), "a join that says it is no answer"),
+        ] {
+            let joined = press_call(&harness, &session.token, call.id(), answer, None, None).await;
+            assert_joined(&joined);
+            assert!(
+                has_call_answer_marker(call.id(), &user.id)
+                    .await
+                    .expect("marker read"),
+                "{} into a call somebody is in must leave the answer marker",
+                what
+            );
+            assert_eq!(
+                ring_notes(call.id(), &user.id).await,
+                (true, false),
+                "{} leaves the marker and no hint",
+                what
+            );
+        }
+
+        // The user's own leftover entry beside the caller: still somebody.
+        create_voice_state(&call_voice, &user.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let joined = press_call(&harness, &session.token, call.id(), None, None, None).await;
+        assert_joined(&joined);
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (true, false),
+            "the joiner's own entry does not hide the caller"
+        );
+
+        let rejoined =
+            press_call(&harness, &session.token, call.id(), None, None, Some(true)).await;
+        assert_joined(&rejoined);
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "the app's own rejoin leaves no marker"
+        );
+        assert!(
+            stub.seen().iter().any(|path| path == CREATE_ROOM),
+            "the joins got their rooms from the stub: {:?}",
+            stub.seen()
+        );
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn a_later_plain_join_removes_the_notes_an_answer_left_behind() {
+        crate::util::test::rt()
+            .block_on(a_later_plain_join_removes_the_notes_an_answer_left_behind_case())
+    }
+
+    /// An accepted answer (to a video call) leaves its marker and hint. Its
+    /// app then never reaches the media server, so nobody collects them, and
+    /// the caller hangs up. When the same user calls back, a plain join into
+    /// the now empty call, both leftovers are removed: collected as they
+    /// were, the marker would silence the ring of this very call and the
+    /// hint would show it as video. The app's own rejoin removes neither:
+    /// the report of the connection it puts back may still be on its way,
+    /// and must find the notes that connection left. Controls: the marker's
+    /// `else if fresh_join` turned `else if false` (the marker survives the
+    /// call back); `&& rejoin != Some(true)` dropped from `fresh_join` (the
+    /// rejoin removes both).
+    async fn a_later_plain_join_removes_the_notes_an_answer_left_behind_case() {
+        use revolt_database::voice::{
+            has_call_answer_marker, set_call_answer_marker, set_call_video_hint,
+        };
+
+        let _stub = SfuStub::start(|_| ()).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        // The caller rings, and the answer is accepted.
+        create_voice_state(&call_voice, &caller.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let answered = press_call(
+            &harness,
+            &session.token,
+            call.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_joined(&answered);
+        assert!(
+            has_call_answer_marker(call.id(), &user.id)
+                .await
+                .expect("marker read"),
+            "an accepted answer leaves its marker"
+        );
+
+        // Nobody collects the notes, and the caller hangs up.
+        delete_channel_voice_state(&call_voice, &[caller.id.clone()])
+            .await
+            .expect("the caller leaves");
+
+        // The user calls back.
+        let called_back = press_call(&harness, &session.token, call.id(), None, None, None).await;
+        assert_joined(&called_back);
+        assert!(
+            !has_call_answer_marker(call.id(), &user.id)
+                .await
+                .expect("marker read"),
+            "a plain join must remove the marker an earlier answer left behind"
+        );
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "a plain join must leave neither leftover for its own ring to collect"
+        );
+
+        // Both notes again, as an answer leaves them, and the app's rejoin.
+        set_call_answer_marker(call.id(), &user.id)
+            .await
+            .expect("marker");
+        set_call_video_hint(call.id(), &user.id)
+            .await
+            .expect("hint");
+        let rejoined =
+            press_call(&harness, &session.token, call.id(), None, None, Some(true)).await;
+        assert_joined(&rejoined);
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (true, true),
+            "a rejoin must remove neither note"
+        );
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn a_call_can_still_be_started_and_only_a_video_call_leaves_a_hint() {
+        crate::util::test::rt()
+            .block_on(a_call_can_still_be_started_and_only_a_video_call_leaves_a_hint_case())
+    }
+
+    /// Nobody is in the call, and a join that is not an answer still starts
+    /// it: a plain join, one that says `answer: false`, and the app's own
+    /// rejoin even when it also says `answer: true`. Each gets its room and
+    /// leaves no answer marker. The video hint is left by a join that says
+    /// `video: true` and by no other. Controls: `answer == Some(true)`
+    /// turned `answer != Some(false)` (the plain join is refused); `&& rejoin
+    /// != Some(true)` dropped (the rejoin is refused); `video ==
+    /// Some(true)` turned `video != Some(false)` (a plain join leaves a
+    /// hint) or `false` (the video call leaves none).
+    async fn a_call_can_still_be_started_and_only_a_video_call_leaves_a_hint_case() {
+        let stub = SfuStub::start(|_| ()).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        for (answer, rejoin, what) in [
+            (None, None, "a plain join"),
+            (Some(false), None, "a join that says it is no answer"),
+            (Some(true), Some(true), "the app's own rejoin"),
+        ] {
+            let joined =
+                press_call(&harness, &session.token, call.id(), answer, None, rejoin).await;
+            assert_eq!(
+                joined.0,
+                Status::Ok,
+                "{} into a call nobody is in must start it: {}",
+                what,
+                joined.1
+            );
+            assert_eq!(
+                ring_notes(call.id(), &user.id).await,
+                (false, false),
+                "{} leaves no marker and no hint",
+                what
+            );
+        }
+        assert_eq!(
+            stub.seen(),
+            [CREATE_ROOM, CREATE_ROOM, CREATE_ROOM],
+            "each of the three got its room"
+        );
+
+        for (video, hinted) in [(Some(true), true), (Some(false), false)] {
+            let joined = press_call(&harness, &session.token, call.id(), None, video, None).await;
+            assert_joined(&joined);
+            assert_eq!(
+                ring_notes(call.id(), &user.id).await,
+                (false, hinted),
+                "`video: {:?}` leaves a hint exactly when it is true",
+                video
+            );
+        }
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn with_call_signals_off_an_answer_is_the_join_it_always_was() {
+        crate::util::test::rt()
+            .block_on(with_call_signals_off_an_answer_is_the_join_it_always_was_case())
+    }
+
+    /// The kill switch: with `features.call_signals` off, `answer` and
+    /// `video` are not read at all. An answer into a call nobody is in
+    /// starts it, as every join did before the flag existed, and neither
+    /// that join nor one into a call somebody is in leaves a marker or a
+    /// hint. Control: `config.features.call_signals &&` dropped from
+    /// `rings` (the first join is refused with `CallEnded`).
+    async fn with_call_signals_off_an_answer_is_the_join_it_always_was_case() {
+        let stub = SfuStub::start(|settings| settings.features.call_signals = false).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        let (_account_c, _session_c, caller) = harness.new_user().await;
+        let call = direct_message(&harness, &user, &caller).await;
+        let call_voice = UserVoiceChannel::from_channel(&call);
+
+        let joined = press_call(
+            &harness,
+            &session.token,
+            call.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_joined(&joined);
+        assert_eq!(stub.seen(), [CREATE_ROOM], "the join gets its room");
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "with the switch off a join leaves no marker and no hint"
+        );
+
+        create_voice_state(&call_voice, &caller.id, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let joined = press_call(
+            &harness,
+            &session.token,
+            call.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_joined(&joined);
+        assert_eq!(
+            ring_notes(call.id(), &user.id).await,
+            (false, false),
+            "nor does an answer somebody is there for"
+        );
+
+        forget_call(&call_voice, &[user.id.clone(), caller.id.clone()]).await;
+    }
+
+    // Needs RabbitMQ and Redis, as every route test in this module does.
+    #[test]
+    fn a_group_rings_as_a_direct_message_does_and_a_server_channel_never() {
+        crate::util::test::rt()
+            .block_on(a_group_rings_as_a_direct_message_does_and_a_server_channel_never_case())
+    }
+
+    /// A group is the other kind of call that rings: an answer nobody is
+    /// there for is refused and leaves nothing, and one somebody is there
+    /// for joins and leaves both notes it asked for. A voice channel of a
+    /// server does not ring, so there the same two flags do nothing at all:
+    /// an answer into an empty channel joins it, as anyone may sit in an
+    /// empty voice channel, and no note is ever written for it, whoever is
+    /// there. Controls: `| Channel::Group { .. }` dropped from `rings` (the
+    /// group answer starts a call); the whole `matches!` dropped (the
+    /// server channel answers `CallEnded`).
+    async fn a_group_rings_as_a_direct_message_does_and_a_server_channel_never_case() {
+        let stub = SfuStub::start(|_| ()).await;
+        let harness = TestHarness::new().await;
+        let (_account, session, user) = harness.new_user().await;
+        // Somebody on a roster: an id of nobody, fresh so that no other run
+        // shares its Redis keys.
+        let somebody = ulid::Ulid::new().to_string();
+
+        let group = Channel::create_group(
+            &harness.db,
+            v0::DataCreateGroup {
+                name: "Ring".to_string(),
+                ..Default::default()
+            },
+            user.id.clone(),
+        )
+        .await
+        .expect("group");
+        let group_voice = UserVoiceChannel::from_channel(&group);
+
+        let refused = press_call(
+            &harness,
+            &session.token,
+            group.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_call_ended(&refused);
+        assert_eq!(
+            ring_notes(group.id(), &user.id).await,
+            (false, false),
+            "a refused answer leaves no marker and no hint"
+        );
+        assert!(
+            stub.seen().is_empty(),
+            "a refused answer opens no room: {:?}",
+            stub.seen()
+        );
+
+        create_voice_state(&group_voice, &somebody, Timestamp::now_utc())
+            .await
+            .expect("voice state");
+        let answered = press_call(
+            &harness,
+            &session.token,
+            group.id(),
+            Some(true),
+            Some(true),
+            None,
+        )
+        .await;
+        assert_joined(&answered);
+        assert_eq!(
+            ring_notes(group.id(), &user.id).await,
+            (true, true),
+            "an accepted answer leaves the notes it asked for"
+        );
+
+        let channel = voice_channel(&harness, &user, &[]).await;
+        let channel_voice = UserVoiceChannel::from_channel(&channel);
+        for occupied in [false, true] {
+            if occupied {
+                create_voice_state(&channel_voice, &somebody, Timestamp::now_utc())
+                    .await
+                    .expect("voice state");
+            }
+            let joined = press_call(
+                &harness,
+                &session.token,
+                channel.id(),
+                Some(true),
+                Some(true),
+                None,
+            )
+            .await;
+            assert_joined(&joined);
+            assert_eq!(
+                ring_notes(channel.id(), &user.id).await,
+                (false, false),
+                "no note is ever written for a channel of a server (occupied: {})",
+                occupied
+            );
+        }
+
+        forget_call(&group_voice, &[user.id.clone(), somebody.clone()]).await;
+        forget_call(&channel_voice, &[user.id.clone(), somebody]).await;
     }
 }

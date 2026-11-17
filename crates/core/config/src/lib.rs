@@ -1902,6 +1902,39 @@ pub fn default_ios_call_e2ee() -> bool {
     true
 }
 
+/// Serde default for `Features::call_signals`: a missing value reads ON
+pub fn default_call_signals() -> bool {
+    true
+}
+
+/// Serde default for `Features::push_session_scope`: a missing value reads ON
+pub fn default_push_session_scope() -> bool {
+    true
+}
+
+/// Ring length used when none is configured
+const CALL_RING_DEFAULT_SECS: usize = 45;
+
+/// Shortest ring a configuration can ask for: anything less is over before a
+/// phone has had the time to show it
+const CALL_RING_MIN_SECS: usize = 5;
+
+/// Longest ring a configuration can ask for
+const CALL_RING_MAX_SECS: usize = 120;
+
+/// How long a call rings, in seconds, given the configured
+/// `api.livekit.call_ring_duration`. Every service and every app must agree
+/// on how long a call rings, so each of them reads the setting through this
+/// one rule: a missing or zero setting means 45 seconds, and any other value
+/// is brought into the range of 5 to 120 seconds.
+pub fn effective_call_ring_secs(configured: usize) -> usize {
+    if configured == 0 {
+        CALL_RING_DEFAULT_SECS
+    } else {
+        configured.clamp(CALL_RING_MIN_SECS, CALL_RING_MAX_SECS)
+    }
+}
+
 /// `[features.e2ee]`: E2EE switches read at process start. Flipping one
 /// needs a RESTART of delta AND bonfire (config is frozen into each process
 /// at first access).
@@ -2010,6 +2043,33 @@ pub struct Features {
     /// sources are frozen into the process at first access.
     #[serde(default = "default_ios_call_e2ee")]
     pub ios_call_e2ee: bool,
+
+    /// Kill switch for call ring signals: the call id each ring carries and
+    /// the signals that stop the other devices ringing. ON by default, and
+    /// the default holds twice: the embedded `Revolt.toml` sets it, and the
+    /// serde default is `true`, so a config that never mentions the key
+    /// still reads ON. Off, calls ring the way they did before: a ring
+    /// carries no call id, nothing tells a device that the call was answered
+    /// on another one, the decline route does nothing, and the `answer` flag
+    /// on a join is ignored. Turn it off with
+    /// `REVOLT__FEATURES__CALL_SIGNALS=false` (double underscores) or under
+    /// `[features]` in `Revolt.overrides.toml`, then RESTART voice-ingress
+    /// AND delta: config sources are frozen into each process at first
+    /// access.
+    #[serde(default = "default_call_signals")]
+    pub call_signals: bool,
+
+    /// Kill switch for the per-session push preferences ("chats only" and
+    /// "do not ring"). ON by default, and the default holds twice: the
+    /// embedded `Revolt.toml` sets it, and the serde default is `true`, so a
+    /// config that never mentions the key still reads ON. Off, the push
+    /// daemon ignores both preferences on every session and delivers
+    /// everything as before. Turn it off with
+    /// `REVOLT__FEATURES__PUSH_SESSION_SCOPE=false` (double underscores) or
+    /// under `[features]` in `Revolt.overrides.toml`, then RESTART pushd:
+    /// config sources are frozen into the process at first access.
+    #[serde(default = "default_push_session_scope")]
+    pub push_session_scope: bool,
 
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
@@ -2565,6 +2625,201 @@ mod ios_call_e2ee_tests {
                 .features
                 .ios_call_e2ee
         );
+    }
+}
+
+// The two call switches (ring signals, per-session push preferences) and the
+// ring length. Built from in-process sources only, the way CONFIG_BUILDER
+// layers them, so no local override file or environment variable can skew
+// the result.
+#[cfg(test)]
+mod call_ring_switch_tests {
+    use config::{Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::{effective_call_ring_secs, Settings};
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    fn settings(builder: ConfigBuilder<config::builder::DefaultState>) -> Settings {
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    fn with_env(name: &str, value: &str) -> Settings {
+        settings(
+            Config::builder().add_source(embedded()).add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(name.to_string(), value.to_string())].into())),
+            ),
+        )
+    }
+
+    /// The embedded Revolt.toml with the line that sets `key` under
+    /// `[features]` removed: the table is still there, the key is not
+    fn without_feature_key(key: &str) -> Settings {
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(key))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+
+        // The key must really be gone, or the caller proves nothing
+        assert!(config.get_bool(&format!("features.{key}")).is_err());
+        // And the table it sat in must still be there
+        assert!(config.get_bool("features.webhooks_enabled").is_ok());
+
+        config
+            .try_deserialize()
+            .expect("a config without the key deserializes")
+    }
+
+    #[test]
+    fn call_signals_is_on_in_the_embedded_default() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .call_signals
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default), so
+    /// losing the line can never quietly take the stop-ringing signals away
+    #[test]
+    fn a_missing_call_signals_key_reads_on() {
+        assert!(without_feature_key("call_signals").features.call_signals);
+    }
+
+    #[test]
+    fn the_overrides_file_turns_call_signals_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\ncall_signals = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.call_signals);
+    }
+
+    #[test]
+    fn the_environment_override_turns_call_signals_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__CALL_SIGNALS", "false")
+                .features
+                .call_signals
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_leaves_call_signals_on() {
+        assert!(
+            with_env("REVOLT_FEATURES__CALL_SIGNALS", "false")
+                .features
+                .call_signals
+        );
+    }
+
+    #[test]
+    fn push_session_scope_is_on_in_the_embedded_default() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default), so
+    /// losing the line can never quietly drop what a session asked for
+    #[test]
+    fn a_missing_push_session_scope_key_reads_on() {
+        assert!(
+            without_feature_key("push_session_scope")
+                .features
+                .push_session_scope
+        );
+    }
+
+    #[test]
+    fn the_overrides_file_turns_push_session_scope_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\npush_session_scope = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.push_session_scope);
+    }
+
+    #[test]
+    fn the_environment_override_turns_push_session_scope_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__PUSH_SESSION_SCOPE", "false")
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_leaves_push_session_scope_on() {
+        assert!(
+            with_env("REVOLT_FEATURES__PUSH_SESSION_SCOPE", "false")
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// Every client rings for this long, and the push that rings a phone
+    /// expires after it
+    #[test]
+    fn the_embedded_ring_lasts_45_seconds() {
+        assert_eq!(
+            settings(Config::builder().add_source(embedded()))
+                .api
+                .livekit
+                .call_ring_duration,
+            45
+        );
+    }
+
+    /// The one rule every service applies to the configured ring length. A
+    /// zero would end every ring the moment it starts, so it reads as the
+    /// default; a value outside the range is brought to its nearest end.
+    #[test]
+    fn the_effective_ring_length_defaults_a_zero_and_clamps_the_rest() {
+        // (configured, effective)
+        let table = [
+            (0, 45),
+            (1, 5),
+            (5, 5),
+            (45, 45),
+            (120, 120),
+            (121, 120),
+            (usize::MAX, 120),
+        ];
+        for (configured, effective) in table {
+            assert_eq!(
+                effective_call_ring_secs(configured),
+                effective,
+                "configured {configured}"
+            );
+        }
+    }
+
+    /// The length the embedded default asks for is one the rule leaves alone
+    #[test]
+    fn the_embedded_ring_length_is_already_effective() {
+        let configured = settings(Config::builder().add_source(embedded()))
+            .api
+            .livekit
+            .call_ring_duration;
+        assert_eq!(effective_call_ring_secs(configured), configured);
     }
 }
 

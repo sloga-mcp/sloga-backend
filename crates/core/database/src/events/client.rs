@@ -1057,6 +1057,16 @@ pub enum EventV1 {
         /// clients drop an update whose version is <= the newest they hold
         version: u64,
     },
+
+    /// A callee declined a ringing DM or group call. Always published on the
+    /// decliner's private topic (their other open apps stop ringing); in a DM
+    /// also on the channel topic, so the caller learns of it. Never published
+    /// for a call that was already answered.
+    VoiceCallDeclined {
+        channel_id: String,
+        call_id: String,
+        user_id: String,
+    },
 }
 
 /// Redis topic that reaches exactly one session's bonfire connection
@@ -1374,5 +1384,115 @@ mod prot_tests {
             }
             other => panic!("deserialized to another event: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::EventV1;
+
+    /// Clients read exactly `{ type, channel_id, call_id, user_id }`. A rename
+    /// still compiles here and silently leaves the decliner's other apps, and
+    /// in a DM the caller, ringing. Each field carries a different value so
+    /// two ids swapped on the way through are caught as well.
+    #[test]
+    fn the_voice_call_declined_wire_shape_is_type_channel_call_user() {
+        let event = EventV1::VoiceCallDeclined {
+            channel_id: "channel".to_string(),
+            call_id: "call".to_string(),
+            user_id: "user".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({
+                "type": "VoiceCallDeclined",
+                "channel_id": "channel",
+                "call_id": "call",
+                "user_id": "user"
+            })
+        );
+
+        match serde_json::from_str::<EventV1>(
+            r#"{"type":"VoiceCallDeclined","channel_id":"c1","call_id":"k1","user_id":"u1"}"#,
+        )
+        .expect("deserializes")
+        {
+            EventV1::VoiceCallDeclined {
+                channel_id,
+                call_id,
+                user_id,
+            } => {
+                assert_eq!(
+                    (channel_id.as_str(), call_id.as_str(), user_id.as_str()),
+                    ("c1", "k1", "u1")
+                )
+            }
+            other => panic!("deserialized to another event: {other:?}"),
+        }
+    }
+
+    /// The names of the `EventV1` variants in the order this file declares
+    /// them. Inside the enum a variant is the only line that starts with a
+    /// capital letter one indent deep (fields sit deeper, comments and
+    /// attributes start otherwise), and the enum ends at the first line that
+    /// is neither blank nor indented.
+    fn event_variants_in_source_order() -> Vec<&'static str> {
+        const SOURCE: &str = include_str!("client.rs");
+
+        let mut lines = SOURCE
+            .lines()
+            .skip_while(|line| !line.starts_with("pub enum EventV1 "));
+        assert!(lines.next().is_some(), "the EventV1 enum was not found");
+
+        lines
+            .take_while(|line| line.is_empty() || line.starts_with(' '))
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|ch: char| ch.is_ascii_uppercase()))
+            .map(|line| {
+                line.split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// New events are appended to `EventV1`, never inserted. Bonfire chooses
+    /// how to decode what it reads from Redis by `REDIS_PAYLOAD_TYPE`, and one
+    /// of the choices, bincode, is a positional encoding. While the enum
+    /// carries its `type` tag every encoding names the variant, so the order
+    /// does not reach the wire; encoded by position, an insertion in the
+    /// middle would renumber every later variant, and a daemon still on the
+    /// older build would read each of them as a different event. Appending is
+    /// the one change that is safe either way, so this event has to stay
+    /// where it was added.
+    ///
+    /// Appending a newer event after this one is fine: move this pin to it.
+    #[test]
+    fn voice_call_declined_is_the_last_event_variant() {
+        let variants = event_variants_in_source_order();
+
+        // The scan has to be reading the real enum, or "last" proves nothing.
+        assert!(
+            variants.len() >= 100,
+            "suspiciously small scan of EventV1 ({} variants): {variants:?}",
+            variants.len()
+        );
+        assert_eq!(variants.first(), Some(&"Bulk"), "{variants:?}");
+        assert!(variants.contains(&"ProtBalanceUpdate"), "{variants:?}");
+        assert_eq!(
+            variants
+                .iter()
+                .filter(|name| **name == "VoiceCallDeclined")
+                .count(),
+            1,
+            "{variants:?}"
+        );
+
+        assert_eq!(
+            variants.last(),
+            Some(&"VoiceCallDeclined"),
+            "an EventV1 variant is declared after VoiceCallDeclined, or it was moved up: \
+             {variants:?}"
+        );
     }
 }

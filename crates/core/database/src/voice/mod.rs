@@ -13284,6 +13284,712 @@ pub async fn get_call_notification_recipients(
         .to_internal_error()
 }
 
+/// Who is ringing a direct message or group, and since when. Kept so the
+/// later signals about that ring (answered on another device, declined, call
+/// over) can name the same ring, and so a decline that arrives after the ring
+/// is over can be told apart from one for a ring that is still live.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CallRing {
+    pub call_id: String,
+    pub initiator_id: String,
+    /// The same string the ring push carries as `started_at`
+    pub started_at: String,
+    /// Unix seconds of the same moment, for window arithmetic
+    pub started_unix: i64,
+    pub video: bool,
+    pub answered: bool,
+}
+
+/// How long a ring record is kept. Long, because the signal that the call
+/// ended still has to name the ring; finite, because a call whose end is
+/// never seen must not leave its record behind for good.
+pub const CALL_RING_TTL_SECS: u64 = 6 * 60 * 60;
+
+/// How long an answer marker, a video hint or a decline claim is kept. Each
+/// is left by one request and only matters to what follows it moments later;
+/// one that is never collected must not be read as part of a later call.
+pub const CALL_MARKER_TTL_SECS: u64 = 120;
+
+/// Slack added to the ring duration before a ring counts as over: the ring
+/// takes a moment to reach a device, and a device's clock is not the
+/// server's, so a decline pressed on the last ring would otherwise be late.
+pub const CALL_RING_GRACE_SECS: i64 = 15;
+
+/// The last second the ring still rings on a device: `started_unix +
+/// ring_secs`, with no grace.
+fn ring_ends_unix(ring: &CallRing, ring_secs: usize) -> i64 {
+    let ring_secs = i64::try_from(ring_secs).unwrap_or(i64::MAX);
+
+    ring.started_unix.saturating_add(ring_secs)
+}
+
+/// True while the ring is unanswered and `now_unix` is no later than
+/// `started_unix + ring_secs + CALL_RING_GRACE_SECS`. This is the window in
+/// which a late answer or decline still counts as being about this ring.
+///
+/// `ring_secs` is used as given: callers pass the value of
+/// `revolt_config::effective_call_ring_secs`, never the raw setting.
+pub fn ring_window_open(ring: &CallRing, now_unix: i64, ring_secs: usize) -> bool {
+    let closes_at = ring_ends_unix(ring, ring_secs).saturating_add(CALL_RING_GRACE_SECS);
+
+    !ring.answered && now_unix <= closes_at
+}
+
+/// What a join that leaves the joiner alone in the call does about the ring
+/// record already stored for the channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RingMint {
+    /// The stored record is this very ring: keep it, call id included
+    Reuse(CallRing),
+    /// Nothing is stored, or what is stored belongs to an earlier call
+    Mint,
+}
+
+/// What the ring branch does with whatever record is already stored when a
+/// join leaves the joiner alone in the call. Reuse only when the stored
+/// record is this same joiner's ring, nobody has answered it, and it is
+/// still ringing: `now_unix` is no later than `started_unix + ring_secs` (a
+/// webhook retry or the lone caller reconnecting). Anything else is a
+/// leftover from an earlier call and is replaced.
+///
+/// The grace of [`ring_window_open`] does not count here. A reused ring is
+/// sent again with the start time it already had, and a ring older than the
+/// ring length is dropped before it reaches a device, so a ring reused
+/// inside the grace would ring nobody.
+///
+/// `ring_secs` is used as given: callers pass the value of
+/// `revolt_config::effective_call_ring_secs`, never the raw setting.
+pub fn ring_mint_decision(
+    existing: Option<&CallRing>,
+    joiner_id: &str,
+    now_unix: i64,
+    ring_secs: usize,
+) -> RingMint {
+    match existing {
+        Some(ring)
+            if ring.initiator_id == joiner_id
+                && !ring.answered
+                && now_unix <= ring_ends_unix(ring, ring_secs) =>
+        {
+            RingMint::Reuse(ring.clone())
+        }
+        _ => RingMint::Mint,
+    }
+}
+
+fn call_ring_key(channel_id: &str) -> String {
+    format!("call_ring:{channel_id}")
+}
+
+fn call_ring_answered_key(call_id: &str) -> String {
+    format!("call_ring_answered:{call_id}")
+}
+
+fn call_answer_marker_key(channel_id: &str, user_id: &str) -> String {
+    format!("call_answer:{channel_id}-{user_id}")
+}
+
+fn call_video_hint_key(channel_id: &str, user_id: &str) -> String {
+    format!("call_video_hint:{channel_id}-{user_id}")
+}
+
+fn call_decline_key(call_id: &str, user_id: &str) -> String {
+    format!("call_decline:{call_id}-{user_id}")
+}
+
+/// A stored value this build cannot read (a leftover in another shape) is no
+/// ring at all: the next ring replaces it, and no call fails over it.
+fn decode_call_ring(raw: Option<String>) -> Option<CallRing> {
+    raw.and_then(|raw| serde_json::from_str(&raw).ok())
+}
+
+/// The ring record as its readers see it: answered when the record itself
+/// says so, or when the ring was marked answered after the record was
+/// written ([`mark_call_ring_answered`]).
+fn fold_answered(ring: CallRing, answered_key: bool) -> CallRing {
+    CallRing {
+        answered: ring.answered || answered_key,
+        ..ring
+    }
+}
+
+/// Store the channel's ring record, replacing whatever was there.
+pub async fn set_call_ring(channel_id: &str, ring: &CallRing) -> Result<()> {
+    let serialized = serde_json::to_string(ring).to_internal_error()?;
+
+    get_connection()
+        .await?
+        .set_ex(
+            call_ring_key(channel_id),
+            serialized,
+            CALL_RING_TTL_SECS as usize,
+        )
+        .await
+        .to_internal_error()
+}
+
+/// Mark the ring with this call id as answered. The mark is a key of its
+/// own, named by the call id, and never a rewrite of the channel's ring
+/// record: reading the record and writing it back could overwrite a newer
+/// ring stored in between, or bring back a record that was just taken. A
+/// mark for a ring that is already gone names a call id nothing reads any
+/// more, and expires. It is kept as long as a ring record is and is written
+/// after the record, so it is still there for as long as the record is.
+pub async fn mark_call_ring_answered(call_id: &str) -> Result<()> {
+    get_connection()
+        .await?
+        .set_ex(
+            call_ring_answered_key(call_id),
+            "1",
+            CALL_RING_TTL_SECS as usize,
+        )
+        .await
+        .to_internal_error()
+}
+
+/// The channel's ring record, left in place. `None` when there is none, or
+/// when what is stored does not decode. `answered` is true when the record
+/// says so or when the ring was marked answered since
+/// ([`mark_call_ring_answered`]).
+pub async fn get_call_ring(channel_id: &str) -> Result<Option<CallRing>> {
+    let mut conn = get_connection().await?;
+
+    let raw: Option<String> = conn
+        .get(call_ring_key(channel_id))
+        .await
+        .to_internal_error()?;
+    let Some(ring) = decode_call_ring(raw) else {
+        return Ok(None);
+    };
+
+    // A failure here fails the whole read: a ring whose answer could not be
+    // looked up must not be handed out as one nobody answered.
+    let answered_key: bool = conn
+        .exists(call_ring_answered_key(&ring.call_id))
+        .await
+        .to_internal_error()?;
+
+    Ok(Some(fold_answered(ring, answered_key)))
+}
+
+/// The channel's ring record, removed in the same step, so that of two
+/// callers racing to close a ring only one is handed it. `answered` is true
+/// when the record says so or when the ring was marked answered since
+/// ([`mark_call_ring_answered`]); that mark is removed along with the record.
+///
+/// Removing the mark is best effort. If it fails, the ring is still
+/// returned, with `answered` as the record alone had it.
+pub async fn take_call_ring(channel_id: &str) -> Result<Option<CallRing>> {
+    let mut conn = get_connection().await?;
+
+    let raw: Option<String> = conn
+        .get_del(call_ring_key(channel_id))
+        .await
+        .to_internal_error()?;
+    let Some(ring) = decode_call_ring(raw) else {
+        return Ok(None);
+    };
+
+    // The record is gone from the store by now and nobody can be handed it
+    // again. Failing here would lose the ring, and with it the call id the
+    // stop-ringing signal has to name, so a mark that cannot be collected is
+    // logged and not returned as an error. A mark left behind names a call
+    // id that is never used again, and expires.
+    let mark = conn
+        .get_del::<_, Option<String>>(call_ring_answered_key(&ring.call_id))
+        .await;
+    let answered_key = match mark {
+        Ok(mark) => mark.is_some(),
+        Err(error) => {
+            log::warn!(
+                "could not collect the answered mark of call {} in {channel_id}: {error}",
+                ring.call_id
+            );
+            false
+        }
+    };
+
+    Ok(Some(fold_answered(ring, answered_key)))
+}
+
+async fn set_call_marker(key: String) -> Result<()> {
+    get_connection()
+        .await?
+        .set_ex(key, "1", CALL_MARKER_TTL_SECS as usize)
+        .await
+        .to_internal_error()
+}
+
+/// Whether the marker was there. It is removed in the same step, so a marker
+/// is collected at most once.
+async fn take_call_marker(key: String) -> Result<bool> {
+    let marker: Option<String> = get_connection()
+        .await?
+        .get_del(key)
+        .await
+        .to_internal_error()?;
+
+    Ok(marker.is_some())
+}
+
+/// Whether the marker is there. Nothing is removed.
+async fn has_call_marker(key: String) -> Result<bool> {
+    get_connection()
+        .await?
+        .exists(key)
+        .await
+        .to_internal_error()
+}
+
+/// Note that this user's next join of the channel answers a ring.
+pub async fn set_call_answer_marker(channel_id: &str, user_id: &str) -> Result<()> {
+    set_call_marker(call_answer_marker_key(channel_id, user_id)).await
+}
+
+/// Whether this user has an answer marker for the channel, without
+/// collecting it: the marker stays for [`take_call_answer_marker`].
+pub async fn has_call_answer_marker(channel_id: &str, user_id: &str) -> Result<bool> {
+    has_call_marker(call_answer_marker_key(channel_id, user_id)).await
+}
+
+/// True when this user's join of the channel answers a ring: an answer
+/// marker was waiting for it. The marker is written by
+/// [`set_call_answer_marker`], which the join route calls for a join that
+/// says it answers a ring. Reading the marker consumes it, so one answer is
+/// acted on once however many times the join is reported; to look without
+/// consuming, use [`has_call_answer_marker`]. A marker that is never read
+/// expires `CALL_MARKER_TTL_SECS` after it was written, so it cannot be
+/// taken for the answer to a later call.
+pub async fn take_call_answer_marker(channel_id: &str, user_id: &str) -> Result<bool> {
+    take_call_marker(call_answer_marker_key(channel_id, user_id)).await
+}
+
+/// Note that this user's next join of the channel starts a video call.
+pub async fn set_call_video_hint(channel_id: &str, user_id: &str) -> Result<()> {
+    set_call_marker(call_video_hint_key(channel_id, user_id)).await
+}
+
+/// True when this user's join of the channel starts a video call: a video
+/// hint was waiting for it. The hint is written by [`set_call_video_hint`],
+/// which the join route calls for a join that says the caller pressed the
+/// video button. Reading the hint consumes it, so it describes one ring
+/// only. A hint that is never read expires `CALL_MARKER_TTL_SECS` after it
+/// was written, so it cannot turn a later voice call into a video one. It
+/// only says how the ring should look; it grants nothing.
+pub async fn take_call_video_hint(channel_id: &str, user_id: &str) -> Result<bool> {
+    take_call_marker(call_video_hint_key(channel_id, user_id)).await
+}
+
+/// One decline per user per ring: true only for the call that newly set the
+/// claim, so a decline sent twice (two devices, a retry) is acted on once.
+pub async fn claim_call_decline(call_id: &str, user_id: &str) -> Result<bool> {
+    use redis_kiss::redis::{ExistenceCheck, SetExpiry, SetOptions};
+
+    // One atomic SET with NX and EX, never set-if-absent followed by an
+    // expire: of two declines racing only one may win, and a failure between
+    // the two commands would leave a claim that never expires.
+    let claimed: Option<String> = get_connection()
+        .await?
+        .set_options(
+            call_decline_key(call_id, user_id),
+            "1",
+            SetOptions::default()
+                .conditional_set(ExistenceCheck::NX)
+                .with_expiration(SetExpiry::EX(CALL_MARKER_TTL_SECS as usize)),
+        )
+        .await
+        .to_internal_error()?;
+
+    Ok(claimed.is_some())
+}
+
+#[cfg(test)]
+mod call_ring_tests {
+    use super::{
+        call_answer_marker_key, call_decline_key, call_ring_answered_key, call_ring_key,
+        call_video_hint_key, decode_call_ring, fold_answered, ring_mint_decision,
+        ring_window_open, CallRing, RingMint, CALL_RING_GRACE_SECS,
+    };
+
+    const SOURCE: &str = include_str!("mod.rs");
+
+    const RING_SECS: usize = 45;
+    const STARTED: i64 = 1_700_000_000;
+    /// The last second a ring that started at `STARTED` still rings.
+    const RING_END: i64 = STARTED + RING_SECS as i64;
+    /// The last second a ring that started at `STARTED` is still open.
+    const LAST_OPEN: i64 = RING_END + CALL_RING_GRACE_SECS;
+
+    /// One function of this file, from its name to the closing brace in
+    /// column 0 that ends it.
+    fn fn_source(name: &str) -> &'static str {
+        let start = SOURCE
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("{name} left voice/mod.rs"));
+        let end = start
+            + SOURCE[start..]
+                .find("\n\u{7d}\n")
+                .expect("the end of the fn");
+        &SOURCE[start..end]
+    }
+
+    fn ring_by(initiator_id: &str) -> CallRing {
+        CallRing {
+            call_id: "01CALL".to_string(),
+            initiator_id: initiator_id.to_string(),
+            started_at: "2023-11-14T22:13:20.000Z".to_string(),
+            started_unix: STARTED,
+            video: true,
+            answered: false,
+        }
+    }
+
+    fn answered(ring: CallRing) -> CallRing {
+        CallRing {
+            answered: true,
+            ..ring
+        }
+    }
+
+    #[test]
+    fn ring_window_is_open_until_the_grace_runs_out_and_never_once_answered() {
+        let ring = ring_by("caller");
+        let picked_up = answered(ring_by("caller"));
+
+        // (record, now, open)
+        let table = [
+            (&ring, STARTED, true),
+            (&ring, STARTED + RING_SECS as i64, true),
+            (&ring, LAST_OPEN, true),
+            (&ring, LAST_OPEN + 1, false),
+            // a clock a little behind the one that stamped the ring
+            (&ring, STARTED - 5, true),
+            (&picked_up, STARTED, false),
+            (&picked_up, LAST_OPEN, false),
+            (&picked_up, LAST_OPEN + 1, false),
+        ];
+        for (record, now, open) in table {
+            assert_eq!(
+                ring_window_open(record, now, RING_SECS),
+                open,
+                "answered {} at {} seconds past the start",
+                record.answered,
+                now - STARTED
+            );
+        }
+
+        // The window is the ring duration plus the grace, nothing else. A
+        // zero duration shows that here and nowhere else: real callers pass
+        // the effective ring length, which is never zero.
+        let grace_end = STARTED + CALL_RING_GRACE_SECS;
+        assert!(ring_window_open(&ring, grace_end, 0));
+        assert!(!ring_window_open(&ring, grace_end + 1, 0));
+
+        // A start stamp at the far end of the clock saturates: it neither
+        // overflows nor wraps the window shut.
+        let far = CallRing {
+            started_unix: i64::MAX - 1,
+            ..ring_by("caller")
+        };
+        assert!(ring_window_open(&far, i64::MAX, RING_SECS));
+    }
+
+    /// A ring is reused only while it still rings. The grace that keeps the
+    /// window open for a late answer or decline does not count: a reused
+    /// ring goes out again with its first start time, and one older than the
+    /// ring length is dropped before it reaches a device, so reusing it
+    /// there would ring nobody.
+    #[test]
+    fn ring_is_reused_only_for_the_same_joiner_while_it_still_rings() {
+        let ring = ring_by("caller");
+        let picked_up = answered(ring_by("caller"));
+        let reuse = RingMint::Reuse(ring.clone());
+
+        // (stored record, joiner, now, decision)
+        let table = [
+            (None, "caller", STARTED, RingMint::Mint),
+            (Some(&ring), "caller", STARTED, reuse.clone()),
+            // a clock a little behind the one that stamped the ring
+            (Some(&ring), "caller", STARTED - 5, reuse.clone()),
+            (Some(&ring), "caller", RING_END, reuse.clone()),
+            // inside the grace: still open to a decline, no longer reused
+            (Some(&ring), "caller", RING_END + 1, RingMint::Mint),
+            (Some(&ring), "caller", LAST_OPEN, RingMint::Mint),
+            (Some(&ring), "caller", LAST_OPEN + 1, RingMint::Mint),
+            (Some(&ring), "someone_else", STARTED, RingMint::Mint),
+            (Some(&ring), "someone_else", RING_END, RingMint::Mint),
+            (Some(&ring), "someone_else", LAST_OPEN + 1, RingMint::Mint),
+            (Some(&picked_up), "caller", STARTED, RingMint::Mint),
+            (Some(&picked_up), "caller", RING_END, RingMint::Mint),
+        ];
+        for (existing, joiner, now, decision) in table {
+            assert_eq!(
+                ring_mint_decision(existing, joiner, now, RING_SECS),
+                decision,
+                "joiner {joiner} at {} seconds past the start, stored {existing:?}",
+                now - STARTED
+            );
+        }
+
+        // The grace is the whole difference between the two rules: where the
+        // reuse stops, the window is still open.
+        assert!(ring_window_open(&ring, RING_END + 1, RING_SECS));
+        assert!(ring_window_open(&ring, LAST_OPEN, RING_SECS));
+
+        // A start stamp at the far end of the clock saturates: it neither
+        // overflows nor wraps the ring shut.
+        let far = CallRing {
+            started_unix: i64::MAX - 1,
+            ..ring_by("caller")
+        };
+        assert_eq!(
+            ring_mint_decision(Some(&far), "caller", i64::MAX, RING_SECS),
+            RingMint::Reuse(far.clone())
+        );
+        assert_eq!(
+            ring_mint_decision(Some(&far), "caller", i64::MAX, usize::MAX),
+            RingMint::Reuse(far.clone())
+        );
+    }
+
+    #[test]
+    fn answered_mark_folds_into_the_ring_record() {
+        // (the record says answered, the mark is set, the reader sees)
+        let table = [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ];
+        for (stored, marked, seen) in table {
+            let ring = CallRing {
+                answered: stored,
+                ..ring_by("caller")
+            };
+            let folded = fold_answered(ring.clone(), marked);
+            assert_eq!(folded.answered, seen, "stored {stored}, marked {marked}");
+            // Nothing but the answer changes hands.
+            assert_eq!(
+                folded,
+                CallRing {
+                    answered: seen,
+                    ..ring
+                }
+            );
+        }
+
+        // A ring that was marked answered is neither open to a decline nor
+        // reused, exactly like one whose record says so.
+        let marked = fold_answered(ring_by("caller"), true);
+        assert!(!ring_window_open(&marked, STARTED, RING_SECS));
+        assert_eq!(
+            ring_mint_decision(Some(&marked), "caller", STARTED, RING_SECS),
+            RingMint::Mint
+        );
+    }
+
+    /// Marking a ring answered must not go through the channel's record: a
+    /// record read and written back could overwrite a newer ring or bring
+    /// back one that was just taken. Nothing here can reach a store, so the
+    /// source is pinned instead.
+    #[test]
+    fn answered_mark_is_a_key_of_its_own_and_never_rewrites_the_record() {
+        let mark = fn_source("mark_call_ring_answered");
+
+        assert!(
+            mark.contains("call_ring_answered_key(call_id)"),
+            "the mark is named by the call id: {mark}"
+        );
+        assert!(
+            mark.contains(".set_ex(") && mark.contains("CALL_RING_TTL_SECS"),
+            "the mark is kept as long as a ring record is: {mark}"
+        );
+        for record_access in [
+            "call_ring_key(",
+            "get_call_ring(",
+            "set_call_ring(",
+            "take_call_ring(",
+            ".get(",
+            ".get_del(",
+        ] {
+            assert!(
+                !mark.contains(record_access),
+                "the mark must not touch the ring record (`{record_access}`): {mark}"
+            );
+        }
+    }
+
+    /// Both readers of the record report the answered mark of the ring they
+    /// read. Looking leaves everything in place and fails as a whole when
+    /// the mark cannot be looked up; taking removes the mark with the
+    /// record, and a mark it cannot collect does not cost it the ring it has
+    /// already taken out of the store.
+    #[test]
+    fn reading_and_taking_a_ring_both_fold_in_the_answered_mark() {
+        let get = fn_source("get_call_ring");
+        let take = fn_source("take_call_ring");
+
+        for (name, body) in [("get_call_ring", get), ("take_call_ring", take)] {
+            assert!(
+                body.contains("call_ring_answered_key(&ring.call_id)"),
+                "{name} reads the mark of the ring it read: {body}"
+            );
+            assert!(
+                body.contains("Ok(Some(fold_answered(ring, answered_key)))"),
+                "{name} returns the record with the mark folded in: {body}"
+            );
+        }
+
+        assert!(get.contains(".get(call_ring_key(channel_id))"), "{get}");
+        assert!(
+            get.contains(".exists(call_ring_answered_key(&ring.call_id))"),
+            "{get}"
+        );
+        assert!(
+            !get.contains("get_del") && !get.contains(".del("),
+            "looking at a ring removes nothing: {get}"
+        );
+        assert_eq!(
+            get.matches("to_internal_error()?").count(),
+            2,
+            "a failed read of the record or of the mark fails the look: {get}"
+        );
+
+        assert!(
+            take.contains(".get_del(call_ring_key(channel_id))"),
+            "{take}"
+        );
+        let mark_at = take
+            .find("call_ring_answered_key(")
+            .expect("take_call_ring collects the mark");
+        assert!(
+            take[..mark_at].ends_with(".get_del::<_, Option<String>>("),
+            "the mark is removed in the step that reads it: {take}"
+        );
+        assert!(
+            !take[mark_at..].contains('?'),
+            "once the record is taken nothing may fail the take: {take}"
+        );
+    }
+
+    /// Looking at an answer marker leaves it for the take, and every reader
+    /// and writer of a marker builds its key in the one place.
+    #[test]
+    fn looking_at_an_answer_marker_does_not_consume_it() {
+        let has = fn_source("has_call_marker");
+        assert!(has.contains(".exists(key)"), "{has}");
+        assert!(
+            !has.contains("get_del") && !has.contains(".del("),
+            "a look removes nothing: {has}"
+        );
+        assert!(fn_source("take_call_marker").contains(".get_del(key)"));
+
+        for (name, call) in [
+            (
+                "set_call_answer_marker",
+                "set_call_marker(call_answer_marker_key(channel_id, user_id))",
+            ),
+            (
+                "has_call_answer_marker",
+                "has_call_marker(call_answer_marker_key(channel_id, user_id))",
+            ),
+            (
+                "take_call_answer_marker",
+                "take_call_marker(call_answer_marker_key(channel_id, user_id))",
+            ),
+            (
+                "set_call_video_hint",
+                "set_call_marker(call_video_hint_key(channel_id, user_id))",
+            ),
+            (
+                "take_call_video_hint",
+                "take_call_marker(call_video_hint_key(channel_id, user_id))",
+            ),
+        ] {
+            let body = fn_source(name);
+            assert!(
+                body.contains(call),
+                "{name} must go through `{call}`: {body}"
+            );
+        }
+    }
+
+    /// The record is written by one service and read by another, which may
+    /// be running a different build: the stored field names are a contract.
+    #[test]
+    fn call_ring_round_trips_through_its_stored_json() {
+        let ring = ring_by("caller");
+
+        let stored = serde_json::to_string(&ring).expect("serialize");
+        let read: CallRing = serde_json::from_str(&stored).expect("deserialize");
+        assert_eq!(read, ring);
+
+        let value: serde_json::Value = serde_json::from_str(&stored).expect("stored JSON");
+        let expected = serde_json::json!({
+            "call_id": "01CALL",
+            "initiator_id": "caller",
+            "started_at": "2023-11-14T22:13:20.000Z",
+            "started_unix": 1_700_000_000i64,
+            "video": true,
+            "answered": false
+        });
+        assert_eq!(value, expected);
+
+        let picked_up = answered(ring_by("caller"));
+        let stored = serde_json::to_string(&picked_up).expect("serialize");
+        let read: CallRing = serde_json::from_str(&stored).expect("deserialize");
+        assert_eq!(read, picked_up);
+    }
+
+    #[test]
+    fn stored_value_that_does_not_decode_reads_as_no_ring() {
+        let ring = ring_by("caller");
+        let stored = serde_json::to_string(&ring).expect("serialize");
+
+        assert_eq!(decode_call_ring(None), None);
+        assert_eq!(decode_call_ring(Some(stored)), Some(ring));
+
+        // A record with a field this build does not know still reads: a
+        // newer build may be writing next to this one.
+        let mut wider = serde_json::to_value(ring_by("caller")).expect("value");
+        wider["ringing_devices"] = serde_json::json!(2);
+        assert_eq!(
+            decode_call_ring(Some(wider.to_string())),
+            Some(ring_by("caller"))
+        );
+
+        // Leftovers: a record missing a field, a bare id, an empty value.
+        let narrower = serde_json::json!({ "call_id": "01CALL", "initiator_id": "caller" });
+        for leftover in [narrower.to_string(), "01CALL".to_string(), String::new()] {
+            let decoded = decode_call_ring(Some(leftover.clone()));
+            assert_eq!(decoded, None, "{leftover}");
+        }
+    }
+
+    #[test]
+    fn call_keys_are_the_ones_every_service_agrees_on() {
+        assert_eq!(call_ring_key("chan"), "call_ring:chan");
+        assert_eq!(
+            call_answer_marker_key("chan", "user"),
+            "call_answer:chan-user"
+        );
+        assert_eq!(
+            call_video_hint_key("chan", "user"),
+            "call_video_hint:chan-user"
+        );
+        assert_eq!(
+            call_decline_key("01CALL", "user"),
+            "call_decline:01CALL-user"
+        );
+        // Named by the call id alone, so a mark can only ever speak for the
+        // ring it was made for.
+        assert_eq!(
+            call_ring_answered_key("01CALL"),
+            "call_ring_answered:01CALL"
+        );
+    }
+}
+
 /// Remove `user_id` from every voice channel `vc:{user}` names (bots, when
 /// deleted). EVERY channel is tried, with no early exit (AFK S-3 D-2): one
 /// channel's failure is logged and recorded, the rest are still removed, and
