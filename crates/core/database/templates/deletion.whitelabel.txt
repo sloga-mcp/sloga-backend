@@ -1,6 +1,14 @@
-You requested to have your account deleted. If you did not perform this action, please take measures to secure your account immediately.
+Someone (hopefully you) asked to delete the Sloga account for this email.
 
-Please navigate to: {{url}}
+To finish, open this link and press "Delete permanently": {{url}}
+
+Once you confirm, there is no going back: your account, your messages and everything tied to it are deleted right away and can't be recovered.
+
+The link works for 24 hours.
+
+Changed your mind? Just sign in to Sloga before you use the link, and the request is cancelled.
+
+Didn't ask for this? Sign in and change your password.
 
 This email is intended for {{email}}
 
