@@ -7,7 +7,9 @@
 
 use futures::future::BoxFuture;
 use revolt_config::config;
-use revolt_database::{iso8601_timestamp::Timestamp, Database, File, FileHash, Metadata};
+use revolt_database::{
+    iso8601_timestamp::Timestamp, upload_hash_block_key, Database, File, FileHash, Metadata,
+};
 use revolt_files::{
     delete_from_s3, sanitize_image, upload_to_s3, FileKeyring, ImageLimits, SanitizeError,
     SanitizedImage, AUTHENTICATION_TAG_SIZE_BYTES,
@@ -51,6 +53,9 @@ pub(crate) enum StoreFileError {
     TooLarge,
     /// The object store or the database failed.
     Storage,
+    /// On the Take It Down re-upload block list. Skipped like a failed
+    /// download.
+    Blocked,
 }
 
 /// Bounds every imported image is cleaned under: icons, banners, emoji and
@@ -139,15 +144,32 @@ async fn sanitize(buf: Vec<u8>) -> Result<SanitizedImage, StoreFileError> {
     }
 }
 
+/// Refuse an image whose `(kind, hash)` is on the Take It Down re-upload
+/// block list, as autumn does (`kind` as in `upload_hash_block_key`). A
+/// failed lookup is a storage failure, so nothing is stored on a database
+/// error. The caller logs the refusal; no hash or id is logged here.
+async fn refuse_if_blocked(db: &Database, hashes: &[(&str, &str)]) -> Result<(), StoreFileError> {
+    for (kind, hash) in hashes {
+        match db.is_hash_blocked(&upload_hash_block_key(kind, hash)).await {
+            Ok(false) => {}
+            Ok(true) => return Err(StoreFileError::Blocked),
+            Err(_) => return Err(StoreFileError::Storage),
+        }
+    }
+
+    Ok(())
+}
+
 /// Store image bytes the way autumn's upload would, under `tag`, and return
 /// the unclaimed attachment. The caller attaches it (`File::use_server_icon`,
 /// `use_server_banner`, `use_emoji`, `use_sticker`), which also sets
 /// `used_for` so the dangling-file pruner never touches it.
 ///
 /// What is stored is the sanitised image, never the downloaded bytes: see
-/// [`sanitize`]. Refuses anything the sanitiser refuses, and anything over
-/// the tag's upload limit before or after cleaning. The stored content type,
-/// dimensions and `animated` flag are the sanitiser's.
+/// [`sanitize`]. Refuses anything the sanitiser refuses, anything over the
+/// tag's upload limit before or after cleaning, and anything on the Take It
+/// Down re-upload block list (as downloaded or as cleaned). The stored
+/// content type, dimensions and `animated` flag are the sanitiser's.
 ///
 /// `_animated` is IGNORED: whether an image is animated is read from its
 /// bytes, not taken from the source's claim. The parameter stays so callers
@@ -233,6 +255,12 @@ async fn store_image(
         return Err(StoreFileError::TooLarge);
     }
 
+    // Re-upload block on the bytes as downloaded: the same file uploaded
+    // through autumn is blocked under its original hash. Before cleaning,
+    // which is the expensive part.
+    let download_hex = format!("{:02x}", sha2::Sha256::digest(&buf));
+    refuse_if_blocked(db, &[("orig", download_hex.as_str())]).await?;
+
     let SanitizedImage {
         bytes: buf,
         mime,
@@ -255,6 +283,13 @@ async fn store_image(
     // the download and is never matched (unless the download was already
     // clean, byte for byte).
     let hash_hex = format!("{:02x}", sha2::Sha256::digest(&buf));
+
+    // The cleaned bytes are this file's original and processed hash alike
+    refuse_if_blocked(
+        db,
+        &[("orig", hash_hex.as_str()), ("proc", hash_hex.as_str())],
+    )
+    .await?;
 
     // ACCEPTED RESIDUAL: content-addressed reuse means byte-identical media
     // uploaded earlier through autumn keeps ITS hash row, content type
@@ -323,6 +358,11 @@ async fn store_image(
                 .map_err(|_| StoreFileError::Storage)?
         }
     };
+
+    // A reused row stored through autumn has its own processed hash
+    if file_hash.processed_hash != hash_hex {
+        refuse_if_blocked(db, &[("proc", file_hash.processed_hash.as_str())]).await?;
+    }
 
     // Same id scheme as autumn: emoji ids are ULIDs (a message references a
     // custom emoji as `:<ULID>:` and `Emoji::can_use` tells custom from
@@ -1114,5 +1154,91 @@ pub(super) mod tests {
             .err(),
             Some(StoreFileError::TooLarge)
         );
+    }
+
+    pub(crate) async fn block(db: &Database, kind: &str, hash: &str) {
+        db.insert_upload_hash_block(&revolt_database::UploadHashBlock {
+            id: upload_hash_block_key(kind, hash),
+            request_id: "01TD0000000000000000000007".to_string(),
+            created_at: Timestamp::now_utc(),
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Take It Down re-upload block: an image blocked under the hash of its
+    /// download, or of its cleaned bytes as original or processed, is refused
+    /// before anything is stored, and so is one whose reused hash row has a
+    /// blocked processed hash. The control: a block on other bytes refuses
+    /// nothing.
+    #[tokio::test]
+    async fn blocked_images_are_refused_before_anything_is_written() {
+        let input = jpeg_with_gps();
+        let raw_hash = hash_of(&input);
+        let clean_hash = hash_of(&cleaned(&input));
+        assert_ne!(raw_hash, clean_hash, "setup: cleaning changes the bytes");
+
+        for (kind, hash) in [
+            ("orig", &raw_hash),
+            ("orig", &clean_hash),
+            ("proc", &clean_hash),
+        ] {
+            let db = DatabaseInfo::Reference.connect().await.unwrap();
+            let store = FakeStore::matching();
+            block(&db, kind, hash).await;
+
+            assert_eq!(
+                put(&db, &store, "icons", input.clone(), false, None)
+                    .await
+                    .err(),
+                Some(StoreFileError::Blocked),
+                "{kind}:{hash}"
+            );
+            assert!(store.uploaded.lock().unwrap().is_empty(), "{kind}:{hash}");
+            assert!(
+                db.fetch_attachment_hash(&clean_hash).await.is_err(),
+                "{kind}:{hash}: no hash row"
+            );
+        }
+
+        // A row autumn stored for the same cleaned bytes, whose processed
+        // hash is blocked: reused rows are checked too
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let store = FakeStore::matching();
+        db.insert_attachment_hash(&FileHash {
+            id: clean_hash.clone(),
+            processed_hash: "autumn-processed".to_string(),
+            created_at: Timestamp::now_utc(),
+            bucket_id: "revolt-uploads".to_string(),
+            path: "rk/k1/autumn".to_string(),
+            iv: "iv".to_string(),
+            format_version: None,
+            key_id: Some("k1".to_string()),
+            metadata: Metadata::Image {
+                width: 655,
+                height: 582,
+                thumbhash: None,
+                animated: None,
+            },
+            content_type: "image/jpeg".to_string(),
+            size: 1,
+        })
+        .await
+        .unwrap();
+        block(&db, "proc", "autumn-processed").await;
+        assert_eq!(
+            put(&db, &store, "icons", input.clone(), false, None)
+                .await
+                .err(),
+            Some(StoreFileError::Blocked)
+        );
+        assert!(store.uploaded.lock().unwrap().is_empty());
+
+        // Control
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let store = FakeStore::matching();
+        block(&db, "orig", &hash_of(PNG_1X1)).await;
+        let file = put(&db, &store, "icons", input, false, None).await.unwrap();
+        assert_eq!(file.hash.as_deref(), Some(clean_hash.as_str()));
     }
 }

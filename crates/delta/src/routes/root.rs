@@ -317,6 +317,9 @@ pub struct LegalLinks {
     pub privacy_policy: String,
     /// Guidelines URL
     pub guidelines: String,
+    /// Take It Down page URL; left out when the node has none
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub take_it_down: String,
 }
 
 /// # Global limits
@@ -526,6 +529,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 terms_of_service: config.features.legal_links.terms_of_service,
                 privacy_policy: config.features.legal_links.privacy_policy,
                 guidelines: config.features.legal_links.guidelines,
+                take_it_down: config.features.legal_links.take_it_down,
             },
             boosts: BoostsFeature {
                 enabled: config.features.boosts.enabled,
@@ -1050,5 +1054,45 @@ mod test {
             body["features"]["boosts"]["purchases_enabled"],
             config.features.boosts.purchases_enabled
         );
+    }
+
+    /// The legal links object of `GET /`
+    async fn legal_links() -> serde_json::Value {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        body["features"]["legal_links"].clone()
+    }
+
+    #[test]
+    fn root_serves_the_take_it_down_link_when_set() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.legal_links.take_it_down =
+                    "https://sloga.gg/legal/take-it-down.html".to_string();
+            })
+            .await;
+
+            assert_eq!(
+                legal_links().await["take_it_down"],
+                "https://sloga.gg/legal/take-it-down.html"
+            );
+        })
+    }
+
+    #[test]
+    fn root_leaves_out_an_unset_take_it_down_link() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.legal_links.take_it_down = String::new();
+            })
+            .await;
+
+            let links = legal_links().await;
+            assert!(links.get("take_it_down").is_none(), "{links}");
+            assert!(links.get("terms_of_service").is_some(), "{links}");
+        })
     }
 }
