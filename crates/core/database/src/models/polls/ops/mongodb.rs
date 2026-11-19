@@ -13,6 +13,20 @@ use super::AbstractPolls;
 static COL: &str = "polls";
 static COL_VOTES: &str = "poll_votes";
 
+/// The `_id` of every row, as a string. Polls are only ever written with
+/// string ids, so a non-string `_id` is a corrupt row: skipping it would
+/// leave it behind unreported, so the call fails closed instead.
+fn string_ids(rows: &[Document]) -> Result<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.get_str("_id").map(str::to_string).map_err(|error| {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("find", COL)
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl AbstractPolls for MongoDb {
     /// Insert a new poll.
@@ -247,8 +261,13 @@ impl AbstractPolls for MongoDb {
     /// Fetch every open poll of a channel, ordered by poll id.
     async fn fetch_open_polls_for_channel(&self, channel: &str) -> Result<Vec<Poll>> {
         // `closed: false` is a missing key, as in `close_poll_if_open`.
-        Ok(self
-            .col::<Poll>(COL)
+        //
+        // Fails closed: an open row that does not decode as a `Poll`, or a
+        // cursor error, fails the scan instead of being skipped. Closing
+        // works on decoded polls (`Poll::close_listed`), and the caller's
+        // `PollClose` needs the message id and the answers, so a skipped
+        // row would stay open, unreported, on a channel being protected.
+        self.col::<Poll>(COL)
             .find(doc! {
                 "channel": channel,
                 "closed": { "$ne": true }
@@ -256,18 +275,21 @@ impl AbstractPolls for MongoDb {
             .sort(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await)
+            .try_collect()
+            .await
+            .map_err(|error| {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("find", COL)
+            })
     }
 
     /// Delete the polls carried by the given messages, and their ballots.
     async fn delete_polls_for_messages(&self, message_ids: &[String]) -> Result<()> {
         // Ids only, read as plain documents: a row that no longer decodes as
         // a `Poll` is still deleted (the history wipe must not leave poll
-        // text behind), and a cursor error fails the call instead of
-        // silently skipping a row.
-        let poll_ids: Vec<String> = self
+        // text behind), and a cursor error or a non-string `_id` fails the
+        // call instead of silently skipping a row.
+        let rows: Vec<Document> = self
             .col::<Document>(COL)
             .find(doc! {
                 "message": {
@@ -277,12 +299,10 @@ impl AbstractPolls for MongoDb {
             .projection(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .try_collect::<Vec<Document>>()
+            .try_collect()
             .await
-            .map_err(|_| create_database_error!("find", COL))?
-            .iter()
-            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
-            .collect();
+            .map_err(|_| create_database_error!("find", COL))?;
+        let poll_ids = string_ids(&rows)?;
 
         if poll_ids.is_empty() {
             return Ok(());

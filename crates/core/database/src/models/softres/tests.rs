@@ -404,3 +404,139 @@ async fn delete_for_messages_removes_a_sheet_row_that_does_not_decode() {
         }
     });
 }
+
+/// The call failed with a database error (the fail-closed answer of the
+/// Mongo scans), not with any other error and not with a value.
+#[cfg(feature = "mongodb")]
+fn assert_database_error<T: std::fmt::Debug>(result: revolt_result::Result<T>) {
+    match result {
+        Err(error) => assert!(
+            matches!(
+                error.error_type,
+                revolt_result::ErrorType::DatabaseError { .. }
+            ),
+            "{error:?}"
+        ),
+        Ok(value) => panic!("expected a database error, got {value:?}"),
+    }
+}
+
+/// MongoDB only (the Reference driver stores typed rows): the open-sheet
+/// scan reads ids only, so an open sheet that does not decode is still
+/// listed; a sheet row whose `_id` is not a string fails the scan, and so
+/// the protect close, instead of being skipped and left open.
+#[tokio::test]
+async fn open_sheet_scan_fails_closed_on_a_row_with_a_non_string_id() {
+    database_test!(|db| async move {
+        #[cfg(feature = "mongodb")]
+        {
+            if let crate::Database::MongoDb(mongo) = &db {
+                let good = sheet(
+                    "01SRSF1000000000000000000",
+                    "01MSGF1000000000000000000",
+                    CHAN_A,
+                    false,
+                );
+                db.insert_sheet(&good).await.unwrap();
+                let undecodable = "01SRSF2000000000000000000";
+                let raw = mongo.col::<bson::Document>("softres_sheets");
+                raw.insert_one(bson::doc! {
+                    "_id": undecodable,
+                    "message": "01MSGF2000000000000000000",
+                    "channel": CHAN_A,
+                    "title": "Sunday MC",
+                    "raids": "not a list"
+                })
+                .await
+                .unwrap();
+                // Proof of the fixture: the typed read cannot decode it.
+                assert!(mongo
+                    .col::<SoftResSheet>("softres_sheets")
+                    .find_one(bson::doc! { "_id": undecodable })
+                    .await
+                    .is_err());
+                assert_eq!(
+                    db.fetch_open_sheet_ids_for_channel(CHAN_A).await.unwrap(),
+                    vec![good.id.clone(), undecodable.to_string()]
+                );
+
+                raw.insert_one(bson::doc! {
+                    "_id": 42_i32,
+                    "message": "01MSGF3000000000000000000",
+                    "channel": CHAN_A
+                })
+                .await
+                .unwrap();
+
+                assert_database_error(db.fetch_open_sheet_ids_for_channel(CHAN_A).await);
+                assert_database_error(SoftResSheet::close_open_for_channel(&db, CHAN_A).await);
+
+                // The scan failed before any flip: nothing was locked.
+                assert_eq!(db.fetch_sheet(&good.id).await.unwrap(), good);
+                assert!(raw
+                    .find_one(bson::doc! { "_id": undecodable })
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get("locked")
+                    .is_none());
+                // Another channel's scan is unaffected.
+                assert!(db
+                    .fetch_open_sheet_ids_for_channel(CHAN_B)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    });
+}
+
+/// MongoDB only: a sheet row whose `_id` is not a string fails the delete
+/// before anything is deleted, instead of being skipped and left behind.
+#[tokio::test]
+async fn delete_for_messages_fails_closed_on_a_sheet_row_with_a_non_string_id() {
+    database_test!(|db| async move {
+        #[cfg(feature = "mongodb")]
+        {
+            if let crate::Database::MongoDb(mongo) = &db {
+                let kept = sheet(
+                    "01SRSG1000000000000000000",
+                    "01MSGG1000000000000000000",
+                    CHAN_A,
+                    false,
+                );
+                db.insert_sheet(&kept).await.unwrap();
+                db.upsert_reserve(&reserve(&kept, USER_1)).await.unwrap();
+                let message = "01MSGG2000000000000000000";
+                let raw = mongo.col::<bson::Document>("softres_sheets");
+                raw.insert_one(bson::doc! {
+                    "_id": 42_i32,
+                    "message": message,
+                    "channel": CHAN_A
+                })
+                .await
+                .unwrap();
+
+                assert_database_error(
+                    SoftResSheet::delete_for_messages(
+                        &db,
+                        &[kept.message.clone(), message.to_string()],
+                    )
+                    .await,
+                );
+
+                // Nothing was deleted: both rows and the reserve remain.
+                assert_eq!(db.fetch_sheet(&kept.id).await.unwrap(), kept);
+                assert_eq!(
+                    db.fetch_reserve(&kept.id, USER_1).await.unwrap(),
+                    Some(reserve(&kept, USER_1))
+                );
+                assert!(raw
+                    .find_one(bson::doc! { "_id": 42_i32 })
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    });
+}

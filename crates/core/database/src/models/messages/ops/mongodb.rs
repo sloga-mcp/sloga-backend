@@ -12,7 +12,7 @@ use ulid::Ulid;
 use crate::models::admin_migrations::PROTECTED_NONCE_INDEX_NAME;
 use crate::{
     AbstractChannels, AppendMessage, Channel, DocumentId, FieldsMessage, IntoDocumentPath, Message,
-    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage,
+    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage, ProtectedReadView,
 };
 
 use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
@@ -143,6 +143,25 @@ fn thread_stats_pipeline(channel_ids: &[String]) -> Vec<Document> {
     ]
 }
 
+/// The `$or` arms of the servable predicate of `view` (design 7.5 "S4"),
+/// None when `view` serves every row
+///
+/// `encrypted: { $ne: null }` matches only a present, non-null field: the
+/// rows that decode to `encrypted: Some(_)`, the exact complement of the wipe
+/// job's `encrypted: null`. The `_id <= B` arm exists only while the channel
+/// has a boundary and is not wiped.
+fn servable_arms(view: &ProtectedReadView) -> Option<Vec<Document>> {
+    if !view.protected {
+        return None;
+    }
+
+    let mut arms = vec![doc! { "encrypted": { "$ne": null } }];
+    if let (Some(boundary), false) = (&view.boundary, view.wiped) {
+        arms.push(doc! { "_id": { "$lte": boundary } });
+    }
+    Some(arms)
+}
+
 #[async_trait]
 impl AbstractMessages for MongoDb {
     /// Insert a new message into the database
@@ -212,6 +231,23 @@ impl AbstractMessages for MongoDb {
 
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>> {
+        self.fetch_servable_messages(query, &ProtectedReadView::unprotected())
+            .await
+    }
+
+    /// Fetch the messages of `query` that `view` serves: `servable_arms`
+    /// joins the filter as a top-level `$or`, so both directions of a
+    /// `nearby` read and the limit see only servable rows
+    async fn fetch_servable_messages(
+        &self,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> Result<Vec<Message>> {
+        // A protected channel holds no text the server may search (O-12)
+        if view.protected && query.filter.query.is_some() {
+            return Ok(vec![]);
+        }
+
         let mut filter = doc! {};
 
         // 1. Apply message filters
@@ -239,6 +275,11 @@ impl AbstractMessages for MongoDb {
         if let Some(pinned) = query.filter.pinned {
             filter.insert("pinned", pinned);
         };
+
+        // 1.1. Keep only the rows `view` serves (design 7.5 "S4")
+        if let Some(arms) = servable_arms(view) {
+            filter.insert("$or", arms);
+        }
 
         // 2. Find query limit
         let limit = query.limit.unwrap_or(50);
@@ -853,8 +894,17 @@ impl AbstractMessages for MongoDb {
         Ok(batch)
     }
 
-    /// Delete the listed plaintext rows of a channel; returns how many went
-    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64> {
+    /// Delete the listed plaintext rows of a channel at or below the boundary;
+    /// returns how many went
+    ///
+    /// Still served by `{channel, _id}`: the `$in` and the `$lte` both bound
+    /// `_id`.
+    async fn delete_messages_by_ids(
+        &self,
+        channel: &str,
+        boundary: &str,
+        ids: &[String],
+    ) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -862,7 +912,8 @@ impl AbstractMessages for MongoDb {
         self.col::<Document>(COL)
             .delete_many(doc! {
                 "channel": channel,
-                "_id": { "$in": ids },
+                // Never a row above B, whatever the list says
+                "_id": { "$in": ids, "$lte": boundary },
                 // Never a row carrying `encrypted`, whatever the list says
                 "encrypted": null,
             })

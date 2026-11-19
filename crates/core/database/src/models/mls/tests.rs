@@ -4038,6 +4038,8 @@ async fn device_revocation_racing_a_text_add_never_leaves_an_unqueued_member() {
 /// per-user slots, the five-candidate cap, the byte caps, the page order and
 /// whole epochs per page
 mod history_link_tests {
+    use std::collections::BTreeMap;
+
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_result::ErrorType;
@@ -4115,7 +4117,8 @@ mod history_link_tests {
     }
 
     /// Store a link row directly, bypassing every rule (a fixture for the
-    /// stored byte sums)
+    /// stored byte sums). Mongo: the row's bytes also join the holder
+    /// group's running sums, the state a series of inserts leaves
     async fn insert_raw_link(db: &Database, link: &MlsHistoryLink) {
         match db {
             Database::Reference(reference) => {
@@ -4132,6 +4135,20 @@ mod history_link_tests {
                     .insert_one(link)
                     .await
                     .expect("raw link");
+                let mut sums = bson::Document::new();
+                sums.insert("history_link_bytes", link.size);
+                sums.insert(
+                    format!("history_link_user_bytes.{}", link.writer_user_id),
+                    link.size,
+                );
+                mongo
+                    .col::<bson::Document>("mls_groups")
+                    .update_one(
+                        bson::doc! { "_id": &link.group_id },
+                        bson::doc! { "$inc": sums },
+                    )
+                    .await
+                    .expect("raw link sums");
             }
         }
     }
@@ -4835,6 +4852,466 @@ mod history_link_tests {
                 InsertOutcome::Inserted,
                 "a closed holder still takes late links"
             );
+        });
+    }
+
+    /// A holder group document's `txn_serial` (Mongo; `None` on Reference)
+    async fn group_serial(db: &Database, group: &str) -> Option<i64> {
+        #[cfg(feature = "mongodb")]
+        if let Some(stored) = super::raw_document(db, "mls_groups", group).await {
+            return Some(stored.get_i64("txn_serial").unwrap_or(0));
+        }
+        let _ = (db, group);
+        None
+    }
+
+    /// Each refusal case answers exactly as expected, within 3 s
+    async fn assert_refusals(
+        db: &Database,
+        caps: HistoryLinkCaps,
+        cases: &[(&MlsHistoryLink, &str)],
+    ) {
+        for (row, what) in cases {
+            let answer = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                insert_capped(db.clone(), (*row).clone(), caps),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{what}: no answer within 3 s"));
+            match *what {
+                "identical" => assert_eq!(answer.unwrap(), InsertOutcome::Identical, "{what}"),
+                "exists" | "full" => assert_exists(answer, what),
+                "user cap" => assert_failed(answer, "history link user byte cap reached", what),
+                "group cap" => assert_failed(answer, "history link group byte cap reached", what),
+                other => panic!("unknown case {other}"),
+            }
+        }
+    }
+
+    /// The answers that never change (`Identical`, a taken slot, a full
+    /// epoch, a reached byte cap) come before any transaction and without
+    /// claiming the holder group. Mongo: `txn_serial` does not move, and a
+    /// refusal answers at once while another transaction holds the group
+    /// (a Text commit or link insert in flight) instead of write-conflicting
+    /// with it until the retry budget runs out. Every committed insert still
+    /// claims its group exactly once
+    ///
+    /// Controls: drop the pre-check (the claim comes first again); claim
+    /// outside the transaction before the pre-check; off-by-one on the
+    /// pre-check's epoch count.
+    #[tokio::test]
+    async fn history_link_refusals_never_claim_the_holder_group() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+            reference_note(&db, "history_link_precheck", "the claim");
+            let caps = HistoryLinkCaps {
+                group_bytes: 1000,
+                user_bytes: 300,
+            };
+            let insert = |row: MlsHistoryLink| insert_capped(db.clone(), row, caps);
+
+            // A: epoch 2 full (5 x 100), Alice at 300 of 300, A at 700
+            let a = link_group(&db, 0x59, true).await;
+            for user in 1..=5 {
+                assert_eq!(
+                    insert(link(&a, 2, &writer(user), 1, 100, at(0)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+            for epoch in [3, 4] {
+                assert_eq!(
+                    insert(link(&a, epoch, &writer(ALICE), 1, 100, at(1)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+            // B: at its 1000-byte group cap
+            let b = link_group(&db, 0x5f, true).await;
+            for (user, bytes) in [(BOB, 300), (CAROL, 300), (DAVE, 300), (EVE, 100)] {
+                assert_eq!(
+                    insert(link(&b, 1, &writer(user), 1, bytes, at(0)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+
+            let identical = link(&a, 2, &writer(BOB), 1, 100, at(9));
+            let exists = link(&a, 2, &writer(BOB), 2, 100, at(9));
+            let full = link(&a, 2, &writer(6), 1, 17, at(9));
+            let over_user = link(&a, 5, &writer(ALICE), 1, 17, at(9));
+            let over_group = link(&b, 9, &writer(6), 1, 17, at(9));
+            let cases = [
+                (&identical, "identical"),
+                (&exists, "exists"),
+                (&full, "full"),
+                (&over_user, "user cap"),
+                (&over_group, "group cap"),
+            ];
+
+            let serials = (group_serial(&db, &a).await, group_serial(&db, &b).await);
+            if is_mongo(&db) {
+                assert_eq!(
+                    serials,
+                    (Some(7), Some(4)),
+                    "one claim per committed insert"
+                );
+            }
+
+            assert_refusals(&db, caps, &cases).await;
+            assert_eq!(
+                (group_serial(&db, &a).await, group_serial(&db, &b).await),
+                serials,
+                "no refusal claims its group"
+            );
+
+            // The same answers while another transaction holds both groups
+            #[cfg(feature = "mongodb")]
+            if let Database::MongoDb(mongo) = &db {
+                let mut holder = mongo.start_session().await.expect("session");
+                holder.start_transaction().await.expect("transaction");
+                for group in [&a, &b] {
+                    mongo
+                        .col::<bson::Document>("mls_groups")
+                        .update_one(
+                            bson::doc! { "_id": group },
+                            bson::doc! { "$inc": { "txn_serial": 1_i64 } },
+                        )
+                        .session(&mut holder)
+                        .await
+                        .expect("hold the group");
+                }
+                assert_refusals(&db, caps, &cases).await;
+                holder.abort_transaction().await.expect("abort");
+                assert_eq!(
+                    (group_serial(&db, &a).await, group_serial(&db, &b).await),
+                    serials
+                );
+            }
+
+            assert_eq!(stored(&db, &a).await.len(), 7, "nothing was written");
+            assert_eq!(stored(&db, &b).await.len(), 4, "nothing was written");
+        });
+    }
+
+    /// The running byte sums on a holder group document equal `want` (per
+    /// user; the group sum is their total); an empty `want` is no sum
+    /// fields at all (Mongo only; a no-op on Reference)
+    async fn assert_group_sums(db: &Database, group: &str, want: &BTreeMap<String, i64>) {
+        #[cfg(feature = "mongodb")]
+        if let Some(stored) = super::raw_document(db, "mls_groups", group).await {
+            if want.is_empty() {
+                assert!(stored.get("history_link_bytes").is_none(), "{stored:?}");
+                assert!(
+                    stored.get("history_link_user_bytes").is_none(),
+                    "{stored:?}"
+                );
+                return;
+            }
+            assert_eq!(
+                stored.get_i64("history_link_bytes").ok(),
+                Some(want.values().sum::<i64>()),
+                "group sum of {group}"
+            );
+            let users: BTreeMap<String, i64> = stored
+                .get_document("history_link_user_bytes")
+                .expect("user sums")
+                .iter()
+                .map(|(user, bytes)| (user.clone(), bytes.as_i64().expect("Int64 sum")))
+                .collect();
+            assert_eq!(&users, want, "user sums of {group}");
+        }
+        let _ = (db, group, want);
+    }
+
+    fn user_sums(sums: &[(u32, i64)]) -> BTreeMap<String, i64> {
+        sums.iter()
+            .map(|(user, bytes)| (ulid(*user), *bytes))
+            .collect()
+    }
+
+    /// The holder group document carries the running byte sums the caps
+    /// read (`history_link_bytes`, `history_link_user_bytes.<user>`). After
+    /// a mix of inserts, an identical re-insert and every refusal they equal
+    /// the sums of the stored rows, and the delete takes them with the rows
+    /// (Mongo; on Reference the caps sum the rows, and the stored rows are
+    /// checked on both drivers)
+    ///
+    /// Control: drop the `$inc` of the sums.
+    #[tokio::test]
+    async fn history_link_group_sums_equal_the_stored_rows() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+            reference_note(&db, "history_link_sums", "the sums document");
+            let a = link_group(&db, 0x5a, true).await;
+            let b = link_group(&db, 0x5b, true).await;
+            let caps = HistoryLinkCaps {
+                group_bytes: 2000,
+                user_bytes: 700,
+            };
+            let insert = |row: MlsHistoryLink| insert_capped(db.clone(), row, caps);
+
+            for (group, epoch, user, bytes) in [
+                (&a, 1, ALICE, 300),
+                (&a, 1, BOB, 41),
+                (&a, 2, ALICE, 400),
+                (&a, 1, CAROL, 17),
+                (&a, 1, DAVE, 99),
+                (&a, 1, EVE, 18),
+                (&b, 1, ALICE, 650),
+                (&b, 4, BOB, 33),
+            ] {
+                assert_eq!(
+                    insert(link(group, epoch, &writer(user), 1, bytes, at(0)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+            assert_eq!(
+                insert(link(&a, 1, &writer(BOB), 1, 41, at(5)))
+                    .await
+                    .unwrap(),
+                InsertOutcome::Identical
+            );
+            assert_exists(
+                insert(link(&a, 1, &writer(BOB), 9, 41, at(5))).await,
+                "exists",
+            );
+            assert_exists(insert(link(&a, 1, &writer(6), 1, 17, at(5))).await, "full");
+            assert_failed(
+                insert(link(&a, 3, &writer(ALICE), 1, 17, at(5))).await,
+                "history link user byte cap reached",
+                "user cap",
+            );
+            assert_failed(
+                insert(MlsHistoryLink {
+                    size: 50,
+                    ..link(&a, 3, &writer(BOB), 1, 51, at(5))
+                })
+                .await,
+                "history link size must be the decoded ciphertext length",
+                "an untrue size",
+            );
+            let refused = refusal(
+                insert(link(&group_id(0x5c), 1, &writer(BOB), 1, 17, at(5))).await,
+                "unknown group",
+            );
+            assert!(matches!(refused, ErrorType::NotFound), "{refused:?}");
+            // A stores 875 bytes: 1125 more reach the group cap exactly
+            for (user, bytes) in [(BOB, 600), (CAROL, 525)] {
+                assert_eq!(
+                    insert(link(&a, 3, &writer(user), 4, bytes, at(6)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+            assert_failed(
+                insert(link(&a, 4, &writer(DAVE), 1, 17, at(7))).await,
+                "history link group byte cap reached",
+                "group cap",
+            );
+
+            let want_a = user_sums(&[
+                (ALICE, 700),
+                (BOB, 641),
+                (CAROL, 542),
+                (DAVE, 99),
+                (EVE, 18),
+            ]);
+            let want_b = user_sums(&[(ALICE, 650), (BOB, 33)]);
+            assert_eq!(want_a.values().sum::<i64>(), 2000);
+            for (group, want) in [(&a, &want_a), (&b, &want_b)] {
+                let mut rows = BTreeMap::<String, i64>::new();
+                for row in stored(&db, group).await {
+                    *rows.entry(row.writer_user_id).or_default() += row.size;
+                }
+                assert_eq!(&rows, want, "the stored rows of {group}");
+                assert_group_sums(&db, group, want).await;
+            }
+
+            // The delete takes A's sums with its rows: A starts over (650
+            // would pass neither cap on the old sums)
+            db.delete_mls_history_links_for_group(&a).await.unwrap();
+            assert_group_sums(&db, &a, &BTreeMap::new()).await;
+            assert_eq!(
+                insert(link(&a, 1, &writer(DAVE), 5, 650, at(8)))
+                    .await
+                    .unwrap(),
+                InsertOutcome::Inserted
+            );
+            assert_group_sums(&db, &a, &user_sums(&[(DAVE, 650)])).await;
+            assert_group_sums(&db, &b, &want_b).await;
+        });
+    }
+
+    /// Mongo sorts the page on `epoch` only (index-backed) and orders each
+    /// epoch's rows by `created_at`, then the writer user, in Rust. An epoch
+    /// whose rows straddle the page limit is dropped whole, and rows stored
+    /// in an order other than the page order come back in the page order,
+    /// the same on both drivers
+    ///
+    /// Control: drop the in-Rust within-epoch sort.
+    #[tokio::test]
+    async fn history_link_fetch_trims_an_epoch_straddling_the_page_limit() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+            let group = link_group(&db, 0x5d, true).await;
+            // Stored in an order other than the page order in each epoch
+            for (epoch, user, ms) in [
+                (6, ALICE, 5),
+                (6, BOB, 3),
+                (5, CAROL, 9),
+                (5, ALICE, 7),
+                (5, EVE, 7),
+                (5, BOB, 1),
+                (5, DAVE, 4),
+                (4, ALICE, 0),
+            ] {
+                assert_eq!(
+                    db.insert_mls_history_link(&link(&group, epoch, &writer(user), 1, 20, at(ms)))
+                        .await
+                        .unwrap(),
+                    InsertOutcome::Inserted
+                );
+            }
+            let six = vec![entry(6, BOB), entry(6, ALICE)];
+            let five = vec![
+                entry(5, BOB),
+                entry(5, DAVE),
+                entry(5, ALICE),
+                entry(5, EVE),
+                entry(5, CAROL),
+            ];
+            let four = vec![entry(4, ALICE)];
+
+            // 5 and 6 rows: epoch 5 straddles the limit (the row past the
+            // page is one of its own)
+            assert_eq!(page(&db, &group, None, 5).await, six);
+            assert_eq!(page(&db, &group, None, 6).await, six);
+            // 7 rows: epoch 5 fits whole; the row past the page is epoch 4
+            assert_eq!(
+                page(&db, &group, None, 7).await,
+                [six.clone(), five.clone()].concat()
+            );
+            assert_eq!(
+                page(&db, &group, None, 8).await,
+                [six.clone(), five.clone(), four.clone()].concat()
+            );
+            assert_eq!(page(&db, &group, Some(6), 5).await, five);
+            assert_eq!(page(&db, &group, Some(5), 5).await, four);
+            assert!(page(&db, &group, Some(4), 5).await.is_empty());
+        });
+    }
+
+    /// Mongo explain: the epoch count and the page fetch (the filter and
+    /// sort the driver sends) are served by `history_links_by_holder`, with
+    /// no collection scan and no blocking sort
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn history_link_count_and_fetch_use_the_holder_index() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!("NOTE history_link_explain: Mongo only");
+                return;
+            };
+            let group = link_group(&db, 0x5e, true).await;
+            for epoch in 0..20 {
+                for user in 1..=3 {
+                    insert_raw_link(&db, &link(&group, epoch, &writer(user), 1, 20, at(0))).await;
+                }
+            }
+
+            fn plan_names(value: &bson::Bson, out: &mut Vec<String>) {
+                match value {
+                    bson::Bson::Document(document) => {
+                        for (key, value) in document {
+                            if let (true, bson::Bson::String(name)) =
+                                (key == "stage" || key == "indexName", value)
+                            {
+                                out.push(name.clone());
+                            }
+                            plan_names(value, out);
+                        }
+                    }
+                    bson::Bson::Array(values) => {
+                        for value in values {
+                            plan_names(value, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            async fn winning_plan(mongo: &crate::MongoDb, command: bson::Document) -> Vec<String> {
+                let explained = mongo
+                    .db()
+                    .run_command(bson::doc! { "explain": command, "verbosity": "queryPlanner" })
+                    .await
+                    .expect("explain");
+                // A find, or an aggregate pushed down whole, answers with
+                // `queryPlanner`; otherwise its first stage is the `$cursor`
+                let planner = match explained.get_document("queryPlanner") {
+                    Ok(planner) => planner.clone(),
+                    Err(_) => explained
+                        .get_array("stages")
+                        .expect("stages")
+                        .first()
+                        .and_then(|stage| stage.as_document())
+                        .and_then(|stage| stage.get_document("$cursor").ok())
+                        .and_then(|cursor| cursor.get_document("queryPlanner").ok())
+                        .expect("queryPlanner")
+                        .clone(),
+                };
+                let mut out = Vec::new();
+                plan_names(planner.get("winningPlan").expect("winningPlan"), &mut out);
+                out
+            }
+
+            let fetch = winning_plan(
+                mongo,
+                bson::doc! {
+                    "find": "mls_history_links",
+                    "filter": { "group_id": &group, "epoch": { "$lt": 15_i64 } },
+                    "sort": { "epoch": -1 },
+                    "limit": 6_i64,
+                },
+            )
+            .await;
+            eprintln!("explain fetch: {fetch:?}");
+            assert!(
+                fetch.iter().any(|name| name == "history_links_by_holder"),
+                "{fetch:?}"
+            );
+            assert!(
+                !fetch
+                    .iter()
+                    .any(|name| name == "COLLSCAN" || name == "SORT"),
+                "{fetch:?}"
+            );
+
+            let count = winning_plan(
+                mongo,
+                bson::doc! {
+                    "aggregate": "mls_history_links",
+                    "pipeline": [
+                        { "$match": { "group_id": &group, "epoch": 7_i64 } },
+                        { "$group": { "_id": 1_i32, "n": { "$sum": 1_i32 } } },
+                    ],
+                    "cursor": {},
+                },
+            )
+            .await;
+            eprintln!("explain count: {count:?}");
+            assert!(
+                count.iter().any(|name| name == "history_links_by_holder"),
+                "{count:?}"
+            );
+            assert!(!count.iter().any(|name| name == "COLLSCAN"), "{count:?}");
         });
     }
 }

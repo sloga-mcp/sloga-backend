@@ -5900,8 +5900,9 @@ fn step4c_pre_history_never_goes_from_wiped_to_kept() {
     );
 }
 
-/// Until S4: `wiped` is refused on every path (genesis included), so `kept`
-/// to `wiped` is refused on the PUT
+/// Until S4 (`history_setting` off): a `wiped` genesis is refused, and
+/// `kept` to `wiped` is refused on the PUT (as it is with the flag on: only
+/// the wipe write moves it; fix round F1)
 #[test]
 fn step4c_pre_history_wiped_is_refused_until_s4() {
     let wiped = next_v2(with_boundary(
@@ -5919,13 +5920,16 @@ fn step4c_pre_history_wiped_is_refused_until_s4() {
     ));
     assert_refused(
         check_seat_list_v2_lines(&wiped, Some(&stored)),
-        "pre_history wiped is refused until S4",
+        "only through the history wipe",
         "kept to wiped",
     );
 }
 
+/// Until S4 (`history_setting` off): a genesis may not carry a boundary; a
+/// PUT carrying the stored one unchanged is no new boundary and passes (fix
+/// round F1, the H1 wedge)
 #[test]
-fn step4c_history_boundary_is_refused_until_s4() {
+fn step4c_a_new_history_boundary_is_refused_until_s4() {
     let boundary = next_v2(with_boundary(
         v2_lines(GROUP_SALT),
         SeatListPreHistory::Kept,
@@ -5939,11 +5943,7 @@ fn step4c_history_boundary_is_refused_until_s4() {
         v2_lines(GROUP_SALT),
         SeatListPreHistory::Kept,
     ));
-    assert_refused(
-        check_seat_list_v2_lines(&boundary, Some(&stored)),
-        "history_boundary is refused until S4",
-        "same boundary as stored",
-    );
+    assert!(check_seat_list_v2_lines(&boundary, Some(&stored)).is_ok());
 }
 
 /// 4.1.1 / PA-18: a stored v1 list is the predecessor `{ authority: empty,
@@ -5967,7 +5967,7 @@ fn step4c_a_stored_v1_list_is_the_v2_predecessor() {
             )),
             Some(&stored),
         ),
-        "history_boundary is refused until S4",
+        "history_boundary is immutable",
         "a boundary over v1",
     );
 }
@@ -7716,6 +7716,12 @@ const S4_ON: SeatListFlags = SeatListFlags {
     history_setting: true,
 };
 
+/// `history_setting` turned back off on a v2 deployment (fix round F1)
+const S4_HISTORY_OFF: SeatListFlags = SeatListFlags {
+    formats_v2: true,
+    history_setting: false,
+};
+
 tokio::task_local! {
     /// What `SeatListFlags::read` answers inside `with_flags`
     static SEAT_LIST_FLAGS: SeatListFlags;
@@ -7978,51 +7984,182 @@ fn step4c_with_history_setting_a_put_keeps_the_boundary_and_never_wipes() {
     );
 }
 
-/// 4.1.1 "S4": with `history_setting` off, S2's refusals apply on every
-/// path, a channel that already carries a boundary included (pinned: the
-/// doc says "every path")
+/// 4.1.1 "S4" with `history_setting` off (fix round F1, the H1 ruling):
+/// only what would introduce history is refused: a genesis carrying a
+/// boundary or `wiped`, the wipe write, and `kept -> wiped`
 #[test]
-fn step4c_without_history_setting_refuses_a_boundary_and_wiped_on_every_path() {
+fn step4c_without_history_setting_refuses_what_would_introduce_history() {
     let kept = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let wiped = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Wiped);
     let stored = stored_v2(kept.clone());
-    assert_refused(
-        check_seat_list_history_lines(
-            SeatListWriteKind::Protect,
-            &next_v2(kept.clone()),
-            None,
-            false,
+
+    for (case, lines, needle) in [
+        (
+            "a boundary genesis",
+            kept.clone(),
+            "history_boundary is refused until S4",
         ),
-        "history_boundary is refused until S4",
-        "protect",
-    );
-    assert_refused(
-        check_seat_list_history_lines(
-            SeatListWriteKind::Put,
-            &next_v2(kept.clone()),
-            Some(&stored),
-            false,
+        (
+            "a wiped genesis",
+            wiped.clone(),
+            "pre_history wiped is refused until S4",
         ),
-        "history_boundary is refused until S4",
-        "put on a boundary channel",
-    );
+    ] {
+        assert_refused(
+            check_seat_list_history_lines(
+                SeatListWriteKind::Protect,
+                &next_v2(lines.clone()),
+                None,
+                false,
+            ),
+            needle,
+            case,
+        );
+        // S2's entry point (the route) is the flag-off call
+        assert_refused(
+            check_seat_list_v2_lines(&next_v2(lines), None),
+            needle,
+            case,
+        );
+    }
+
     assert_refused(
         check_seat_list_history_lines(
             SeatListWriteKind::Wipe,
-            &next_v2(s4_lines(
-                Some(TV4_BOUNDARY_MESSAGE_ID),
-                SeatListPreHistory::Wiped,
-            )),
+            &next_v2(wiped.clone()),
             Some(&stored),
             false,
         ),
         "pre_history wiped is refused until S4",
-        "wipe",
+        "the wipe write",
     );
-    // S2's entry point is the flag-off call
+
     assert_refused(
-        check_seat_list_v2_lines(&next_v2(kept), Some(&stored)),
-        "history_boundary is refused until S4",
-        "S2 entry point",
+        check_seat_list_history_lines(
+            SeatListWriteKind::Put,
+            &next_v2(wiped.clone()),
+            Some(&stored),
+            false,
+        ),
+        "only through the history wipe",
+        "kept to wiped",
+    );
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(wiped), Some(&stored)),
+        "only through the history wipe",
+        "kept to wiped, S2 entry point",
+    );
+}
+
+/// Fix round F1 (the H1 wedge): with `history_setting` off a seat PUT that
+/// carries the stored boundary and `pre_history` unchanged passes, on a
+/// `kept` channel and on a `wiped` one, and the planner lands a
+/// removal-only list without touching `protected_history`
+#[test]
+fn step4c_without_history_setting_a_put_carrying_the_stored_history_lines_passes() {
+    for pre_history in [SeatListPreHistory::Kept, SeatListPreHistory::Wiped] {
+        let case = format!("{pre_history:?}");
+        let lines = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), pre_history);
+
+        let stored = stored_v2(lines.clone());
+        assert!(
+            check_seat_list_history_lines(
+                SeatListWriteKind::Put,
+                &next_v2(lines.clone()),
+                Some(&stored),
+                false,
+            )
+            .is_ok(),
+            "{case}"
+        );
+        assert!(
+            check_seat_list_v2_lines(&next_v2(lines.clone()), Some(&stored)).is_ok(),
+            "{case}: S2 entry point"
+        );
+
+        // The planner as both drivers call it: B is removed
+        let stored = stored_row(&s4_submit(1, &[USER_A, USER_B], lines.clone()));
+        let removal = s4_submit(2, &[USER_A], lines);
+        let planned = applied(
+            plan_s4(
+                SeatListWriteKind::Put,
+                &removal,
+                Some(&stored),
+                &active_seats(&[USER_A, USER_B]),
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+        assert_eq!(planned.row.body, removal.body, "{case}");
+        assert_eq!(planned.released, vec![USER_B.to_string()], "{case}");
+        assert!(planned.claimed.is_empty(), "{case}");
+        assert_eq!(planned.protected_history, None, "{case}");
+    }
+}
+
+/// Fix round F1: with `history_setting` off the immutable and one-way lines
+/// still hold on the seat PUT: the boundary is neither changed, dropped nor
+/// added, the salt stays, and `wiped` never goes back to `kept`
+#[test]
+fn step4c_without_history_setting_a_put_still_keeps_the_immutable_lines() {
+    let put = |body: &SeatListBody, stored: &SeatList| {
+        check_seat_list_history_lines(SeatListWriteKind::Put, body, Some(stored), false)
+    };
+    let kept = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Kept);
+    let wiped = s4_lines(Some(TV4_BOUNDARY_MESSAGE_ID), SeatListPreHistory::Wiped);
+
+    let stored = stored_v2(kept.clone());
+    for (case, lines, needle) in [
+        (
+            "another boundary",
+            s4_lines(Some(CID), SeatListPreHistory::Kept),
+            "history_boundary is immutable",
+        ),
+        (
+            "boundary dropped",
+            v2_lines(GROUP_SALT),
+            "history_boundary is immutable",
+        ),
+        (
+            "another salt",
+            SeatListV2Lines {
+                group_salt: "5".repeat(64),
+                ..kept.clone()
+            },
+            "group_salt is immutable",
+        ),
+    ] {
+        assert_refused(put(&next_v2(lines), &stored), needle, case);
+    }
+
+    let stored_wiped = stored_v2(wiped.clone());
+    for (case, lines, needle) in [
+        (
+            "wiped to kept",
+            kept.clone(),
+            "cannot go from wiped to kept",
+        ),
+        (
+            "wiped, another boundary",
+            s4_lines(Some(CID), SeatListPreHistory::Wiped),
+            "history_boundary is immutable",
+        ),
+    ] {
+        assert_refused(put(&next_v2(lines), &stored_wiped), needle, case);
+    }
+
+    // A boundary the stored list never had
+    let v1 = stored_row(&submit(1, &[USER_A]));
+    assert_refused(
+        put(&next_v2(kept.clone()), &v1),
+        "history_boundary is immutable",
+        "a boundary over v1",
+    );
+    assert_refused(
+        put(&next_v2(kept), &stored_v2(v2_lines(GROUP_SALT))),
+        "history_boundary is immutable",
+        "a boundary over a v2 list without one",
     );
 }
 
@@ -8726,8 +8863,9 @@ async fn s4_seat_list_flags_come_from_the_configuration() {
 }
 
 /// Doc 11 "Backend, protect": a seat PUT changing the boundary, dropping
-/// it, or moving `kept -> wiped` is refused; `wiped -> kept` too; with
-/// `history_setting` off every list on the channel is refused
+/// it, or moving `kept -> wiped` is refused; `wiped -> kept` too. With
+/// `history_setting` off see
+/// `s4_without_history_setting_a_boundary_channel_still_takes_seat_puts`
 #[tokio::test]
 async fn s4_a_seat_put_keeps_the_boundary_and_never_moves_pre_history() {
     database_test!(|db| async move {
@@ -8779,22 +8917,149 @@ async fn s4_a_seat_put_keeps_the_boundary_and_never_moves_pre_history() {
                 );
             }
             assert_eq!(protected_history_of(&db).await, Some(kept_history(b)));
+        })
+        .await;
+    });
+}
 
-            with_flags(
-                SeatListFlags {
-                    formats_v2: true,
-                    history_setting: false,
-                },
-                async {
-                    let next = s4_submit(3, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+/// Fix round F1 (the H1 wedge), end to end: with `history_setting` turned
+/// back off, a channel protected with a boundary while it was on still
+/// takes a seat PUT carrying the stored history lines unchanged (here a
+/// removal); `kept -> wiped`, a changed or dropped boundary and the wipe
+/// write stay refused, writing nothing
+#[tokio::test]
+async fn s4_without_history_setting_a_boundary_channel_still_takes_seat_puts() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            db.put_seat_list(
+                CHANNEL,
+                &s4_submit(
+                    2,
+                    &[USER_A, USER_B],
+                    s4_lines(Some(b), SeatListPreHistory::Kept),
+                ),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+
+            with_flags(S4_HISTORY_OFF, async {
+                let removal = s4_submit(3, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+                let outcome = db
+                    .put_seat_list(CHANNEL, &removal, true, at(2), Some(SEAT_PUT_REASON))
+                    .await
+                    .unwrap();
+                assert!(!outcome.unchanged);
+                assert_eq!(outcome.released, vec![USER_B.to_string()]);
+                let row = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+                assert_eq!(row.body, removal.body);
+
+                for (case, lines) in [
+                    (
+                        "kept to wiped",
+                        s4_lines(Some(b), SeatListPreHistory::Wiped),
+                    ),
+                    (
+                        "another boundary",
+                        s4_lines(Some(&message_id_at(-2_000, 7)), SeatListPreHistory::Kept),
+                    ),
+                    ("no boundary", v2_lines(GROUP_SALT)),
+                ] {
                     let error = db
-                        .put_seat_list(CHANNEL, &next, true, at(2), Some(SEAT_PUT_REASON))
+                        .put_seat_list(
+                            CHANNEL,
+                            &s4_submit(4, &[USER_A], lines),
+                            true,
+                            at(3),
+                            Some(SEAT_PUT_REASON),
+                        )
                         .await
                         .unwrap_err();
-                    assert!(is_failed_validation(&error), "{error:?}");
-                },
-            )
+                    assert!(is_failed_validation(&error), "{case}: {error:?}");
+                    assert_eq!(
+                        db.fetch_seat_list(CHANNEL).await.unwrap().unwrap(),
+                        row,
+                        "{case}"
+                    );
+                }
+
+                let wipe = s4_submit(4, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+                let error = db
+                    .request_history_wipe(CHANNEL, &wipe, at(3))
+                    .await
+                    .unwrap_err();
+                assert!(is_failed_validation(&error), "the wipe write: {error:?}");
+                assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap().unwrap(), row);
+            })
             .await;
+            assert_eq!(protected_history_of(&db).await, Some(kept_history(b)));
+        })
+        .await;
+    });
+}
+
+/// Fix round F1, end to end on a `wiped` channel: with `history_setting`
+/// off a seat PUT that stays `wiped` with the stored boundary lands, and
+/// `wiped -> kept` stays refused; the requested wipe is left as it was
+#[tokio::test]
+async fn s4_without_history_setting_a_wiped_channel_still_takes_seat_puts() {
+    database_test!(|db| async move {
+        with_flags(S4_ON, async {
+            let ids = busy_setup(&db, &[-1_000]).await;
+            let b = &ids[0];
+            db.protect_channel(
+                CHANNEL,
+                &s4_submit(1, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped)),
+                at(0),
+            )
+            .await
+            .unwrap();
+            db.put_seat_list(
+                CHANNEL,
+                &s4_submit(
+                    2,
+                    &[USER_A, USER_B],
+                    s4_lines(Some(b), SeatListPreHistory::Wiped),
+                ),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+
+            with_flags(S4_HISTORY_OFF, async {
+                let removal = s4_submit(3, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Wiped));
+                let outcome = db
+                    .put_seat_list(CHANNEL, &removal, true, at(2), Some(SEAT_PUT_REASON))
+                    .await
+                    .unwrap();
+                assert!(!outcome.unchanged);
+                assert_eq!(outcome.released, vec![USER_B.to_string()]);
+                let row = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+                assert_eq!(row.body, removal.body);
+
+                let back = s4_submit(4, &[USER_A], s4_lines(Some(b), SeatListPreHistory::Kept));
+                let error = db
+                    .put_seat_list(CHANNEL, &back, true, at(3), Some(SEAT_PUT_REASON))
+                    .await
+                    .unwrap_err();
+                assert!(is_failed_validation(&error), "wiped to kept: {error:?}");
+                assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap().unwrap(), row);
+            })
+            .await;
+            assert_eq!(protected_history_of(&db).await, Some(requested(b, at(0))));
         })
         .await;
     });

@@ -1744,8 +1744,10 @@ pub struct SeatListWriteInput<'a> {
     pub formats_v2: bool,
     /// S4 `history_setting` (7.1 "S4"), read from the configuration by the
     /// driver: a protect genesis with a boundary or `wiped`, and the wipe
-    /// write, need it. While it is off, S2's "until S4" refusals of a
-    /// non-empty boundary and of `wiped` apply on every path (4.1.1 "S4").
+    /// write, need it. While it is off only what would introduce history is
+    /// refused (a genesis carrying a boundary or `wiped`, the wipe write,
+    /// `kept -> wiped`); a seat PUT carrying the stored boundary and
+    /// `pre_history` unchanged still lands (fix round F1, the H1 wedge).
     pub history_setting: bool,
     /// Protect only: the request's `wipe_history` flag (7.2 "S4"); `None`
     /// takes the signed `pre_history` line. Every other write passes `None`.
@@ -2376,14 +2378,16 @@ pub fn check_seat_list_authority(
     }))
 }
 
-/// 4.3 step 4c as S2 calls it, unchanged: [`check_seat_list_history_lines`]
-/// for a genesis (`stored == None`) or a seat PUT with `history_setting`
-/// OFF, so S2's "until S4" refusals of a non-empty `history_boundary` and of
-/// `pre_history:wiped` apply on every path. The route's pre-transaction
-/// validation (`protected_seat_validation.rs`) still calls this; until it
-/// moves to [`check_seat_list_history_lines`] with the configured flag (W2),
-/// the route refuses every boundary and `wiped` before a driver sees them,
-/// which fails closed.
+/// 4.3 step 4c as S2 calls it: [`check_seat_list_history_lines`] for a
+/// genesis (`stored == None`) or a seat PUT with `history_setting` OFF, so a
+/// genesis carrying a non-empty `history_boundary` or `pre_history:wiped`,
+/// and a PUT moving `kept -> wiped` or setting a boundary the stored list
+/// never had, are refused, while a PUT carrying the stored boundary and
+/// `pre_history` unchanged passes (fix round F1). The route's
+/// pre-transaction validation (`protected_seat_validation.rs`) still calls
+/// this; until it moves to [`check_seat_list_history_lines`] with the
+/// configured flag (W2), the route refuses every boundary genesis and every
+/// `wiped` genesis before a driver sees them, which fails closed.
 pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) -> Result<()> {
     let kind = if stored.is_some() {
         SeatListWriteKind::Put
@@ -2403,17 +2407,23 @@ pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) 
 /// first v2 list may pick any salt and any `history` (#222) but sets no
 /// boundary. `history` is free either way. Then:
 ///
-/// - `history_setting` off: S2's "until S4" refusals, keyed on the flag,
-///   on every path (4.1.1 "S4"): a non-empty boundary and `wiped` are
-///   refused, protect and the wipe write included. A channel protected with
-///   a boundary while the flag was on is therefore refused every list while
-///   it is off (the doc's "every path").
-/// - On, a seat PUT: `kept -> wiped` is refused (only the wipe write and a
-///   protect genesis set it), and a boundary over a stored v1 list is
-///   refused (the predecessor has none).
-/// - On, protect: the genesis may set both; its own rules are
+/// - A seat PUT, whatever the flag: `kept -> wiped` is refused (only the
+///   wipe write and a protect genesis set it), and so is a boundary the
+///   stored list never had (a stored v1 list, the predecessor, has none).
+///   So with the flag off a PUT carrying the stored boundary and
+///   `pre_history` unchanged lands, a stored `wiped` list included: a
+///   channel protected with a boundary while the flag was on is not
+///   wedged when it is turned back off (fix round F1, the H1 ruling).
+/// - Protect, `history_setting` off: S2's "until S4" refusals, keyed on
+///   the flag (4.1.1 "S4"): a genesis carrying a non-empty boundary or
+///   `wiped` is refused. On: the genesis may set both; its own rules are
 ///   [`check_protect_genesis_history`].
-/// - The wipe write: [`check_seat_list_wipe_lines`].
+/// - The wipe write: refused while `history_setting` is off, else
+///   [`check_seat_list_wipe_lines`].
+///
+/// With the flag off this refuses exactly what would introduce history: a
+/// genesis carrying a boundary or `wiped`, the wipe write, and `kept ->
+/// wiped`.
 ///
 /// Not here, each enforced once elsewhere: a v1 body over a stored v2 list
 /// (step 1, `check_seat_list_format`), the authority never emptied nor
@@ -2462,20 +2472,13 @@ pub fn check_seat_list_history_lines(
         }
     }
 
-    // S2's "until S4" rules, now keyed on `history_setting`: a signed
-    // `wiped` with no wipe behind it would be false, and no path may carry a
-    // boundary
-    if !history_setting {
-        if lines.pre_history == SeatListPreHistory::Wiped {
-            return Err(invalid("pre_history wiped is refused until S4"));
-        }
-        if lines.history_boundary.is_some() {
-            return Err(invalid("history_boundary is refused until S4"));
-        }
-        return Ok(());
-    }
-
     if kind == SeatListWriteKind::Put {
+        // The seat PUT, whatever `history_setting` says (fix round F1): it
+        // refuses only what would introduce history, so a list carrying
+        // the stored boundary and `pre_history` unchanged lands even after
+        // the flag is turned back off. With the immutable lines above, a
+        // boundary is carried only if the stored list has the same one, and
+        // `wiped` only if the stored list is `wiped`.
         let stored_wiped = previous
             .as_ref()
             .is_some_and(|previous| previous.pre_history == SeatListPreHistory::Wiped);
@@ -2486,6 +2489,20 @@ pub fn check_seat_list_history_lines(
         }
         if previous.is_none() && lines.history_boundary.is_some() {
             return Err(invalid("history_boundary is immutable"));
+        }
+        return Ok(());
+    }
+
+    // A genesis (protect) introduces both lines: S2's "until S4" rules, now
+    // keyed on `history_setting` (a signed `wiped` with no wipe behind it
+    // would be false). With the flag on, its own rules are
+    // `check_protect_genesis_history`.
+    if !history_setting {
+        if lines.pre_history == SeatListPreHistory::Wiped {
+            return Err(invalid("pre_history wiped is refused until S4"));
+        }
+        if lines.history_boundary.is_some() {
+            return Err(invalid("history_boundary is refused until S4"));
         }
     }
     Ok(())

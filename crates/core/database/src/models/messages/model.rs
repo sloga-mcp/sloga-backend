@@ -417,6 +417,16 @@ impl ProtectedReadView {
             | Channel::Forum { .. } => Self::unprotected(),
         }
     }
+
+    /// The view a read of `channel` is judged by, where `permission_channel`
+    /// is its permission target (`Channel::permission_target`): a thread's
+    /// view is its parent's (#182), any other channel's is its own
+    pub fn of_read_target(channel: &Channel, permission_channel: &Channel) -> Self {
+        match channel {
+            Channel::Thread { .. } => Self::of(permission_channel),
+            _ => Self::of(channel),
+        }
+    }
 }
 
 auto_derived!(
@@ -1253,13 +1263,55 @@ impl Message {
         self.validate_protected_shape(channel_protected)
     }
 
-    /// Whether this stored row may be served from `channel` (R15 backstop)
+    /// Whether this stored row may be served by a read judged by `view`
+    /// (design 7.5 "S4", S4-D15; pinned name)
     ///
-    /// A protected channel serves only rows carrying `encrypted`. A plaintext
-    /// row there (one left by the protect-vs-send compensation window, R15)
-    /// is dropped, not flagged, by the read paths that filter with this.
-    pub fn is_servable(&self, channel_protected: bool) -> bool {
-        !channel_protected || self.encrypted.is_some()
+    /// A row carrying `encrypted` always is. A plaintext row is only when the
+    /// channel is not protected, or when it was protected with a boundary B,
+    /// the row's id is at or below B (ULIDs compare as strings) and the
+    /// history is not wiped (`wiped` holds from `Requested` on). Every other
+    /// plaintext row is dropped, not flagged, by the read paths that filter
+    /// with this: a stray (R15) or a row a pending wipe is about to delete.
+    pub fn is_servable(&self, view: &ProtectedReadView) -> bool {
+        if self.encrypted.is_some() || !view.protected {
+            return true;
+        }
+
+        match &view.boundary {
+            Some(boundary) => !view.wiped && self.id.as_str() <= boundary.as_str(),
+            None => false,
+        }
+    }
+
+    /// Whether this row is a TRUE stray under `view`: plaintext in a protected
+    /// channel above its boundary, or in one protected without a boundary
+    /// (R15). A plaintext row at or below the boundary of a wiped channel is
+    /// unservable too, but it is a row the wipe is about to delete, not a
+    /// stray, and is never reported (design 7.5 "S4").
+    pub fn is_stray(&self, view: &ProtectedReadView) -> bool {
+        view.protected
+            && self.encrypted.is_none()
+            && view
+                .boundary
+                .as_deref()
+                .is_none_or(|boundary| self.id.as_str() > boundary)
+    }
+
+    /// Drop every row `view` does not serve (the backstop behind the drivers'
+    /// query filter), passing each TRUE stray to `report` (`is_stray`); a
+    /// wipe-pending drop is never reported
+    pub fn retain_servable(
+        messages: &mut Vec<Message>,
+        view: &ProtectedReadView,
+        mut report: impl FnMut(&Message),
+    ) {
+        messages.retain(|message| {
+            let servable = message.is_servable(view);
+            if !servable && message.is_stray(view) {
+                report(message);
+            }
+            servable
+        });
     }
 
     /// Refuse a partial that would write a plaintext-bearing field onto a row
@@ -1689,32 +1741,31 @@ impl Message {
 
     /// Helper function to fetch many messages with users
     ///
-    /// `channel_protected` is the queried channel's flag. In a protected
-    /// channel every row without `encrypted` is dropped (R15 backstop) before
-    /// any user id is collected, so a dropped row's author is not returned in
-    /// `users` or `members` either. Each drop is reported by ids only. The
-    /// drivers' fetch paths are untouched, so such a row can still be deleted.
+    /// `view` is the queried channel's read view (for a thread, its
+    /// parent's, #182). The drivers' query only matches the rows it serves
+    /// (`fetch_servable_messages`), so a page is full unless the history is
+    /// exhausted. Behind that, every row `is_servable` refuses is dropped
+    /// before any user id is collected, so a dropped row's author is not
+    /// returned in `users` or `members` either; a TRUE stray is reported by
+    /// ids only, a wipe-pending row never. The drivers' other fetch paths
+    /// are untouched, so such a row can still be deleted.
     pub async fn fetch_with_users(
         db: &Database,
         query: MessageQuery,
         perspective: &User,
         include_users: Option<bool>,
         server_id: Option<&str>,
-        channel_protected: bool,
+        view: &ProtectedReadView,
     ) -> Result<BulkMessageResponse> {
-        let mut messages = db.fetch_messages(query).await?;
-        messages.retain(|message| {
-            let servable = message.is_servable(channel_protected);
-            if !servable {
-                revolt_config::capture_message(
-                    &format!(
-                        "Dropped a plaintext row in protected channel {} (message {})",
-                        message.channel, message.id
-                    ),
-                    revolt_config::Level::Error,
-                );
-            }
-            servable
+        let mut messages = db.fetch_servable_messages(query, view).await?;
+        Message::retain_servable(&mut messages, view, |message| {
+            revolt_config::capture_message(
+                &format!(
+                    "Dropped a plaintext row in protected channel {} (message {})",
+                    message.channel, message.id
+                ),
+                revolt_config::Level::Error,
+            );
         });
 
         let user_ids = if let Some(true) = include_users {
@@ -3433,23 +3484,36 @@ mod encrypted_payload_tests {
         });
     }
 
+    /// The read view of a channel protected while empty (no boundary)
+    fn protected_view() -> ProtectedReadView {
+        ProtectedReadView {
+            protected: true,
+            boundary: None,
+            wiped: false,
+        }
+    }
+
     /// Message ids, user ids and member user ids of one `fetch_with_users`
     /// page of `PROTECTED_CHANNEL`, each sorted
     async fn users_page(
         db: &Database,
         viewer: &User,
-        channel_protected: bool,
+        view: &ProtectedReadView,
     ) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let response = Message::fetch_with_users(
-            db,
-            channel_query(PROTECTED_CHANNEL),
-            viewer,
-            Some(true),
-            Some(SERVER),
-            channel_protected,
-        )
-        .await
-        .expect("fetch_with_users");
+        users_page_of(db, viewer, channel_query(PROTECTED_CHANNEL), view).await
+    }
+
+    /// Message ids, user ids and member user ids of the `fetch_with_users`
+    /// page `query`, each sorted
+    async fn users_page_of(
+        db: &Database,
+        viewer: &User,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let response = Message::fetch_with_users(db, query, viewer, Some(true), Some(SERVER), view)
+            .await
+            .expect("fetch_with_users");
         let BulkMessageResponse::MessagesAndUsers {
             messages,
             users,
@@ -3538,7 +3602,7 @@ mod encrypted_payload_tests {
             }
 
             let viewer = user(VIEWER);
-            let (messages, users, members) = users_page(&db, &viewer, true).await;
+            let (messages, users, members) = users_page(&db, &viewer, &protected_view()).await;
             assert_eq!(
                 messages,
                 vec![ciphertext.id.clone()],
@@ -3555,11 +3619,156 @@ mod encrypted_payload_tests {
                 "the stray's member is dropped"
             );
 
-            let (messages, users, members) = users_page(&db, &viewer, false).await;
+            let (messages, users, members) =
+                users_page(&db, &viewer, &ProtectedReadView::unprotected()).await;
             assert_eq!(messages, vec![stray.id.clone(), ciphertext.id.clone()]);
             assert_eq!(users, vec![SENDER.to_string(), STRAY_AUTHOR.to_string()]);
             assert_eq!(members, vec![SENDER.to_string(), STRAY_AUTHOR.to_string()]);
         });
+    }
+
+    /// Design 7.5 "S4" (S4-D15, S4-PA-15): on a channel protected with its
+    /// history, `fetch_with_users` serves the pre-boundary plaintext rows
+    /// (B itself included) and drops the strays above B with their author,
+    /// and every page is FULL: the strays sit in the middle of the history
+    /// and the limit counts only served rows. From `Requested` on, the
+    /// pre-boundary rows are not served either.
+    ///
+    /// Controls: `<=` to `<` in `is_servable`; the wipe arm dropped; the
+    /// query filter dropped from either driver (a page comes back short).
+    #[tokio::test]
+    async fn fetch_with_users_serves_pre_boundary_rows_in_full_pages() {
+        use crate::{Member, MemberCompositeKey};
+
+        const STRAY_AUTHOR: &str = "01HZXCCCCCCCCCCCCCCCCCCCCC";
+        const SENDER: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+        const VIEWER: &str = "01HZXDDDDDDDDDDDDDDDDDDDDD";
+
+        database_test!(|db| async move {
+            for id in [STRAY_AUTHOR, SENDER, VIEWER] {
+                db.insert_user(&user(id)).await.expect("user");
+                db.insert_or_merge_member(&Member {
+                    id: MemberCompositeKey {
+                        server: SERVER.to_string(),
+                        user: id.to_string(),
+                    },
+                    ..Default::default()
+                })
+                .await
+                .expect("member");
+            }
+            db.insert_channel(&text_channel(PROTECTED_CHANNEL, true))
+                .await
+                .expect("protected channel");
+
+            let id = |ms: u64| Ulid::from_parts(ms, 0).to_string();
+            // Oldest first: two pre-protect rows (the second is B), a stray,
+            // a ciphertext row, a stray, a ciphertext row
+            let (p1, b, s1, c1, s2, c2) = (id(1), id(2), id(3), id(4), id(5), id(6));
+            for row in [&p1, &b] {
+                raw_insert(&db, &plaintext_message(row, PROTECTED_CHANNEL)).await;
+            }
+            for row in [&s1, &s2] {
+                let stray = Message {
+                    author: STRAY_AUTHOR.to_string(),
+                    ..plaintext_message(row, PROTECTED_CHANNEL)
+                };
+                raw_insert(&db, &stray).await;
+            }
+            for row in [&c1, &c2] {
+                db.insert_message(&Message {
+                    id: row.clone(),
+                    nonce: Some(row.clone()),
+                    ..protected_message()
+                })
+                .await
+                .expect("ciphertext row");
+            }
+
+            let page = |limit: i64, before: Option<&String>, sort: MessageSort| MessageQuery {
+                limit: Some(limit),
+                filter: MessageFilter {
+                    channel: Some(PROTECTED_CHANNEL.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: before.cloned(),
+                    after: None,
+                    sort: Some(sort),
+                },
+            };
+            let sorted = |mut ids: Vec<String>| {
+                ids.sort();
+                ids
+            };
+            let viewer = user(VIEWER);
+            let kept = ProtectedReadView {
+                protected: true,
+                boundary: Some(b.clone()),
+                wiped: false,
+            };
+
+            for (query, expected) in [
+                (
+                    page(2, None, MessageSort::Latest),
+                    vec![c1.clone(), c2.clone()],
+                ),
+                (
+                    page(2, Some(&c1), MessageSort::Latest),
+                    vec![p1.clone(), b.clone()],
+                ),
+                (
+                    page(3, None, MessageSort::Oldest),
+                    vec![p1.clone(), b.clone(), c1.clone()],
+                ),
+            ] {
+                let (messages, users, members) = users_page_of(&db, &viewer, query, &kept).await;
+                assert_eq!(messages, sorted(expected), "a full page around the strays");
+                assert!(!users.contains(&STRAY_AUTHOR.to_string()), "{users:?}");
+                assert!(!members.contains(&STRAY_AUTHOR.to_string()), "{members:?}");
+            }
+
+            let wiped = ProtectedReadView {
+                wiped: true,
+                ..kept.clone()
+            };
+            let (messages, users, _) =
+                users_page_of(&db, &viewer, page(50, None, MessageSort::Latest), &wiped).await;
+            assert_eq!(messages, vec![c1.clone(), c2.clone()], "wipe pending");
+            assert_eq!(users, vec![SENDER.to_string()]);
+
+            // The same first page read as unprotected holds a stray: the
+            // fixture really interleaves them
+            let (messages, _, _) = users_page_of(
+                &db,
+                &viewer,
+                page(2, None, MessageSort::Latest),
+                &ProtectedReadView::unprotected(),
+            )
+            .await;
+            assert_eq!(messages, sorted(vec![s2.clone(), c2.clone()]));
+        });
+    }
+
+    /// Store `message` raw, past `insert_message`'s protected-shape check
+    async fn raw_insert(db: &Database, message: &Message) {
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .messages
+                    .lock()
+                    .await
+                    .insert(message.id.clone(), message.clone());
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<Message>("messages")
+                    .insert_one(message)
+                    .await
+                    .expect("raw row");
+            }
+        }
     }
 
     /// R2 guard: a row carrying `encrypted` refuses every partial that writes
@@ -3761,7 +3970,7 @@ mod encrypted_payload_tests {
 mod protected_read_view_tests {
     use std::collections::HashMap;
 
-    use super::ProtectedReadView;
+    use super::{EncryptedPayload, Message, ProtectedReadView};
     use crate::{Channel, HistoryWipe, ProtectedHistory};
 
     fn text(protected: bool, protected_history: Option<ProtectedHistory>) -> Channel {
@@ -3865,5 +4074,195 @@ mod protected_read_view_tests {
         ] {
             assert_eq!(ProtectedReadView::of(&channel), unprotected);
         }
+    }
+
+    fn row(id: &str, encrypted: bool) -> Message {
+        Message {
+            id: id.to_string(),
+            content: (!encrypted).then(|| "hi".to_string()),
+            encrypted: encrypted.then(|| {
+                serde_json::from_str::<EncryptedPayload>(
+                    r#"{"v":1,"group_id":"4a4ba4afc6e6ea1c9f4a271f7eded44ea860fdb814e4e1377121e02635a715b5","epoch":7,"sender_device_id":"ffeeddccbbaa99887766554433221100","nonce":"YGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3","ciphertext":"7lyFR0kjzwme2lNYYODt2rZmmYbNUdZ30V/L+qdgbzKONjAeYv8uelDf4K/WcWB+eZH5NVTNV+9i0rW+AGfyD6wMllEfcDpoWSemybsLAnUd2vkx5tmdCrhnWkKmIt4AYuiW2wJroVo6I6KRe9NVyjAYMDwcOtyPnYobI5CPNwg3O7QjdMMjhdkjNGEVh4oGVS+nI04P","sig":"Ylo7oNHshb/EPJ67afoJrw2H0t6FKRiM3dDOUbHGchXCtq3AqxJLv0GuR87KNu8msVg2nKn3iVs4OCDOu15MAA"}"#,
+                )
+                .expect("5.6 payload_json")
+            }),
+            ..Default::default()
+        }
+    }
+
+    // Ids around the boundary B = "01J0000000000000000000000B"
+    const BELOW: &str = "01J0000000000000000000000A";
+    const AT_B: &str = "01J0000000000000000000000B";
+    const ABOVE: &str = "01J0000000000000000000000C";
+
+    fn view(protected: bool, boundary: Option<&str>, wiped: bool) -> ProtectedReadView {
+        ProtectedReadView {
+            protected,
+            boundary: boundary.map(str::to_string),
+            wiped,
+        }
+    }
+
+    /// Design 7.5 "S4" (S4-D15): the `is_servable` truth table. An
+    /// encrypted row always passes; a plaintext row only when the channel is
+    /// unprotected, or at or below a boundary that is not wiped.
+    ///
+    /// Controls: `<=` to `<` (the row at B); the wipe arm dropped.
+    #[test]
+    fn is_servable_truth_table() {
+        let views = [
+            ("unprotected", view(false, None, false)),
+            ("protected while empty", view(true, None, false)),
+            ("boundary, kept", view(true, Some(AT_B), false)),
+            (
+                "boundary, wipe requested or done",
+                view(true, Some(AT_B), true),
+            ),
+        ];
+        // (row, encrypted, servable under each view in order)
+        let table = [
+            (BELOW, true, [true, true, true, true]),
+            (AT_B, true, [true, true, true, true]),
+            (ABOVE, true, [true, true, true, true]),
+            (BELOW, false, [true, false, true, false]),
+            (AT_B, false, [true, false, true, false]),
+            (ABOVE, false, [true, false, false, false]),
+        ];
+        for (id, encrypted, expected) in table {
+            let message = row(id, encrypted);
+            for ((name, view), servable) in views.iter().zip(expected) {
+                assert_eq!(
+                    message.is_servable(view),
+                    servable,
+                    "{id} encrypted={encrypted} under {name}"
+                );
+            }
+        }
+
+        // A protected view without a boundary ignores `wiped`
+        assert!(!row(BELOW, false).is_servable(&view(true, None, true)));
+        assert!(row(BELOW, true).is_servable(&view(true, None, true)));
+        // An unprotected view serves plaintext whatever else it says
+        assert!(row(ABOVE, false).is_servable(&view(false, Some(AT_B), true)));
+    }
+
+    /// Design 7.5 "S4": the backstop drops every unservable row but reports
+    /// only TRUE strays (plaintext above B, or on a channel protected
+    /// without a boundary), never a wipe-pending drop
+    ///
+    /// Control: every drop reported -> the wipe-pending rows are reported.
+    #[test]
+    fn retain_servable_reports_only_true_strays() {
+        let rows = || {
+            vec![
+                row(BELOW, false),
+                row(AT_B, false),
+                row(AT_B, true),
+                row(ABOVE, false),
+                row(ABOVE, true),
+            ]
+        };
+        let run = |view: &ProtectedReadView| {
+            let mut messages = rows();
+            let mut reported = Vec::new();
+            Message::retain_servable(&mut messages, view, |message| {
+                reported.push(message.id.clone())
+            });
+            let kept: Vec<(String, bool)> = messages
+                .iter()
+                .map(|message| (message.id.clone(), message.encrypted.is_some()))
+                .collect();
+            (kept, reported)
+        };
+        let ids = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|(id, e)| (id.to_string(), *e)).collect()
+        };
+
+        // Kept history: the stray above B is dropped and reported
+        let (kept, reported) = run(&view(true, Some(AT_B), false));
+        assert_eq!(
+            kept,
+            ids(&[(BELOW, false), (AT_B, false), (AT_B, true), (ABOVE, true)])
+        );
+        assert_eq!(reported, vec![ABOVE.to_string()]);
+
+        // Wipe pending: the pre-boundary rows are dropped silently
+        let (kept, reported) = run(&view(true, Some(AT_B), true));
+        assert_eq!(kept, ids(&[(AT_B, true), (ABOVE, true)]));
+        assert_eq!(reported, vec![ABOVE.to_string()], "no wipe-pending report");
+
+        // Protected while empty: every plaintext row is a stray
+        let (kept, reported) = run(&view(true, None, false));
+        assert_eq!(kept, ids(&[(AT_B, true), (ABOVE, true)]));
+        assert_eq!(
+            reported,
+            vec![BELOW.to_string(), AT_B.to_string(), ABOVE.to_string()]
+        );
+
+        // Unprotected: nothing dropped, nothing reported
+        let (kept, reported) = run(&ProtectedReadView::unprotected());
+        assert_eq!(kept.len(), 5);
+        assert!(reported.is_empty());
+
+        for (id, encrypted, view, stray) in [
+            (ABOVE, false, view(true, Some(AT_B), true), true),
+            (AT_B, false, view(true, Some(AT_B), true), false),
+            (BELOW, false, view(true, Some(AT_B), true), false),
+            (BELOW, false, view(true, None, false), true),
+            (ABOVE, true, view(true, Some(AT_B), false), false),
+            (ABOVE, false, view(false, Some(AT_B), false), false),
+        ] {
+            assert_eq!(row(id, encrypted).is_stray(&view), stray, "{id} {view:?}");
+        }
+    }
+
+    /// #182: a thread is judged by its parent's view, every other channel by
+    /// its own
+    ///
+    /// Control: a thread judged by its own view -> unprotected.
+    #[test]
+    fn a_read_target_judges_a_thread_by_its_parent() {
+        let at = iso8601_timestamp::Timestamp::UNIX_EPOCH;
+        let parent = text(
+            true,
+            history(HistoryWipe::Requested {
+                at,
+                by: "U".to_string(),
+            }),
+        );
+        let thread = Channel::Thread {
+            id: "TH".to_string(),
+            server: "S".to_string(),
+            parent_channel: "T".to_string(),
+            name: "thread".to_string(),
+            creator: "U".to_string(),
+            origin_message_id: None,
+            last_message_id: None,
+            archived: false,
+            archived_timestamp: None,
+            auto_archive_minutes: 1440,
+            locked: false,
+            applied_tags: vec![],
+        };
+        let parent_view = ProtectedReadView::of(&parent);
+        assert!(parent_view.protected && parent_view.wiped);
+
+        assert_eq!(
+            ProtectedReadView::of_read_target(&thread, &parent),
+            parent_view
+        );
+        // A non-thread is its own permission target
+        assert_eq!(
+            ProtectedReadView::of_read_target(&parent, &parent),
+            parent_view
+        );
+        let open = text(false, None);
+        assert_eq!(
+            ProtectedReadView::of_read_target(&open, &open),
+            ProtectedReadView::unprotected()
+        );
+        // A thread's stray at or below the parent's boundary is not served
+        // once the parent's wipe is requested
+        assert!(!row("A", false).is_servable(&ProtectedReadView::of_read_target(&thread, &parent)));
     }
 }

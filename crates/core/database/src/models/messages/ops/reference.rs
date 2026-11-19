@@ -1,6 +1,6 @@
 use crate::{
     AppendMessage, Channel, FieldsMessage, Message, MessageQuery, MessageTimePeriod,
-    PartialMessage, ReferenceDb,
+    PartialMessage, ProtectedReadView, ReferenceDb,
 };
 use indexmap::IndexSet;
 use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
@@ -83,6 +83,23 @@ impl AbstractMessages for ReferenceDb {
 
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>> {
+        self.fetch_servable_messages(query, &ProtectedReadView::unprotected())
+            .await
+    }
+
+    /// Fetch the messages of `query` that `view` serves: the match below
+    /// tests `Message::is_servable` before the limit is applied, as the
+    /// MongoDB driver's `$or` does
+    async fn fetch_servable_messages(
+        &self,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> Result<Vec<Message>> {
+        // A protected channel holds no text the server may search (O-12)
+        if view.protected && query.filter.query.is_some() {
+            return Ok(vec![]);
+        }
+
         let messages = self.messages.lock().await;
         let mut matched_messages: Vec<Message> = messages
             .values()
@@ -113,6 +130,11 @@ impl AbstractMessages for ReferenceDb {
                     if message.pinned.unwrap_or_default() == pinned {
                         return false;
                     }
+                }
+
+                // Keep only the rows `view` serves (design 7.5 "S4")
+                if !message.is_servable(view) {
+                    return false;
                 }
 
                 true
@@ -472,14 +494,21 @@ impl AbstractMessages for ReferenceDb {
         Ok(batch.into_iter().cloned().collect())
     }
 
-    /// Delete the listed plaintext rows of a channel; returns how many went
-    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64> {
+    /// Delete the listed plaintext rows of a channel at or below the boundary;
+    /// returns how many went
+    async fn delete_messages_by_ids(
+        &self,
+        channel: &str,
+        boundary: &str,
+        ids: &[String],
+    ) -> Result<u64> {
         let listed: HashSet<&str> = ids.iter().map(String::as_str).collect();
         let mut messages = self.messages.lock().await;
         let before = messages.len();
 
         messages.retain(|id, message| {
             let wiped = message.channel == channel
+                && id.as_str() <= boundary
                 && message.encrypted.is_none()
                 && listed.contains(id.as_str());
             !wiped

@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, User,
+    Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, ProtectedReadView, User,
 };
 use revolt_models::v0::{self, MessageSort};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -47,9 +47,11 @@ pub async fn query(
         include_users,
     } = options;
 
-    // Stray plaintext rows are dropped in a protected channel (decision 9
-    // (W2)); a thread is judged by its parent (W2 audit B1)
-    let channel_protected = channel.is_protected() || permission_channel.is_protected();
+    // A protected channel serves its encrypted rows and, while its history
+    // is kept, the plaintext rows at or below its boundary; strays and
+    // wipe-pending rows are left out by the query itself (design 7.5 "S4").
+    // A thread is judged by its parent (W2 audit B1, #182).
+    let view = ProtectedReadView::of_read_target(&channel, &permission_channel);
 
     Message::fetch_with_users(
         db,
@@ -72,7 +74,7 @@ pub async fn query(
         &user,
         include_users,
         channel.server(),
-        channel_protected,
+        &view,
     )
     .await
     .map(Json)
@@ -189,5 +191,104 @@ mod test {
         protect_under_stored_rows(&harness.db, parent.id()).await;
         let after = history(&harness, &session.token, thread.id()).await;
         assert!(after.is_empty(), "{after:?}");
+    }
+
+    /// The route's JSON answer to `GET /channels/{channel_id}/messages?{query}`
+    async fn history_json(
+        harness: &TestHarness,
+        token: &str,
+        channel_id: &str,
+        query: &str,
+    ) -> Value {
+        let response = harness
+            .client
+            .get(format!("/channels/{channel_id}/messages?{query}"))
+            .header(Header::new("x-session-token", token.to_string()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "{query}");
+        response.into_json().await.expect("JSON")
+    }
+
+    fn ids_of(list: &Value) -> Vec<String> {
+        list.as_array()
+            .unwrap_or_else(|| panic!("not a list: {}", list))
+            .iter()
+            .map(|message| message["_id"].as_str().expect("an id").to_string())
+            .collect()
+    }
+
+    /// Design 7.5 "S4" (S4-D15, S4-PA-15): the history of a channel
+    /// protected with its history serves the pre-boundary plaintext rows (B
+    /// included) and leaves out the strays above B and their author, in FULL
+    /// pages in both directions though the strays sit mid-history. From the
+    /// moment the wipe is `Requested`, the pre-boundary rows are not served.
+    ///
+    /// Controls: `<=` to `<`; the wipe arm dropped; the query filter dropped
+    /// from the driver (a page comes back short).
+    #[test]
+    fn history_serves_pre_boundary_rows_in_full_pages() {
+        crate::util::test::rt().block_on(history_serves_pre_boundary_rows_in_full_pages_case())
+    }
+
+    async fn history_serves_pre_boundary_rows_in_full_pages_case() {
+        use crate::util::test::HistoryChannel;
+        use revolt_database::HistoryWipe;
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (_, _, stray_author) = harness.new_user().await;
+        let fixture = harness
+            .new_history_channel(&owner, &session, &stray_author)
+            .await;
+        let channel_id = fixture.protected.channel.id();
+        let [p1, b] = [&fixture.pre_boundary[0], &fixture.pre_boundary[1]];
+        let [c1, c2] = [&fixture.ciphertext[0], &fixture.ciphertext[1]];
+
+        for (query, expected) in [
+            ("limit=2".to_string(), HistoryChannel::ids(&[c2, c1])),
+            (
+                format!("limit=2&before={}", c1.id),
+                HistoryChannel::ids(&[b, p1]),
+            ),
+            (
+                "limit=3&sort=Oldest".to_string(),
+                HistoryChannel::ids(&[p1, b, c1]),
+            ),
+        ] {
+            let page = history_json(&harness, &session.token, channel_id, &query).await;
+            assert_eq!(ids_of(&page), expected, "{query}");
+
+            let with_users = history_json(
+                &harness,
+                &session.token,
+                channel_id,
+                &format!("{query}&include_users=true"),
+            )
+            .await;
+            assert_eq!(ids_of(&with_users["messages"]), expected, "{query}");
+            let text = with_users.to_string();
+            assert!(!text.contains(&stray_author.id), "{}: {}", query, text);
+            for stray in &fixture.strays {
+                assert!(!text.contains(&stray.id), "{}: {}", query, text);
+            }
+        }
+
+        harness
+            .protect_with_history_raw(
+                channel_id,
+                fixture.boundary(),
+                HistoryWipe::Requested {
+                    at: iso8601_timestamp::Timestamp::now_utc(),
+                    by: owner.id.clone(),
+                },
+            )
+            .await;
+        let page = history_json(&harness, &session.token, channel_id, "limit=50").await;
+        assert_eq!(
+            ids_of(&page),
+            HistoryChannel::ids(&[c2, c1]),
+            "wipe pending"
+        );
     }
 }

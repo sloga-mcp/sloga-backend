@@ -21,6 +21,7 @@ use revolt_database::{
 };
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
+use revolt_database::{HistoryWipe, PartialChannel, ProtectedHistory, ProtectedReadView};
 use revolt_models::v0;
 use revolt_payments::stripe::MockStripe;
 use revolt_permissions::OverrideField;
@@ -1234,8 +1235,21 @@ impl TestHarness {
         sender: &TestE2EEDevice,
         group: &MlsGroup,
     ) -> Message {
+        self.new_encrypted_message_with_id(channel, sender, group, &Ulid::new().to_string())
+            .await
+    }
+
+    /// [`Self::new_encrypted_message`] with the message id `id`, so a
+    /// fixture can place the row in a channel's history
+    pub async fn new_encrypted_message_with_id(
+        &self,
+        channel: &Channel,
+        sender: &TestE2EEDevice,
+        group: &MlsGroup,
+        id: &str,
+    ) -> Message {
         let message = Message {
-            id: Ulid::new().to_string(),
+            id: id.to_string(),
             channel: channel.id().to_string(),
             author: sender.user_id.clone(),
             nonce: Some(Ulid::new().to_string()),
@@ -1247,6 +1261,168 @@ impl TestHarness {
             .await
             .expect("Failed to store test encrypted message");
         message
+    }
+
+    /// Give the already protected `channel_id` the history boundary
+    /// `boundary` and the wipe state `wipe`, written straight through the
+    /// driver (`update_channel`, past `Channel::update`'s guard) as protect
+    /// with a boundary and the wipe writers store it (design 2.1 "S4"; no
+    /// seat list carries it). Returns the re-read channel.
+    pub async fn protect_with_history_raw(
+        &self,
+        channel_id: &str,
+        boundary: &str,
+        wipe: HistoryWipe,
+    ) -> Channel {
+        let wiped = !matches!(wipe, HistoryWipe::None);
+        self.db
+            .update_channel(
+                channel_id,
+                &PartialChannel {
+                    protected_history: Some(Box::new(ProtectedHistory {
+                        boundary: boundary.to_string(),
+                        wipe,
+                    })),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("Failed to store test protected history");
+        let channel = self
+            .db
+            .fetch_channel(channel_id)
+            .await
+            .expect("the channel");
+        assert_eq!(
+            ProtectedReadView::of(&channel),
+            ProtectedReadView {
+                protected: true,
+                boundary: Some(boundary.to_string()),
+                wiped,
+            },
+            "the fixture channel must already be protected"
+        );
+        channel
+    }
+
+    /// Store `message` as-is, past `insert_message`'s protected-shape check,
+    /// as pre-protect history or the R15 compensation window leaves a row
+    pub async fn insert_raw_message(&self, message: &Message) {
+        match &self.db {
+            Database::Reference(reference) => {
+                reference
+                    .messages
+                    .lock()
+                    .await
+                    .insert(message.id.clone(), message.clone());
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<Message>("messages")
+                    .insert_one(message)
+                    .await
+                    .expect("Failed to store raw test message");
+            }
+        }
+    }
+
+    /// End to end: [`Self::new_protected_channel`] (owned by `owner`,
+    /// `stray_author` joined but not seated), its generation-0 Text group,
+    /// and six rows, oldest first: two plaintext rows by the owner written
+    /// before protect (the second is the boundary B), a plaintext stray by
+    /// `stray_author` above B, a ciphertext row, a second stray, a second
+    /// ciphertext row; then the boundary with `HistoryWipe::None`
+    /// ([`Self::protect_with_history_raw`]). The strays sit in the MIDDLE of
+    /// the history, where a post-filter alone would leave a short page.
+    pub async fn new_history_channel(
+        &self,
+        owner: &User,
+        owner_session: &Session,
+        stray_author: &User,
+    ) -> HistoryChannel {
+        let protected = self.new_protected_channel(owner, owner_session, &[]).await;
+        self.join_server(&protected.server, stray_author).await;
+        let group = self
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+
+        // Ten minutes ago, a second apart: ids in creation order
+        let base = Ulid::new().timestamp_ms() - 600_000;
+        let id = |k: u64| Ulid::from_parts(base + k * 1_000, 0).to_string();
+        let plaintext = |k: u64, author: &User, content: &str| Message {
+            id: id(k),
+            channel: protected.channel.id().to_string(),
+            author: author.id.clone(),
+            content: Some(content.to_string()),
+            ..Default::default()
+        };
+
+        let pre_boundary = vec![
+            plaintext(0, owner, "Before protect"),
+            plaintext(1, owner, "Before protect"),
+        ];
+        let strays = vec![
+            plaintext(2, stray_author, "Stray"),
+            plaintext(4, stray_author, "Stray"),
+        ];
+        for row in pre_boundary.iter().chain(&strays) {
+            self.insert_raw_message(row).await;
+        }
+        let mut ciphertext = Vec::new();
+        for k in [3, 5] {
+            ciphertext.push(
+                self.new_encrypted_message_with_id(
+                    &protected.channel,
+                    &protected.owner_device,
+                    &group,
+                    &id(k),
+                )
+                .await,
+            );
+        }
+
+        let channel = self
+            .protect_with_history_raw(
+                protected.channel.id(),
+                &pre_boundary[1].id,
+                HistoryWipe::None,
+            )
+            .await;
+
+        HistoryChannel {
+            protected: ProtectedChannel {
+                channel,
+                ..protected
+            },
+            pre_boundary,
+            strays,
+            ciphertext,
+        }
+    }
+}
+
+/// What [`TestHarness::new_history_channel`] built
+pub struct HistoryChannel {
+    /// The protected channel, re-read after its boundary was written
+    pub protected: ProtectedChannel,
+    /// The two pre-protect plaintext rows, oldest first; the last is B
+    pub pre_boundary: Vec<Message>,
+    /// The two plaintext strays above B, oldest first
+    pub strays: Vec<Message>,
+    /// The two ciphertext rows above B, oldest first
+    pub ciphertext: Vec<Message>,
+}
+
+impl HistoryChannel {
+    /// The boundary B
+    pub fn boundary(&self) -> &str {
+        &self.pre_boundary[1].id
+    }
+
+    /// Ids of `rows`
+    pub fn ids(rows: &[&Message]) -> Vec<String> {
+        rows.iter().map(|row| row.id.clone()).collect()
     }
 }
 
@@ -2103,7 +2279,13 @@ mod protected_fixture_tests {
         assert_eq!(encrypted.group_id, successor.id);
         assert_eq!(encrypted.epoch, successor.current_epoch);
         assert_eq!(encrypted.sender_device_id, member_device.device_id);
-        assert!(fetched.is_servable(true));
+        // Servable under the strictest view: protected, its pre-boundary
+        // history being wiped
+        assert!(fetched.is_servable(&ProtectedReadView {
+            protected: true,
+            boundary: Some(fetched.id.clone()),
+            wiped: true,
+        }));
         fetched
             .validate_protected_shape(true)
             .expect("the stored shape");

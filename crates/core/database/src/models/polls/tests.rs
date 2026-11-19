@@ -355,3 +355,131 @@ async fn delete_for_messages_removes_a_poll_row_that_does_not_decode() {
         }
     });
 }
+
+/// The call failed with a database error (the fail-closed answer of the
+/// Mongo scans), not with any other error and not with a value.
+#[cfg(feature = "mongodb")]
+fn assert_database_error<T: std::fmt::Debug>(result: revolt_result::Result<T>) {
+    match result {
+        Err(error) => assert!(
+            matches!(
+                error.error_type,
+                revolt_result::ErrorType::DatabaseError { .. }
+            ),
+            "{error:?}"
+        ),
+        Ok(value) => panic!("expected a database error, got {value:?}"),
+    }
+}
+
+/// MongoDB only (the Reference driver stores typed rows): an OPEN poll row
+/// that does not decode fails the open-poll scan, and so the protect close,
+/// instead of being skipped and left open. An undecodable CLOSED row is not
+/// part of the scan and does not fail it.
+#[tokio::test]
+async fn open_poll_scan_fails_closed_on_an_open_row_that_does_not_decode() {
+    database_test!(|db| async move {
+        #[cfg(feature = "mongodb")]
+        {
+            if let crate::Database::MongoDb(mongo) = &db {
+                let good = poll(
+                    "01POLLF1000000000000000000",
+                    "01MSGF10000000000000000000",
+                    CHAN_A,
+                    false,
+                );
+                db.insert_poll(&good).await.unwrap();
+                let raw = mongo.col::<bson::Document>("polls");
+                raw.insert_one(bson::doc! {
+                    "_id": "01POLLF2000000000000000000",
+                    "message": "01MSGF20000000000000000000",
+                    "channel": CHAN_A,
+                    "question": "Best crab?",
+                    "answers": "not a list",
+                    "closed": true
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    ids(&db.fetch_open_polls_for_channel(CHAN_A).await.unwrap()),
+                    vec![good.id.clone()]
+                );
+
+                let broken = "01POLLF3000000000000000000";
+                raw.insert_one(bson::doc! {
+                    "_id": broken,
+                    "message": "01MSGF30000000000000000000",
+                    "channel": CHAN_A,
+                    "question": "Best crab?",
+                    "answers": "not a list"
+                })
+                .await
+                .unwrap();
+                // Proof of the fixture: the typed read cannot decode it.
+                assert!(mongo
+                    .col::<Poll>("polls")
+                    .find_one(bson::doc! { "_id": broken })
+                    .await
+                    .is_err());
+
+                assert_database_error(db.fetch_open_polls_for_channel(CHAN_A).await);
+                assert_database_error(Poll::close_open_for_channel(&db, CHAN_A).await);
+
+                // The scan failed before any flip: the good poll is still open.
+                assert_eq!(db.fetch_poll(&good.id).await.unwrap(), good);
+                // Another channel's scan is unaffected.
+                assert!(db
+                    .fetch_open_polls_for_channel(CHAN_B)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+    });
+}
+
+/// MongoDB only: a poll row whose `_id` is not a string fails the delete
+/// before anything is deleted, instead of being skipped and left behind.
+#[tokio::test]
+async fn delete_for_messages_fails_closed_on_a_poll_row_with_a_non_string_id() {
+    database_test!(|db| async move {
+        #[cfg(feature = "mongodb")]
+        {
+            if let crate::Database::MongoDb(mongo) = &db {
+                let kept = poll(
+                    "01POLLG1000000000000000000",
+                    "01MSGG10000000000000000000",
+                    CHAN_A,
+                    false,
+                );
+                db.insert_poll(&kept).await.unwrap();
+                db.upsert_poll_vote(&ballot(&kept, USER_1, vec![0]))
+                    .await
+                    .unwrap();
+                let message = "01MSGG20000000000000000000";
+                let raw = mongo.col::<bson::Document>("polls");
+                raw.insert_one(bson::doc! {
+                    "_id": 42_i32,
+                    "message": message,
+                    "channel": CHAN_A
+                })
+                .await
+                .unwrap();
+
+                assert_database_error(
+                    Poll::delete_for_messages(&db, &[kept.message.clone(), message.to_string()])
+                        .await,
+                );
+
+                // Nothing was deleted: both rows and the ballot remain.
+                assert_eq!(db.fetch_poll(&kept.id).await.unwrap(), kept);
+                assert_eq!(db.fetch_poll_votes(&kept.id).await.unwrap().len(), 1);
+                assert!(raw
+                    .find_one(bson::doc! { "_id": 42_i32 })
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    });
+}

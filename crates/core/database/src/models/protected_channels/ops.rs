@@ -210,10 +210,11 @@ pub trait AbstractProtectedChannels: Sync + Send {
     /// server (its membership is claimed, else `FailedValidation`;
     /// decision 13 (W2)).
     ///
-    /// S4: `history_setting` is read from the config too; while it is off a
-    /// list carrying a boundary or `wiped` is refused, and while it is on
-    /// the list keeps the stored boundary and never moves `kept -> wiped`
-    /// (only `request_history_wipe` does), 4.3 "S4".
+    /// S4: `history_setting` is read from the config too. Flag on or off,
+    /// the list keeps the stored boundary and `pre_history` and never moves
+    /// `kept -> wiped` (only `request_history_wipe` does), 4.3 "S4"; while
+    /// the flag is off nothing may introduce history (no new boundary, no
+    /// `wiped`, no wipe), so a list carrying the stored lines still lands.
     ///
     /// S2: `formats_v2` is read from the config. While the open Text group
     /// carries `signer_lost`, a list that does not resolve it (4.3 step 7)

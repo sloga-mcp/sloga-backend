@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use revolt_result::Result;
 
-use crate::{AppendMessage, FieldsMessage, Message, MessageQuery, PartialMessage};
+use crate::{
+    AppendMessage, FieldsMessage, Message, MessageQuery, PartialMessage, ProtectedReadView,
+};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -51,6 +53,26 @@ pub trait AbstractMessages: Sync + Send {
 
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>>;
+
+    /// Fetch the messages of `query` that a read judged by `view` serves
+    /// (design 7.5 "S4", S4-PA-15), for the history, search and pinned reads
+    ///
+    /// On a protected channel the query itself carries the servable
+    /// predicate: a row carrying `encrypted`, or, while the channel has a
+    /// boundary B and is not wiped, a row with `_id <= B`. On MongoDB that is
+    /// `{ $or: [{ encrypted: { $ne: null } }, { _id: { $lte: B } }] }` (the
+    /// second arm only with a boundary and no wipe), the exact complement of
+    /// the wipe job's `encrypted: null`; the Reference driver tests
+    /// `Message::is_servable`. The limit counts only those rows, so a page is
+    /// full unless the history is exhausted. A content search
+    /// (`filter.query`) on a protected channel answers nothing without
+    /// reading a row (O-12). With an unprotected view this is
+    /// `fetch_messages`.
+    async fn fetch_servable_messages(
+        &self,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> Result<Vec<Message>>;
 
     /// Fetch multiple messages by given IDs
     async fn fetch_messages_by_id(&self, ids: &[String]) -> Result<Vec<Message>>;
@@ -157,13 +179,21 @@ pub trait AbstractMessages: Sync + Send {
         limit: i64,
     ) -> Result<Vec<Message>>;
 
-    /// Delete the listed plaintext rows of `channel`; returns how many went
+    /// Delete the listed plaintext rows of `channel` at or below `boundary`;
+    /// returns how many went
     ///
-    /// Scoped to `channel` AND `encrypted: null` as well as to the ids, so a
-    /// wrong id list can never delete a row carrying `encrypted` or another
-    /// channel's row. No cascade: attachments, polls, softres sheets and
-    /// unread mentions are the caller's (the `history_wipes` job).
-    async fn delete_messages_by_ids(&self, channel: &str, ids: &[String]) -> Result<u64>;
+    /// Scoped to `channel`, `_id <= boundary` AND `encrypted: null` as well as
+    /// to the ids, so a wrong id list can never delete a row carrying
+    /// `encrypted`, a row above the boundary or another channel's row. Ids
+    /// compare as strings, as in `fetch_history_wipe_batch`, so an empty
+    /// boundary deletes nothing. No cascade: attachments, polls, softres
+    /// sheets and unread mentions are the caller's (the `history_wipes` job).
+    async fn delete_messages_by_ids(
+        &self,
+        channel: &str,
+        boundary: &str,
+        ids: &[String],
+    ) -> Result<u64>;
 
     /// Id of the newest row of `channel`, encrypted or not; None when it has none
     async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>>;
@@ -982,15 +1012,24 @@ mod tests {
 
             let listed = [id(0), id(1), id(2)];
             assert_eq!(
-                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                db.delete_messages_by_ids(channel, &boundary, &listed)
+                    .await
+                    .unwrap(),
                 3
             );
             assert_eq!(
-                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                db.delete_messages_by_ids(channel, &boundary, &listed)
+                    .await
+                    .unwrap(),
                 0,
                 "a repeat deletes nothing"
             );
-            assert_eq!(db.delete_messages_by_ids(channel, &[]).await.unwrap(), 0);
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &boundary, &[])
+                    .await
+                    .unwrap(),
+                0
+            );
             assert!(db
                 .fetch_history_wipe_batch(channel, &boundary, 100)
                 .await
@@ -1040,7 +1079,9 @@ mod tests {
                 elsewhere.id.clone(),
             ];
             assert_eq!(
-                db.delete_messages_by_ids(channel, &listed).await.unwrap(),
+                db.delete_messages_by_ids(channel, &boundary, &listed)
+                    .await
+                    .unwrap(),
                 2,
                 "only the channel's two plaintext rows may go"
             );
@@ -1108,7 +1149,7 @@ mod tests {
                 .unwrap();
             assert_eq!(wipe_ids(&batch), vec![row.id.clone()]);
             assert_eq!(
-                db.delete_messages_by_ids(channel, std::slice::from_ref(&row.id))
+                db.delete_messages_by_ids(channel, &row.id, std::slice::from_ref(&row.id))
                     .await
                     .unwrap(),
                 1
@@ -1188,7 +1229,7 @@ mod tests {
                 db.fetch_newest_message_id(channel).await.unwrap(),
                 Some(middle.id.clone())
             );
-            db.delete_messages_by_ids(channel, &[first.id.clone(), middle.id.clone()])
+            db.delete_messages_by_ids(channel, &middle.id, &[first.id.clone(), middle.id.clone()])
                 .await
                 .unwrap();
             assert_eq!(db.fetch_newest_message_id(channel).await.unwrap(), None);
@@ -1196,6 +1237,262 @@ mod tests {
                 db.fetch_newest_message_id(other).await.unwrap(),
                 Some(elsewhere.id.clone())
             );
+        });
+    }
+
+    /// The delete is bounded by B too: a plaintext stray ABOVE B is never
+    /// deleted, not even when the list names it, and the count leaves it out;
+    /// the row exactly at B goes. An empty boundary deletes nothing.
+    ///
+    /// Controls: the bound dropped from either driver -> the stray goes and
+    /// the count is 3; `$lt` / `<` -> the row at B stays and the count is 1.
+    #[tokio::test]
+    async fn wipe_delete_never_goes_above_the_boundary() {
+        database_test!(|db| async move {
+            let channel = "01CHANWIPE0000000000000008";
+            let oldest = wipe_row(1_000, 1, channel, None);
+            let at_boundary = wipe_row(2_000, 1, channel, None);
+            // Plaintext just above B, in the same millisecond: a stray the
+            // read rule hides, which the wipe has no mandate to delete
+            let stray = wipe_row(2_000, 2, channel, None);
+            let newer = wipe_row(3_000, 1, channel, None);
+            for row in [&oldest, &at_boundary, &stray, &newer] {
+                insert_raw(&db, row).await;
+            }
+            let boundary = at_boundary.id.clone();
+            assert!(stray.id > boundary && newer.id > stray.id);
+
+            let listed = [
+                newer.id.clone(),
+                stray.id.clone(),
+                at_boundary.id.clone(),
+                oldest.id.clone(),
+            ];
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &boundary, &listed)
+                    .await
+                    .unwrap(),
+                2,
+                "the count must leave out the listed rows above B"
+            );
+            assert!(!exists(&db, &oldest.id).await, "a row below B was kept");
+            assert!(
+                !exists(&db, &at_boundary.id).await,
+                "the row exactly at B must be deleted"
+            );
+            assert!(
+                exists(&db, &stray.id).await,
+                "a listed plaintext stray above B was deleted"
+            );
+            assert!(
+                exists(&db, &newer.id).await,
+                "a listed plaintext row above B was deleted"
+            );
+
+            let above = [stray.id.clone(), newer.id.clone()];
+            assert_eq!(
+                db.delete_messages_by_ids(channel, &boundary, &above)
+                    .await
+                    .unwrap(),
+                0,
+                "a list of rows above B deletes nothing"
+            );
+            assert_eq!(
+                db.delete_messages_by_ids(channel, "", &above)
+                    .await
+                    .unwrap(),
+                0,
+                "an empty boundary deletes nothing"
+            );
+            assert!(exists(&db, &stray.id).await);
+            assert!(exists(&db, &newer.id).await);
+        });
+    }
+
+    fn read_view(boundary: Option<&Message>, wiped: bool) -> crate::ProtectedReadView {
+        crate::ProtectedReadView {
+            protected: true,
+            boundary: boundary.map(|row| row.id.clone()),
+            wiped,
+        }
+    }
+
+    fn history_page(
+        channel: &str,
+        limit: i64,
+        before: Option<&Message>,
+        sort: v0::MessageSort,
+    ) -> crate::MessageQuery {
+        crate::MessageQuery {
+            limit: Some(limit),
+            filter: crate::MessageFilter {
+                channel: Some(channel.to_string()),
+                ..Default::default()
+            },
+            time_period: crate::MessageTimePeriod::Absolute {
+                before: before.map(|row| row.id.clone()),
+                after: None,
+                sort: Some(sort),
+            },
+        }
+    }
+
+    async fn servable_ids(
+        db: &crate::Database,
+        query: crate::MessageQuery,
+        view: &crate::ProtectedReadView,
+    ) -> Vec<String> {
+        wipe_ids(
+            &db.fetch_servable_messages(query, view)
+                .await
+                .expect("a servable read"),
+        )
+    }
+
+    /// Design 7.5 "S4" (S4-PA-15): the history query itself carries the
+    /// servable predicate, so the limit counts only served rows and a page
+    /// is full around strays sitting in the MIDDLE of the history (just
+    /// after B), in both directions and for a `nearby` read. An encrypted
+    /// row is served whatever its id; from `Requested` on no plaintext row
+    /// is. On MongoDB an explicit `encrypted: null` is plaintext, as for the
+    /// wipe job.
+    ///
+    /// Control: the filter dropped from either driver -> pages come back
+    /// with strays in them.
+    #[tokio::test]
+    async fn servable_query_keeps_full_pages_around_strays() {
+        use v0::MessageSort::{Latest, Oldest};
+
+        database_test!(|db| async move {
+            let channel = "01CHANREAD0000000000000001";
+            // Oldest first: ciphertext below B, two pre-protect rows (the
+            // second is B), a stray, ciphertext, a stray, ciphertext
+            let e0 = wipe_row(500, 1, channel, Some(1));
+            let p1 = wipe_row(1_000, 1, channel, None);
+            let b = wipe_row(2_000, 1, channel, None);
+            let s1 = wipe_row(3_000, 1, channel, None);
+            let c1 = wipe_row(4_000, 1, channel, Some(2));
+            let s2 = wipe_row(5_000, 1, channel, None);
+            let c2 = wipe_row(6_000, 1, channel, Some(3));
+            for row in [&c2, &s2, &c1, &s1, &b, &p1, &e0] {
+                insert_raw(&db, row).await;
+            }
+            let ids = |rows: &[&Message]| -> Vec<String> {
+                rows.iter().map(|row| row.id.clone()).collect()
+            };
+
+            #[cfg(feature = "mongodb")]
+            if let crate::Database::MongoDb(mongo) = &db {
+                use bson::{Bson, Document};
+
+                let null = wipe_row(5_500, 1, channel, None);
+                let mut raw = bson::to_document(&null).expect("encode the row");
+                raw.insert("encrypted", Bson::Null);
+                mongo
+                    .col::<Document>("messages")
+                    .insert_one(raw)
+                    .await
+                    .expect("insert the explicit null row");
+            }
+
+            let kept = read_view(Some(&b), false);
+            for (query, expected) in [
+                (history_page(channel, 2, None, Latest), ids(&[&c2, &c1])),
+                (history_page(channel, 2, Some(&c1), Latest), ids(&[&b, &p1])),
+                (history_page(channel, 2, Some(&p1), Latest), ids(&[&e0])),
+                (
+                    history_page(channel, 4, None, Oldest),
+                    ids(&[&e0, &p1, &b, &c1]),
+                ),
+            ] {
+                assert_eq!(servable_ids(&db, query, &kept).await, expected);
+            }
+
+            // Wipe pending, and a channel protected without a boundary:
+            // ciphertext only
+            for view in [read_view(Some(&b), true), read_view(None, false)] {
+                assert_eq!(
+                    servable_ids(&db, history_page(channel, 50, None, Latest), &view).await,
+                    ids(&[&c2, &c1, &e0]),
+                    "{view:?}"
+                );
+            }
+
+            // Both directions of a `nearby` read (the Reference driver
+            // neither sorts nor limits it)
+            let nearby = crate::MessageQuery {
+                limit: Some(50),
+                filter: crate::MessageFilter {
+                    channel: Some(channel.to_string()),
+                    ..Default::default()
+                },
+                time_period: crate::MessageTimePeriod::Relative {
+                    nearby: s1.id.clone(),
+                },
+            };
+            let mut around = servable_ids(&db, nearby, &kept).await;
+            around.sort();
+            assert_eq!(around, ids(&[&e0, &p1, &b, &c1, &c2]));
+
+            // The fixture really interleaves: read unprotected, the first
+            // page holds a stray
+            let open = crate::ProtectedReadView::unprotected();
+            let first = servable_ids(&db, history_page(channel, 2, None, Latest), &open).await;
+            assert_eq!(first[0], c2.id);
+            assert_ne!(first[1], c1.id, "a plaintext row sits between c1 and c2");
+            assert_eq!(
+                wipe_ids(
+                    &db.fetch_messages(history_page(channel, 2, None, Latest))
+                        .await
+                        .unwrap()
+                ),
+                first,
+                "fetch_messages is the unprotected read"
+            );
+        });
+    }
+
+    /// O-12: a content search on a protected channel answers nothing, even
+    /// with pre-boundary plaintext matching it, and reads no row (on MongoDB
+    /// a `$text` query would fail without the text index, which this
+    /// database lacks)
+    #[tokio::test]
+    async fn servable_query_answers_a_protected_content_search_with_nothing() {
+        database_test!(|db| async move {
+            let channel = "01CHANREAD0000000000000002";
+            let b = wipe_row(1_000, 1, channel, None);
+            insert_raw(&db, &b).await;
+
+            let search = || crate::MessageQuery {
+                limit: Some(50),
+                filter: crate::MessageFilter {
+                    channel: Some(channel.to_string()),
+                    query: Some("before".to_string()),
+                    ..Default::default()
+                },
+                time_period: crate::MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            };
+            for view in [read_view(Some(&b), false), read_view(None, false)] {
+                assert_eq!(
+                    db.fetch_servable_messages(search(), &view)
+                        .await
+                        .expect("no read, no error"),
+                    vec![],
+                    "{view:?}"
+                );
+            }
+
+            if matches!(db, crate::Database::Reference(_)) {
+                assert_eq!(
+                    servable_ids(&db, search(), &crate::ProtectedReadView::unprotected()).await,
+                    vec![b.id.clone()],
+                    "the same search unprotected matches the row"
+                );
+            }
         });
     }
 }

@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, User,
+    Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, ProtectedReadView, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -53,13 +53,14 @@ pub async fn search(
         include_users,
     } = options;
 
-    // Decision 9 (W2): a protected channel holds no text the server can
-    // search, so a content search there finds nothing, and answers so
-    // without reading a message. The pinned listing below still runs; it
-    // drops any stray plaintext row in `fetch_with_users`. A thread is
-    // judged by its parent (W2 audit B1).
-    let channel_protected = channel.is_protected() || permission_channel.is_protected();
-    if query.is_some() && channel_protected {
+    // Decision 9 (W2), O-12: a protected channel holds no text the server
+    // may search (its pre-boundary plaintext included), so a content search
+    // there finds nothing, and answers so without reading a message. The
+    // pinned listing below still runs; it serves what history serves
+    // (design 7.5 "S4"). A thread is judged by its parent (W2 audit B1,
+    // #182).
+    let view = ProtectedReadView::of_read_target(&channel, &permission_channel);
+    if query.is_some() && view.protected {
         return Ok(Json(no_matches(include_users, channel.server())));
     }
 
@@ -82,7 +83,7 @@ pub async fn search(
         &user,
         include_users,
         channel.server(),
-        channel_protected,
+        &view,
     )
     .await
     .map(Json)
@@ -104,8 +105,8 @@ fn no_matches(include_users: Option<bool>, server_id: Option<&str>) -> v0::BulkM
 #[cfg(test)]
 mod tests {
     use revolt_database::{
-        Channel, Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, PartialChannel,
-        PartialMessage, Session, User,
+        Channel, Database, HistoryWipe, Message, MessageFilter, MessageQuery, MessageTimePeriod,
+        PartialChannel, PartialMessage, ProtectedReadView, Session, User,
     };
     use revolt_permissions::{ChannelPermission, OverrideField};
     use rocket::http::{ContentType, Header, Status};
@@ -379,7 +380,13 @@ mod tests {
             encrypted: fixture.ciphertext.encrypted.clone(),
             ..Default::default()
         };
-        assert!(probe.is_servable(true));
+        // Servable under the strictest view: a protected channel whose
+        // pre-boundary history is being wiped
+        assert!(probe.is_servable(&ProtectedReadView {
+            protected: true,
+            boundary: Some(probe.id.clone()),
+            wiped: true,
+        }));
         insert_raw(&harness.db, &probe).await;
         let mut matched = driver_matches(&harness.db, protected_id).await;
         matched.sort();
@@ -613,6 +620,106 @@ mod tests {
     fn a_search_in_a_thread_under_a_protected_parent_serves_no_stray() {
         crate::util::test::rt().block_on(Box::pin(
             a_search_in_a_thread_under_a_protected_parent_serves_no_stray_case(),
+        ))
+    }
+
+    /// Design 7.5 "S4", O-12: on a channel protected with its history a
+    /// content search still answers nothing, though pre-boundary plaintext
+    /// matches it; the pinned listing serves the pinned pre-boundary row and
+    /// ciphertext and drops the pinned stray above B (MONGODB only for the
+    /// listing: the Reference driver's `pinned` filter is inverted), and
+    /// from `Requested` on it drops the pre-boundary row too
+    ///
+    /// Controls: `<=` to `<`, the wipe arm dropped (listing, MONGODB).
+    async fn a_boundary_channel_searches_nothing_and_lists_pre_boundary_pins_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        ensure_text_index(db).await;
+        let (_, session, owner) = harness.new_user().await;
+        let (_, _, stray_author) = harness.new_user().await;
+        let fixture = Box::pin(harness.new_history_channel(&owner, &session, &stray_author)).await;
+        let channel_id = fixture.protected.channel.id();
+        let (p1, stray, c1) = (
+            &fixture.pre_boundary[0],
+            &fixture.strays[0],
+            &fixture.ciphertext[0],
+        );
+
+        // Lowercase (the Reference driver lowercases the content only) and
+        // not an English stop word (MongoDB's `$text` drops those)
+        let search_query = json!({ "query": "protect" });
+        let mut matched = db
+            .fetch_messages(MessageQuery {
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    query: Some("protect".to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+                limit: None,
+            })
+            .await
+            .expect("the driver search")
+            .into_iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        matched.sort();
+        assert_eq!(
+            matched,
+            vec![p1.id.clone(), fixture.boundary().to_string()],
+            "the driver itself matches the pre-boundary rows"
+        );
+        let answer = search(&harness, &session, channel_id, search_query).await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+        assert_eq!(body(&answer), json!([]));
+
+        if !is_mongo(db) {
+            eprintln!("listing skipped: the Reference driver's pinned filter is inverted");
+            return;
+        }
+        for row in [p1, stray, c1] {
+            db.update_message(
+                &row.id,
+                &PartialMessage {
+                    pinned: Some(true),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("pin");
+        }
+        let listed = |answer: &(Status, String)| {
+            assert_eq!(answer.0, Status::Ok, "{:?}", answer);
+            let mut listed = ids(&body(answer));
+            listed.sort();
+            listed
+        };
+        let answer = search(&harness, &session, channel_id, json!({ "pinned": true })).await;
+        assert_eq!(listed(&answer), vec![p1.id.clone(), c1.id.clone()]);
+
+        harness
+            .protect_with_history_raw(
+                channel_id,
+                fixture.boundary(),
+                HistoryWipe::Requested {
+                    at: iso8601_timestamp::Timestamp::now_utc(),
+                    by: owner.id.clone(),
+                },
+            )
+            .await;
+        let answer = search(&harness, &session, channel_id, json!({ "pinned": true })).await;
+        assert_eq!(listed(&answer), vec![c1.id.clone()], "wipe pending");
+    }
+
+    #[test]
+    fn a_boundary_channel_searches_nothing_and_lists_pre_boundary_pins() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_boundary_channel_searches_nothing_and_lists_pre_boundary_pins_case(),
         ))
     }
 }

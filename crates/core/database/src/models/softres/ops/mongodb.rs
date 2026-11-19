@@ -11,6 +11,20 @@ use super::AbstractSoftRes;
 static COL: &str = "softres_sheets";
 static COL_RESERVES: &str = "softres_reserves";
 
+/// The `_id` of every row, as a string. Sheets are only ever written with
+/// string ids, so a non-string `_id` is a corrupt row: skipping it would
+/// leave it behind (or open) unreported, so the call fails closed instead.
+fn string_ids(rows: &[Document]) -> Result<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.get_str("_id").map(str::to_string).map_err(|error| {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("find", COL)
+            })
+        })
+        .collect()
+}
+
 #[async_trait]
 impl AbstractSoftRes for MongoDb {
     /// Insert a new sheet, enforcing one sheet per event.
@@ -193,10 +207,7 @@ impl AbstractSoftRes for MongoDb {
             .await
             .map_err(|_| create_database_error!("find", COL))?;
 
-        Ok(rows
-            .iter()
-            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
-            .collect())
+        string_ids(&rows)
     }
 
     /// Insert or replace a user's reserve row, returning the previous row
@@ -301,11 +312,11 @@ impl AbstractSoftRes for MongoDb {
     async fn delete_softres_for_messages(&self, message_ids: &[String]) -> Result<()> {
         // Ids only, read as plain documents: a sheet that no longer decodes
         // as a `SoftResSheet` is still deleted (the history wipe must not
-        // leave its title or note behind), and a cursor error fails the
-        // call instead of silently skipping a row. Reserves go first, so a
-        // failure between the two deletes leaves the sheets for a retry to
-        // find.
-        let sheet_ids: Vec<String> = self
+        // leave its title or note behind), and a cursor error or a
+        // non-string `_id` fails the call instead of silently skipping a
+        // row. Reserves go first, so a failure between the two deletes
+        // leaves the sheets for a retry to find.
+        let rows: Vec<Document> = self
             .col::<Document>(COL)
             .find(doc! {
                 "message": {
@@ -315,12 +326,10 @@ impl AbstractSoftRes for MongoDb {
             .projection(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .try_collect::<Vec<Document>>()
+            .try_collect()
             .await
-            .map_err(|_| create_database_error!("find", COL))?
-            .iter()
-            .filter_map(|row| row.get_str("_id").ok().map(str::to_string))
-            .collect();
+            .map_err(|_| create_database_error!("find", COL))?;
+        let sheet_ids = string_ids(&rows)?;
 
         if sheet_ids.is_empty() {
             return Ok(());
