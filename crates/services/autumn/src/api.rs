@@ -881,6 +881,7 @@ mod upload_tests {
             id: upload_hash_block_key(kind, hash),
             request_id: BLOCK_REQUEST.to_string(),
             created_at: Timestamp::now_utc(),
+            also_request_ids: vec![],
         })
         .await
         .unwrap();

@@ -9,6 +9,11 @@ auto_derived!(
         /// The request whose removal added the block
         pub request_id: String,
         pub created_at: Timestamp,
+        /// Other requests whose removal blocked the same key later. The block
+        /// stays until every request holding it lets go (a restore), so one
+        /// request's restore never lifts another request's block.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub also_request_ids: Vec<String>,
     }
 );
 

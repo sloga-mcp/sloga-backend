@@ -8,7 +8,7 @@
 //! before are recorded on the request first (`held_files`), so an unhide or
 //! a hold release never touches a file that was already deleted or reported.
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -762,15 +762,55 @@ pub async fn plan_copy_count(
         .count() as u64)
 }
 
-/// Record each file's current flags on the request, then hide every file
+/// Whether each file was `reported` before any Take It Down request hid it.
+///
+/// Hiding sets `reported`, so for a file another request already holds the
+/// live flag may be nothing but that request's hide. Then the holders'
+/// records decide (reported before only if every holder saw it reported);
+/// otherwise the live flag does. Without this, two requests holding one file
+/// would each take the other's hide for a report, and no hold release would
+/// ever let the sweep delete the file.
+///
+/// Only `reported` is inherited: `was_deleted` stays the live flag, so an
+/// unhide can never show a file another request removed.
+pub async fn prior_reported(
+    db: &Database,
+    request_id: &str,
+    files: &[File],
+) -> Result<HashMap<String, bool>> {
+    let others = db
+        .fetch_recent_takedown_requests(Timestamp::UNIX_EPOCH)
+        .await?;
+
+    Ok(files
+        .iter()
+        .map(|file| {
+            let mut records = others
+                .iter()
+                .filter(|other| other.id != request_id)
+                .flat_map(|other| other.held_files.iter())
+                .filter(|held| held.id == file.id)
+                .peekable();
+            let was_reported = if records.peek().is_some() {
+                records.all(|held| held.was_reported)
+            } else {
+                file.reported == Some(true)
+            };
+            (file.id.clone(), was_reported)
+        })
+        .collect())
+}
+
+/// Record each file's flags from before on the request, then hide every file
 /// (`deleted` and `reported`). A file the request already holds keeps its
-/// first record. `files` must be rows read before this request changed
-/// them. Returns the ids hidden.
+/// first record; `reported` comes from [`prior_reported`]. `files` must be
+/// rows read before this request changed them. Returns the ids hidden.
 pub async fn hold_files(
     db: &Database,
     request: &mut TakedownRequest,
     files: &[File],
 ) -> Result<Vec<String>> {
+    let prior = prior_reported(db, &request.id, files).await?;
     let mut ids: Vec<String> = Vec::new();
     for file in files {
         if ids.contains(&file.id) {
@@ -782,7 +822,10 @@ pub async fn hold_files(
             request.held_files.push(HeldFile {
                 id: file.id.clone(),
                 was_deleted: file.deleted == Some(true),
-                was_reported: file.reported == Some(true),
+                was_reported: prior
+                    .get(&file.id)
+                    .copied()
+                    .unwrap_or(file.reported == Some(true)),
             });
         }
     }
@@ -1100,6 +1143,7 @@ pub async fn execute_removal_tracked(
                 id: key.clone(),
                 request_id: request.id.clone(),
                 created_at,
+                also_request_ids: vec![],
             })
             .await?;
             blocked_keys.push(key);
@@ -1593,6 +1637,50 @@ mod tests {
             assert!(again.removed_files.is_empty());
             assert!(again.deleted_messages.is_empty());
             assert_eq!(request.held_files, held_before);
+        });
+    }
+
+    #[tokio::test]
+    async fn second_holder_does_not_take_a_hide_for_a_report() {
+        database_test!(|db| async move {
+            seed(&db).await;
+
+            // A first request hides a live file that was never reported
+            let live = db.fetch_attachment_by_id(TARGET_FILE).await.unwrap();
+            assert_ne!(live.reported, Some(true));
+            let mut first = request(vec![]);
+            super::hold_files(&db, &mut first, &[live]).await.unwrap();
+            db.insert_takedown_request(&first).await.unwrap();
+
+            // A second request holds the same file: its row now says reported,
+            // but only because of the first hide
+            let hidden = db.fetch_attachment_by_id(TARGET_FILE).await.unwrap();
+            assert_eq!(hidden.reported, Some(true));
+            let mut second = request(vec![]);
+            second.id = "01TDREQUEST000000000000002".to_string();
+            super::hold_files(&db, &mut second, &[hidden])
+                .await
+                .unwrap();
+
+            let record = second
+                .held_files
+                .iter()
+                .find(|held| held.id == TARGET_FILE)
+                .unwrap();
+            assert!(!record.was_reported, "a hide is not a report");
+            // `was_deleted` stays live, so the second request can never
+            // unhide what the first one removed
+            assert!(record.was_deleted);
+
+            // The request's own record is never read as another holder's
+            let own = super::prior_reported(
+                &db,
+                &first.id,
+                &[db.fetch_attachment_by_id(TARGET_FILE).await.unwrap()],
+            )
+            .await
+            .unwrap();
+            assert_eq!(own.get(TARGET_FILE), Some(&true));
         });
     }
 

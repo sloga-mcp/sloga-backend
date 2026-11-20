@@ -48,7 +48,7 @@ use redis_kiss::{
 };
 use revolt_config::{capture_error, FeaturesTakedown};
 use revolt_database::{
-    removal::{still_shown, try_takedown_mutex, TakedownMutexGuard},
+    removal::{prior_reported, still_shown, try_takedown_mutex, TakedownMutexGuard},
     resolve_locations,
     util::{
         email::{email_templates, send_email_safe},
@@ -1138,12 +1138,17 @@ async fn auto_hide_request(
         return Ok(false);
     }
 
+    // Another request's hide is not a report (see `prior_reported`)
+    let prior = prior_reported(db, &request.id, &files).await?;
     let held: Vec<HeldFile> = files
         .iter()
         .map(|file| HeldFile {
             id: file.id.clone(),
             was_deleted: file.deleted == Some(true),
-            was_reported: file.reported == Some(true),
+            was_reported: prior
+                .get(&file.id)
+                .copied()
+                .unwrap_or(file.reported == Some(true)),
         })
         .collect();
     let ids: Vec<String> = held.iter().map(|file| file.id.clone()).collect();

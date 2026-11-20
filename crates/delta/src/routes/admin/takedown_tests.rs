@@ -1504,6 +1504,73 @@ async fn a_decline_and_a_removal_at_once_leave_the_removed_file_hidden_case() {
 }
 
 #[test]
+fn a_removal_after_a_decline_corrects_it() {
+    crate::util::test::rt().block_on(a_removal_after_a_decline_corrects_it_case())
+}
+
+/// A reviewer who declined (with bad faith) and then removes is correcting
+/// the decision: the decline reason and the bad-faith mark go, the log says
+/// so, and the requester gets the new outcome by email.
+async fn a_removal_after_a_decline_corrects_it_case() {
+    let fixture = fixture(25, true).await;
+    let harness = &fixture.harness;
+    let session = &fixture.session;
+
+    let (_, _, uploader) = harness.new_user().await;
+    let (target, image, _) = image_message(harness, &uploader, 0).await;
+    let requester = requester_address();
+    let request = insert_request(harness, vec![target], &requester, "fp-a", 48).await;
+
+    let response = act(
+        harness,
+        session,
+        &path(&request, "decline"),
+        Some(json!({ "reason": "NotIntimate", "bad_faith": true })),
+    )
+    .await;
+    assert_eq!(response.status(), Status::NoContent);
+    let (declined_mail, _) = harness.assert_email(&requester).await;
+    assert_eq!(declined_mail.subject, "takedown_declined");
+    // Bad faith reads as "other" to the requester
+    assert!(declined_mail
+        .text
+        .contains(revolt_database::util::email::TAKEDOWN_DECLINE_OTHER));
+
+    let response = act(
+        harness,
+        session,
+        &path(&request, "remove"),
+        Some(json!({ "targets": [0] })),
+    )
+    .await;
+    assert_eq!(response.status(), Status::Ok);
+
+    let after = stored(&harness.db, &request).await;
+    assert_eq!(after.status, TakedownStatus::Removed);
+    assert_eq!(after.decline_reason, None);
+    assert!(
+        !after.bad_faith,
+        "a corrected decline leaves no bad-faith mark"
+    );
+    assert_eq!(flags(&harness.db, &image).await, (Some(true), Some(true)));
+
+    let (removed_mail, code) = harness.assert_email(&requester).await;
+    assert_eq!(code, reference_for(&request.id));
+    // The full outcome, not the partial text or a second decline
+    assert_eq!(removed_mail.subject, "takedown_removed");
+
+    let actions = audit_actions(&harness.db, &request).await;
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| **action == StaffAuditAction::TakedownBadFaith)
+            .count(),
+        2,
+        "marked at the decline, cleared at the removal: {actions:?}"
+    );
+}
+
+#[test]
 fn an_unhide_and_a_removal_at_once_leave_the_removed_file_hidden() {
     crate::util::test::rt()
         .block_on(an_unhide_and_a_removal_at_once_leave_the_removed_file_hidden_case())

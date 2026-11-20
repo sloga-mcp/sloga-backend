@@ -1161,6 +1161,7 @@ pub(super) mod tests {
             id: upload_hash_block_key(kind, hash),
             request_id: "01TD0000000000000000000007".to_string(),
             created_at: Timestamp::now_utc(),
+            also_request_ids: vec![],
         })
         .await
         .unwrap();

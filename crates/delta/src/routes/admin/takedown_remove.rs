@@ -26,7 +26,14 @@ struct Removed {
     request: TakedownRequest,
     outcome: RemovalOutcome,
     plan: RemovalPlan,
+    /// The request had been declined: this removal corrects that decision,
+    /// so the requester gets the new outcome under its own marker
+    corrected: bool,
 }
+
+/// Outcome marker for a removal that corrects a decline (the decline
+/// already spent `email:outcome`)
+const MARK_OUTCOME_CORRECTED: &str = "email:outcome:corrected";
 
 /// # Remove Take It Down Targets
 ///
@@ -61,6 +68,7 @@ pub async fn remove_takedown_targets(
         request,
         outcome,
         plan,
+        corrected,
     } = removed?;
 
     // Emails after the mutex: a slow mail server never holds it
@@ -68,12 +76,17 @@ pub async fn remove_takedown_targets(
     // Requester: "removed" only for a full removal with copies and the
     // re-upload block, otherwise the fixed partial text
     let templates = email_templates().await;
+    let marker = if corrected {
+        MARK_OUTCOME_CORRECTED
+    } else {
+        "email:outcome"
+    };
     if request.status == TakedownStatus::Removed && plan.include_copies && plan.block_reuploads {
         email_requester(
             db,
             &user.id,
             &request,
-            "email:outcome",
+            marker,
             &templates.takedown_removed,
             None,
             "requester_removed",
@@ -84,7 +97,7 @@ pub async fn remove_takedown_targets(
             db,
             &user.id,
             &request,
-            "email:outcome",
+            marker,
             &templates.takedown_partial,
             Some(TAKEDOWN_PARTIAL_REASON),
             "requester_partial",
@@ -222,8 +235,19 @@ async fn remove_locked(
     let now = Timestamp::now_utc();
     let hold_until = hold_end(now).await;
     let mut taken: Vec<HeldFile> = Vec::new();
+    let mut corrected = false;
+    let mut cleared_bad_faith = false;
     let saved = save_with(db, working.clone(), |r| {
         merge_held_files(&mut r.held_files, &new_held);
+        // Removing after a decline corrects it: the decline reason and any
+        // bad-faith mark go, or the status page would show both outcomes and
+        // the requester's later requests would lose auto-hide
+        corrected = r.status == TakedownStatus::Declined;
+        cleared_bad_faith = corrected && r.bad_faith;
+        if corrected {
+            r.decline_reason = None;
+            r.bad_faith = false;
+        }
         // Closed meanwhile: keep that outcome, only add what was hidden
         if r.status != TakedownStatus::Closed {
             r.status = if partly {
@@ -273,10 +297,23 @@ async fn remove_locked(
         Some(reason),
     )
     .await;
+    if cleared_bad_faith {
+        StaffAuditEntry::record(
+            db,
+            Some(actor),
+            StaffAuditAction::TakedownBadFaith,
+            Some(request.id.as_str()),
+            vec![],
+            None,
+            Some("cleared_by_removal"),
+        )
+        .await;
+    }
 
     Ok(Removed {
         request,
         outcome,
         plan,
+        corrected,
     })
 }
