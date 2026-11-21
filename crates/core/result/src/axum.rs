@@ -171,6 +171,7 @@ impl IntoResponse for Error {
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
             ErrorType::E2EEDeviceRemoved => StatusCode::FORBIDDEN,
             ErrorType::E2EEDeviceHeldElsewhere => StatusCode::FORBIDDEN,
+            ErrorType::EncryptionRequired { .. } => StatusCode::FORBIDDEN,
 
             ErrorType::PaymentsDisabled => StatusCode::BAD_REQUEST,
             ErrorType::CipherSalesClosed => StatusCode::FORBIDDEN,
@@ -291,6 +292,32 @@ mod tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("in-memory response body was not ready"),
         }
+    }
+
+    /// A refused unencrypted write is a 403 with the side in the body and
+    /// nothing else; `rocket.rs` pins the same answer
+    #[test]
+    fn encryption_required_is_forbidden_with_side_in_body() {
+        let response = crate::create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
     }
 
     #[test]

@@ -2432,6 +2432,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice: None,
+            e2ee_only: false,
         };
         assert!(!gates_turned_on(
             &group,

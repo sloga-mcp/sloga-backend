@@ -379,6 +379,12 @@ pub enum ErrorType {
     /// device, or this session cannot show it is the device or another of
     /// the account's devices. Nothing was removed
     E2EEDeviceHeldElsewhere,
+    /// An unencrypted write was refused because one side of the conversation
+    /// takes encrypted messages only. `side` is one of `sender`,
+    /// `recipient`, `group`, `member`.
+    EncryptionRequired {
+        side: String,
+    },
 
     // ? Payment and Cipher errors
     /// Payments are switched off in the config (`[features.payments]`)
@@ -595,6 +601,25 @@ mod tests {
     fn device_held_elsewhere_error_serializes_by_name() {
         let value = serde_json::to_value(create_error!(E2EEDeviceHeldElsewhere)).unwrap();
         assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceHeldElsewhere" }));
+    }
+
+    /// The type and the side the client keys its "encrypted only" notice on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn encryption_required_error_serializes_by_name() {
+        let error = create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#"{"type":"EncryptionRequired","side":"sender"}"#
+        );
     }
 
     /// The type the client keys its "Call ended" notice on

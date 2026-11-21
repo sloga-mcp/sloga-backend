@@ -176,6 +176,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::VideoCallFull { .. } => Status::Conflict,
             ErrorType::E2EEDeviceRemoved => Status::Forbidden,
             ErrorType::E2EEDeviceHeldElsewhere => Status::Forbidden,
+            ErrorType::EncryptionRequired { .. } => Status::Forbidden,
 
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
@@ -300,6 +301,31 @@ mod tests {
             .respond_to(request.inner())
             .unwrap();
         assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    /// A refused unencrypted write is a 403 with the side in the body and
+    /// nothing else; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn encryption_required_is_forbidden_with_side_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        })
+        .respond_to(request.inner())
+        .expect("error responder");
+
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
     }
 
     #[rocket::async_test]

@@ -598,6 +598,17 @@ prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 # and delta's device removal decides from the database alone; the lock's
 # protections between a user's own installs are gone while it is off.
 claim_lock = true
+# "Encrypted only" for accounts and groups. only_available lets people turn
+# the setting on; it ships OFF, and a config without the key keeps it off
+# (turning the setting off still works).
+# only_enforced makes existing marks refuse unencrypted writes; it is ON by
+# default, and a config without the key keeps it on. Emergency switch only:
+# false keeps every stored mark but refuses nothing. Set either one here under
+# an explicit [features.e2ee] header in Revolt.overrides.toml, or with
+# REVOLT__FEATURES__E2EE__ONLY_AVAILABLE / REVOLT__FEATURES__E2EE__ONLY_ENFORCED,
+# and RESTART delta AND crond.
+only_available = false
+only_enforced = true
 
 [features.takedown]
 # Take It Down Act requests. Ships OFF; prod sets it in Revolt.overrides.toml under an explicit

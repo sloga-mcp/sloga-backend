@@ -74,6 +74,12 @@ auto_derived_partial!(
         /// fetched, signature-verified key bundle, never from this flag
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub e2ee_enabled: bool,
+        /// Whether this account only takes end-to-end encrypted direct
+        /// and group messages
+        ///
+        /// Public. Only `PUT /e2ee/only` and account deletion write it.
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub e2ee_only: bool,
 
         /// Linked streaming channels (public denormalized copy; tokens live
         /// ONLY in the private user_stream_connections collection)
@@ -384,6 +390,7 @@ impl Default for User {
             privileged: Default::default(),
             bot: Default::default(),
             e2ee_enabled: Default::default(),
+            e2ee_only: Default::default(),
             connections: Default::default(),
             name_style: Default::default(),
             custom_badge: Default::default(),
@@ -1360,6 +1367,8 @@ impl User {
                 discriminator: Some("0000".to_string()),
                 flags: Some(2),
                 relations: Some(Vec::new()),
+                // A deleted account is never encrypted-only
+                e2ee_only: Some(false),
                 ..Default::default()
             },
             vec![
@@ -2620,6 +2629,30 @@ mod tests {
                     .await
                     .unwrap(),
                 "another account's tombstone was removed"
+            );
+        });
+    }
+
+    /// A deleted account does not stay encrypted-only, in memory or stored
+    #[tokio::test]
+    async fn mark_deleted_clears_e2ee_only() {
+        database_test!(|db| async move {
+            let mut user = User {
+                id: "01JA0000000000000000000EO1".to_string(),
+                username: "EncryptedOnly".to_string(),
+                discriminator: "1003".to_string(),
+                e2ee_only: true,
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+            assert!(db.fetch_user(&user.id).await.unwrap().e2ee_only);
+
+            user.mark_deleted(&db).await.unwrap();
+
+            assert!(!user.e2ee_only, "the in-memory user kept the flag");
+            assert!(
+                !db.fetch_user(&user.id).await.unwrap().e2ee_only,
+                "the stored user kept the flag"
             );
         });
     }

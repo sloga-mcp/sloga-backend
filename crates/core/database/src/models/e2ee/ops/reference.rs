@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
@@ -25,6 +27,18 @@ impl AbstractE2EE for ReferenceDb {
             .collect();
         result.sort_by(|a, b| a.device_id.cmp(&b.device_id));
         Ok(result)
+    }
+
+    async fn fetch_e2ee_user_ids_with_identity(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashSet<String>> {
+        let identities = self.e2ee_identities.lock().await;
+        Ok(identities
+            .values()
+            .filter(|identity| user_ids.contains(&identity.user_id))
+            .map(|identity| identity.user_id.clone())
+            .collect())
     }
 
     async fn insert_e2ee_identity(&self, identity: &E2EEIdentity) -> Result<()> {

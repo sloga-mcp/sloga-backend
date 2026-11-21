@@ -193,6 +193,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice: None,
+            e2ee_only: false,
         };
 
         assert!(ensure_interactions_allowed(&group).is_ok());

@@ -79,6 +79,15 @@ auto_derived!(
             /// Voice call configuration for this group (limits, on/off)
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
             voice: Option<VoiceInformation>,
+
+            /// Whether this group only takes end-to-end encrypted messages.
+            /// Set when the group is created; no edit route can set or
+            /// clear it.
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            e2ee_only: bool,
         },
         /// Text channel belonging to a server
         TextChannel {

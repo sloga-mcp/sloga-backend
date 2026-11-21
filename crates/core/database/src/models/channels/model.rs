@@ -81,6 +81,13 @@ auto_derived!(
             /// Voice call configuration for this group (limits, on/off)
             #[serde(skip_serializing_if = "Option::is_none")]
             voice: Option<VoiceInformation>,
+
+            /// Whether this group only takes end-to-end encrypted messages.
+            ///
+            /// Set when the group is created. No client edit can set or
+            /// clear it: it is not in `PartialChannel` or `FieldsChannel`.
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            e2ee_only: bool,
         },
         /// Text channel belonging to a server
         TextChannel {
@@ -876,6 +883,8 @@ impl Channel {
             spoiler: data.spoiler.unwrap_or(false),
 
             voice: None,
+
+            e2ee_only: false,
         };
 
         db.insert_channel(&channel).await?;
@@ -1787,6 +1796,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice,
+            e2ee_only: false,
         };
 
         // Default group (unconfigured): calling is ON with no limit.
@@ -1966,6 +1976,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice: None,
+            e2ee_only: false,
         };
         assert!(!group.is_protected());
         assert!(refused_with(
@@ -2686,6 +2697,7 @@ mod tests {
                 nsfw,
                 spoiler,
                 voice: None,
+                e2ee_only: false,
             };
 
             for channel in [text, forum, group] {

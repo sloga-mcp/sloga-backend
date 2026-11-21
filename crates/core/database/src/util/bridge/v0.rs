@@ -174,6 +174,7 @@ impl From<crate::Channel> for Channel {
                 nsfw,
                 spoiler,
                 voice,
+                e2ee_only,
             } => Channel::Group {
                 id,
                 name,
@@ -188,6 +189,7 @@ impl From<crate::Channel> for Channel {
                 // Calling is on for an unconfigured group, and clients read
                 // call availability from this object, so always send one.
                 voice: Some(voice.unwrap_or_default().into()),
+                e2ee_only,
             },
             crate::Channel::TextChannel {
                 id,
@@ -314,6 +316,7 @@ impl From<Channel> for crate::Channel {
                 nsfw,
                 spoiler,
                 voice,
+                e2ee_only,
             } => crate::Channel::Group {
                 id,
                 name,
@@ -326,6 +329,7 @@ impl From<Channel> for crate::Channel {
                 nsfw,
                 spoiler,
                 voice: voice.map(|voice| voice.into()),
+                e2ee_only,
             },
             Channel::TextChannel {
                 id,
@@ -1657,6 +1661,7 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            e2ee_only: self.e2ee_only,
             name_style,
             cipher,
             perks: 0,
@@ -1747,6 +1752,7 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            e2ee_only: self.e2ee_only,
             name_style,
             cipher,
             perks: 0,
@@ -1793,6 +1799,7 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            e2ee_only: self.e2ee_only,
             name_style,
             cipher,
             perks: 0,
@@ -1847,6 +1854,7 @@ impl crate::User {
             privileged: self.privileged,
             bot: self.bot.map(|bot| bot.into()),
             e2ee_enabled: self.e2ee_enabled,
+            e2ee_only: self.e2ee_only,
             name_style,
             cipher,
             perks,
@@ -1888,6 +1896,7 @@ impl From<User> for crate::User {
             privileged: value.privileged,
             bot: value.bot.map(Into::into),
             e2ee_enabled: value.e2ee_enabled,
+            e2ee_only: value.e2ee_only,
             suspended_until: None,
             last_acknowledged_policy_change: Timestamp::UNIX_EPOCH,
             referral_count: None,
@@ -1928,6 +1937,7 @@ impl From<crate::PartialUser> for PartialUser {
             privileged: value.privileged,
             bot: value.bot.map(|bot| bot.into()),
             e2ee_enabled: value.e2ee_enabled,
+            e2ee_only: value.e2ee_only,
             name_style: value.name_style,
             cipher: value.cipher,
             perks: None,
@@ -2865,5 +2875,109 @@ mod protected_channel_bridge_tests {
         assert_eq!(entitlement.device_cap, Some(3));
         assert_eq!(entitlement.state, v0::ChannelEntitlementState::Active);
         assert_eq!(entitlement.granted_by, "01JA00000000000000000ADMIN0");
+    }
+}
+
+#[cfg(test)]
+mod e2ee_only_bridge_tests {
+    use revolt_models::v0;
+
+    fn user(e2ee_only: bool) -> crate::User {
+        crate::User {
+            id: "01JA00000000000000000USERA".to_string(),
+            username: "EncryptedOnly".to_string(),
+            discriminator: "1001".to_string(),
+            e2ee_only,
+            ..Default::default()
+        }
+    }
+
+    /// An explicit `false` is what tells clients the setting was switched
+    /// off, so the partial has to carry it
+    #[test]
+    fn a_partial_user_keeps_an_explicit_false() {
+        let partial: v0::PartialUser = crate::PartialUser {
+            e2ee_only: Some(false),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(partial.e2ee_only, Some(false));
+
+        let json = serde_json::to_value(&partial).unwrap();
+        assert_eq!(json.get("e2ee_only"), Some(&serde_json::Value::Bool(false)));
+
+        let on: v0::PartialUser = crate::PartialUser {
+            e2ee_only: Some(true),
+            ..Default::default()
+        }
+        .into();
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json.get("e2ee_only"), Some(&serde_json::Value::Bool(true)));
+
+        let untouched: v0::PartialUser = crate::PartialUser::default().into();
+        let json = serde_json::to_value(&untouched).unwrap();
+        assert_eq!(json.get("e2ee_only"), None);
+    }
+
+    #[tokio::test]
+    async fn a_full_user_omits_false_and_carries_true() {
+        let off = user(false).into_known_static(false).await;
+        assert!(!off.e2ee_only);
+        let json = serde_json::to_value(&off).unwrap();
+        assert_eq!(json.get("e2ee_only"), None);
+
+        let on = user(true).into_known_static(false).await;
+        assert!(on.e2ee_only);
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json.get("e2ee_only"), Some(&serde_json::Value::Bool(true)));
+
+        // Public: shown to a stranger and to nobody in particular alike
+        let stranger = crate::User {
+            id: "01JA00000000000000000USERB".to_string(),
+            ..user(false)
+        };
+        for perspective in [None, Some(&stranger)] {
+            let seen = user(true).into_known(perspective, false).await;
+            assert!(seen.e2ee_only);
+        }
+
+        let own = user(true).into_self(true).await;
+        assert!(own.e2ee_only);
+
+        let back: crate::User = on.into();
+        assert!(back.e2ee_only);
+    }
+
+    #[test]
+    fn the_group_mark_survives_both_directions() {
+        for mark in [false, true] {
+            let group = crate::Channel::Group {
+                id: "01JA000000000000000000GROUP".to_string(),
+                name: "Group".to_string(),
+                owner: "01JA00000000000000000USERA".to_string(),
+                description: None,
+                recipients: vec!["01JA00000000000000000USERA".to_string()],
+                icon: None,
+                last_message_id: None,
+                permissions: None,
+                nsfw: false,
+                spoiler: false,
+                voice: None,
+                e2ee_only: mark,
+            };
+
+            let model: v0::Channel = group.into();
+            let json = serde_json::to_value(&model).unwrap();
+            if mark {
+                assert_eq!(json.get("e2ee_only"), Some(&serde_json::Value::Bool(true)));
+            } else {
+                assert_eq!(json.get("e2ee_only"), None);
+            }
+
+            let back: crate::Channel = model.into();
+            assert!(
+                matches!(back, crate::Channel::Group { e2ee_only, .. } if e2ee_only == mark)
+            );
+        }
     }
 }
