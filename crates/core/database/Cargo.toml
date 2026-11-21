@@ -116,6 +116,7 @@ rust-argon2 = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Email
 lettre = { workspace = true }

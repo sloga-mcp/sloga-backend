@@ -61,15 +61,44 @@ impl AbstractMessages for ReferenceDb {
     }
 
     /// Remove a single attachment (by file id) from a message's embedded attachment list.
+    ///
+    /// Like the MongoDB `$pull`, the file goes from the `attachments` list
+    /// AND from a forwarded snapshot's `forwarded.attachments`; nothing else
+    /// on the message changes.
     async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()> {
         let mut messages = self.messages.lock().await;
         if let Some(message) = messages.get_mut(message_id) {
             if let Some(attachments) = &mut message.attachments {
                 attachments.retain(|attachment| attachment.id != file_id);
             }
+            if let Some(forwarded) = &mut message.forwarded {
+                forwarded
+                    .attachments
+                    .retain(|attachment| attachment.id != file_id);
+            }
         }
         // Idempotent: a missing message/attachment is treated as success.
         Ok(())
+    }
+
+    /// Pull a file from every message's forwarded snapshot.
+    async fn remove_forwarded_attachment(&self, file_id: &str) -> Result<Vec<(String, String)>> {
+        let mut messages = self.messages.lock().await;
+        let mut touched = Vec::new();
+        for message in messages.values_mut() {
+            if let Some(forwarded) = &mut message.forwarded {
+                let before = forwarded.attachments.len();
+                forwarded
+                    .attachments
+                    .retain(|attachment| attachment.id != file_id);
+                if forwarded.attachments.len() != before {
+                    touched.push((message.channel.clone(), message.id.clone()));
+                }
+            }
+        }
+
+        touched.sort();
+        Ok(touched)
     }
 
     /// Fetch a message by its id

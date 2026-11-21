@@ -52,6 +52,15 @@ pub trait AbstractAttachmentHashes: Sync + Send {
 
     /// Delete attachment hash by id.
     async fn delete_attachment_hash(&self, id: &str) -> Result<()>;
+
+    /// Fetch every hash entry whose `processed_hash` is `processed_hash`
+    /// (several original hashes can process to the same bytes). Matches on
+    /// `processed_hash` only, never on the original hash (`_id`). Order is
+    /// not guaranteed.
+    async fn fetch_attachment_hashes_by_processed(
+        &self,
+        processed_hash: &str,
+    ) -> Result<Vec<FileHash>>;
 }
 
 #[cfg(test)]
@@ -392,6 +401,58 @@ mod tests {
                 db.fetch_attachment_hash("hash-h").await.unwrap(),
                 with_storage(&bystander, "rk/k1/fresh", "iv-1", Some("k1"))
             );
+        });
+    }
+
+    /// Copies of a removed image are found through the processed hash: every
+    /// original that processed to the same bytes, and nothing matched by an
+    /// original hash alone.
+    #[tokio::test]
+    async fn fetch_by_processed_returns_every_original() {
+        database_test!(|db| async move {
+            let mut first = file_hash("orig-1", "orig-1", "iv-0", None);
+            first.processed_hash = "proc-shared".to_string();
+            let mut second = file_hash("orig-2", "orig-2", "iv-0", None);
+            second.processed_hash = "proc-shared".to_string();
+            // Its id equals the other rows' processed hash: an `_id` match
+            // must not count
+            let mut decoy = file_hash("proc-shared", "proc-shared", "iv-0", None);
+            decoy.processed_hash = "proc-other".to_string();
+            for row in [&first, &second, &decoy] {
+                db.insert_attachment_hash(row).await.unwrap();
+            }
+
+            let ids = |rows: Vec<FileHash>| {
+                let mut ids: Vec<String> = rows.into_iter().map(|row| row.id).collect();
+                ids.sort();
+                ids
+            };
+
+            assert_eq!(
+                ids(db
+                    .fetch_attachment_hashes_by_processed("proc-shared")
+                    .await
+                    .unwrap()),
+                vec!["orig-1".to_string(), "orig-2".to_string()]
+            );
+            assert_eq!(
+                ids(db
+                    .fetch_attachment_hashes_by_processed("proc-other")
+                    .await
+                    .unwrap()),
+                vec!["proc-shared".to_string()]
+            );
+            // An original hash is not a processed hash
+            assert!(db
+                .fetch_attachment_hashes_by_processed("orig-1")
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .fetch_attachment_hashes_by_processed("proc-missing")
+                .await
+                .unwrap()
+                .is_empty());
         });
     }
 }

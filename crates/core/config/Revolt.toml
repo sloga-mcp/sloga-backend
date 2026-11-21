@@ -599,6 +599,31 @@ prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 # protections between a user's own installs are gone while it is off.
 claim_lock = true
 
+[features.takedown]
+# Take It Down Act requests. Ships OFF; prod sets it in Revolt.overrides.toml under an explicit
+# [features.takedown] header, then restarts delta AND crond. It stays off until data_key is 64 hex
+# characters (openssl rand -hex 32); keep the key in the overrides file or the environment
+# (REVOLT__FEATURES__TAKEDOWN__DATA_KEY), never in a committed file. Losing it loses every stored
+# requester's details.
+enabled = false
+data_key = ""
+# User ids that may review requests (each also needs privileged + active MFA). A list, or one
+# comma-separated string in the environment form.
+reviewers = []
+# Addresses that get staff alert emails; same forms as reviewers
+staff_alert_emails = []
+# Webhook that gets each staff alert as a plain-text POST body (ntfy style); empty = none
+alert_webhook_url = ""
+# Status page linked from the received email; "#<reference>.<token>" is appended
+status_url_base = "https://sloga.gg/legal/take-it-down-status.html"
+auto_hide_hour = 44                 # unreviewed by this hour: hide the directly linked attachment; 0 = never
+auto_hide_daily_cap = 3             # most auto-hides per requester address per day
+copy_confirm_threshold = 25         # removals with more copies need confirm_copies
+per_address_daily_soft_limit = 5    # per contact address per day before throttling (never refused)
+retention_adult_days = 30           # days after close that removed adult images are held, then deleted
+retention_requester_days = 365      # days after close before requester details are purged
+restore_enabled = false
+
 # --- Protected channels (protected-channels design §7.1) ---
 # The feature ships DARK: all keys below default in code to the values shown,
 # with enabled = false. To turn it on, put the block in Revolt.overrides.toml
@@ -769,6 +794,7 @@ process_message_delay_limit = 5
 terms_of_service = ""
 privacy_policy = ""
 guidelines = ""
+take_it_down = ""
 
 [sentry]
 # Configuration for Sentry error reporting

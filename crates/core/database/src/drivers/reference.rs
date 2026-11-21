@@ -21,6 +21,7 @@ use crate::{
 use crate::{
     CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
 };
+use crate::{StaffAuditEntry, TakedownRequest, UploadHashBlock};
 
 database_derived!(
     /// Reference implementation
@@ -72,6 +73,10 @@ database_derived!(
         pub servers: Arc<Mutex<HashMap<String, Server>>>,
         pub safety_reports: Arc<Mutex<HashMap<String, Report>>>,
         pub safety_snapshots: Arc<Mutex<HashMap<String, Snapshot>>>,
+        pub staff_audit: Arc<Mutex<HashMap<String, StaffAuditEntry>>>,
+        pub takedown_requests: Arc<Mutex<HashMap<String, TakedownRequest>>>,
+        /// Keyed by the block key (`orig:<hash>` etc.)
+        pub upload_hash_blocks: Arc<Mutex<HashMap<String, UploadHashBlock>>>,
         pub accounts: Arc<Mutex<HashMap<String, Account>>>,
         pub account_invites: Arc<Mutex<HashMap<String, AccountInvite>>>,
         pub sessions: Arc<Mutex<HashMap<String, Session>>>,

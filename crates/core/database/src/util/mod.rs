@@ -16,6 +16,7 @@ pub mod password;
 pub mod permissions;
 pub mod reference;
 pub mod shield;
+pub mod takedown_crypto;
 pub mod test_fixtures;
 pub mod unreads;
 

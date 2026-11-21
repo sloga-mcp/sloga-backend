@@ -65,6 +65,16 @@ pub trait AbstractMessages: Sync + Send {
     /// Idempotent: succeeds even if the message or attachment no longer exists.
     async fn remove_message_attachment(&self, message_id: &str, file_id: &str) -> Result<()>;
 
+    /// Pull the file `file_id` from the `forwarded.attachments` of every
+    /// message that carries it, returning the `(channel, message)` ids
+    /// touched, sorted. Nothing else on the message changes: `edited` is not
+    /// set and a plain `attachments` entry with the same id is left alone.
+    /// No event is published.
+    ///
+    /// A forward mints new file ids for its copies, so pass the copy's id
+    /// (found by hash), not the source attachment's.
+    async fn remove_forwarded_attachment(&self, file_id: &str) -> Result<Vec<(String, String)>>;
+
     /// Add a new reaction to a message
     async fn add_reaction(&self, id: &str, emoji: &str, user: &str) -> Result<()>;
 
@@ -830,6 +840,195 @@ mod tests {
                 seen,
                 vec![("MessageAppend".to_string(), live.id.clone())],
                 "ghost or unexpected events on the channel topic"
+            );
+        });
+    }
+}
+
+/// Pulling a file out of forwarded snapshots (Take It Down copies).
+#[cfg(test)]
+mod forwarded_attachment_tests {
+    use crate::{File, ForwardedSnapshot, Message, Metadata};
+
+    const CHANNEL_A: &str = "01FWDCHANNELA0000000000001";
+    const CHANNEL_B: &str = "01FWDCHANNELB0000000000001";
+    const TARGET: &str = "01FWDTARGETFILE00000000001";
+    const SIBLING: &str = "01FWDSIBLINGFILE0000000001";
+
+    fn file(id: &str) -> File {
+        File {
+            id: id.to_string(),
+            tag: "attachments".to_string(),
+            filename: "image.png".to_string(),
+            hash: Some("hash-fwd".to_string()),
+            uploaded_at: None,
+            uploader_id: None,
+            used_for: None,
+            deleted: None,
+            reported: None,
+            metadata: Metadata::File,
+            content_type: "image/png".to_string(),
+            size: 1,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        }
+    }
+
+    fn forward(id: &str, channel: &str, attachments: &[&str]) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: "01FWDAUTHOR000000000000001".to_string(),
+            forwarded: Some(ForwardedSnapshot {
+                message_id: "01FWDSOURCE000000000000001".to_string(),
+                channel_id: "01FWDSOURCECHANNEL00000001".to_string(),
+                server_id: None,
+                author_id: None,
+                content: Some("look".to_string()),
+                attachments: attachments.iter().map(|id| file(id)).collect(),
+                original_sent_at: 0,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn forwarded_ids(message: &Message) -> Vec<String> {
+        message
+            .forwarded
+            .as_ref()
+            .map(|forwarded| forwarded.attachments.iter().map(|f| f.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn remove_forwarded_attachment_pulls_only_that_file() {
+        database_test!(|db| async move {
+            let both = forward("01FWDMESSAGE00000000000001", CHANNEL_A, &[TARGET, SIBLING]);
+            let only = forward("01FWDMESSAGE00000000000002", CHANNEL_B, &[TARGET]);
+            let unrelated = forward("01FWDMESSAGE00000000000003", CHANNEL_A, &[SIBLING]);
+            // The same id as a plain attachment is not a forwarded copy
+            let plain = Message {
+                id: "01FWDMESSAGE00000000000004".to_string(),
+                channel: CHANNEL_A.to_string(),
+                author: "01FWDAUTHOR000000000000001".to_string(),
+                content: Some("plain".to_string()),
+                attachments: Some(vec![file(TARGET)]),
+                ..Default::default()
+            };
+            for message in [&both, &only, &unrelated, &plain] {
+                db.insert_message(message).await.unwrap();
+            }
+
+            let touched = db.remove_forwarded_attachment(TARGET).await.unwrap();
+            assert_eq!(
+                touched,
+                vec![
+                    (CHANNEL_A.to_string(), both.id.clone()),
+                    (CHANNEL_B.to_string(), only.id.clone()),
+                ]
+            );
+
+            let both_after = db.fetch_message(&both.id).await.unwrap();
+            assert_eq!(forwarded_ids(&both_after), vec![SIBLING.to_string()]);
+            assert_eq!(both_after.edited, None, "a removal is not an edit");
+            let forwarded = both_after.forwarded.as_ref().unwrap();
+            assert_eq!(forwarded.content.as_deref(), Some("look"));
+            assert_eq!(forwarded.message_id, "01FWDSOURCE000000000000001");
+
+            let only_after = db.fetch_message(&only.id).await.unwrap();
+            assert!(forwarded_ids(&only_after).is_empty());
+            assert!(only_after.forwarded.is_some(), "the snapshot itself stays");
+            assert_eq!(only_after.edited, None);
+
+            let unrelated_after = db.fetch_message(&unrelated.id).await.unwrap();
+            assert_eq!(forwarded_ids(&unrelated_after), vec![SIBLING.to_string()]);
+            let plain_after = db.fetch_message(&plain.id).await.unwrap();
+            assert_eq!(
+                plain_after
+                    .attachments
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f.id)
+                    .collect::<Vec<_>>(),
+                vec![TARGET.to_string()]
+            );
+
+            // Nothing left to pull
+            assert!(db
+                .remove_forwarded_attachment(TARGET)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .remove_forwarded_attachment("01FWDNOSUCHFILE00000000001")
+                .await
+                .unwrap()
+                .is_empty());
+        });
+    }
+
+    /// `remove_message_attachment` pulls a forwarded copy by id on both
+    /// drivers, from that message only, and is not an edit.
+    ///
+    /// Control: the REFERENCE driver at 09b77abc only pulled from
+    /// `attachments`, so the first forwarded assertion fails there.
+    #[tokio::test]
+    async fn remove_message_attachment_pulls_a_forwarded_copy() {
+        database_test!(|db| async move {
+            const PLAIN: &str = "01FWDPLAINFILE000000000001";
+
+            let mut target = forward("01FWDMESSAGE00000000000011", CHANNEL_A, &[TARGET, SIBLING]);
+            target.attachments = Some(vec![file(PLAIN)]);
+            // Another message carrying the same id keeps it: the call is per message
+            let other = forward("01FWDMESSAGE00000000000012", CHANNEL_B, &[TARGET]);
+            for message in [&target, &other] {
+                db.insert_message(message).await.unwrap();
+            }
+
+            db.remove_message_attachment(&target.id, TARGET)
+                .await
+                .unwrap();
+
+            let after = db.fetch_message(&target.id).await.unwrap();
+            assert_eq!(forwarded_ids(&after), vec![SIBLING.to_string()]);
+            assert_eq!(
+                after
+                    .attachments
+                    .as_ref()
+                    .map(|files| files.iter().map(|f| f.id.clone()).collect::<Vec<_>>()),
+                Some(vec![PLAIN.to_string()])
+            );
+            assert_eq!(after.edited, None, "a removal is not an edit");
+            let forwarded = after.forwarded.as_ref().unwrap();
+            assert_eq!(forwarded.content.as_deref(), Some("look"));
+            assert_eq!(forwarded.message_id, "01FWDSOURCE000000000000001");
+
+            let other_after = db.fetch_message(&other.id).await.unwrap();
+            assert_eq!(forwarded_ids(&other_after), vec![TARGET.to_string()]);
+
+            // A plain attachment still goes the same way
+            db.remove_message_attachment(&target.id, PLAIN)
+                .await
+                .unwrap();
+            let after = db.fetch_message(&target.id).await.unwrap();
+            assert!(after.attachments.as_ref().map_or(true, |files| files.is_empty()));
+            assert_eq!(forwarded_ids(&after), vec![SIBLING.to_string()]);
+
+            // Idempotent: a repeat, an unknown file and an unknown message are Ok
+            db.remove_message_attachment(&target.id, TARGET)
+                .await
+                .unwrap();
+            db.remove_message_attachment(&target.id, "01FWDNOSUCHFILE00000000001")
+                .await
+                .unwrap();
+            db.remove_message_attachment("01FWDNOSUCHMESSAGE00000001", TARGET)
+                .await
+                .unwrap();
+            assert_eq!(
+                forwarded_ids(&db.fetch_message(&target.id).await.unwrap()),
+                vec![SIBLING.to_string()]
             );
         });
     }

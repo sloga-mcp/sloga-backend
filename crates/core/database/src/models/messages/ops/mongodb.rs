@@ -813,6 +813,57 @@ impl AbstractMessages for MongoDb {
             .map(|_| ())
             .map_err(|_| create_database_error!("update_one", COL))
     }
+
+    async fn remove_forwarded_attachment(&self, file_id: &str) -> Result<Vec<(String, String)>> {
+        // `forwarded.attachments._id` has no index: this is a collection
+        // scan, run only on a staff removal
+        let mut cursor = self
+            .col::<Document>(COL)
+            .find(doc! {
+                "forwarded.attachments._id": file_id
+            })
+            .projection(doc! { "_id": 1_i32, "channel": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        // A row that does not read back fails the call, so the caller never
+        // acts on fewer messages than carry the file
+        let mut touched = Vec::new();
+        while let Some(row) = cursor.next().await {
+            let row = row.map_err(|_| create_database_error!("find", COL))?;
+            let (Ok(id), Ok(channel)) = (row.get_str("_id"), row.get_str("channel")) else {
+                return Err(create_database_error!("find", COL));
+            };
+            touched.push((channel.to_string(), id.to_string()));
+        }
+
+        if touched.is_empty() {
+            return Ok(touched);
+        }
+
+        let ids: Vec<String> = touched.iter().map(|(_, id)| id.clone()).collect();
+        self.col::<Document>(COL)
+            .update_many(
+                doc! {
+                    "_id": {
+                        "$in": ids
+                    },
+                    "forwarded.attachments._id": file_id
+                },
+                doc! {
+                    "$pull": {
+                        "forwarded.attachments": {
+                            "_id": file_id
+                        }
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_many", COL))?;
+
+        touched.sort();
+        Ok(touched)
+    }
 }
 
 impl IntoDocumentPath for FieldsMessage {
