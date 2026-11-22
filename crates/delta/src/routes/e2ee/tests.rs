@@ -1287,6 +1287,124 @@ async fn backup_put_requires_a_device_bound_session_case() {
     );
 }
 
+/// PUT a backup whose ciphertext is `encoded_len` base64 characters.
+async fn put_backup_of_size(
+    harness: &TestHarness,
+    session_token: &str,
+    device_id: &str,
+    header: String,
+    generation: i64,
+    encoded_len: usize,
+) -> Status {
+    let body = v0::DataPutE2EEBackup {
+        device_id: device_id.to_string(),
+        header,
+        ciphertext: "A".repeat(encoded_len),
+        generation,
+    };
+    harness
+        .client
+        .put("/e2ee/backup")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session_token.to_string()))
+        .body(serde_json::to_string(&body).unwrap())
+        .dispatch()
+        .await
+        .status()
+}
+
+/// A backup between Rocket's 1 MiB JSON default and the 8 MiB cap is stored
+/// (it used to be refused 413 before the route ran); one just over the cap
+/// reaches the route and is refused by it; a body over the route's own
+/// 12 MiB limit is refused 413 before it is parsed.
+#[test]
+fn backup_put_body_limit_is_the_route_cap_not_the_json_default() {
+    crate::util::test::rt()
+        .block_on(backup_put_body_limit_is_the_route_cap_not_the_json_default_case())
+}
+
+async fn backup_put_body_limit_is_the_route_cap_not_the_json_default_case() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+    const MIB: usize = 1024 * 1024;
+
+    // 2 MiB decoded: over the 1 MiB JSON default, well under the cap
+    let two_mib = 2 * MIB / 3 * 4;
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 1),
+            1,
+            two_mib,
+        )
+        .await,
+        Status::Ok
+    );
+    let stored = harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .expect("2 MiB backup stored");
+    assert_eq!(stored.ciphertext.len(), two_mib);
+
+    // Exactly at the cap: stored
+    let at_cap = revolt_database::E2EE_MAX_BACKUP_SIZE / 3 * 4;
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 2),
+            2,
+            at_cap,
+        )
+        .await,
+        Status::Ok
+    );
+
+    // Just over the cap but inside the body limit: the route's own check
+    // refuses it (400 FailedValidation), and nothing is stored
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 3),
+            3,
+            at_cap + 8,
+        )
+        .await,
+        Status::BadRequest
+    );
+
+    // Over the route's 12 MiB body limit: 413 before parsing
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 3),
+            3,
+            13 * MIB,
+        )
+        .await,
+        Status::PayloadTooLarge
+    );
+
+    let stored = harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .expect("backup still stored");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(stored.ciphertext.len(), at_cap);
+}
+
 #[test]
 fn backup_survives_device_revocation_but_dies_with_account() {
     crate::util::test::rt().block_on(backup_survives_device_revocation_but_dies_with_account_case())
