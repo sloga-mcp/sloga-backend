@@ -2325,53 +2325,78 @@ mod tests {
         }
     }
 
+    /// The oracle polls every caller class times three variants times four
+    /// targets of route futures straight from this thread (`block_on`, plus
+    /// the HTTP leg), and since the acutest merge that overflows the default
+    /// 2 MiB test stack in a debug build on both drivers. Run each case on a
+    /// thread with room (the `webhook.rs` pattern). A panic in the case still
+    /// fails the test.
+    fn on_a_roomy_stack(case: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(case)
+            .expect("test thread")
+            .join()
+            .expect("the case passes")
+    }
+
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_every_flag_on() {
-        crate::util::test::rt().block_on(Box::pin(hidden_and_missing_channels_answer_alike()))
+        on_a_roomy_stack(|| {
+            crate::util::test::rt().block_on(Box::pin(hidden_and_missing_channels_answer_alike()))
+        })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_e2ee_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.e2ee_enabled = false;
+        on_a_roomy_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.protected_channels.enabled = false;
+        on_a_roomy_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.protected_channels.enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_media_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.media_e2ee_enabled = false;
+        on_a_roomy_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.media_e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_and_media_off() {
-        crate::util::test::rt().block_on(async {
-            revolt_config::overwrite_config(|settings| {
-                settings.features.protected_channels.enabled = false;
-                settings.features.media_e2ee_enabled = false;
+        on_a_roomy_stack(|| {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.protected_channels.enabled = false;
+                    settings.features.media_e2ee_enabled = false;
+                })
+                .await;
+                Box::pin(hidden_and_missing_channels_answer_alike()).await
             })
-            .await;
-            Box::pin(hidden_and_missing_channels_answer_alike()).await
         })
     }
 }
