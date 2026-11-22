@@ -50,6 +50,7 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
     ("e2ee/revoke_device.rs", "foreign_ticket_revoke_device"),
+    ("e2ee/set_only.rs", "foreign_ticket_set_e2ee_only"),
     ("mfa/fetch_recovery.rs", "foreign_ticket_fetch_recovery"),
     (
         "mfa/generate_recovery.rs",
@@ -739,6 +740,55 @@ async fn foreign_ticket_delete_backup_case() {
     );
     pair.assert_unchanged("delete_backup", &before).await;
     pair.assert_ticket_kept("delete_backup").await;
+}
+
+#[test]
+fn foreign_ticket_set_e2ee_only() {
+    rt().block_on(foreign_ticket_set_e2ee_only_case())
+}
+
+/// PUT /e2ee/only with `enabled: false` would turn the victim's
+/// Encrypted-only setting off. Turning it off needs nothing but the ticket,
+/// so the refusal can only come from the binding.
+async fn foreign_ticket_set_e2ee_only_case() {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                e2ee_only: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the victim is Encrypted-only");
+    let before = victim_state(&pair).await;
+
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .put("/e2ee/only")
+                .header(ContentType::JSON)
+                .body(json!({ "enabled": false }).to_string()),
+        )
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "set_e2ee_only");
+    assert!(
+        pair.harness
+            .db
+            .fetch_user(&pair.victim_user.id)
+            .await
+            .expect("victim `User`")
+            .e2ee_only,
+        "set_e2ee_only: the victim's setting was turned off"
+    );
+    pair.assert_unchanged("set_e2ee_only", &before).await;
+    pair.assert_ticket_kept("set_e2ee_only").await;
 }
 
 #[test]

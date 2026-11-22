@@ -1,7 +1,8 @@
 //! Structural rules shared by every route that resolves an interaction's
 //! channel.
 
-use revolt_database::Channel;
+use revolt_config::{config, E2EEFeatures};
+use revolt_database::{util::e2ee_only, Channel, Database, User};
 use revolt_result::{create_error, Result};
 
 /// Reject channels where interactions are structurally unavailable.
@@ -28,9 +29,10 @@ use revolt_result::{create_error, Result};
 /// passes it. Callers that have resolved the permission target use
 /// [`ensure_interactions_allowed_in`]; this one is kept for the two modal
 /// routes, which run it before their permission calculation (the accepted
-/// decision 18 exemption).
+/// decision 18 exemption). It reads no account, so it never refuses for
+/// encrypted-only reasons; those routes call the full form afterwards.
 pub fn ensure_interactions_allowed(channel: &Channel) -> Result<()> {
-    ensure_interactions_allowed_in(channel, channel)
+    structural_rule(channel, channel)
 }
 
 /// [`ensure_interactions_allowed`] for a resolved channel: `channel` is the
@@ -39,10 +41,37 @@ pub fn ensure_interactions_allowed(channel: &Channel) -> Result<()> {
 /// channel itself). The structural exclusions read `channel`; the protected
 /// refusal reads either, so a thread under a protected parent refuses too
 /// (W2 audit B1).
-pub fn ensure_interactions_allowed_in(
+///
+/// Then the encrypted-only rule for `user`, the account acting on the
+/// route (the invoking or submitting user, or the answering bot): every
+/// interaction carries plain text to or from a bot, so a group marked
+/// encrypted-only refuses it (`group`), and so does an unmarked group for
+/// an encrypted-only account (`sender`). Lifted with
+/// `[features.e2ee] only_enforced = false`.
+pub async fn ensure_interactions_allowed_in(
+    db: &Database,
+    user: &User,
     channel: &Channel,
     permission_channel: &Channel,
 ) -> Result<()> {
+    let e2ee_config = config().await.features.e2ee.clone();
+    interactions_allowed_in(db, &e2ee_config, user, channel, permission_channel).await
+}
+
+/// [`ensure_interactions_allowed_in`] with the switch passed in
+async fn interactions_allowed_in(
+    db: &Database,
+    e2ee_config: &E2EEFeatures,
+    user: &User,
+    channel: &Channel,
+    permission_channel: &Channel,
+) -> Result<()> {
+    structural_rule(channel, permission_channel)?;
+    e2ee_only::plain_write_allowed(db, e2ee_config, user, channel, None).await
+}
+
+/// The structural exclusions and the protected refusal
+fn structural_rule(channel: &Channel, permission_channel: &Channel) -> Result<()> {
     match channel {
         Channel::Forum { .. } | Channel::DirectMessage { .. } | Channel::SavedMessages { .. } => {
             Err(create_error!(InvalidOperation))
@@ -58,10 +87,49 @@ pub fn ensure_interactions_allowed_in(
 mod tests {
     use std::collections::HashMap;
 
-    use revolt_database::{Channel, ForumLayout, ForumSortOrder};
-    use revolt_result::ErrorType;
+    use revolt_config::E2EEFeatures;
+    use revolt_database::{Channel, Database, ForumLayout, ForumSortOrder, User};
+    use revolt_result::{ErrorType, Result};
 
-    use super::{ensure_interactions_allowed, ensure_interactions_allowed_in};
+    use super::{ensure_interactions_allowed, interactions_allowed_in};
+
+    fn user(e2ee_only: bool) -> User {
+        User {
+            id: "user".to_string(),
+            username: "user".to_string(),
+            discriminator: "0001".to_string(),
+            e2ee_only,
+            ..Default::default()
+        }
+    }
+
+    /// The full rule for `user` with the switch at `only_enforced`, against
+    /// an empty in-memory database: no channel kind that reaches the
+    /// encrypted-only check here needs a lookup
+    fn allowed_for(
+        user: &User,
+        only_enforced: bool,
+        channel: &Channel,
+        permission_channel: &Channel,
+    ) -> Result<()> {
+        let db = Database::Reference(Default::default());
+        let e2ee_config = E2EEFeatures {
+            only_enforced,
+            ..Default::default()
+        };
+        crate::util::test::rt().block_on(interactions_allowed_in(
+            &db,
+            &e2ee_config,
+            user,
+            channel,
+            permission_channel,
+        ))
+    }
+
+    /// The full rule for an ordinary account, switch on
+    fn allowed_in(channel: &Channel, permission_channel: &Channel) -> Result<()> {
+        allowed_for(&user(false), true, channel, permission_channel)
+    }
 
     fn thread() -> Channel {
         Channel::Thread {
@@ -88,14 +156,14 @@ mod tests {
     #[test]
     fn thread_under_a_protected_parent_refuses_interactions() {
         assert!(matches!(
-            ensure_interactions_allowed_in(&thread(), &text_channel(true))
+            allowed_in(&thread(), &text_channel(true))
                 .err()
                 .map(|error| error.error_type),
             Some(ErrorType::ChannelProtected)
         ));
-        assert!(ensure_interactions_allowed_in(&thread(), &text_channel(false)).is_ok());
+        assert!(allowed_in(&thread(), &text_channel(false)).is_ok());
         assert!(matches!(
-            ensure_interactions_allowed_in(&text_channel(true), &text_channel(true))
+            allowed_in(&text_channel(true), &text_channel(true))
                 .err()
                 .map(|error| error.error_type),
             Some(ErrorType::ChannelProtected)
@@ -179,9 +247,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn group_channel_still_allows_interactions() {
-        let group = Channel::Group {
+    fn group(e2ee_only: bool) -> Channel {
+        Channel::Group {
             id: "group".to_string(),
             name: "group".to_string(),
             owner: "user".to_string(),
@@ -193,9 +260,96 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice: None,
-            e2ee_only: false,
-        };
+            e2ee_only,
+        }
+    }
+
+    #[test]
+    fn group_channel_still_allows_interactions() {
+        let group = group(false);
 
         assert!(ensure_interactions_allowed(&group).is_ok());
+        assert!(allowed_in(&group, &group).is_ok());
+    }
+
+    /// The side an encrypted-only refusal names, or `None` when allowed.
+    /// Any other error fails the test.
+    fn side_of(result: Result<()>) -> Option<String> {
+        match result {
+            Ok(()) => None,
+            Err(error) => match error.error_type {
+                ErrorType::EncryptionRequired { side } => Some(side),
+                other => panic!("expected EncryptionRequired, got {other:?}"),
+            },
+        }
+    }
+
+    /// A marked group refuses every interaction (`group`); an unmarked one
+    /// refuses an encrypted-only account (`sender`) and nobody else; the
+    /// switch lifts both.
+    ///
+    /// Control: the `plain_write_allowed` line removed → every case allows.
+    #[test]
+    fn encrypted_only_groups_refuse_interactions() {
+        for only_enforced in [true, false] {
+            for marked in [false, true] {
+                for author_only in [false, true] {
+                    let group = group(marked);
+                    let expected = match (only_enforced, marked, author_only) {
+                        (false, ..) => None,
+                        (true, true, _) => Some("group"),
+                        (true, false, true) => Some("sender"),
+                        (true, false, false) => None,
+                    };
+                    assert_eq!(
+                        side_of(allowed_for(
+                            &user(author_only),
+                            only_enforced,
+                            &group,
+                            &group
+                        ))
+                        .as_deref(),
+                        expected,
+                        "enforced={only_enforced} marked={marked} author_only={author_only}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The account-free form the modal routes run before their permission
+    /// check never reads the mark, so it reveals nothing before that check
+    #[test]
+    fn the_account_free_form_ignores_the_mark() {
+        assert!(ensure_interactions_allowed(&group(true)).is_ok());
+    }
+
+    /// Server channels and threads are untouched by an encrypted-only
+    /// account, and the structural refusals still come first for one
+    #[test]
+    fn encrypted_only_accounts_change_nothing_outside_groups() {
+        let only = user(true);
+
+        assert!(allowed_for(&only, true, &text_channel(false), &text_channel(false)).is_ok());
+        assert!(allowed_for(&only, true, &thread(), &text_channel(false)).is_ok());
+        assert!(matches!(
+            allowed_for(&only, true, &thread(), &text_channel(true))
+                .err()
+                .map(|error| error.error_type),
+            Some(ErrorType::ChannelProtected)
+        ));
+
+        let direct = Channel::DirectMessage {
+            id: "direct".to_string(),
+            active: true,
+            recipients: vec!["user".to_string(), "peer".to_string()],
+            last_message_id: None,
+        };
+        assert!(matches!(
+            allowed_for(&only, true, &direct, &direct)
+                .err()
+                .map(|error| error.error_type),
+            Some(ErrorType::InvalidOperation)
+        ));
     }
 }

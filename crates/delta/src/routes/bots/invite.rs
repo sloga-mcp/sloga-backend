@@ -66,9 +66,119 @@ pub async fn invite_bot(
 #[cfg(test)]
 mod test {
     use crate::{rocket, util::test::TestHarness};
-    use revolt_database::{events::client::EventV1, Bot, Channel, Server};
+    use revolt_database::{events::client::EventV1, Bot, Channel, Server, Session, User};
     use revolt_models::v0::{self, DataCreateServer};
     use rocket::http::{ContentType, Header, Status};
+    use rocket::local::asynchronous::LocalResponse;
+
+    /// A stored group of `owner` alone, marked encrypted-only or not
+    async fn stored_group(harness: &TestHarness, owner: &User, marked: bool) -> Channel {
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: TestHarness::rand_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: marked,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        group
+    }
+
+    async fn invite_to_group<'a>(
+        harness: &'a TestHarness,
+        session: &Session,
+        bot: &Bot,
+        group: &Channel,
+    ) -> LocalResponse<'a> {
+        harness
+            .client
+            .post(format!("/bots/{}/invite", bot.id))
+            .header(ContentType::JSON)
+            .body(
+                json!(v0::InviteBotDestination::Group {
+                    group: group.id().to_string()
+                })
+                .to_string(),
+            )
+            .header(Header::new("x-session-token", session.token.to_string()))
+            .dispatch()
+            .await
+    }
+
+    async fn is_member(harness: &TestHarness, group: &Channel, bot: &Bot) -> bool {
+        harness
+            .db
+            .fetch_channel(group.id())
+            .await
+            .expect("group")
+            .contains_user(&bot.id)
+    }
+
+    #[test]
+    fn invite_bot_to_encrypted_group_is_refused() {
+        crate::util::test::rt().block_on(invite_bot_to_encrypted_group_is_refused_case())
+    }
+
+    /// A marked group takes no bot (`member`), even one with a device row;
+    /// an unmarked group does
+    async fn invite_bot_to_encrypted_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (bot, bot_user) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        harness
+            .new_e2ee_device(&bot_user, "bot-session", crate::util::test::MEMBER_DEVICE_SEED)
+            .await;
+
+        let marked = stored_group(&harness, &user, true).await;
+        let response = invite_to_group(&harness, &session, &bot, &marked).await;
+        assert_eq!(response.status(), Status::Forbidden);
+        let body: serde_json::Value = response.into_json().await.expect("error body");
+        assert_eq!(body["type"], "EncryptionRequired", "{body}");
+        assert_eq!(body["side"], "member", "{body}");
+        assert!(!is_member(&harness, &marked, &bot).await);
+
+        let plain = stored_group(&harness, &user, false).await;
+        let response = invite_to_group(&harness, &session, &bot, &plain).await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(is_member(&harness, &plain, &bot).await);
+    }
+
+    #[test]
+    fn invite_bot_to_encrypted_group_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            invite_bot_to_encrypted_group_not_enforced_case().await
+        })
+    }
+
+    /// With the marks not enforced (nextest only: the override is per
+    /// process) a bot joins a marked group
+    async fn invite_bot_to_encrypted_group_not_enforced_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+
+        let marked = stored_group(&harness, &user, true).await;
+        let response = invite_to_group(&harness, &session, &bot, &marked).await;
+        assert_eq!(response.status(), Status::NoContent);
+        drop(response);
+        assert!(is_member(&harness, &marked, &bot).await);
+    }
 
     #[test]
     fn invite_bot_to_group() {

@@ -35,6 +35,8 @@ mod session;
 mod mfa;
 mod oauth;
 mod import;
+#[cfg(test)]
+mod e2ee_only_scan_tests;
 
 pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
     let settings = OpenApiSettings::default();

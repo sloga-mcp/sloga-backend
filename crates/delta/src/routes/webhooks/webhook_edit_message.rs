@@ -1,7 +1,9 @@
 use iso8601_timestamp::Timestamp;
 use revolt_config::config;
 use revolt_database::{
-    tasks::process_embeds::queue, util::reference::Reference, Database, Message, PartialMessage,
+    tasks::process_embeds::queue,
+    util::{e2ee_only, reference::Reference},
+    Database, Message, PartialMessage,
 };
 use revolt_models::v0::{self, DataEditMessage, Embed};
 use revolt_models::validator::Validate;
@@ -45,8 +47,29 @@ pub async fn webhook_edit_message(
     // protected channel refuses the edit here: after the token and author
     // checks (a bad token learns nothing, decision 18), before any embed,
     // write, event or embed task
-    if message.encrypted.is_some() || db.fetch_channel(&message.channel).await?.is_protected() {
+    if message.encrypted.is_some() {
         return Err(create_error!(ChannelProtected));
+    }
+    let channel = db.fetch_channel(&message.channel).await?;
+    if channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
+    // Likewise a group marked encrypted-only takes no plain edit, refused at
+    // the same point. Embed media the request named will never be claimed,
+    // so it is released at once (a webhook's uploads carry its id).
+    if let Err(error) =
+        e2ee_only::plain_write_allowed_unauthored(&config().await.features.e2ee, &channel)
+    {
+        let named: Vec<String> = edit
+            .embeds
+            .iter()
+            .flatten()
+            .filter_map(|embed| embed.media.clone())
+            .collect();
+        e2ee_only::release_refused_attachments(db, &webhook.id, &named).await;
+
+        return Err(error);
     }
 
     message.edited = Some(Timestamp::now_utc());
@@ -94,7 +117,9 @@ pub async fn webhook_edit_message(
 #[cfg(test)]
 mod test {
     use crate::util::test::TestHarness;
-    use revolt_database::{events::client::EventV1, Channel, Database, Message, Webhook};
+    use revolt_database::{
+        events::client::EventV1, Channel, Database, File, Message, Metadata, Webhook,
+    };
     use revolt_models::v0::MessageWebhook;
     use rocket::http::{ContentType, Status};
     use serde_json::{json, Value};
@@ -342,5 +367,176 @@ mod test {
 
         assert_unchanged(&harness, &protected_message).await;
         assert_unchanged(&harness, &ordinary_message).await;
+    }
+
+    /// A group of a new owner, stored directly and unmarked, with a webhook
+    /// and a message from it written before any mark
+    async fn group_fixture(harness: &TestHarness) -> (Channel, Webhook, Message) {
+        let (_, _, owner) = harness.new_user().await;
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        let hook = webhook(&group, &owner.id);
+        harness.db.insert_webhook(&hook).await.expect("`Webhook`");
+        let message = insert_webhook_message(&harness.db, &hook).await;
+        (group, hook, message)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation, and a marked group takes no plain row
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// An unclaimed message attachment uploaded under `uploader_id`
+    async fn unclaimed_attachment(db: &Database, uploader_id: &str) -> String {
+        let id = ulid::Ulid::new().to_string();
+        db.insert_attachment(&File {
+            id: id.clone(),
+            tag: "attachments".to_string(),
+            filename: "file.png".to_string(),
+            hash: None,
+            uploaded_at: None,
+            uploader_id: Some(uploader_id.to_string()),
+            used_for: None,
+            deleted: None,
+            reported: None,
+            metadata: Metadata::File,
+            content_type: "image/png".to_string(),
+            size: 10,
+            message_id: None,
+            user_id: None,
+            server_id: None,
+            object_id: None,
+        })
+        .await
+        .expect("attachment");
+        id
+    }
+
+    /// A group marked encrypted-only refuses the webhook's edit (`group`):
+    /// the row unchanged and the embed media the request named released.
+    /// With the mark lifted the same content edit applies (the control).
+    ///
+    /// Control: the `plain_write_allowed_unauthored` call removed → the
+    /// first edit applies.
+    #[test]
+    fn webhook_edit_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(
+            webhook_edit_in_an_encrypted_only_group_is_refused_case(),
+        ))
+    }
+
+    async fn webhook_edit_in_an_encrypted_only_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (group, hook, message) = group_fixture(&harness).await;
+        let media = unclaimed_attachment(&harness.db, &hook.id).await;
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let (status, refused) = edit(
+            &harness,
+            &hook,
+            token(&hook),
+            &message,
+            &json!({ "content": "after", "embeds": [{ "media": media }] }),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "a marked group: {refused}");
+        let refused: Value = serde_json::from_str(&refused).expect("a JSON error body");
+        assert_eq!(refused["type"], "EncryptionRequired", "{refused}");
+        assert_eq!(refused["side"], "group", "{refused}");
+        assert_unchanged(&harness, &message).await;
+
+        let released = harness
+            .db
+            .fetch_deleted_attachments()
+            .await
+            .expect("deleted attachments");
+        assert!(
+            released.iter().any(|file| file.id == media),
+            "the named embed media was not released"
+        );
+
+        mark_group_raw(&harness.db, group.id(), false).await;
+        let (status, applied) = edit(
+            &harness,
+            &hook,
+            token(&hook),
+            &message,
+            &json!({ "content": "after" }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "an unmarked group: {applied}");
+        let stored = harness
+            .db
+            .fetch_message(&message.id)
+            .await
+            .expect("the message");
+        assert_eq!(stored.content.as_deref(), Some("after"));
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn webhook_edit_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            // Must run before the harness primes the config cache
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+
+            let harness = TestHarness::new().await;
+            let (group, hook, message) = group_fixture(&harness).await;
+            mark_group_raw(&harness.db, group.id(), true).await;
+
+            let (status, applied) = edit(
+                &harness,
+                &hook,
+                token(&hook),
+                &message,
+                &json!({ "content": "after" }),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{applied}");
+            let stored = harness
+                .db
+                .fetch_message(&message.id)
+                .await
+                .expect("the message");
+            assert_eq!(stored.content.as_deref(), Some("after"));
+        }))
     }
 }

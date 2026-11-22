@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use revolt_config::config;
 use revolt_database::util::antispam;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -11,7 +12,7 @@ use revolt_database::{
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::serde::json::Json;
 use rocket::State;
 use ulid::Ulid;
@@ -184,6 +185,29 @@ pub async fn message_schedule(
         return Err(create_error!(ChannelProtected));
     }
 
+    // The same holds for an encrypted-only account or group: the row would
+    // be stored plain and delivered plain. Refused in the same place, before
+    // the nonce, the attachment claims and the insert; the files the request
+    // named will never be claimed, so they are released at once. Delivery
+    // checks again, as the setting can be turned on in between.
+    if let Err(error) =
+        e2ee_only::plain_write_allowed(db, &config.features.e2ee, &user, &channel, None).await
+    {
+        if matches!(error.error_type, ErrorType::EncryptionRequired { .. }) {
+            let mut named: Vec<String> = payload.attachments.clone().unwrap_or_default();
+            named.extend(
+                payload
+                    .embeds
+                    .iter()
+                    .flatten()
+                    .filter_map(|embed| embed.media.clone()),
+            );
+            e2ee_only::release_refused_attachments(db, &user.id, &named).await;
+        }
+
+        return Err(error);
+    }
+
     // A paused account may not queue DMs to strangers who never wrote
     // back. Checked before the nonce, attachments or row are touched;
     // delivery checks again, as a pause can start in between.
@@ -281,11 +305,16 @@ mod test {
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::{Error, ErrorType};
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use rocket::local::asynchronous::LocalResponse;
     use serde_json::{json, Value};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_marked_group, e2ee_released,
+        e2ee_request, e2ee_upload, set_e2ee_only,
+    };
 
     fn in_ms(offset: i64) -> i64 {
         SystemTime::now()
@@ -827,5 +856,170 @@ mod test {
                 "{case}"
             );
         }
+    }
+
+    /// Scheduling into a direct message or group with an encrypted-only
+    /// side is refused, queues nothing, spends no nonce and releases the
+    /// files the request named. Control: with the flags lifted the same
+    /// request, nonce included, is queued.
+    #[test]
+    fn e2ee_only_schedule_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            e2ee_only_schedule_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn e2ee_only_schedule_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let dm_path = format!("/channels/{}/scheduled_messages", dm.id());
+        let group_path = format!("/channels/{}/scheduled_messages", group.id());
+        let body = json!({
+            "content": "see you tomorrow",
+            "nonce": Ulid::new().to_string(),
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&body),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        // The files a refused request named are released
+        let attachment = e2ee_upload(&harness, &author).await;
+        let media = e2ee_upload(&harness, &author).await;
+        let with_files = json!({
+            "content": "see you tomorrow",
+            "attachments": [attachment],
+            "embeds": [{ "title": "embed", "media": media }],
+            "scheduled_at": in_ms(60 * 60 * 1000)
+        });
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&with_files),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author with files");
+        assert!(
+            e2ee_released(&harness, &attachment).await,
+            "the attachment was not released"
+        );
+        assert!(
+            e2ee_released(&harness, &media).await,
+            "the embed media was not released"
+        );
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&body),
+        )
+        .await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &peer_session,
+            Some(&json!({
+                "content": "see you tomorrow",
+                "scheduled_at": in_ms(60 * 60 * 1000)
+            })),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "the encrypted-only peer writing back");
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &group_path,
+            &author_session,
+            Some(&body),
+        )
+        .await;
+        assert_encryption_required(&answer, "group", "a marked group");
+
+        assert_eq!(pending_rows(&harness, dm.id(), &author).await, 0);
+        assert_eq!(pending_rows(&harness, dm.id(), &peer).await, 0);
+        assert_eq!(pending_rows(&harness, group.id(), &author).await, 0);
+
+        // Control: no flags, the same request and nonce
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&body),
+        )
+        .await;
+        assert_accepted(&answer, "no flags, the refused requests' nonce");
+        assert_eq!(pending_rows(&harness, dm.id(), &author).await, 1);
+    }
+
+    /// With `only_enforced = false` the same requests are queued
+    #[test]
+    fn e2ee_only_schedule_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_schedule_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_schedule_allowed_when_not_enforced_case() {
+        assert!(
+            !revolt_config::config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (session, channel_id, case) in [
+            (
+                &author_session,
+                dm.id(),
+                "an encrypted-only author and peer",
+            ),
+            (&peer_session, dm.id(), "the peer writing back"),
+            (&author_session, group.id(), "a marked group"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &format!("/channels/{channel_id}/scheduled_messages"),
+                session,
+                Some(&json!({
+                    "content": "see you tomorrow",
+                    "scheduled_at": in_ms(60 * 60 * 1000)
+                })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        assert_eq!(pending_rows(&harness, dm.id(), &author).await, 1);
+        assert_eq!(pending_rows(&harness, dm.id(), &peer).await, 1);
+        assert_eq!(pending_rows(&harness, group.id(), &author).await, 1);
     }
 }

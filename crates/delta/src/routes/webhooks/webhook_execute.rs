@@ -1,6 +1,6 @@
 use revolt_config::config;
 use revolt_database::{
-    util::{idempotency::IdempotencyKey, reference::Reference},
+    util::{e2ee_only, idempotency::IdempotencyKey, reference::Reference},
     Database, Message, AMQP,
 };
 use revolt_models::v0;
@@ -41,6 +41,24 @@ pub async fn webhook_execute(
     let channel = db.fetch_channel(&webhook.channel_id).await?;
     if channel.is_protected() {
         return Err(create_error!(ChannelProtected));
+    }
+
+    // Nor does a group marked encrypted-only, refused at the same point. The
+    // files the request named will never be claimed, so they are released
+    // at once (a webhook's uploads carry the webhook's id as uploader).
+    if let Err(error) =
+        e2ee_only::plain_write_allowed_unauthored(&config().await.features.e2ee, &channel)
+    {
+        let mut named: Vec<String> = data.attachments.clone().unwrap_or_default();
+        named.extend(
+            data.embeds
+                .iter()
+                .flatten()
+                .filter_map(|embed| embed.media.clone()),
+        );
+        e2ee_only::release_refused_attachments(db, &webhook.id, &named).await;
+
+        return Err(error);
     }
 
     let permissions: PermissionValue = webhook.permissions.into();
@@ -85,7 +103,8 @@ pub async fn webhook_execute(
 mod test {
     use crate::util::test::{TestHarness, FIXTURE_DEVICE_CAP, OWNER_DEVICE_SEED};
     use revolt_database::{
-        events::client::EventV1, Channel, MessageFilter, MessageQuery, MessageTimePeriod, Webhook,
+        events::client::EventV1, Channel, Database, File, MessageFilter, MessageQuery,
+        MessageTimePeriod, Metadata, Webhook,
     };
     use revolt_permissions::ChannelPermission;
     use rocket::http::{ContentType, Status};
@@ -340,5 +359,171 @@ mod test {
             let f = Box::pin(fixture(ChannelPermission::SendMessage as u64)).await;
             Box::pin(refused_before_the_field_checks(&f)).await;
         })
+    }
+
+    /// A group of a new owner, stored directly and unmarked, with a webhook
+    /// of the default permissions
+    async fn group_fixture(harness: &TestHarness) -> (Channel, Webhook) {
+        let (_, _, owner) = harness.new_user().await;
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        let hook = webhook(
+            &group,
+            &owner.id,
+            *revolt_permissions::DEFAULT_WEBHOOK_PERMISSIONS,
+        );
+        harness.db.insert_webhook(&hook).await.expect("`Webhook`");
+        (group, hook)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// An unclaimed message attachment uploaded under `uploader_id`
+    async fn unclaimed_attachment(harness: &TestHarness, uploader_id: &str) -> String {
+        let id = ulid::Ulid::new().to_string();
+        harness
+            .db
+            .insert_attachment(&File {
+                id: id.clone(),
+                tag: "attachments".to_string(),
+                filename: "file.png".to_string(),
+                hash: None,
+                uploaded_at: None,
+                uploader_id: Some(uploader_id.to_string()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: Metadata::File,
+                content_type: "image/png".to_string(),
+                size: 10,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            })
+            .await
+            .expect("attachment");
+        id
+    }
+
+    /// A group marked encrypted-only refuses the webhook (`group`) before
+    /// its field checks: no message row, the named attachment released, the
+    /// nonce not consumed (the same nonce sends once the mark is lifted, the
+    /// control).
+    ///
+    /// Control: the `plain_write_allowed_unauthored` call removed → the
+    /// refusal turns into the field check's `MissingPermission` (default
+    /// webhook permissions carry no UploadFiles).
+    #[test]
+    fn execute_in_an_encrypted_only_group_is_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            execute_in_an_encrypted_only_group_is_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn execute_in_an_encrypted_only_group_is_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (group, hook) = group_fixture(&harness).await;
+        let file_id = unclaimed_attachment(&harness, &hook.id).await;
+        let nonce = ulid::Ulid::new().to_string();
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let refused = execute(
+            &harness,
+            &hook.id,
+            token(&hook),
+            &json!({ "content": "from a webhook", "nonce": nonce, "attachments": [file_id] }),
+        )
+        .await;
+        assert_eq!(refused.0, Status::Forbidden, "{}", refused.1);
+        let error: Value = serde_json::from_str(&refused.1).expect("a JSON error body");
+        assert_eq!(error["type"], "EncryptionRequired", "{}", refused.1);
+        assert_eq!(error["side"], "group", "{}", refused.1);
+        assert_eq!(stored_messages(&harness, &group).await, 0);
+
+        let released = harness
+            .db
+            .fetch_deleted_attachments()
+            .await
+            .expect("deleted attachments");
+        assert!(
+            released.iter().any(|file| file.id == file_id),
+            "the named attachment was not released"
+        );
+
+        mark_group_raw(&harness.db, group.id(), false).await;
+        let (status, sent) = execute(
+            &harness,
+            &hook.id,
+            token(&hook),
+            &json!({ "content": "from a webhook", "nonce": nonce }),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "an unmarked group: {sent}");
+        assert_eq!(stored_messages(&harness, &group).await, 1);
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn execute_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            // Must run before the harness primes the config cache
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+
+            let harness = TestHarness::new().await;
+            let (group, hook) = group_fixture(&harness).await;
+            mark_group_raw(&harness.db, group.id(), true).await;
+
+            let (status, sent) = execute(
+                &harness,
+                &hook.id,
+                token(&hook),
+                &json!({ "content": "from a webhook" }),
+            )
+            .await;
+            assert_eq!(status, Status::Ok, "{sent}");
+            assert_eq!(stored_messages(&harness, &group).await, 1);
+        }))
     }
 }
