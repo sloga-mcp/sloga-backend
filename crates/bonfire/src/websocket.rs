@@ -37,10 +37,14 @@ use tokio::{
     task::spawn,
 };
 use tokio_util::compat::{TokioAsyncReadCompatExt, Compat};
-use revolt_result::create_error;
+use revolt_result::{create_error, ErrorType};
 use sentry::Level;
 
 use crate::config::{ProtocolConfiguration, WebsocketHandshakeCallback};
+use crate::e2ee_claim_lock::{
+    claim_lock_ttl, ClaimLockStore, ConnectionClaim, RedisClaimLock, REASON_HELD_ELSEWHERE,
+    REASON_REMOVED,
+};
 use crate::events::state::{State, SubscriptionStateChange};
 use revolt_models::v0;
 
@@ -59,6 +63,166 @@ fn e2ee_generate_nonce() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     STANDARD_NO_PAD.encode(bytes)
+}
+
+/// The session `device_id`'s row is bound to, if the row exists: the
+/// fallback for [`ConnectionClaim::may_act`] when the claim lock is absent
+/// or unreadable
+async fn e2ee_bound_session(db: &Database, user_id: &str, device_id: &str) -> Option<String> {
+    db.fetch_e2ee_identity(user_id, device_id)
+        .await
+        .ok()
+        .map(|identity| identity.last_session_id)
+}
+
+/// What the worker sends after an `E2EEProveDevice` frame
+#[derive(Debug, PartialEq, Eq)]
+struct ClaimOutcome {
+    /// `accepted` of the `E2EEClaimResult`
+    accepted: bool,
+    /// `reason` of the `E2EEClaimResult`
+    reason: Option<&'static str>,
+    /// Whether the device's queue is drained after the result
+    drain: bool,
+}
+
+/// Decide an `E2EEProveDevice` claim for `device_id` against the
+/// connection's pending `challenge` (already taken: single use), and apply
+/// it: the lock, the device binding, the predecessor sweep and the
+/// connection's `proven_device`.
+///
+/// - The signature is verified against the row before anything else; the
+///   lock is consulted only after a valid proof, so a keyless token learns
+///   nothing about where the device is live.
+/// - A missing row of a removed device is refused as `removed` (plan D8);
+///   every other unproven claim carries no reason and changes nothing.
+/// - A valid proof ends this connection's rights on its previous device,
+///   whatever the outcome. A claim held by another session is refused as
+///   `held_elsewhere` with no rebind, no sweep and no drain.
+#[allow(clippy::too_many_arguments)]
+async fn decide_claim<S: ClaimLockStore>(
+    db: &Database,
+    lock: &mut ConnectionClaim<S>,
+    proven_device: &mut Option<String>,
+    user_id: &str,
+    session_id: &str,
+    challenge: Option<(String, String)>,
+    device_id: &str,
+    signature: &str,
+    now: Instant,
+) -> ClaimOutcome {
+    // The row the proof verified against, read before any rebind
+    let mut reason = None;
+    let verified = match challenge {
+        Some((challenged_device, nonce)) if challenged_device == device_id => {
+            match db.fetch_e2ee_identity(user_id, device_id).await {
+                Ok(identity) => identity
+                    .verify_claim(&nonce, session_id, signature)
+                    .then_some(identity),
+                Err(err) => {
+                    if matches!(err.error_type, ErrorType::NotFound)
+                        && db
+                            .is_e2ee_device_removed(user_id, device_id)
+                            .await
+                            .unwrap_or(false)
+                    {
+                        reason = Some(REASON_REMOVED);
+                    }
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let mut accepted = false;
+    if let Some(identity) = &verified {
+        *proven_device = None;
+        if lock.acquire(device_id, now).await.is_accepted() {
+            accepted = true;
+
+            // Moving the binding off a session that still exists is how a
+            // cloned install shows up
+            let previous = &identity.last_session_id;
+            if !previous.is_empty()
+                && previous != session_id
+                && db.fetch_session(previous).await.is_ok()
+            {
+                info!(
+                    "E2EE claim moved the device binding: user={} device={} from_session={} to_session={}",
+                    user_id, device_id, previous, session_id
+                );
+            }
+        } else {
+            reason = Some(REASON_HELD_ELSEWHERE);
+        }
+    }
+
+    if accepted {
+        *proven_device = Some(device_id.to_string());
+
+        db.update_e2ee_identity_session(user_id, device_id, session_id, Timestamp::now_utc())
+            .await
+            .ok();
+
+        // Same-session predecessor sweep (device-lifecycle fixes §2): an
+        // accepted claim proves THIS install's store holds device_id; any
+        // other row bound to this session is a dead predecessor. Recurring
+        // self-heal for a crash between publish-insert and its sweep.
+        revolt_database::E2EEIdentity::revoke_same_session_predecessors(
+            db, user_id, session_id, device_id, None,
+        )
+        .await;
+    }
+
+    // The queue drain is gated like an acknowledgement (multi-device D4),
+    // which right after an accepted claim holds
+    let drain = accepted
+        && lock
+            .may_act(device_id, e2ee_bound_session(db, user_id, device_id))
+            .await;
+
+    ClaimOutcome {
+        accepted,
+        reason,
+        drain,
+    }
+}
+
+/// Apply an `E2EEAck` of `ids` (at most [`E2EE_MAX_ACK_BATCH`] are taken)
+/// to the connection's proven device. Acknowledgement rights require a
+/// proven device claim, and only while this SESSION still holds the
+/// device's live claim or, with no readable lock, is still its bound
+/// session (multi-device D4, audit m4): a proof made before another session
+/// took the device over grants nothing. Acks are scoped to that device and
+/// idempotent. Whether the ack was honoured.
+async fn e2ee_ack<S: ClaimLockStore>(
+    db: &Database,
+    lock: &ConnectionClaim<S>,
+    user_id: &str,
+    session_id: &str,
+    proven_device: Option<&str>,
+    ids: &[String],
+) -> bool {
+    let Some(device_id) = proven_device else {
+        return false;
+    };
+
+    if !lock
+        .may_act(device_id, e2ee_bound_session(db, user_id, device_id))
+        .await
+    {
+        debug!(
+            "Ignored an E2EE acknowledgement: user={user_id} device={device_id} session={session_id} no longer holds the device"
+        );
+        return false;
+    }
+
+    for id in ids.iter().take(E2EE_MAX_ACK_BATCH) {
+        db.delete_e2ee_envelope(id, user_id, device_id).await.ok();
+    }
+
+    true
 }
 
 type WsReader = SplitStream<WebSocketStream<Compat<TcpStream>>>;
@@ -869,6 +1033,19 @@ async fn worker(
     let mut e2ee_pending_challenge: Option<(String, String)> = None;
     let mut e2ee_proven_device: Option<String> = None;
 
+    // Live-claim lock on the proven device (multi-device D4). Dropped with
+    // the worker, which releases it on every exit. Switched off
+    // (`[features.e2ee] claim_lock`), it neither writes nor reads the lock.
+    let mut e2ee_claim = ConnectionClaim::new(
+        RedisClaimLock,
+        &user_id,
+        &session_id,
+        claim_lock_ttl(keep_alive.idle_timeout),
+        revolt_config.features.e2ee.claim_lock,
+    );
+    // The refresh's device-binding lookup, when the lock went absent
+    let bound_user: &str = &user_id;
+
     // Ping the client regularly; a client that sends nothing at all (not
     // even the Pong) for `idle_timeout` is gone.
     let mut liveness = Liveness::new(Instant::now(), keep_alive.idle_timeout);
@@ -913,6 +1090,11 @@ async fn worker(
                 };
 
                 liveness.record_inbound(Instant::now());
+                e2ee_claim
+                    .refresh_if_due(Instant::now(), |device| async move {
+                        e2ee_bound_session(db, bound_user, &device).await
+                    })
+                    .await;
 
                 let Ok(payload) = config.decode(&msg) else {
                     continue;
@@ -1002,45 +1184,18 @@ async fn worker(
                         // cannot be retried against the same nonce
                         let challenge = e2ee_pending_challenge.take();
 
-                        let accepted = match challenge {
-                            Some((challenged_device, nonce)) if challenged_device == device_id => {
-                                if let Ok(identity) =
-                                    db.fetch_e2ee_identity(&user_id, &device_id).await
-                                {
-                                    identity.verify_claim(&nonce, &session_id, &signature)
-                                } else {
-                                    false
-                                }
-                            }
-                            _ => false,
-                        };
-
-                        if accepted {
-                            e2ee_proven_device = Some(device_id.clone());
-
-                            db.update_e2ee_identity_session(
-                                &user_id,
-                                &device_id,
-                                &session_id,
-                                Timestamp::now_utc(),
-                            )
-                            .await
-                            .ok();
-
-                            // Same-session predecessor sweep (device-
-                            // lifecycle fixes §2): an accepted claim
-                            // proves THIS install's store holds device_id;
-                            // any other row bound to this session is a
-                            // dead predecessor. Recurring self-heal for a
-                            // crash between publish-insert and its sweep.
-                            revolt_database::E2EEIdentity::revoke_same_session_predecessors(
-                                db,
-                                &user_id,
-                                &session_id,
-                                &device_id,
-                            )
-                            .await;
-                        }
+                        let outcome = decide_claim(
+                            db,
+                            &mut e2ee_claim,
+                            &mut e2ee_proven_device,
+                            &user_id,
+                            &session_id,
+                            challenge,
+                            &device_id,
+                            &signature,
+                            Instant::now(),
+                        )
+                        .await;
 
                         {
                             let mut write = write.lock().await;
@@ -1049,7 +1204,8 @@ async fn worker(
                                 &mut *write,
                                 config.encode(&EventV1::E2EEClaimResult {
                                     device_id: device_id.clone(),
-                                    accepted,
+                                    accepted: outcome.accepted,
+                                    reason: outcome.reason.map(str::to_string),
                                 }),
                                 keep_alive.send_timeout,
                             )
@@ -1066,8 +1222,9 @@ async fn worker(
                             // Drain the queue for the proven device, ordered
                             // by envelope ULID. Envelopes stay queued until
                             // acknowledged; clients dedup against live pushes
-                            // by envelope id.
-                            if accepted {
+                            // by envelope id. `decide_claim` gates it like an
+                            // acknowledgement (multi-device D4).
+                            if outcome.drain {
                                 if let Ok(envelopes) = db
                                     .fetch_e2ee_envelopes(&user_id, &device_id, E2EE_DRAIN_LIMIT)
                                     .await
@@ -1097,22 +1254,26 @@ async fn worker(
                             continue;
                         }
 
-                        // Acknowledgement rights require a proven device
-                        // claim; acks are scoped to that device and
-                        // idempotent (deleting an already-deleted envelope
-                        // is a no-op)
-                        let Some(device_id) = &e2ee_proven_device else {
-                            continue;
-                        };
-
-                        for id in ids.iter().take(E2EE_MAX_ACK_BATCH) {
-                            db.delete_e2ee_envelope(id, &user_id, device_id).await.ok();
-                        }
+                        e2ee_ack(
+                            db,
+                            &e2ee_claim,
+                            &user_id,
+                            &session_id,
+                            e2ee_proven_device.as_deref(),
+                            &ids,
+                        )
+                        .await;
                     }
                     _ => {}
                 }
             },
             _ = t3 => {
+                e2ee_claim
+                    .refresh(Instant::now(), |device| async move {
+                        e2ee_bound_session(db, bound_user, &device).await
+                    })
+                    .await;
+
                 let sent = send_bounded(
                     &mut *write.lock().await,
                     Message::Ping(Vec::new()),
@@ -1467,6 +1628,14 @@ mod tests {
         // An older timestamp never moves it back
         liveness.record_inbound(now);
         assert!(!liveness.is_expired(now + Duration::from_secs(150)));
+    }
+
+    /// Multi-device D4 (audit m3): the claim lock outlives the idle timeout
+    /// by 30 s, and the ping tick refreshes it well inside that
+    #[test]
+    fn d4_claim_lock_ttl_is_the_idle_timeout_plus_thirty_seconds() {
+        assert_eq!(claim_lock_ttl(IDLE_TIMEOUT), Duration::from_secs(150));
+        assert!(PING_INTERVAL < claim_lock_ttl(IDLE_TIMEOUT) / 2);
     }
 
     #[test]
@@ -1861,6 +2030,404 @@ mod tests {
                 let event = typing_event(&state, &subscribed, id, begin);
                 assert!(event.is_none(), "{id} begin={begin}: got {event:?}");
             }
+        }
+    }
+
+    // ====================================================================
+    // E2EE device claim and acknowledgement, as the worker decides them
+    // (multi-device D4/D8), over the in-memory lock and the Reference DB
+    // ====================================================================
+
+    mod e2ee_claims {
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
+        use revolt_database::{
+            iso8601_timestamp::Timestamp, Database, DatabaseInfo, E2EEEnvelope, E2EEIdentity,
+            E2EERemovedDevice, E2EESignedKey,
+        };
+
+        use super::super::{decide_claim, e2ee_ack, ClaimOutcome, E2EE_MAX_ACK_BATCH};
+        use crate::e2ee_claim_lock::{
+            fake::FakeLock, lock_key, ConnectionClaim, REASON_HELD_ELSEWHERE, REASON_REMOVED,
+        };
+
+        use std::time::Duration;
+
+        const USER: &str = "U";
+        const TTL: Duration = Duration::from_secs(150);
+        const NONCE: &str = "bm9uY2U";
+
+        async fn reference() -> Database {
+            DatabaseInfo::Reference.connect().await.expect("database")
+        }
+
+        /// One connection of `session`, with its proven device
+        struct Conn {
+            session: String,
+            claim: ConnectionClaim<FakeLock>,
+            proven: Option<String>,
+        }
+
+        impl Conn {
+            fn new(lock: &FakeLock, session: &str, conn_id: &str) -> Conn {
+                Conn {
+                    session: session.to_string(),
+                    claim: ConnectionClaim::with_conn_id(lock.clone(), USER, session, conn_id, TTL),
+                    proven: None,
+                }
+            }
+
+            /// A connection with the claim lock switched off
+            fn lock_off(lock: &FakeLock, session: &str, conn_id: &str) -> Conn {
+                let mut conn = Conn::new(lock, session, conn_id);
+                conn.claim = conn.claim.lock_enabled(false);
+                conn
+            }
+
+            /// `E2EEProveDevice` for `device` with `signature`, against a
+            /// pending challenge for `challenged` (none when `None`)
+            async fn prove(
+                &mut self,
+                db: &Database,
+                lock: &FakeLock,
+                challenged: Option<&str>,
+                device: &str,
+                signature: &str,
+            ) -> ClaimOutcome {
+                let challenge = challenged.map(|device| (device.to_string(), NONCE.to_string()));
+                decide_claim(
+                    db,
+                    &mut self.claim,
+                    &mut self.proven,
+                    USER,
+                    &self.session,
+                    challenge,
+                    device,
+                    signature,
+                    lock.now(),
+                )
+                .await
+            }
+
+            /// A valid `E2EEProveDevice` for `device`
+            async fn prove_valid(
+                &mut self,
+                db: &Database,
+                lock: &FakeLock,
+                device: &Device,
+            ) -> ClaimOutcome {
+                let signature = device.proof(&self.session, NONCE);
+                self.prove(db, lock, Some(&device.id), &device.id, &signature)
+                    .await
+            }
+
+            async fn ack(&self, db: &Database, ids: &[String]) -> bool {
+                e2ee_ack(db, &self.claim, USER, &self.session, self.proven.as_deref(), ids).await
+            }
+        }
+
+        /// A device row with a real identity key
+        struct Device {
+            id: String,
+            key: SigningKey,
+        }
+
+        impl Device {
+            /// A device whose row (bound to `session`) is stored when `stored`
+            async fn new(db: &Database, session: &str, stored: bool) -> Device {
+                let device = Device {
+                    id: format!("{:032x}", rand::random::<u128>()),
+                    key: SigningKey::from_bytes(&rand::random::<[u8; 32]>()),
+                };
+                if stored {
+                    db.insert_e2ee_identity(&E2EEIdentity {
+                        id: E2EEIdentity::composite_id(USER, &device.id),
+                        user_id: USER.to_string(),
+                        device_id: device.id.clone(),
+                        protocol_version: 1,
+                        ed25519_key: STANDARD_NO_PAD.encode(device.key.verifying_key().as_bytes()),
+                        curve25519_key: STANDARD_NO_PAD.encode([7u8; 32]),
+                        signature: String::new(),
+                        fallback_key: E2EESignedKey {
+                            key_id: "f0".to_string(),
+                            key: STANDARD_NO_PAD.encode([8u8; 32]),
+                            signature: String::new(),
+                        },
+                        previous_fallback_key: None,
+                        created_at: Timestamp::now_utc(),
+                        last_seen_at: Timestamp::now_utc(),
+                        last_session_id: session.to_string(),
+                    })
+                    .await
+                    .expect("insert identity");
+                }
+                device
+            }
+
+            /// The claim proof this device's key makes for `session`
+            fn proof(&self, session: &str, nonce: &str) -> String {
+                let payload = E2EEIdentity::claim_payload(&self.id, session, nonce);
+                STANDARD_NO_PAD.encode(self.key.sign(payload.as_bytes()).to_bytes())
+            }
+
+            fn key(&self) -> String {
+                lock_key(USER, &self.id)
+            }
+
+            async fn bound(&self, db: &Database) -> String {
+                db.fetch_e2ee_identity(USER, &self.id)
+                    .await
+                    .expect("row")
+                    .last_session_id
+            }
+
+            /// Queue one envelope for this device; its id
+            async fn queue(&self, db: &Database) -> String {
+                let id = ulid::Ulid::new().to_string();
+                let envelope: E2EEEnvelope = serde_json::from_value(serde_json::json!({
+                    "_id": id,
+                    "recipient_user_id": USER,
+                    "recipient_device_id": self.id,
+                    "sender_user_id": "P",
+                    "sender_device_id": "p".repeat(32),
+                    "protocol_version": 1,
+                    "sequence": 0,
+                    "ciphertext": "Y2lwaGVy",
+                    "timestamp": "1970-01-01T00:00:00.000Z"
+                }))
+                .expect("envelope");
+                db.insert_e2ee_envelopes(&[envelope]).await.expect("queue");
+                id
+            }
+
+            async fn queued(&self, db: &Database) -> u64 {
+                db.count_e2ee_envelopes(USER, &self.id).await.expect("count")
+            }
+        }
+
+        fn refused(reason: Option<&'static str>) -> ClaimOutcome {
+            ClaimOutcome {
+                accepted: false,
+                reason,
+                drain: false,
+            }
+        }
+
+        const ACCEPTED: ClaimOutcome = ClaimOutcome {
+            accepted: true,
+            reason: None,
+            drain: true,
+        };
+
+        /// D4 / audit m4: once another SESSION took the device over, an ack
+        /// from a connection that proved it earlier deletes nothing, whether
+        /// the lock or (with no lock) the row names the new session
+        #[tokio::test]
+        async fn d4_worker_ack_after_another_session_took_over_leaves_the_envelope() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let device = Device::new(&db, "S1", true).await;
+            let mut old = Conn::new(&lock, "S1", "a");
+            let mut new = Conn::new(&lock, "S2", "b");
+
+            assert_eq!(old.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            let first = device.queue(&db).await;
+
+            // The old connection's lock lapsed and S2 claimed the device
+            lock.advance(TTL);
+            assert_eq!(new.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            assert_eq!(device.bound(&db).await, "S2");
+
+            assert!(!old.ack(&db, &[first.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "the stale ack deleted the envelope");
+
+            // With no lock at all the row decides, and it names S2
+            lock.remove(&device.key());
+            assert!(!old.ack(&db, &[first.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "the stale ack deleted the envelope");
+
+            // The holder's ack does delete, bounded per frame
+            let mut ids = vec![first];
+            for _ in 0..E2EE_MAX_ACK_BATCH {
+                ids.push(device.queue(&db).await);
+            }
+            assert!(new.ack(&db, &ids).await);
+            assert_eq!(device.queued(&db).await, 1, "one past the batch bound");
+        }
+
+        /// D4: a claim refused as `held_elsewhere` drains nothing, rebinds
+        /// nothing, and ends this connection's rights on the device it
+        /// proved before. An unproven claim never drains either, even while
+        /// this connection holds the device's lock
+        #[tokio::test]
+        async fn d4_worker_refused_claim_drains_nothing_and_clears_the_proven_device() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let ours = Device::new(&db, "S1", true).await;
+            let theirs = Device::new(&db, "S2", true).await;
+            let mut conn = Conn::new(&lock, "S1", "a");
+
+            assert_eq!(conn.prove_valid(&db, &lock, &ours).await, ACCEPTED);
+            assert_eq!(conn.proven.as_deref(), Some(ours.id.as_str()));
+            let envelope = ours.queue(&db).await;
+            theirs.queue(&db).await;
+
+            lock.put(&theirs.key(), "S2:x", TTL);
+            assert_eq!(
+                conn.prove_valid(&db, &lock, &theirs).await,
+                refused(Some(REASON_HELD_ELSEWHERE))
+            );
+            assert_eq!(conn.proven, None, "the refused claim left the old device proven");
+            assert_eq!(theirs.bound(&db).await, "S2", "a refused claim rebound the device");
+            assert_eq!(lock.get(&theirs.key()).as_deref(), Some("S2:x"));
+            assert_eq!(lock.get(&ours.key()), None, "the old device's lock was kept");
+
+            // The old device's queue is out of reach now, though its row
+            // still names this session
+            assert!(!conn.ack(&db, &[envelope.clone()]).await);
+            assert_eq!(ours.queued(&db).await, 1);
+            assert_eq!(theirs.queued(&db).await, 1);
+
+            // An unproven claim while holding the device's lock
+            assert_eq!(conn.prove_valid(&db, &lock, &ours).await, ACCEPTED);
+            let bad = theirs.proof("S1", NONCE);
+            assert_eq!(
+                conn.prove(&db, &lock, Some(&ours.id), &ours.id, &bad).await,
+                refused(None)
+            );
+            assert_eq!(ours.queued(&db).await, 1);
+        }
+
+        /// D4: the lock is consulted only after a VALID proof, so a keyless
+        /// token learns nothing about where a device is live: every
+        /// unproven claim is the same bare refusal whether or not another
+        /// session holds the device, and never reaches the lock
+        #[tokio::test]
+        async fn d4_worker_bad_proof_never_touches_the_lock() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let device = Device::new(&db, "S2", true).await;
+            let other = Device::new(&db, "S1", true).await;
+            let stranger = SigningKey::from_bytes(&[9u8; 32]);
+            let mut conn = Conn::new(&lock, "S1", "a");
+
+            let wrong_key = {
+                let payload = E2EEIdentity::claim_payload(&device.id, "S1", NONCE);
+                STANDARD_NO_PAD.encode(stranger.sign(payload.as_bytes()).to_bytes())
+            };
+            let (claimed, elsewhere) = (Some(device.id.as_str()), Some(other.id.as_str()));
+            let cases: [(&str, Option<&str>, String); 6] = [
+                ("another key", claimed, wrong_key),
+                ("another nonce", claimed, device.proof("S1", "b3RoZXI")),
+                ("another session", claimed, device.proof("S2", NONCE)),
+                ("not base64", claimed, "!!!".to_string()),
+                ("challenge for another device", elsewhere, device.proof("S1", NONCE)),
+                ("no challenge", None, device.proof("S1", NONCE)),
+            ];
+
+            for held in [false, true] {
+                if held {
+                    lock.put(&device.key(), "S2:x", TTL);
+                }
+                for (name, challenged, signature) in &cases {
+                    let outcome = conn
+                        .prove(&db, &lock, *challenged, &device.id, signature)
+                        .await;
+                    assert_eq!(outcome, refused(None), "{name}, held={held}");
+                    assert_eq!(lock.acquires(), 0, "{name}, held={held}: reached the lock");
+                    assert_eq!(conn.proven, None, "{name}");
+                    assert_eq!(device.bound(&db).await, "S2", "{name}");
+                }
+            }
+            assert_eq!(lock.get(&device.key()).as_deref(), Some("S2:x"));
+
+            // The same proof with the right key does reach it
+            assert_eq!(
+                conn.prove_valid(&db, &lock, &device).await,
+                refused(Some(REASON_HELD_ELSEWHERE))
+            );
+            assert_eq!(lock.acquires(), 1);
+        }
+
+        /// Addendum A3(b): with the lock switched off, a verified claim is
+        /// accepted even while another session holds the lock, no lock is
+        /// written, and an ack counts only from the session the row is
+        /// bound to: one from any other session is dropped, and a lock left
+        /// in Redis naming it changes nothing
+        #[tokio::test]
+        async fn lock_off_worker_accepts_and_gates_acks_on_the_binding() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let device = Device::new(&db, "S2", true).await;
+            lock.put(&device.key(), "S2:x", TTL);
+            let mut first = Conn::lock_off(&lock, "S1", "a");
+            let mut second = Conn::lock_off(&lock, "S2", "b");
+
+            assert_eq!(first.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            assert_eq!(device.bound(&db).await, "S1");
+            assert_eq!(lock.get(&device.key()).as_deref(), Some("S2:x"), "a lock was written");
+
+            // The other session claims it back; the first one's ack is dropped
+            assert_eq!(second.prove_valid(&db, &lock, &device).await, ACCEPTED);
+            assert_eq!(device.bound(&db).await, "S2");
+            let envelope = device.queue(&db).await;
+            assert!(!first.ack(&db, &[envelope.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "an unbound session's ack deleted it");
+
+            // A stale lock naming the first session grants it nothing
+            lock.put(&device.key(), "S1:a", TTL);
+            assert!(!first.ack(&db, &[envelope.clone()]).await);
+            assert_eq!(device.queued(&db).await, 1, "a stale lock granted ack rights");
+            assert_eq!(lock.calls(), 0, "the switched-off worker used the lock");
+
+            // The bound session's ack is honoured
+            assert!(second.ack(&db, &[envelope]).await);
+            assert_eq!(device.queued(&db).await, 0);
+            assert_eq!(lock.calls(), 0, "the switched-off worker used the lock");
+        }
+
+        /// D8: `reason: "removed"` only when the claimed device's row is
+        /// missing AND the device has a tombstone, for a challenge issued
+        /// for that device
+        #[tokio::test]
+        async fn d8_worker_removed_reason_only_for_a_missing_tombstoned_row() {
+            let db = reference().await;
+            let lock = FakeLock::new();
+            let removed = Device::new(&db, "S1", false).await;
+            let missing = Device::new(&db, "S1", false).await;
+            let present = Device::new(&db, "S1", true).await;
+            for device in [&removed, &present] {
+                db.upsert_e2ee_removed_device(&E2EERemovedDevice::new(
+                    USER,
+                    &device.id,
+                    Timestamp::now_utc(),
+                ))
+                .await
+                .expect("tombstone");
+            }
+            let mut conn = Conn::new(&lock, "S1", "a");
+
+            assert_eq!(
+                conn.prove_valid(&db, &lock, &removed).await,
+                refused(Some(REASON_REMOVED))
+            );
+            assert_eq!(conn.prove_valid(&db, &lock, &missing).await, refused(None));
+
+            // A row that still exists is judged on its proof, tombstone or not
+            let bad = missing.proof("S1", NONCE);
+            assert_eq!(
+                conn.prove(&db, &lock, Some(&present.id), &present.id, &bad).await,
+                refused(None)
+            );
+
+            // Without a challenge for that device there is no verdict at all
+            let proof = removed.proof("S1", NONCE);
+            assert_eq!(
+                conn.prove(&db, &lock, Some(&present.id), &removed.id, &proof).await,
+                refused(None)
+            );
+            assert_eq!(conn.prove(&db, &lock, None, &removed.id, &proof).await, refused(None));
+            assert_eq!(lock.acquires(), 0);
         }
     }
 }

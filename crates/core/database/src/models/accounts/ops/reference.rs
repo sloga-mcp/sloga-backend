@@ -78,17 +78,11 @@ impl AbstractAccounts for ReferenceDb {
 
     /// Find account with active deletion token
     async fn fetch_account_with_deletion_token(&self, token_to_match: &str) -> Result<Account> {
+        let now = Timestamp::now_utc();
         let accounts = self.accounts.lock().await;
         accounts
             .values()
-            .find(|account| {
-                if let Some(DeletionInfo::WaitingForVerification { token, .. }) = &account.deletion
-                {
-                    token == token_to_match
-                } else {
-                    false
-                }
-            })
+            .find(|account| pending_deletion_matches(account, token_to_match, now))
             .cloned()
             .ok_or_else(|| create_error!(InvalidToken))
     }
@@ -116,14 +110,100 @@ impl AbstractAccounts for ReferenceDb {
         let mut accounts = self.accounts.lock().await;
         let mut account = account.clone();
 
-        // Lockout is written only through the lockout ops, so a stale
-        // whole-document save cannot reset the counter. An update keeps the
-        // stored lockout; an insert stores none, as the MongoDB driver does.
-        account.lockout = accounts
-            .get(&account.id)
-            .and_then(|stored| stored.lockout.clone());
+        // Lockout and deletion are written only through their own ops, so a
+        // stale whole-document save can neither reset the counter nor
+        // cancel or revive a deletion. An update keeps the stored values; an
+        // insert stores none, as the MongoDB driver (which leaves both out of
+        // its upsert `$set`) does.
+        let stored = accounts.get(&account.id);
+        account.lockout = stored.and_then(|stored| stored.lockout.clone());
+        account.deletion = stored.and_then(|stored| stored.deletion.clone());
 
         accounts.insert(account.id.to_string(), account);
+        Ok(())
+    }
+
+    /// Overwrite the deletion state, and nothing else
+    async fn set_account_deletion(&self, id: &str, deletion: Option<DeletionInfo>) -> Result<()> {
+        let mut accounts = self.accounts.lock().await;
+        let account = accounts
+            .get_mut(id)
+            .ok_or_else(|| create_error!(UnknownUser))?;
+
+        account.deletion = deletion;
+        Ok(())
+    }
+
+    /// Atomically store a new deletion request
+    async fn request_account_deletion(&self, id: &str, deletion: DeletionInfo) -> Result<()> {
+        let mut accounts = self.accounts.lock().await;
+
+        // A missing account is `InvalidOperation` too, not `UnknownUser`: the
+        // MongoDB filter cannot tell it apart from a refused one, and the
+        // drivers must agree. The caller has loaded the account already.
+        let account = accounts
+            .get_mut(id)
+            .ok_or_else(|| create_error!(InvalidOperation))?;
+
+        // The same conditions as the MongoDB filter, checked and applied
+        // under one lock
+        let open = matches!(
+            account.deletion,
+            None | Some(DeletionInfo::WaitingForVerification { .. })
+        );
+
+        if account.disabled || !open {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        account.deletion = Some(deletion);
+        Ok(())
+    }
+
+    /// Atomically confirm a pending deletion
+    async fn claim_account_deletion(&self, token: &str) -> Result<Account> {
+        let now = Timestamp::now_utc();
+        let mut accounts = self.accounts.lock().await;
+
+        // The same conditions as the MongoDB filter, checked and applied
+        // under one lock
+        let account = accounts
+            .values_mut()
+            .find(|account| !account.disabled && pending_deletion_matches(account, token, now))
+            .ok_or_else(|| create_error!(InvalidToken))?;
+
+        account.deletion = Some(DeletionInfo::Scheduled { after: now });
+        account.disabled = true;
+        Ok(account.clone())
+    }
+
+    /// Atomically cancel a pending deletion
+    async fn cancel_account_deletion(&self, account_id: &str) -> Result<Option<DeletionInfo>> {
+        let mut accounts = self.accounts.lock().await;
+        let Some(account) = accounts.get_mut(account_id) else {
+            return Ok(None);
+        };
+
+        // Only a pending deletion is cancelled; Scheduled and Deleted stay
+        if matches!(
+            account.deletion,
+            Some(DeletionInfo::WaitingForVerification { .. })
+        ) {
+            Ok(account.deletion.take())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Remove the linked Google and Apple ids, and nothing else
+    async fn unlink_account_oauth(&self, id: &str) -> Result<()> {
+        let mut accounts = self.accounts.lock().await;
+        let account = accounts
+            .get_mut(id)
+            .ok_or_else(|| create_error!(UnknownUser))?;
+
+        account.google_id = None;
+        account.apple_id = None;
         Ok(())
     }
 
@@ -217,6 +297,16 @@ impl AbstractAccounts for ReferenceDb {
         account.verification = verification.clone();
         Ok(())
     }
+}
+
+/// Whether the account holds a pending deletion with this token that has not
+/// expired. The expiry is inclusive, as MongoDB's `$gte` is.
+fn pending_deletion_matches(account: &Account, token_to_match: &str, now: Timestamp) -> bool {
+    matches!(
+        &account.deletion,
+        Some(DeletionInfo::WaitingForVerification { token, expiry })
+            if token == token_to_match && *expiry >= now
+    )
 }
 
 /// Count one failed attempt and set the expiry from the new count `n`:

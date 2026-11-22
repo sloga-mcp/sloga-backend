@@ -1,7 +1,7 @@
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    events::client::EventV1, is_valid_device_id, Database, E2EEIdentity, E2EEOneTimeKey,
-    Session, User, ValidatedTicket, E2EE_PROTOCOL_VERSION,
+    e2ee_claim_lock, events::client::EventV1, is_valid_device_id, Database, E2EEIdentity,
+    E2EEOneTimeKey, Session, User, ValidatedTicket, E2EE_PROTOCOL_VERSION,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -33,6 +33,13 @@ fn check_signed_key(key: &v0::E2EESignedKey) -> Result<()> {
 /// republishing may only rotate the fallback key and add one-time keys; a
 /// fresh identity requires revoking the device and enrolling a new one.
 ///
+/// A first publication may carry `split_from` + `split_proof`: the install
+/// leaves a device it shared with another install and becomes this new
+/// device. The old device is unbound from this session, and its live-claim
+/// lock released if this session holds it; it is not revoked. A
+/// device id removed with `DELETE /e2ee/keys/{device}` cannot be published
+/// again.
+///
 /// All signatures are verified server-side as a hygiene check; clients MUST
 /// still verify them on fetch — the server is outside the trust boundary.
 #[openapi(tag = "E2EE")]
@@ -52,6 +59,8 @@ pub async fn publish_keys(
 
     let data = data.into_inner();
     let replace_one_time_keys = data.replace_one_time_keys;
+    let split_from = data.split_from;
+    let split_proof = data.split_proof;
 
     // Structural validation before any crypto
     if !is_valid_device_id(&data.device_id) {
@@ -134,6 +143,11 @@ pub async fn publish_keys(
         // already-consumed public keys and wedge the device's peers
         existing.assert_bound_session(&session.id)?;
 
+        // A split creates a device; it is never part of a republish
+        if split_from.is_some() || split_proof.is_some() {
+            return Err(create_error!(InvalidOperation));
+        }
+
         // Identity keys are immutable per device: a differing key is a
         // substitution attempt (or a reinstall that must enroll fresh)
         if existing.ed25519_key != identity.ed25519_key
@@ -173,6 +187,70 @@ pub async fn publish_keys(
             return Err(create_error!(InvalidToken));
         }
 
+        // Split (multi-device D5): the old device, one of THIS user's rows,
+        // must have signed the move to this device id and identity key from
+        // this session (an unpadded standard base64 Ed25519 signature).
+        // Every check runs before any write
+        match (&split_from, &split_proof) {
+            (None, None) => {}
+            (Some(old_device_id), Some(proof)) => {
+                let old = if is_valid_device_id(old_device_id) {
+                    db.fetch_e2ee_identity(&user.id, old_device_id).await.ok()
+                } else {
+                    None
+                };
+
+                let verified = old.is_some_and(|old| {
+                    old.verify_split_proof(
+                        &identity.device_id,
+                        &identity.ed25519_key,
+                        &session.id,
+                        proof,
+                    )
+                });
+
+                if !verified {
+                    return Err(create_error!(InvalidCredentials));
+                }
+            }
+            (Some(_), None) => return Err(create_error!(InvalidCredentials)),
+            (None, Some(_)) => return Err(create_error!(InvalidOperation)),
+        }
+
+        // A device id removed with `DELETE /e2ee/keys/{device}` stays
+        // removed (multi-device D8); the install sets up a new device
+        if db
+            .is_e2ee_device_removed(&user.id, &identity.device_id)
+            .await?
+        {
+            return Err(create_error!(E2EEDeviceRemoved));
+        }
+
+        if let Some(old_device_id) = &split_from {
+            // Release the old device from this session only (one filtered
+            // update, so a twin that re-bound it keeps its binding). A
+            // failure writes nothing and fails the publish; the client
+            // keeps the old device. A failed insert below leaves the old
+            // row unbound, and this session's next claim of it rebinds it
+            E2EEIdentity::unbind_session_if(db, &user.id, old_device_id, &session.id).await?;
+
+            // ...and its live-claim lock (plan D4), iff this session holds
+            // it: an acknowledgement for the old device then falls back to
+            // the binding, `""`, and is refused. A twin's lock is left
+            // alone. A Redis error is ignored (owner decision O4); the lock
+            // then expires with its TTL
+            let key = e2ee_claim_lock::lock_key(&user.id, old_device_id);
+            if let Err(err) = e2ee_claim_lock::release_held_by_session(&key, &session.id).await {
+                log::warn!(
+                    "E2EE split left the old device's claim lock to its TTL: user={} device={} session={}: {}",
+                    user.id,
+                    old_device_id,
+                    session.id,
+                    err.0
+                );
+            }
+        }
+
         // Uniqueness of (user_id, device_id) is index-enforced; a concurrent
         // duplicate publish loses the race here
         db.insert_e2ee_identity(&identity).await?;
@@ -185,6 +263,7 @@ pub async fn publish_keys(
             EventV1::E2EEDeviceCreate {
                 user_id: user.id.clone(),
                 device_id: identity.device_id.clone(),
+                split_from: split_from.clone(),
             },
         )
         .await;
@@ -192,12 +271,14 @@ pub async fn publish_keys(
         // Same-session predecessor sweep (device-lifecycle fixes §2): a
         // first publication from this session proves any OTHER identity
         // row bound to the same session is a wiped predecessor store.
-        // Best-effort; emits the existing loud delete events.
+        // Best-effort; emits the existing loud delete events. A split's
+        // old device is never one: the twin install still uses it
         E2EEIdentity::revoke_same_session_predecessors(
             db,
             &user.id,
             &session.id,
             &identity.device_id,
+            split_from.as_deref(),
         )
         .await;
     }

@@ -106,4 +106,17 @@ impl AbstractAttachmentHashes for ReferenceDb {
             Err(create_error!(NotFound))
         }
     }
+
+    /// Fetch every hash entry with the given processed hash.
+    async fn fetch_attachment_hashes_by_processed(
+        &self,
+        processed_hash: &str,
+    ) -> Result<Vec<FileHash>> {
+        let hashes = self.file_hashes.lock().await;
+        Ok(hashes
+            .values()
+            .filter(|hash| hash.processed_hash == processed_hash)
+            .cloned()
+            .collect())
+    }
 }

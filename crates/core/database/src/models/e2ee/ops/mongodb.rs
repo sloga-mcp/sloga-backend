@@ -5,13 +5,17 @@ use revolt_result::Result;
 
 use futures::StreamExt;
 
-use crate::{AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, MongoDb};
+use crate::{
+    AbstractE2EE, E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey,
+    E2EERemovedDevice, MongoDb,
+};
 
 const COL_IDENTITY: &str = "e2ee_identity";
 const COL_PREKEYS: &str = "e2ee_prekeys";
 const COL_QUEUE: &str = "e2ee_queue";
 const COL_BLOBS: &str = "e2ee_blobs";
 const COL_BACKUPS: &str = "e2ee_backups";
+const COL_REMOVED: &str = "e2ee_removed_devices";
 
 #[async_trait]
 impl AbstractE2EE for MongoDb {
@@ -99,6 +103,32 @@ impl AbstractE2EE for MongoDb {
                     Ok(())
                 }
             })
+    }
+
+    async fn unbind_e2ee_identity_session_if(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        // The binding is part of the filter, so a twin that re-bound the
+        // device between the caller's read and this write is never undone
+        self.col::<E2EEIdentity>(COL_IDENTITY)
+            .update_one(
+                doc! {
+                    "user_id": user_id,
+                    "device_id": device_id,
+                    "last_session_id": session_id
+                },
+                doc! {
+                    "$set": {
+                        "last_session_id": ""
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL_IDENTITY))
+            .map(|result| result.matched_count > 0)
     }
 
     async fn delete_e2ee_device(&self, user_id: &str, device_id: &str) -> Result<bool> {
@@ -489,6 +519,56 @@ impl AbstractE2EE for MongoDb {
             })
             .await
             .map_err(|_| create_database_error!("delete_many", COL_BACKUPS))
+            .map(|result| result.deleted_count as usize)
+    }
+
+    async fn upsert_e2ee_removed_device(&self, removed: &E2EERemovedDevice) -> Result<()> {
+        let mut document =
+            to_document(removed).map_err(|_| create_database_error!("to_document", COL_REMOVED))?;
+        // The upsert takes `_id` from the filter
+        document.remove("_id");
+
+        // $setOnInsert: an existing tombstone is left exactly as it is
+        self.col::<E2EERemovedDevice>(COL_REMOVED)
+            .update_one(
+                doc! { "_id": &removed.id },
+                doc! { "$setOnInsert": document },
+            )
+            .with_options(
+                mongodb::options::UpdateOptions::builder()
+                    .upsert(true)
+                    .build(),
+            )
+            .await
+            .map(|_| ())
+            .or_else(|error| match *error.kind {
+                // Two concurrent upserts of one tombstone: the loser's
+                // insert hits the unique key, and the tombstone exists
+                mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                    ref write_error,
+                )) if write_error.code == 11000 => Ok(()),
+                _ => Err(create_database_error!("upsert_one", COL_REMOVED)),
+            })
+    }
+
+    async fn is_e2ee_device_removed(&self, user_id: &str, device_id: &str) -> Result<bool> {
+        self.col::<Document>(COL_REMOVED)
+            .count_documents(doc! {
+                "user_id": user_id,
+                "device_id": device_id
+            })
+            .await
+            .map_err(|_| create_database_error!("count_documents", COL_REMOVED))
+            .map(|count| count > 0)
+    }
+
+    async fn delete_all_e2ee_removed_devices(&self, user_id: &str) -> Result<usize> {
+        self.col::<Document>(COL_REMOVED)
+            .delete_many(doc! {
+                "user_id": user_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_REMOVED))
             .map(|result| result.deleted_count as usize)
     }
 }

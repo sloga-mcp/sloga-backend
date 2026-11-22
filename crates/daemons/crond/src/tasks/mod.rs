@@ -30,4 +30,5 @@ pub mod qualify_referrals;
 pub mod scheduled_messages;
 pub mod stoat_import;
 pub mod stream_live;
+pub mod takedown;
 pub mod thread_archiver;

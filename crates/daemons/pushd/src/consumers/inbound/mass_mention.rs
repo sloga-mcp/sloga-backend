@@ -4,16 +4,23 @@ use std::{
     sync::Arc,
 };
 
-use crate::utils::{render_notification_content, Consumer};
+use crate::utils::{render_notification_content, session_wants, Consumer, PushClass};
 use anyhow::Result;
 use async_trait::async_trait;
 use lapin::{message::Delivery, Channel, Connection};
 use revolt_database::{
     events::rabbit::*, util::bulk_permissions::BulkDatabasePermissionQuery, Database, Member,
-    MessageFlagsValue, PushSubscriptionKind,
+    MessageFlagsValue, PushSubscriptionKind, WebPushSubscription,
 };
 use revolt_models::v0::{MessageFlags, PushNotification};
 use revolt_result::ToRevoltError;
+
+/// Whether one session takes the push for an @everyone, @online or role mention. These only
+/// happen in servers, so a session that asked for chats only gives them up. The answer is for
+/// this one session: the same user's other devices are asked separately and are still notified.
+fn wants(sub: &WebPushSubscription, scope_enabled: bool) -> bool {
+    session_wants(sub, PushClass::MassMention, scope_enabled)
+}
 
 #[derive(Clone)]
 #[allow(unused)]
@@ -40,8 +47,13 @@ impl MassMessageConsumer {
             .await
         {
             let config = revolt_config::config().await;
+            let scope_enabled = config.features.push_session_scope;
             for session in sessions {
                 if let Some(sub) = session.subscription {
+                    if !wants(&sub, scope_enabled) {
+                        continue;
+                    }
+
                     let mut sendable = PayloadToService {
                         notification: PayloadKind::MessageNotification(push.clone()),
                         token: sub.auth,
@@ -270,5 +282,65 @@ impl Consumer for MassMessageConsumer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants;
+    use revolt_database::WebPushSubscription;
+
+    fn session(chats_only: Option<bool>, no_ring: Option<bool>) -> WebPushSubscription {
+        WebPushSubscription {
+            endpoint: "fcm".to_string(),
+            p256dh: String::new(),
+            auth: "token".to_string(),
+            kind: None,
+            chats_only,
+            no_ring,
+        }
+    }
+
+    #[test]
+    fn only_a_chats_only_session_with_the_switch_on_is_skipped() {
+        assert!(!wants(&session(Some(true), None), true));
+
+        // No preference stored, which is every session that subscribed before the preference
+        // existed.
+        assert!(wants(&session(None, None), true));
+        assert!(wants(&session(Some(false), None), true));
+        // "Do not ring" is about calls and says nothing about mentions.
+        assert!(wants(&session(None, Some(true)), true));
+        // The switch is off: the stored preference is ignored.
+        assert!(wants(&session(Some(true), Some(true)), false));
+    }
+
+    /// The code above the tests with all whitespace removed, so the pin below does not depend
+    /// on how the file is formatted.
+    fn shipping_source() -> String {
+        include_str!("mass_mention.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the code above the tests")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn a_skipped_session_skips_only_itself() {
+        let source = shipping_source();
+
+        // `continue` moves on to the next session. A `return` or a `break` in its place would
+        // also drop the push for every session after this one, the user's other devices and
+        // the rest of the mentioned members included.
+        assert!(source.contains(
+            "ifletSome(sub)=session.subscription{\
+             if!wants(&sub,scope_enabled){continue;}\
+             letmutsendable=PayloadToService{"
+        ));
+        assert!(source.contains("letscope_enabled=config.features.push_session_scope;"));
+        // The payload is built in one place only, and that place is behind the check.
+        assert_eq!(source.matches("PayloadToService{").count(), 1);
     }
 }

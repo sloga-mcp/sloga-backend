@@ -127,6 +127,7 @@ impl IntoResponse for Error {
             ErrorType::NotInVoiceChannel => StatusCode::BAD_REQUEST,
             ErrorType::AlreadyConnected => StatusCode::BAD_REQUEST,
             ErrorType::UnknownNode => StatusCode::BAD_REQUEST,
+            ErrorType::CallEnded => StatusCode::BAD_REQUEST,
             ErrorType::RemoteControlOfferPending => StatusCode::CONFLICT,
             ErrorType::RemoteControlGrantActive => StatusCode::CONFLICT,
             ErrorType::WatchSessionExists => StatusCode::CONFLICT,
@@ -168,6 +169,8 @@ impl IntoResponse for Error {
             ErrorType::IncorrectData { .. } => StatusCode::BAD_REQUEST,
             ErrorType::MlsCallFull { .. } => StatusCode::CONFLICT,
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
+            ErrorType::E2EEDeviceRemoved => StatusCode::FORBIDDEN,
+            ErrorType::E2EEDeviceHeldElsewhere => StatusCode::FORBIDDEN,
 
             ErrorType::PaymentsDisabled => StatusCode::BAD_REQUEST,
             ErrorType::CipherSalesClosed => StatusCode::FORBIDDEN,
@@ -261,6 +264,25 @@ mod tests {
             let name = format!("{:?}", error.error_type);
             assert_eq!(error.into_response().status().as_u16(), code, "{name}");
         }
+    }
+
+    /// A removed E2EE device is a 403 refusal of an authenticated caller,
+    /// not a 401; `rocket.rs` pins the same answer
+    #[test]
+    fn e2ee_device_removed_is_forbidden() {
+        assert_eq!(
+            create_error!(E2EEDeviceRemoved).into_response().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// A refused device removal is a 403 as well; `rocket.rs` pins the same
+    #[test]
+    fn e2ee_device_held_elsewhere_is_forbidden() {
+        assert_eq!(
+            create_error!(E2EEDeviceHeldElsewhere).into_response().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     /// Polls a future that must already be complete: an error response body

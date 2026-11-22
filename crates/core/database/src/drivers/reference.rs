@@ -7,6 +7,7 @@ use crate::{
     ChannelFollow, ChannelSeat, ChannelUnread,
     AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
+    E2EERemovedDevice,
     EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
     RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
@@ -20,6 +21,7 @@ use crate::{
 use crate::{
     CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
 };
+use crate::{StaffAuditEntry, TakedownRequest, UploadHashBlock};
 
 database_derived!(
     /// Reference implementation
@@ -71,6 +73,10 @@ database_derived!(
         pub servers: Arc<Mutex<HashMap<String, Server>>>,
         pub safety_reports: Arc<Mutex<HashMap<String, Report>>>,
         pub safety_snapshots: Arc<Mutex<HashMap<String, Snapshot>>>,
+        pub staff_audit: Arc<Mutex<HashMap<String, StaffAuditEntry>>>,
+        pub takedown_requests: Arc<Mutex<HashMap<String, TakedownRequest>>>,
+        /// Keyed by the block key (`orig:<hash>` etc.)
+        pub upload_hash_blocks: Arc<Mutex<HashMap<String, UploadHashBlock>>>,
         pub accounts: Arc<Mutex<HashMap<String, Account>>>,
         pub account_invites: Arc<Mutex<HashMap<String, AccountInvite>>>,
         pub sessions: Arc<Mutex<HashMap<String, Session>>>,
@@ -80,6 +86,7 @@ database_derived!(
         pub e2ee_queue: Arc<Mutex<HashMap<String, E2EEEnvelope>>>,
         pub e2ee_blobs: Arc<Mutex<HashMap<String, E2EEBlob>>>,
         pub e2ee_backups: Arc<Mutex<HashMap<String, E2EEBackup>>>,
+        pub e2ee_removed_devices: Arc<Mutex<HashMap<String, E2EERemovedDevice>>>,
         pub mls_key_packages: Arc<Mutex<HashMap<String, MlsKeyPackage>>>,
         pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
         pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,

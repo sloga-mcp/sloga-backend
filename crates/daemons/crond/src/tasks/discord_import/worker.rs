@@ -2845,6 +2845,60 @@ mod tests {
             .any(|note| note.starts_with("1 emoji had names")));
     }
 
+    /// Take It Down re-upload block on import: an image on the block list is
+    /// skipped like a failed download (a note, no file) and the import still
+    /// completes.
+    #[tokio::test]
+    async fn blocked_assets_are_skipped_and_the_import_completes() {
+        use sha2::Digest;
+
+        let db = DatabaseInfo::Reference.connect().await.unwrap();
+        let owner = make_owner(&db).await;
+        seed_png_hash(&db).await;
+        let png_hash = format!("{:02x}", sha2::Sha256::digest(PNG_1X1));
+        super::super::assets::tests::block(&db, "orig", &png_hash).await;
+
+        let mut job = source_job(&owner.id, ImportJobKind::StoatServer, "01SRCBLOCKED");
+        job.status = ImportStatus::Running;
+        db.insert_discord_import_job(&job).await.unwrap();
+
+        let fetcher = TestFetcher {
+            db: db.clone(),
+            job_id: job.id.clone(),
+            supersede_on_emoji: false,
+            member_at_fetch: Mutex::new(vec![]),
+        };
+
+        if execute_plan(&db, &mut job, plan_with_assets(), &fetcher)
+            .await
+            .is_err()
+        {
+            panic!("execute_plan aborted");
+        }
+
+        let server_id = job.server_id.clone().expect("server built");
+        let server = db.fetch_server(&server_id).await.unwrap();
+        assert!(server.icon.is_none(), "the blocked icon was skipped");
+        assert!(db
+            .fetch_emoji_by_parent_id(&server_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            db.fetch_attachments_by_hashes(&[png_hash])
+                .await
+                .unwrap()
+                .is_empty(),
+            "no file was minted for the blocked image"
+        );
+
+        let stored = db.fetch_discord_import_job(&job.id).await.unwrap();
+        assert_eq!(stored.status, ImportStatus::Completed);
+        let notes = stored.summary.expect("summary").notes;
+        assert!(notes.contains(&"The server icon couldn't be imported.".to_string()));
+        assert!(notes.contains(&"1 emoji couldn't be imported and were skipped.".to_string()));
+    }
+
     /// A failure AFTER the Assets stage (here: the job reaped while the
     /// emoji was being fetched) rolls the server back, and the rollback
     /// takes the emoji it created, files included.

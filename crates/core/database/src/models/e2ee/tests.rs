@@ -834,6 +834,7 @@ async fn revoke_recording(
         user_id,
         device_id,
         formats_v2,
+        false,
         |topic, event: EventV1| {
             sent.push((topic, serde_json::to_string(&event).unwrap()));
             std::future::ready(())
@@ -1003,6 +1004,7 @@ async fn the_second_pass_catches_a_device_added_after_the_first() {
             MEMBER,
             MEMBER_DEVICE_2,
             false,
+            false,
             &mut changed
         )
         .await
@@ -1016,6 +1018,7 @@ async fn the_second_pass_catches_a_device_added_after_the_first() {
             MEMBER,
             MEMBER_DEVICE,
             true,
+            false,
             &mut changed
         )
         .await
@@ -1147,6 +1150,7 @@ async fn a_failed_pending_pass_fails_the_revocation_closed() {
                 MEMBER,
                 MEMBER_DEVICE,
                 true,
+                false,
                 &mut changed
             )
             .await
