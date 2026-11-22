@@ -1940,8 +1940,16 @@ async fn e2ee_pause_not_enforced_while_detector_off_case() {
 }
 
 /// The E2EE invariant for the pause: the gate is decided from the
-/// recipient id alone (no envelope field, ciphertext or device id), sits
-/// before anything is queued, and the route never feeds the detector.
+/// recipient id alone (no envelope field, ciphertext or device id) and sits
+/// before anything is queued. The copy-paste detector never sees an E2EE
+/// send; the fan-out signal is called once, after the queue insert, with
+/// the sender and the recipient-id set only.
+///
+/// Rewritten for the fan-out signal (Slim M3 S7). This pin used to assert
+/// that the route never feeds any anti-spam observer ("E2EE is never
+/// observed"). The route now calls `observe_e2ee_fanout` by design, so that
+/// half is a positive pin on exactly what the observer is given. The pause
+/// gate assertions below are unchanged.
 #[test]
 fn e2ee_pause_gate_reads_no_envelope_content() {
     use crate::util::test::{statement_at, without_comments, without_whitespace};
@@ -1950,7 +1958,7 @@ fn e2ee_pause_gate_reads_no_envelope_content() {
 
     assert!(
         !code.contains("observe_dm_message"),
-        "E2EE is never observed"
+        "the copy-paste detector never sees an E2EE send"
     );
     assert!(!code.contains("dm_send_allowed"), "no message-history gate");
     assert_eq!(code.matches("DirectMessagesPaused").count(), 1, "{code}");
@@ -1990,6 +1998,336 @@ fn e2ee_pause_gate_reads_no_envelope_content() {
     assert!(enforced < recipients_loop, "computed once, before the loop");
     assert!(recipients_loop < gate_start, "per recipient id");
     assert!(gate_start < insert, "refused before anything is queued");
+
+    // The fan-out signal: called exactly once, after the queue insert, for a
+    // send that reached another user, with the route's own `user` and the
+    // ids of the other users that got a queued envelope, and nothing else
+    assert_eq!(code.matches("antispam::observe_").count(), 1, "{code}");
+    assert_eq!(code.matches("observe_e2ee_fanout").count(), 1, "{code}");
+    let delivered_set = statement_at(
+        &code,
+        "letdelivered_recipient_ids:HashSet<String>=accepted.iter().map(|envelope|envelope.recipient_user_id.clone()).filter(|id|id!=&user.id).collect();",
+    );
+    let fanout_block = code
+        .find("ifreached_other_user{")
+        .expect("the fan-out block");
+    let user_clone = statement_at(&code, "letuser=user.clone();");
+    let observe = statement_at(
+        &code,
+        "antispam::observe_e2ee_fanout(&db,&antispam_config,&user,&delivered_recipient_ids,).await;",
+    );
+    let config = statement_at(
+        &code,
+        "letantispam_config=revolt_config::config().await.features.antispam;",
+    );
+    // Nothing is cloned or spawned while the signal is off
+    let active = code
+        .find("ifantispam_config.e2ee_fanout_active(){")
+        .expect("the switch check");
+    statement_at(&code, "letdb=db.inner().clone();");
+    assert!(insert < delivered_set, "built from the stored envelopes");
+    assert!(delivered_set < fanout_block, "{code}");
+    assert!(insert < fanout_block, "after the envelopes are stored");
+    assert!(fanout_block < config && config < active, "{code}");
+    assert!(active < user_clone && user_clone < observe, "{code}");
+
+    // No name can be rebound on the way: each is bound exactly once, never
+    // mutably, and the route has no tuple pattern that could shadow any of
+    // them. The set is bound and used once; the config is bound, checked and
+    // used once; so an `if let`, `match` or `for` rebinding adds a count.
+    assert_eq!(code.matches("letuser").count(), 1, "{code}");
+    assert_eq!(
+        code.matches("letdelivered_recipient_ids").count(),
+        1,
+        "{code}"
+    );
+    assert_eq!(code.matches("delivered_recipient_ids").count(), 2, "{code}");
+    assert_eq!(code.matches("antispam_config").count(), 3, "{code}");
+    for rebinding in [
+        "letmutuser",
+        "letmutdelivered_recipient_ids",
+        "letmutantispam_config",
+        "let(",
+        "letmut(",
+    ] {
+        assert!(!code.contains(rebinding), "`{rebinding}` in the route");
+    }
+    assert!(
+        code.contains("user:User,"),
+        "the route's `user` is the guard"
+    );
+
+    let spawned = &code[fanout_block..observe];
+    for forbidden in [
+        "envelope",
+        "ciphertext",
+        "accepted",
+        "receipts",
+        "sequence",
+        "device",
+        "data.",
+    ] {
+        assert!(
+            !spawned.contains(forbidden),
+            "the fan-out block reads `{}`: {}",
+            forbidden,
+            spawned
+        );
+    }
+
+    // Its signature takes recipient ids, never an envelope type
+    let antispam = without_whitespace(&without_comments(include_str!(
+        "../../../../core/database/src/util/antispam.rs"
+    )));
+    assert_eq!(
+        antispam
+            .matches("pubasyncfnobserve_e2ee_fanout(db:&Database,cfg:&AntispamFeatures,author:&User,recipient_ids:&HashSet<String>,){")
+            .count(),
+        1,
+        "the observer's signature changed"
+    );
+}
+
+/// Whether `key` exists in Redis
+async fn redis_key_exists(key: &str) -> bool {
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    redis_kiss::redis::cmd("EXISTS")
+        .arg(key)
+        .query_async(&mut *conn)
+        .await
+        .expect("EXISTS")
+}
+
+/// Whether any key of the fan-out signal exists for `user_id`
+async fn any_fanout_key(user_id: &str) -> bool {
+    let keys =
+        revolt_database::util::antispam::e2ee_fanout_keys(user_id, revolt_database::now_ms());
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    let existing: i64 = redis_kiss::redis::cmd("EXISTS")
+        .arg(&keys[..])
+        .query_async(&mut *conn)
+        .await
+        .expect("EXISTS");
+    existing > 0
+}
+
+/// Run one Redis command whose reply is not needed
+async fn redis_run(command: &str, args: &[&str]) {
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    let _: () = redis_kiss::redis::cmd(command)
+        .arg(args)
+        .query_async(&mut *conn)
+        .await
+        .expect("redis command");
+}
+
+/// The system report filed against `user_id`, waited for (the observer runs
+/// in a spawned task)
+async fn wait_for_system_report(harness: &TestHarness, user_id: &str) -> revolt_database::Report {
+    for _ in 0..50 {
+        let reports = harness.db.fetch_reports(None).await.expect("reports");
+        if let Some(report) = reports.into_iter().find(|report| {
+            report.author_id == revolt_database::SYSTEM_USER_ID
+                && matches!(&report.content, v0::ReportedContent::User { id, .. } if id == user_id)
+        }) {
+            return report;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no system report within 5 s");
+}
+
+/// Off in the shipped and the test config: an envelope to a stranger leaves
+/// no fan-out key behind, on either side. Requires Redis.
+#[test]
+fn e2ee_fanout_off_by_default_writes_no_keys() {
+    crate::util::test::rt().block_on(e2ee_fanout_off_by_default_writes_no_keys_case())
+}
+
+async fn e2ee_fanout_off_by_default_writes_no_keys_case() {
+    assert!(
+        !revolt_config::config()
+            .await
+            .features
+            .antispam
+            .e2ee_fanout_active(),
+        "run WITHOUT REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED"
+    );
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_s, session_s, stranger) = harness.new_user().await;
+
+    share_server(&harness, &user_a, &stranger).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_s = publish_device(&harness, &account_s.id, &session_s.token, 1).await;
+
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(&stranger, &device_s, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_all_queued(&body, 1);
+
+    // Give the spawned observer time to (wrongly) write
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(!any_fanout_key(&user_a.id).await);
+    assert!(!any_fanout_key(&stranger.id).await);
+}
+
+/// Through the route: a new account that writes to the new-account threshold
+/// of strangers (one request each) is reported once, and the report holds
+/// counts only: no message, no recipient. With `e2ee_fanout_pause` it is also
+/// paused under fingerprint `e2ee-fanout`; without it no guard is taken.
+/// Requires Redis.
+///
+/// The two route tests that assert the signal is off
+/// (`e2ee_fanout_off_by_default_writes_no_keys`, and
+/// `e2ee_pause_not_enforced_while_detector_off` for the detector) fail by
+/// design in a run with both switches set; run this one on its own.
+#[test]
+#[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true and REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED=true"]
+fn antispam_route_e2ee_fanout_flags_a_new_account() {
+    crate::util::test::rt().block_on(antispam_route_e2ee_fanout_flags_a_new_account_case())
+}
+
+async fn antispam_route_e2ee_fanout_flags_a_new_account_case() {
+    let antispam = revolt_config::config().await.features.antispam.clone();
+    assert!(
+        antispam.e2ee_fanout_active(),
+        "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true and \
+         REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED=true"
+    );
+    let threshold = antispam.e2ee_fanout_threshold_for(true);
+    assert!(threshold <= 10, "keep the new-account threshold small here");
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, sender) = harness.new_user().await;
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+
+    let mut targets = Vec::new();
+    for _ in 0..threshold {
+        let (account, session, stranger) = harness.new_user().await;
+        share_server(&harness, &sender, &stranger).await;
+        let device = publish_device(&harness, &account.id, &session.token, 1).await;
+        targets.push((stranger, device));
+    }
+
+    for (stranger, device) in &targets[..threshold - 1] {
+        let (status, body) = post_envelopes(
+            &harness,
+            &session_a,
+            &device_a,
+            vec![envelope_to(stranger, device, 1)],
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+    }
+
+    // Give the spawned observers time to (wrongly) flag
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let reports = harness.db.fetch_reports(None).await.expect("reports");
+    assert!(
+        !reports.iter().any(|report| matches!(
+            &report.content,
+            v0::ReportedContent::User { id, .. } if id == &sender.id
+        )),
+        "below the threshold"
+    );
+
+    let (stranger, device) = &targets[threshold - 1];
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(stranger, device, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    let report = wait_for_system_report(&harness, &sender.id).await;
+    match &report.content {
+        v0::ReportedContent::User { message_id, .. } => {
+            assert!(message_id.is_none(), "no message is attached")
+        }
+        content => panic!("expected a user report, got {:?}", content),
+    }
+    for (stranger, _) in &targets {
+        assert!(
+            !report.additional_context.contains(&stranger.id),
+            "no recipient is named: {}",
+            report.additional_context
+        );
+    }
+
+    let guard = harness.db.fetch_user(&sender.id).await.unwrap().dm_guard;
+    if antispam.e2ee_fanout_pause {
+        let guard = guard.expect("a pausing flag takes the guard");
+        assert_eq!(guard.report_id, report.id);
+        assert_eq!(
+            guard.fingerprint,
+            revolt_database::util::antispam::E2EE_FANOUT_FINGERPRINT
+        );
+        assert_eq!(guard.recipients as usize, threshold);
+        assert!(guard.paused);
+    } else {
+        assert!(guard.is_none(), "report only takes no guard");
+    }
+}
+
+/// The fan-out signal's keys for an account die with it (account deletion
+/// cascade), whatever the config says, and its id leaves the window of a
+/// stranger who wrote to it; another user's reply memory is left to its own
+/// expiry. Requires Redis.
+#[test]
+fn e2ee_fanout_keys_die_with_the_account() {
+    crate::util::test::rt().block_on(e2ee_fanout_keys_die_with_the_account_case())
+}
+
+async fn e2ee_fanout_keys_die_with_the_account_case() {
+    use revolt_database::util::antispam::{
+        e2ee_fanout_day, e2ee_fanout_hour, e2ee_fanout_in_key, e2ee_fanout_out_key,
+        e2ee_fanout_reported_key,
+    };
+
+    let harness = TestHarness::new().await;
+    let (_, _, mut user) = harness.new_user().await;
+    let (_, _, other) = harness.new_user().await;
+
+    let now = revolt_database::now_ms();
+    let (hour, day) = (e2ee_fanout_hour(now), e2ee_fanout_day(now));
+    let out_key = e2ee_fanout_out_key(&user.id, hour);
+    let in_key = e2ee_fanout_in_key(&user.id, day);
+    let reported_key = e2ee_fanout_reported_key(&user.id);
+    let other_in_key = e2ee_fanout_in_key(&other.id, day);
+    let other_out_key = e2ee_fanout_out_key(&other.id, hour);
+
+    // The account wrote to `other`, and `other` wrote to it and counted it
+    for (key, member) in [
+        (&out_key, &other.id),
+        (&in_key, &other.id),
+        (&other_in_key, &user.id),
+        (&other_out_key, &user.id),
+        (&reported_key, &user.id),
+    ] {
+        redis_run("SADD", &[key.as_str(), member.as_str()]).await;
+        redis_run("EXPIRE", &[key.as_str(), "600"]).await;
+    }
+    assert!(any_fanout_key(&user.id).await);
+
+    user.delete(&harness.db).await.expect("delete");
+
+    assert!(!any_fanout_key(&user.id).await, "every key of the account");
+    assert!(
+        !redis_key_exists(&other_out_key).await,
+        "its id left the window"
+    );
+    assert!(redis_key_exists(&other_in_key).await);
 }
 
 /// One send is minted at ONE server instant: every copy's id shares its

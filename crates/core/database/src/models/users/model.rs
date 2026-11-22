@@ -1578,6 +1578,12 @@ impl User {
         // design; they die with the account.
         db.delete_all_e2ee_removed_devices(&self.id).await?;
 
+        // The encrypted DM fan-out signal's own Redis keys (who this account
+        // wrote to, who wrote to it) die with the account. Best-effort: they
+        // expire on their own anyway.
+        crate::util::antispam::forget_e2ee_fanout(&config().await.features.antispam, &self.id)
+            .await;
+
         // Streaming connections hold YouTube refresh tokens — revoke
         // (best-effort) and delete here or they outlive the account and the
         // live poller keeps touching a deleted user.

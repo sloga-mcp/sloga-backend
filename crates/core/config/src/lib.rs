@@ -1625,12 +1625,15 @@ impl BoostFeatures {
 }
 
 /// Anti-spam: the copy-paste DM detector (with its pause on DMs to
-/// strangers) and the daily staff alert.
+/// strangers), the fan-out signal for end-to-end encrypted DMs and the daily
+/// staff alert.
 ///
 /// Ships OFF. Prod turns it on in Revolt.overrides.toml under an explicit
 /// `[features.antispam]` header (env form `REVOLT__FEATURES__ANTISPAM__...`,
 /// double underscores), then RESTARTS delta AND crond: config sources are
-/// frozen into each process at first access.
+/// frozen into each process at first access. The fan-out signal has its own
+/// switch, `e2ee_fanout_enabled`, and also needs `dm_dupe_enabled` (the kill
+/// switch for every pause); read both through `e2ee_fanout_active()`.
 ///
 /// `Default` is hand-written on purpose: a derived one would give
 /// `dm_dupe_pause = false` and `dm_dupe_threshold = 0`. Read the threshold
@@ -1651,6 +1654,21 @@ pub struct AntispamFeatures {
     pub dm_dupe_min_chars: usize,
     /// Days after staff clear a flag before the detector may flag again
     pub dm_dupe_rearm_days: u64,
+    /// Switch for the encrypted DM fan-out signal (also needs
+    /// `dm_dupe_enabled`)
+    pub e2ee_fanout_enabled: bool,
+    /// Pause the account flagged by the fan-out signal until staff review the
+    /// report (false = report only, the default: no DM guard is taken)
+    pub e2ee_fanout_pause: bool,
+    /// Distinct strangers written to without a reply, within the window,
+    /// that flag an account (2 to 50)
+    pub e2ee_fanout_threshold: usize,
+    /// The same for accounts younger than 14 days (never above the other)
+    pub e2ee_fanout_new_account_threshold: usize,
+    /// How long a stranger stays counted per author (1 to 48)
+    pub e2ee_fanout_window_hours: u64,
+    /// How long the signal remembers who wrote to whom, a reply (1 to 90)
+    pub e2ee_fanout_reply_memory_days: u64,
     /// Master switch for the daily staff alert (crond)
     pub daily_enabled: bool,
     /// UTC hour at or after which the daily scan runs
@@ -1678,6 +1696,12 @@ impl Default for AntispamFeatures {
             dm_dupe_window_hours: 24,
             dm_dupe_min_chars: 30,
             dm_dupe_rearm_days: 30,
+            e2ee_fanout_enabled: false,
+            e2ee_fanout_pause: false,
+            e2ee_fanout_threshold: 10,
+            e2ee_fanout_new_account_threshold: 5,
+            e2ee_fanout_window_hours: 24,
+            e2ee_fanout_reply_memory_days: 30,
             daily_enabled: false,
             daily_run_hour_utc: 14,
             daily_account_age_days: 14,
@@ -1699,6 +1723,24 @@ impl AntispamFeatures {
     /// Minimum normalized length, never below 10
     pub fn min_chars(&self) -> usize {
         self.dm_dupe_min_chars.max(10)
+    }
+
+    /// Whether the encrypted DM fan-out signal runs: its own switch and the
+    /// detector's kill switch
+    pub fn e2ee_fanout_active(&self) -> bool {
+        self.dm_dupe_enabled && self.e2ee_fanout_enabled
+    }
+
+    /// Fan-out threshold, from 2 to 50 (the cap bounds the re-check at the
+    /// threshold). A new account is never held to a higher bar than an older
+    /// one.
+    pub fn e2ee_fanout_threshold_for(&self, new_account: bool) -> usize {
+        let threshold = self.e2ee_fanout_threshold.clamp(2, 50);
+        if new_account {
+            self.e2ee_fanout_new_account_threshold.max(2).min(threshold)
+        } else {
+            threshold
+        }
     }
 }
 
@@ -2512,6 +2554,7 @@ mod antispam_config_tests {
                 let line = line.trim_start();
                 line != "[features.antispam]"
                     && !line.starts_with("dm_dupe_")
+                    && !line.starts_with("e2ee_fanout_")
                     && !line.starts_with("daily_")
             })
             .collect::<Vec<_>>()
@@ -2525,6 +2568,12 @@ mod antispam_config_tests {
         assert_eq!(antispam.dm_dupe_window_hours, 24);
         assert_eq!(antispam.dm_dupe_min_chars, 30);
         assert_eq!(antispam.dm_dupe_rearm_days, 30);
+        assert!(!antispam.e2ee_fanout_enabled);
+        assert!(!antispam.e2ee_fanout_pause);
+        assert_eq!(antispam.e2ee_fanout_threshold, 10);
+        assert_eq!(antispam.e2ee_fanout_new_account_threshold, 5);
+        assert_eq!(antispam.e2ee_fanout_window_hours, 24);
+        assert_eq!(antispam.e2ee_fanout_reply_memory_days, 30);
         assert!(!antispam.daily_enabled);
         assert_eq!(antispam.daily_run_hour_utc, 14);
         assert_eq!(antispam.daily_account_age_days, 14);
@@ -2670,6 +2719,100 @@ mod antispam_config_tests {
         let antispam = AntispamFeatures::default();
         assert_eq!(antispam.threshold(), 3);
         assert_eq!(antispam.min_chars(), 30);
+    }
+
+    #[test]
+    fn e2ee_fanout_thresholds_follow_account_age_and_clamp() {
+        let antispam = AntispamFeatures::default();
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 10);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 5);
+
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 0,
+            e2ee_fanout_new_account_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 2);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 2);
+
+        // A new account is never held to a higher bar than an older one
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 4,
+            e2ee_fanout_new_account_threshold: 8,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 4);
+
+        // The cap bounds the re-check at the threshold
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 1000,
+            e2ee_fanout_new_account_threshold: 1000,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 50);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 50);
+    }
+
+    /// The signal runs only with its own switch AND the detector's kill
+    /// switch on
+    #[test]
+    fn e2ee_fanout_needs_both_switches() {
+        for (dm_dupe_enabled, e2ee_fanout_enabled, active) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let antispam = AntispamFeatures {
+                dm_dupe_enabled,
+                e2ee_fanout_enabled,
+                ..Default::default()
+            };
+            assert_eq!(
+                antispam.e2ee_fanout_active(),
+                active,
+                "dm_dupe_enabled={dm_dupe_enabled} e2ee_fanout_enabled={e2ee_fanout_enabled}"
+            );
+        }
+    }
+
+    /// The env form reaches the fan-out keys too
+    #[test]
+    fn environment_override_reaches_the_fanout_keys() {
+        let vars = HashMap::from([
+            (
+                "REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_PAUSE".to_owned(),
+                "true".to_owned(),
+            ),
+        ]);
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let antispam = &settings.features.antispam;
+        assert!(antispam.e2ee_fanout_enabled);
+        assert!(antispam.e2ee_fanout_pause);
+        assert_eq!(antispam.e2ee_fanout_threshold, 10);
+        assert!(
+            !antispam.e2ee_fanout_active(),
+            "dm_dupe_enabled is still off"
+        );
     }
 }
 

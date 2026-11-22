@@ -533,6 +533,21 @@ dm_dupe_threshold = 3
 dm_dupe_window_hours = 24
 dm_dupe_min_chars = 30
 dm_dupe_rearm_days = 30
+# Fan-out signal for end-to-end encrypted DMs: counts distinct strangers an account writes to
+# with no reply (recipient ids and time only, never content). Needs dm_dupe_enabled too.
+# Turning it on needs the Privacy Policy update first (30-day memory of who wrote to whom).
+# Switch on with e2ee_fanout_pause = false (staff report only, no pause); set it to true only
+# after two weeks of reviewed reports.
+e2ee_fanout_enabled = false
+e2ee_fanout_pause = false
+# Distinct strangers in the window with no reply; clamped to 2..=50
+e2ee_fanout_threshold = 10
+# Accounts younger than 14 days (never above e2ee_fanout_threshold)
+e2ee_fanout_new_account_threshold = 5
+# Clamped to 1..=48
+e2ee_fanout_window_hours = 24
+# Clamped to 1..=90
+e2ee_fanout_reply_memory_days = 30
 daily_enabled = false
 daily_run_hour_utc = 14
 daily_account_age_days = 14
