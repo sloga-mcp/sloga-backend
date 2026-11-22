@@ -85,12 +85,18 @@ pub async fn fetch_devices(
             (None, None)
         };
 
-    // Names of the caller's own sessions only: a device bound to a session
-    // that is gone (or is not the caller's) lists no name
-    let session_names: HashMap<String, String> = if own {
-        db.fetch_sessions(&user.id)
-            .await?
-            .into_iter()
+        let (session_id, session_name) = if own {
+            (
+                Some(identity.last_session_id.clone()),
+                session_names.get(&identity.last_session_id).cloned(),
+            )
+        } else {
+            (None, None)
+        };
+        // An identity bound to no session (an empty `last_session_id`) lists
+        // neither field
+        let session_id = session_id.filter(|id| !id.is_empty());
+        let session_name = session_name.filter(|_| session_id.is_some());
 
         devices.push(v0::E2EEDeviceInfo {
             created_at,

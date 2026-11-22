@@ -3057,7 +3057,7 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
     }
 
     // Follows the Prot ledger block (revision 76) as its own top-level guard:
-    // a database already at 77 runs only this block.
+    // a database already at 77 runs this block and then the S2 78 block.
     if revision <= 77 {
         info!("Running migration [revision 77 / 01-11-2026]: Create e2ee_removed_devices collection (E2EE device removal tombstones)");
 

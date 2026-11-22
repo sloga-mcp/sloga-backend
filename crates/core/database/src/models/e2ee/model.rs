@@ -792,7 +792,12 @@ impl E2EEIdentity {
 
     /// [`Self::revoke_device`], with the call-seat eviction only when
     /// `evict`. Only the same-session predecessor sweep passes `false`.
-    async fn revoke_device_inner(db: &Database, user_id: &str, device_id: &str, evict: bool) -> Result<bool> {
+    async fn revoke_device_inner(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        evict: bool,
+    ) -> Result<bool> {
         let formats_v2 = revolt_config::config()
             .await
             .features
@@ -1457,9 +1462,14 @@ mod revoke_eviction_wiring_tests {
     /// needles below do not depend on line breaks or a trailing comma
     fn fn_body(fn_name: &str) -> String {
         const SOURCE: &str = include_str!("model.rs");
-        let header = format!("async fn {fn_name}(");
-        assert_eq!(SOURCE.matches(&header).count(), 1, "{header}");
-        let at = SOURCE.find(&header).expect("the fn is defined");
+        // A generic fn (`revoke_device_publishing<F, Fut>(`) is found too
+        let headers = [format!("async fn {fn_name}("), format!("async fn {fn_name}<")];
+        let found: Vec<usize> = headers
+            .iter()
+            .flat_map(|header| SOURCE.match_indices(header.as_str()).map(|(at, _)| at))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one `async fn {fn_name}`");
+        let at = found[0];
         let open = at + SOURCE[at..].find('{').expect("a body");
         let mut depth = 0usize;
         let mut close = None;
