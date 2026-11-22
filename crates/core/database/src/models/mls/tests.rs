@@ -10,10 +10,10 @@ use ulid::Ulid;
 use crate::{
     mls_text_enforced_device_cap, ChannelEntitlement, ChannelEntitlementSource,
     ChannelEntitlementState, ChannelSeat, Database, E2EEContentType, E2EEEnvelope, E2EEIdentity,
-    E2EESignedKey, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
-    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice, MlsPendingDeviceRemoval,
-    MlsPendingRemoval, MlsRejoinReadd, MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
-    SeatList, SeatListBody, SeatListSubmission, E2EE_PROTOCOL_VERSION,
+    E2EESignedKey, MlsAddedProtocol, MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome,
+    MlsGroupKind, MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsMemberDevice,
+    MlsPendingDeviceRemoval, MlsPendingRemoval, MlsRejoinReadd, MlsRemovalReason, MlsSignerLost,
+    MlsSignerLostCause, SeatList, SeatListBody, SeatListSubmission, E2EE_PROTOCOL_VERSION,
     TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS,
 };
 
@@ -73,6 +73,7 @@ fn make_commit(
         removed_reasons: vec![],
         welcome: None,
         history_visible: None,
+        added_protocols: vec![],
     }
 }
 
@@ -2720,6 +2721,7 @@ async fn call_path_preserves_text_fields_and_never_touches_text_groups() {
             user_id: ulid(CAROL),
             device_id: "c".repeat(32),
             at: seconds_from_now(-60),
+            protocol: Some(2),
         }];
         db.create_mls_group(&call, None).await.unwrap();
         let before = db.fetch_mls_group(&call.id).await.unwrap();
@@ -3606,6 +3608,217 @@ async fn rejoin_readd_is_written_by_the_eviction_and_consumed_by_the_readd() {
         #[cfg(feature = "mongodb")]
         if let Some(raw) = raw_document(&db, "mls_groups", &group).await {
             assert!(!raw.contains_key("rejoin_readd"));
+        }
+    });
+}
+
+/// S4: a rule-6 eviction's `rejoin_readd` entry carries the `protocol` of
+/// the rejoin intent it consumed, `Some(2)` or `None` as the intent had
+/// it; a later rewrite of the list (another device's re-Add) keeps it. On
+/// Mongo the stored entry has the key only when set, as an Int64
+///
+/// Controls: the planner writes `protocol: None`; the Mongo builder drops
+/// `protocol`.
+#[tokio::test]
+async fn rejoin_readd_carries_the_consumed_intents_protocol() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let carol = text_device(CAROL, 1);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(
+                138,
+                &bob,
+                &[alice.clone(), bob.clone(), carol.clone()],
+                &[ALICE, BOB, CAROL],
+            ),
+        )
+        .await;
+        let group = fixture.group.id.clone();
+        let protocols = |group: &MlsGroup| -> Vec<(String, Option<u32>)> {
+            let mut entries: Vec<(String, Option<u32>)> = group
+                .rejoin_readd
+                .iter()
+                .map(|entry| (entry.user_id.clone(), entry.protocol))
+                .collect();
+            entries.sort();
+            entries
+        };
+
+        let v2_intent = MlsJoinIntent {
+            protocol: Some(2),
+            ..rejoin_intent(&group, &alice, seconds_from_now(-5))
+        };
+        db.upsert_mls_join_intent(&v2_intent).await.unwrap();
+        db.upsert_mls_join_intent(&rejoin_intent(&group, &carol, seconds_from_now(-5)))
+            .await
+            .unwrap();
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    1,
+                    &bob,
+                    vec![],
+                    vec![alice.clone(), carol.clone()],
+                    Timestamp::now_utc(),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "two rule-6 evictions",
+        );
+        assert_eq!(
+            protocols(&db.fetch_mls_group(&group).await.unwrap()),
+            vec![
+                (alice.user_id.clone(), Some(2)),
+                (carol.user_id.clone(), None)
+            ]
+        );
+        #[cfg(feature = "mongodb")]
+        if let Some(raw) = raw_document(&db, "mls_groups", &group).await {
+            let entries = raw.get_array("rejoin_readd").expect("stored entries");
+            assert_eq!(entries.len(), 2);
+            for entry in entries {
+                let entry = entry.as_document().expect("an entry document");
+                let user = entry.get_str("user_id").unwrap();
+                if user == alice.user_id {
+                    assert_eq!(entry.get("protocol"), Some(&bson::Bson::Int64(2)));
+                } else {
+                    assert_eq!(user, carol.user_id);
+                    assert!(!entry.contains_key("protocol"), "{entry:?}");
+                }
+            }
+        }
+
+        // Carol's re-Add rewrites the list from the stored entries
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(
+                    &fixture,
+                    2,
+                    &bob,
+                    vec![carol.clone()],
+                    vec![],
+                    seconds_from_now(1),
+                ),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "carol's re-Add",
+        );
+        assert_eq!(
+            protocols(&db.fetch_mls_group(&group).await.unwrap()),
+            vec![(alice.user_id.clone(), Some(2))]
+        );
+        #[cfg(feature = "mongodb")]
+        if let Some(raw) = raw_document(&db, "mls_groups", &group).await {
+            let entries = raw.get_array("rejoin_readd").expect("stored entries");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                entries[0].as_document().unwrap().get("protocol"),
+                Some(&bson::Bson::Int64(2))
+            );
+        }
+    });
+}
+
+/// S4: `added_protocols` is stored as the commit route gives it through
+/// the Text commit transaction, and served back by the commit fetch and
+/// the Welcome lookup, on both drivers. A commit with no entry stores no
+/// key (Mongo)
+///
+/// Controls: the Mongo commit insert drops `added_protocols`; the planner
+/// clears it.
+#[tokio::test]
+async fn added_protocols_are_stored_as_given_by_the_text_commit() {
+    database_test!(|db| async move {
+        db.migrate_database().await.expect("schema");
+
+        let alice = text_device(ALICE, 1);
+        let bob = text_device(BOB, 1);
+        let carol = text_device(CAROL, 1);
+        let fixture = seed_text_group(
+            &db,
+            &text_seed(139, &alice, &[alice.clone()], &[ALICE, BOB, CAROL]),
+        )
+        .await;
+        let group = fixture.group.id.clone();
+        register_identities(&db, &[&bob, &carol]).await;
+
+        let mut add = text_commit(
+            &fixture,
+            1,
+            &alice,
+            vec![bob.clone(), carol.clone()],
+            vec![],
+            Timestamp::now_utc(),
+        );
+        add.welcome = Some("d2VsY29tZQ".to_string());
+        add.added_protocols = vec![
+            MlsAddedProtocol {
+                user_id: bob.user_id.clone(),
+                device_id: bob.device_id.clone(),
+                protocol: Some(2),
+            },
+            MlsAddedProtocol {
+                user_id: carol.user_id.clone(),
+                device_id: carol.device_id.clone(),
+                protocol: None,
+            },
+        ];
+        assert_won(
+            db.insert_mls_text_commit(&add, &fixture.hash, 0).await,
+            "Add",
+        );
+
+        assert_eq!(
+            stored_text_commit(&db, &group, 1).await.added_protocols,
+            add.added_protocols
+        );
+        let welcome = db
+            .fetch_mls_text_welcome(&group, &bob.user_id, &bob.device_id)
+            .await
+            .unwrap()
+            .expect("the Welcome row");
+        assert_eq!(welcome.added_protocols, add.added_protocols);
+        #[cfg(feature = "mongodb")]
+        if let Some(raw) =
+            raw_document(&db, "mls_commits", &MlsCommit::composite_id(&group, 1)).await
+        {
+            let stored = raw.get_array("added_protocols").expect("stored entries");
+            assert_eq!(stored.len(), 2);
+            assert_eq!(
+                stored[0].as_document().unwrap().get("protocol"),
+                Some(&bson::Bson::Int64(2))
+            );
+            assert!(!stored[1].as_document().unwrap().contains_key("protocol"));
+        }
+
+        // No entry, no key
+        assert_won(
+            db.insert_mls_text_commit(
+                &text_commit(&fixture, 2, &alice, vec![], vec![], seconds_from_now(1)),
+                &fixture.hash,
+                0,
+            )
+            .await,
+            "an empty commit",
+        );
+        assert!(stored_text_commit(&db, &group, 2)
+            .await
+            .added_protocols
+            .is_empty());
+        #[cfg(feature = "mongodb")]
+        if let Some(raw) =
+            raw_document(&db, "mls_commits", &MlsCommit::composite_id(&group, 2)).await
+        {
+            assert!(!raw.contains_key("added_protocols"));
         }
     });
 }
@@ -4994,6 +5207,85 @@ mod history_link_tests {
 
             assert_eq!(stored(&db, &a).await.len(), 7, "nothing was written");
             assert_eq!(stored(&db, &b).await.len(), 4, "nothing was written");
+        });
+    }
+
+    /// A failed precheck read is no early answer: with each precheck read
+    /// failing in turn (holder, epoch count, slot), the insert falls
+    /// through to its transaction, which stores a row that fits and gives
+    /// the answers the precheck would have (`Identical`, a taken slot, a
+    /// full epoch). Mongo only: the Reference driver has no precheck
+    ///
+    /// Control: propagate the precheck read error again.
+    #[tokio::test]
+    async fn history_link_precheck_read_error_falls_through_to_the_transaction() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+            reference_note(&db, "history_link_precheck", "a failed precheck read");
+            #[cfg(feature = "mongodb")]
+            if is_mongo(&db) {
+                use super::super::ops::HISTORY_LINK_PRECHECK_FAULTS as FAULTS;
+                let caps = HistoryLinkCaps {
+                    group_bytes: 100_000,
+                    user_bytes: 100_000,
+                };
+                let insert = |row: MlsHistoryLink| insert_capped(db.clone(), row, caps);
+
+                for read in 0..3usize {
+                    let group = link_group(&db, 0x70 + read as u8, true).await;
+                    for user in [BOB, CAROL, DAVE, EVE] {
+                        assert_eq!(
+                            insert(link(&group, 2, &writer(user), 1, 100, at(0)))
+                                .await
+                                .unwrap(),
+                            InsertOutcome::Inserted
+                        );
+                    }
+                    FAULTS.lock().unwrap().push((group.clone(), read, 0));
+
+                    let row = link(&group, 2, &writer(ALICE), 1, 100, at(1));
+                    assert_eq!(
+                        insert(row.clone()).await.unwrap(),
+                        InsertOutcome::Inserted,
+                        "read {read}: a row that fits"
+                    );
+                    let identical = MlsHistoryLink {
+                        created_at: at(9),
+                        ..row.clone()
+                    };
+                    assert_eq!(
+                        insert(identical).await.unwrap(),
+                        InsertOutcome::Identical,
+                        "read {read}: identical"
+                    );
+                    assert_exists(
+                        insert(link(&group, 2, &writer(ALICE), 2, 100, at(9))).await,
+                        "a taken slot",
+                    );
+                    assert_exists(
+                        insert(link(&group, 2, &writer(6), 1, 17, at(9))).await,
+                        "a full epoch",
+                    );
+
+                    let fired = {
+                        let mut faults = FAULTS.lock().unwrap();
+                        let index = faults
+                            .iter()
+                            .position(|(armed, at_read, _)| armed == &group && *at_read == read)
+                            .expect("the armed fault");
+                        faults.remove(index).2
+                    };
+                    assert_eq!(fired, 4, "read {read}: every precheck hit the fault");
+                    let rows = stored(&db, &group).await;
+                    assert_eq!(rows.len(), 5, "read {read}");
+                    assert!(rows.contains(&row), "read {read}: the row is stored");
+                    assert_eq!(
+                        group_serial(&db, &group).await,
+                        Some(5),
+                        "read {read}: one claim per committed insert"
+                    );
+                }
+            }
         });
     }
 

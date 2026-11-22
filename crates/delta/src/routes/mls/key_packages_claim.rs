@@ -869,6 +869,7 @@ mod tests {
                 user_id: recovery_target.0.clone(),
                 device_id: recovery_target.1.clone(),
                 at: Timestamp::now_utc(),
+                protocol: None,
             });
             group.signer_lost = Some(MlsSignerLost {
                 user_id: owner.id.clone(),
@@ -1738,6 +1739,7 @@ mod tests {
             user_id: evicted.user_id.clone(),
             device_id: evicted.device_id.clone(),
             at: Timestamp::now_utc(),
+            protocol: None,
         };
         edit_group(db, &fixture.group_id, |group| {
             group.rejoin_readd.push(entry)

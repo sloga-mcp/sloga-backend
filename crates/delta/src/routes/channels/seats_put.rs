@@ -102,8 +102,9 @@ mod test {
 
     use revolt_database::{
         events::client::EventV1, AuditLogAction, AuditLogEntry, AuditValue, BotInformation,
-        Channel, MemberCompositeKey, PartialChannel, PartialMember, PartialUser, RemovalIntention,
-        SeatList, SeatReleaseCause, Server, Session, User, PROTECTED_SCOPE_SEATS,
+        Channel, HistoryWipe, MemberCompositeKey, PartialChannel, PartialMember, PartialUser,
+        ProtectedHistory, RemovalIntention, SeatList, SeatListPreHistory, SeatReleaseCause, Server,
+        Session, User, PROTECTED_SCOPE_SEATS,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -112,7 +113,7 @@ mod test {
     use ulid::Ulid;
 
     use crate::routes::channels::protected_seat_validation::v2_fixtures::{
-        authority, V2List, SALT,
+        authority, boundary_before_issue, store_history_genesis_raw, V2List, SALT,
     };
     use crate::routes::mls::require_channel_access;
     use crate::util::test::{
@@ -979,6 +980,390 @@ mod test {
         let stored_authority = stored.authority.expect("the stored authority");
         assert_eq!(stored_authority.body, world.first.body);
         assert_eq!(stored_authority.signature, world.first.signature);
+    }
+
+    // S4 (4.1.1 "S4", 4.3 "S4" with the fix round F1 ruling): 4c on the seat
+    // PUT through `check_seat_list_history_lines` and the configured
+    // `history_setting`. The route and the driver both run the rule with
+    // the same messages, so the refusals here hold with the route's call
+    // broken (`protected_seat_validation`'s S4 tests pin that call); the
+    // flag-off passes pin it here.
+
+    async fn history_setting(on: bool) {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.protected_channels.formats_v2 = true;
+            settings.features.protected_channels.history_setting = on;
+        })
+        .await;
+    }
+
+    /// A v2 channel protected by the owner-only genesis (S4-D13) with the
+    /// history boundary `boundary` and `pre_history`; the member has joined
+    /// and holds no seat. With `history_setting` on it is protected through
+    /// the driver; with it off, as if protected while the flag was on
+    /// (`store_history_genesis_raw`).
+    struct HistoryWorld {
+        harness: TestHarness,
+        channel: Channel,
+        owner: User,
+        owner_session: Session,
+        owner_device: TestE2EEDevice,
+        member: User,
+        first: v0::SignedAuthority,
+        boundary: String,
+    }
+
+    async fn history_world(pre_history: SeatListPreHistory) -> HistoryWorld {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        harness
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        harness.join_server(&server, &member).await;
+
+        let first = authority(
+            channel.id(),
+            &owner.id,
+            &owner_device.device_id,
+            &[(owner_device.device_id.as_str(), &owner_device.signing_key)],
+            None,
+            &owner_device.signing_key,
+        );
+        let boundary = boundary_before_issue(60_000);
+        let genesis = |boundary: Option<&str>, pre_history| {
+            let seat_list = V2List {
+                channel_id: channel.id(),
+                version: 1,
+                signer_user_id: &owner.id,
+                signer_device_id: &owner_device.device_id,
+                key: &owner_device.signing_key,
+                seats: &[owner.id.as_str()],
+                salt: SALT,
+                authority: &first,
+            }
+            .signed_with_history(boundary, pre_history);
+            v0::DataProtectChannel {
+                seat_list,
+                wipe_history: None,
+            }
+        };
+
+        if revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .history_setting
+        {
+            harness
+                .protect_with_db(&channel, &genesis(Some(boundary.as_str()), pre_history))
+                .await;
+        } else {
+            harness
+                .protect_with_db(&channel, &genesis(None, SeatListPreHistory::Kept))
+                .await;
+            store_history_genesis_raw(
+                &harness,
+                channel.id(),
+                &genesis(Some(boundary.as_str()), pre_history).seat_list,
+            )
+            .await;
+        }
+        let channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the channel");
+
+        HistoryWorld {
+            harness,
+            channel,
+            owner,
+            owner_session,
+            owner_device,
+            member,
+            first,
+            boundary,
+        }
+    }
+
+    impl HistoryWorld {
+        /// The owner device's list at `version` seating the owner and the
+        /// member, with the boundary `boundary` and `pre_history`
+        fn list(
+            &self,
+            version: i64,
+            boundary: Option<&str>,
+            pre_history: SeatListPreHistory,
+        ) -> v0::DataSeatList {
+            V2List {
+                channel_id: self.channel.id(),
+                version,
+                signer_user_id: &self.owner.id,
+                signer_device_id: &self.owner_device.device_id,
+                key: &self.owner_device.signing_key,
+                seats: &[self.owner.id.as_str(), self.member.id.as_str()],
+                salt: SALT,
+                authority: &self.first,
+            }
+            .signed_with_history(boundary, pre_history)
+        }
+
+        async fn stored(&self) -> SeatList {
+            self.harness
+                .db
+                .fetch_seat_list(self.channel.id())
+                .await
+                .expect("read")
+                .expect("a stored list")
+        }
+
+        /// The channel's stored `protected_history` (2.1 "S4")
+        async fn protected_history(&self) -> Option<ProtectedHistory> {
+            match self
+                .harness
+                .db
+                .fetch_channel(self.channel.id())
+                .await
+                .expect("the channel")
+            {
+                Channel::TextChannel {
+                    protected_history, ..
+                } => protected_history.map(|history| *history),
+                _ => None,
+            }
+        }
+
+        /// The owner's PUT of `data`
+        async fn put(&self, data: &v0::DataSeatList) -> (Status, String) {
+            put(&self.harness, &self.owner_session, self.channel.id(), data).await
+        }
+
+        /// The next list (`version`) carrying the stored history lines
+        /// lands: the member is seated, `protected_history` is untouched
+        async fn assert_carried_lines_land(&self, version: i64, pre_history: SeatListPreHistory) {
+            let history = self.protected_history().await;
+            let next = self.list(version, Some(self.boundary.as_str()), pre_history);
+            let answer = self.put(&next).await;
+            assert_ok(&answer, "the stored history lines");
+            let stored = self.stored().await;
+            assert_eq!(stored.version, version);
+            assert_eq!(stored.body, next.body);
+            assert!(self.is_seated_member().await, "the member is seated");
+            assert_eq!(self.protected_history().await, history);
+        }
+
+        async fn is_seated_member(&self) -> bool {
+            self.harness
+                .db
+                .fetch_channel_seats(self.channel.id())
+                .await
+                .expect("read")
+                .iter()
+                .any(|seat| seat.user_id == self.member.id && seat.is_active())
+        }
+
+        /// Each case's list (at `version`) is refused 400 `FailedValidation`
+        /// with its message, and writes nothing: neither the seat list nor
+        /// `protected_history` moves
+        async fn assert_refused(
+            &self,
+            version: i64,
+            cases: &[(&str, Option<&str>, SeatListPreHistory, &str)],
+        ) {
+            let stored = self.stored().await;
+            let history = self.protected_history().await;
+            let mut misses = Vec::new();
+            for (case, boundary, pre_history, message) in cases {
+                let answer = self.put(&self.list(version, *boundary, *pre_history)).await;
+                let expected = serde_json::json!({ "type": "FailedValidation", "error": message });
+                if answer.0 != Status::BadRequest
+                    || serde_json::from_str::<Value>(&answer.1).ok() != Some(expected)
+                {
+                    misses.push(format!("{case}: expected {message}, got {answer:?}"));
+                }
+                if self.stored().await != stored || self.protected_history().await != history {
+                    misses.push(format!("{case}: written"));
+                }
+            }
+            assert!(
+                misses.is_empty(),
+                "not refused as expected:\n{}",
+                misses.join("\n")
+            );
+        }
+    }
+
+    /// 4.3 "S4" with `history_setting` on: on a channel protected with a
+    /// boundary, the owner's next list carrying it lands; `kept -> wiped`
+    /// (only the wipe write moves it) and a changed or dropped boundary are
+    /// refused, writing nothing
+    #[test]
+    fn with_history_setting_on_a_boundary_list_lands_and_kept_to_wiped_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting(true).await;
+            with_history_setting_on_case().await
+        }))
+    }
+
+    async fn with_history_setting_on_case() {
+        let world = Box::pin(history_world(SeatListPreHistory::Kept)).await;
+        let boundary = world.boundary.clone();
+        assert_eq!(
+            world.protected_history().await,
+            Some(ProtectedHistory {
+                boundary: boundary.clone(),
+                wipe: HistoryWipe::None,
+            })
+        );
+
+        world
+            .assert_carried_lines_land(2, SeatListPreHistory::Kept)
+            .await;
+        let other = boundary_before_issue(120_000);
+        world
+            .assert_refused(
+                3,
+                &[
+                    (
+                        "kept to wiped",
+                        Some(boundary.as_str()),
+                        SeatListPreHistory::Wiped,
+                        "pre_history goes from kept to wiped only through the history wipe",
+                    ),
+                    (
+                        "another boundary",
+                        Some(other.as_str()),
+                        SeatListPreHistory::Kept,
+                        "history_boundary is immutable",
+                    ),
+                    (
+                        "no boundary",
+                        None,
+                        SeatListPreHistory::Kept,
+                        "history_boundary is immutable",
+                    ),
+                ],
+            )
+            .await;
+    }
+
+    /// Fix round F1 (4.1.1 "S4") with `history_setting` off: a channel
+    /// protected with a boundary while the flag was on still takes a seat
+    /// PUT carrying the stored lines; `kept -> wiped` and a changed or
+    /// dropped boundary stay refused, writing nothing. Control: the PUT
+    /// checked as a genesis (`Protect`) at the route.
+    #[test]
+    fn with_history_setting_off_a_boundary_channel_still_takes_seat_puts() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting(false).await;
+            with_history_setting_off_boundary_case().await
+        }))
+    }
+
+    async fn with_history_setting_off_boundary_case() {
+        let world = Box::pin(history_world(SeatListPreHistory::Kept)).await;
+        assert!(
+            !revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .history_setting
+        );
+        let boundary = world.boundary.clone();
+
+        world
+            .assert_carried_lines_land(2, SeatListPreHistory::Kept)
+            .await;
+        let other = boundary_before_issue(120_000);
+        world
+            .assert_refused(
+                3,
+                &[
+                    (
+                        "kept to wiped",
+                        Some(boundary.as_str()),
+                        SeatListPreHistory::Wiped,
+                        "pre_history goes from kept to wiped only through the history wipe",
+                    ),
+                    (
+                        "another boundary",
+                        Some(other.as_str()),
+                        SeatListPreHistory::Kept,
+                        "history_boundary is immutable",
+                    ),
+                    (
+                        "no boundary",
+                        None,
+                        SeatListPreHistory::Kept,
+                        "history_boundary is immutable",
+                    ),
+                ],
+            )
+            .await;
+        assert_eq!(
+            world.protected_history().await,
+            Some(ProtectedHistory {
+                boundary,
+                wipe: HistoryWipe::None,
+            })
+        );
+    }
+
+    /// Fix round F1 with `history_setting` off, on a `wiped` channel: a seat
+    /// PUT staying `wiped` with the stored boundary lands, the requested
+    /// wipe is left as it was, and `wiped -> kept` or another boundary stay
+    /// refused. Control: the PUT checked as a genesis (`Protect`) at the
+    /// route.
+    #[test]
+    fn with_history_setting_off_a_wiped_channel_still_takes_seat_puts() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting(false).await;
+            with_history_setting_off_wiped_case().await
+        }))
+    }
+
+    async fn with_history_setting_off_wiped_case() {
+        let world = Box::pin(history_world(SeatListPreHistory::Wiped)).await;
+        let boundary = world.boundary.clone();
+        let requested = world.protected_history().await;
+        assert!(
+            matches!(&requested, Some(ProtectedHistory {
+                boundary: stored,
+                wipe: HistoryWipe::Requested { by, .. },
+            }) if *stored == boundary && *by == world.owner.id),
+            "{:?}",
+            requested
+        );
+
+        world
+            .assert_carried_lines_land(2, SeatListPreHistory::Wiped)
+            .await;
+        let other = boundary_before_issue(120_000);
+        world
+            .assert_refused(
+                3,
+                &[
+                    (
+                        "wiped to kept",
+                        Some(boundary.as_str()),
+                        SeatListPreHistory::Kept,
+                        "pre_history cannot go from wiped to kept",
+                    ),
+                    (
+                        "another boundary",
+                        Some(other.as_str()),
+                        SeatListPreHistory::Wiped,
+                        "history_boundary is immutable",
+                    ),
+                ],
+            )
+            .await;
+        assert_eq!(world.protected_history().await, requested);
     }
 
     /// Design 4.3 step 4 (W0-fix8) and 4.9: a byte-identical re-PUT after a

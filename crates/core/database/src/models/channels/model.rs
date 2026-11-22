@@ -2171,9 +2171,13 @@ mod tests {
     }
 
     /// `Channel::update` refuses a partial carrying `protected_history` before
-    /// anything is written; the driver write (`update_channel`), the path
-    /// protect, the wipe route and the job use, stores it on both drivers.
-    /// Runs on whichever driver `TEST_DB` names.
+    /// anything is written, while the driver write (`update_channel`) stores
+    /// it on both drivers; test fixtures seed a history through it. No
+    /// production path writes `protected_history` with `update_channel`:
+    /// protect (`protect_channel_with_wipe`) and the wipe route
+    /// (`request_history_wipe`) write it inside the seat-list write's driver
+    /// transaction, and the job moves `wipe` to `Done` with
+    /// `complete_history_wipe`. Runs on whichever driver `TEST_DB` names.
     ///
     /// Control: the guard's `protected_history.is_some()` arm removed.
     #[tokio::test]
@@ -2801,6 +2805,7 @@ mod tests {
                 removed_reasons: vec![],
                 welcome: None,
                 history_visible: None,
+                added_protocols: vec![],
             };
             let outcome = db
                 .insert_mls_text_commit(&commit, &list.commit_ad_sha256().unwrap(), 0)

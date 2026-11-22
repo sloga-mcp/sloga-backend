@@ -164,4 +164,26 @@ impl AbstractChannelUnreads for ReferenceDb {
             })
             .cloned())
     }
+
+    /// Pull the ids from the mentions of the channel's unread rows; see the
+    /// trait. Takes the `channel_unreads` lock alone.
+    async fn remove_mentions_of_messages(
+        &self,
+        channel_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut unreads = self.channel_unreads.lock().await;
+        for unread in unreads
+            .values_mut()
+            .filter(|unread| unread.id.channel == channel_id)
+        {
+            if let Some(mentions) = &mut unread.mentions {
+                mentions.retain(|id| !message_ids.contains(id));
+            }
+        }
+        Ok(())
+    }
 }

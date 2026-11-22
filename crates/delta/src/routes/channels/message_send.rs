@@ -1935,6 +1935,7 @@ mod protected_tests {
             removed_reasons: vec![],
             welcome: None,
             history_visible: None,
+            added_protocols: vec![],
         };
         let outcome = db
             .insert_mls_text_commit(&commit, &hash, 0)

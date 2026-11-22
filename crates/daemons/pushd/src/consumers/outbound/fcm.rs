@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use crate::utils::Consumer;
+use crate::utils::{is_protected, Consumer, PROTECTED_PUSH_TITLE};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use fcm_v1::{
@@ -22,6 +22,7 @@ use lapin::{message::Delivery, Channel as AMQPChannel, Connection};
 use log::info;
 use revolt_config::config;
 use revolt_database::{events::rabbit::*, Database};
+use revolt_models::v0::PROTECTED_PUSH_BODY;
 use serde_json::Value;
 
 /// Custom notification data
@@ -48,6 +49,14 @@ pub enum NotificationData {
         author: String,
         author_name: String,
     },
+    /// A protected-channel message (S8-O4): the routing ids and the generic
+    /// title and body. Same type as `Message`, so clients route it the same
+    ProtectedMessage {
+        message: String,
+        channel: String,
+        title: String,
+        body: String,
+    },
     DmCallStartEnd {
         initiator_id: String,
         channel_id: String,
@@ -73,6 +82,7 @@ impl NotificationData {
             NotificationData::FRAccepted { .. } => "push.fr.accept",
             NotificationData::Generic { .. } => "push.generic",
             NotificationData::Message { .. } => "push.message",
+            NotificationData::ProtectedMessage { .. } => "push.message",
             NotificationData::DmCallStartEnd { .. } => "push.dm.call",
             NotificationData::CalendarEvent { .. } => "push.calendar",
         }
@@ -116,6 +126,18 @@ impl NotificationData {
                 data.insert("channel".to_string(), Value::String(channel));
                 data.insert("author".to_string(), Value::String(author));
                 data.insert("author_name".to_string(), Value::String(author_name));
+            }
+            NotificationData::ProtectedMessage {
+                message,
+                channel,
+                title,
+                body,
+            } => {
+                data.insert("message".to_string(), Value::String(message));
+                data.insert("channel".to_string(), Value::String(channel));
+                // Clients show `author_name` as the title
+                data.insert("author_name".to_string(), Value::String(title));
+                data.insert("body".to_string(), Value::String(body));
             }
             NotificationData::DmCallStartEnd {
                 initiator_id,
@@ -205,6 +227,15 @@ pub(crate) async fn notification_data(kind: PayloadKind) -> Result<Option<Notifi
             body: alert.body,
             image: alert.icon,
         },
+
+        PayloadKind::MessageNotification(alert) if is_protected(&alert) => {
+            NotificationData::ProtectedMessage {
+                message: alert.message.id,
+                channel: alert.message.channel,
+                title: PROTECTED_PUSH_TITLE.to_string(),
+                body: PROTECTED_PUSH_BODY.to_string(),
+            }
+        }
 
         PayloadKind::MessageNotification(alert) => NotificationData::Message {
             message: alert.message.id,
@@ -337,6 +368,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+    use crate::utils::protected::fixtures::{self, CHANNEL_ID, MESSAGE_ID};
     use revolt_database::User;
     use revolt_models::v0::{Channel, PushNotification};
     use serde_json::json;
@@ -403,6 +435,8 @@ mod tests {
                     user: "01USER".to_string(),
                 },
             }),
+            // An unprotected server text channel keeps the legacy mapping
+            PayloadKind::MessageNotification(fixtures::notification(false)),
             PayloadKind::DmCallStartEnd(DmCallPayload {
                 initiator_id: "01USER".to_string(),
                 channel_id: "01CHANNEL".to_string(),
@@ -586,5 +620,55 @@ mod tests {
 
         assert_eq!(data.into_payload(), expected);
         Ok(())
+    }
+
+    /// What FCM (and UnifiedPush, which shares the mapping) send for a
+    /// message notification
+    async fn sent(alert: PushNotification) -> HashMap<String, Value> {
+        notification_data(PayloadKind::MessageNotification(alert))
+            .await
+            .unwrap()
+            .expect("FCM sends message pushes")
+            .into_payload()
+    }
+
+    #[tokio::test]
+    async fn fcm_protected_message_title_and_body_are_generic() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let data = sent(alert).await;
+            assert_eq!(data["type"], "push.message", "{data:?}");
+            // Clients show `author_name` as the title
+            assert_eq!(data["author_name"], PROTECTED_PUSH_TITLE, "{data:?}");
+            assert_eq!(data["body"], PROTECTED_PUSH_BODY, "{data:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fcm_protected_message_carries_only_routing_ids() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let data = sent(alert).await;
+            fixtures::assert_carries_nothing_forbidden(
+                "fcm",
+                &serde_json::to_string(&data).unwrap(),
+            );
+
+            let expected: HashMap<String, Value> = [
+                ("type", "push.message"),
+                ("message", MESSAGE_ID),
+                ("channel", CHANNEL_ID),
+                ("author_name", PROTECTED_PUSH_TITLE),
+                ("body", PROTECTED_PUSH_BODY),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
+            .collect();
+            assert_eq!(data, expected);
+        }
     }
 }

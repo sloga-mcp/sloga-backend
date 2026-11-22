@@ -827,6 +827,19 @@ impl AbstractProtectedChannels for ReferenceDb {
         // S4 (2.8): the history links these groups hold go with them
         links.retain(|_, link| !text_group_ids.contains(&link.group_id));
         intents.retain(|_, intent| !text_group_ids.contains(&intent.group_id));
+
+        // S4 (7.5): the `history_wipes` job's lease row, under its own lock
+        // alone (it is never held with another)
+        drop((
+            entitlements,
+            seat_lists,
+            seats,
+            groups,
+            commits,
+            links,
+            intents,
+        ));
+        self.history_wipe_leases.lock().await.remove(channel_id);
         Ok(())
     }
 }

@@ -3041,6 +3041,7 @@ mod protected_channel_bridge_tests {
             removed_reasons: vec![],
             welcome: Some(welcome.clone()),
             history_visible: None,
+            added_protocols: vec![],
         };
         assert!(serde_json::to_string(&commit).unwrap().contains(&welcome));
 
@@ -3079,6 +3080,7 @@ mod protected_channel_bridge_tests {
             removed_reasons: vec![],
             welcome: None,
             history_visible,
+            added_protocols: vec![],
         };
         assert!(serde_json::to_string(&row(Some(true)))
             .unwrap()
@@ -3437,6 +3439,7 @@ mod protected_channel_bridge_tests {
             removed_reasons: vec![],
             welcome: None,
             history_visible: None,
+            added_protocols: vec![],
         };
         let info = commit.into_commit_info(CHANNEL);
         assert_eq!(
@@ -3541,6 +3544,7 @@ mod protected_channel_bridge_tests {
                 user_id: USER_B.to_string(),
                 device_id: "b".repeat(32),
                 at: ms(5),
+                protocol: None,
             }],
             ..text_group()
         }

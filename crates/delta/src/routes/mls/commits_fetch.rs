@@ -245,6 +245,7 @@ mod tests {
             removed_reasons: vec![],
             welcome: None,
             history_visible: None,
+            added_protocols: vec![],
         }
     }
 

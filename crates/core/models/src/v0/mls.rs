@@ -203,7 +203,8 @@ auto_derived!(
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub kind: Option<MlsGroupKind>,
         /// Text only: the group-id generation (design §3.1). Required for
-        /// `Text`, refused for `Call`
+        /// `Text`; ignored for `Call`, whose group is stored with
+        /// `generation: None` (design 7.2 "Text group create", #159)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub generation: Option<u32>,
         /// Text only: the text protocol the creating client speaks

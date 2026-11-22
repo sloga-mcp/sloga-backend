@@ -17,7 +17,7 @@ mod mongodb;
 mod reference;
 
 #[cfg(all(test, feature = "mongodb"))]
-pub(crate) use mongodb::{HISTORY_LINK_RETRIES, TEXT_COMMIT_RETRIES};
+pub(crate) use mongodb::{HISTORY_LINK_PRECHECK_FAULTS, HISTORY_LINK_RETRIES, TEXT_COMMIT_RETRIES};
 
 #[async_trait]
 pub trait AbstractMls: Sync + Send {
@@ -301,9 +301,7 @@ pub trait AbstractMls: Sync + Send {
     /// its SLOT `{group_id}:{epoch}:{writer_user_id}`, derived here (the
     /// given `link.id` is not trusted), so each writer USER holds at most
     /// one candidate per holder epoch, whichever of its devices wrote it.
-    /// In one atomic unit (Mongo: a transaction whose FIRST write claims
-    /// the holder group document, `$inc txn_serial`, the #143 pattern;
-    /// Reference: `mls_groups -> mls_history_links`):
+    /// The rules, in order:
     ///
     /// 1. the shape rules of [`crate::check_history_link_wire`], and `size`
     ///    must be the decoded ciphertext length (`FailedValidation`);
@@ -319,6 +317,16 @@ pub trait AbstractMls: Sync + Send {
     ///    plus `size` exceeds the cap: for the group
     ///    (`history_link_group_cap_bytes`) and for the writer user in that
     ///    group (`history_link_user_cap_bytes`) (`FailedValidation`).
+    ///
+    /// Rules 2 to 5 hold at the insert. Reference checks them and inserts
+    /// under its locks (`mls_groups -> mls_history_links`). Mongo answers
+    /// what never changes (`Identical`, or a refusal of rules 2 to 5) in a
+    /// precheck BEFORE any transaction, without claiming the holder group;
+    /// a row that fits, or a precheck whose read failed, runs one
+    /// transaction whose FIRST write claims the holder group document
+    /// (`$inc txn_serial`, the #143 pattern) and which re-checks rules 2 to
+    /// 5 under the claim, the caps against the byte sums kept on the group
+    /// document (Mongo-only fields, `$inc`ed with each insert).
     ///
     /// Route rules (6.1 "S4": access, the writer, membership, epochs,
     /// visibility, the signature) are the caller's and must already have
@@ -443,8 +451,9 @@ pub(crate) fn check_history_link_room(
 }
 
 /// The stored usage of `row`'s holder group, from its rows (the Reference
-/// driver; Mongo sums the same three values in one aggregation). A
-/// negative stored `size` can only be a corrupt row: fail closed.
+/// driver; Mongo counts the holder epoch's rows and reads both byte sums
+/// from the group document). A negative stored `size` can only be a
+/// corrupt row: fail closed.
 pub(crate) fn history_link_usage<'a>(
     rows: impl Iterator<Item = &'a MlsHistoryLink>,
     row: &MlsHistoryLink,
@@ -880,7 +889,8 @@ pub(crate) fn plan_mls_text_commit(
 
     // rejoin_readd (S2-D32): a device's re-Add consumes its entry; a rule-6
     // eviction writes one (an added device is never also removed, so the
-    // two never touch the same device)
+    // two never touch the same device), carrying the consumed intent's
+    // protocol for the re-Add's floor (S4)
     let mut rejoin_readd = group.rejoin_readd.clone();
     rejoin_readd.retain(|entry| {
         !commit
@@ -896,6 +906,7 @@ pub(crate) fn plan_mls_text_commit(
             user_id: intent.user_id.clone(),
             device_id: intent.device_id.clone(),
             at: commit.created_at,
+            protocol: intent.protocol,
         });
     }
     let rejoin_readd = (rejoin_readd != group.rejoin_readd).then_some(rejoin_readd);
@@ -914,8 +925,8 @@ pub(crate) fn plan_mls_text_commit(
         .collect();
     consumed_intent_ids.extend(rejoin_intents.iter().map(|intent| intent.id.clone()));
 
-    // The Welcome is stored as given (S2-D29); the declarations the
-    // transaction derives replace the submitted ones
+    // The Welcome and `added_protocols` are stored as given (S2-D29, S4);
+    // the declarations the transaction derives replace the submitted ones
     let mut stored = commit.clone();
     stored.id = MlsCommit::composite_id(&commit.group_id, commit.epoch);
     stored.rejoin_intents = rejoin_intents;

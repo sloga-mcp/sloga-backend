@@ -1837,8 +1837,8 @@ impl SeatListWriteDecision {
 /// Order (4.3, W0-fix8): parse (step 1) first, with the S2 format rule
 /// (`check_seat_list_format`) and the authority structure (step 3b,
 /// `check_seat_list_authority`); then the version rule (step 4), where a
-/// byte-identical re-PUT returns the stored row IMMEDIATELY, before the S2
-/// immutable and one-way lines (4c, `check_seat_list_v2_lines`), the
+/// byte-identical re-PUT returns the stored row IMMEDIATELY, before the
+/// immutable and one-way lines (4c, `check_seat_list_history_lines`), the
 /// signer-leaf check (5b), the seat claims (7) and the handover append (8);
 /// only then the removed-users refusal (C1, `seat_list_removed_users`), 5b,
 /// the growth flag (decision 5 (W2)), 7 and 8. Route-side checks
@@ -2378,16 +2378,19 @@ pub fn check_seat_list_authority(
     }))
 }
 
-/// 4.3 step 4c as S2 calls it: [`check_seat_list_history_lines`] for a
-/// genesis (`stored == None`) or a seat PUT with `history_setting` OFF, so a
-/// genesis carrying a non-empty `history_boundary` or `pre_history:wiped`,
-/// and a PUT moving `kept -> wiped` or setting a boundary the stored list
-/// never had, are refused, while a PUT carrying the stored boundary and
-/// `pre_history` unchanged passes (fix round F1). The route's
-/// pre-transaction validation (`protected_seat_validation.rs`) still calls
-/// this; until it moves to [`check_seat_list_history_lines`] with the
-/// configured flag (W2), the route refuses every boundary genesis and every
-/// `wiped` genesis before a driver sees them, which fails closed.
+/// 4.3 step 4c with `history_setting` OFF: [`check_seat_list_history_lines`]
+/// with the flag fixed to `false`, as `Protect` for a genesis (`stored ==
+/// None`) and as `Put` otherwise. So a genesis carrying a non-empty
+/// `history_boundary` or `pre_history:wiped`, and a PUT moving `kept ->
+/// wiped` or setting a boundary the stored list never had, are refused,
+/// while a PUT carrying the stored boundary and `pre_history` unchanged
+/// passes (fix round F1).
+///
+/// Test-only since W2: no production path calls it. The planner
+/// ([`plan_seat_list_write`]) and the route's pre-transaction validation
+/// (`protected_seat_validation.rs`) call [`check_seat_list_history_lines`]
+/// with the configured flag; the model tests use this to pin the flag-off
+/// lines.
 pub fn check_seat_list_v2_lines(body: &SeatListBody, stored: Option<&SeatList>) -> Result<()> {
     let kind = if stored.is_some() {
         SeatListWriteKind::Put

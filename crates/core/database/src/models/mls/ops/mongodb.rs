@@ -76,6 +76,35 @@ pub(crate) static TEXT_COMMIT_RETRIES: std::sync::atomic::AtomicUsize =
 pub(crate) static HISTORY_LINK_RETRIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only fault injection for `history_link_precheck`: each entry is
+/// (holder group id, read, times fired), where read 0 is the holder, 1 the
+/// epoch count, 2 the slot. An armed read fails with a driver error
+#[cfg(test)]
+pub(crate) static HISTORY_LINK_PRECHECK_FAULTS: std::sync::Mutex<Vec<(String, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fail precheck read `read` of `group_id` if a test armed it; always `Ok`
+/// outside tests
+fn precheck_fault(group_id: &str, read: usize) -> mongodb::error::Result<()> {
+    #[cfg(test)]
+    {
+        let mut faults = HISTORY_LINK_PRECHECK_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(fault) = faults
+            .iter_mut()
+            .find(|(group, armed, _)| group == group_id && *armed == read)
+        {
+            fault.2 += 1;
+            return Err(mongodb::error::Error::custom(
+                "injected precheck read error",
+            ));
+        }
+    }
+    let _ = (group_id, read);
+    Ok(())
+}
+
 /// Back off before retrying a whole Text commit transaction (same shape as
 /// the protected-channels `retry_backoff`): a write conflict fails fast
 /// while the winning transaction is still open, so an immediate retry would
@@ -213,6 +242,22 @@ fn timestamp_bson(at: &Timestamp) -> Bson {
         at.duration_since(Timestamp::UNIX_EPOCH)
             .whole_milliseconds() as i64,
     )
+}
+
+/// One `rejoin_readd` entry as the Text commit transaction `$set`s it:
+/// `at` in the typed path's encoding (`timestamp_bson`), `protocol` as the
+/// typed path writes a `u32` (Int64) and absent when `None`, as the serde
+/// skip
+fn rejoin_readd_bson(entry: &MlsRejoinReadd) -> Bson {
+    let mut stored = doc! {
+        "user_id": &entry.user_id,
+        "device_id": &entry.device_id,
+        "at": timestamp_bson(&entry.at)
+    };
+    if let Some(protocol) = entry.protocol {
+        stored.insert("protocol", i64::from(protocol));
+    }
+    Bson::Document(stored)
 }
 
 impl MongoDb {
@@ -479,18 +524,10 @@ impl MongoDb {
                 })
             })
             .collect();
-        let rejoin_readd: Option<Vec<Bson>> = plan.rejoin_readd.as_ref().map(|entries| {
-            entries
-                .iter()
-                .map(|entry: &MlsRejoinReadd| {
-                    Bson::Document(doc! {
-                        "user_id": &entry.user_id,
-                        "device_id": &entry.device_id,
-                        "at": timestamp_bson(&entry.at)
-                    })
-                })
-                .collect()
-        });
+        let rejoin_readd: Option<Vec<Bson>> = plan
+            .rejoin_readd
+            .as_ref()
+            .map(|entries| entries.iter().map(rejoin_readd_bson).collect());
 
         // Step 3: an unmarked row at the id goes first (R22: a Call-plane
         // stray must never win a Text epoch), in this transaction, so a
@@ -743,33 +780,21 @@ impl MongoDb {
     /// are read BEFORE the slot: a row that lands in the slot meanwhile is
     /// still seen, and every answer holds as of the slot read (a racing
     /// identical twin is `Identical`, never the full epoch it completed).
+    ///
+    /// A failed read is no early answer: the insert falls through to the
+    /// transaction, which re-reads and re-checks everything and retries a
+    /// transient error, so a read error here is never the insert's answer.
     async fn history_link_precheck(
         &self,
         row: &MlsHistoryLink,
         caps: HistoryLinkCaps,
     ) -> Result<Option<InsertOutcome>> {
-        let group = self
-            .col::<Document>(COL_GROUPS)
-            .find_one(doc! {
-                "_id": &row.group_id,
-                "kind": kind_filter(MlsGroupKind::Text)
-            })
-            .projection(link_sums_projection(&row.writer_user_id))
-            .await
-            .map_err(|_| create_database_error!("find_one", COL_GROUPS))?
-            .ok_or_else(|| create_error!(NotFound))?;
-
-        let epoch_writers = self
-            .col::<Document>(COL_HISTORY_LINKS)
-            .count_documents(link_epoch_filter(row))
-            .await
-            .map_err(|_| create_database_error!("count_documents", COL_HISTORY_LINKS))?;
-
-        let stored = self
-            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
-            .find_one(doc! { "_id": &row.id })
-            .await
-            .map_err(|_| create_database_error!("find_one", COL_HISTORY_LINKS))?;
+        let Ok(reads) = self.history_link_precheck_reads(row).await else {
+            return Ok(None);
+        };
+        let Some((group, epoch_writers, stored)) = reads else {
+            return Err(create_error!(NotFound));
+        };
         if let Some(stored) = stored {
             return history_link_existing_outcome(&stored, row).map(Some);
         }
@@ -782,9 +807,45 @@ impl MongoDb {
         Ok(None)
     }
 
+    /// The precheck's reads, in its order: the holder group's sums
+    /// (`None` when it is not a Text group), the holder epoch's row count,
+    /// then the slot
+    #[allow(clippy::type_complexity)]
+    async fn history_link_precheck_reads(
+        &self,
+        row: &MlsHistoryLink,
+    ) -> mongodb::error::Result<Option<(Document, u64, Option<MlsHistoryLink>)>> {
+        precheck_fault(&row.group_id, 0)?;
+        let Some(group) = self
+            .col::<Document>(COL_GROUPS)
+            .find_one(doc! {
+                "_id": &row.group_id,
+                "kind": kind_filter(MlsGroupKind::Text)
+            })
+            .projection(link_sums_projection(&row.writer_user_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        precheck_fault(&row.group_id, 1)?;
+        let epoch_writers = self
+            .col::<Document>(COL_HISTORY_LINKS)
+            .count_documents(link_epoch_filter(row))
+            .await?;
+
+        precheck_fault(&row.group_id, 2)?;
+        let stored = self
+            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
+            .find_one(doc! { "_id": &row.id })
+            .await?;
+        Ok(Some((group, epoch_writers, stored)))
+    }
+
     /// `insert_mls_history_link` with explicit caps (the trait fn passes
     /// the configured ones). The final answers come from
-    /// `history_link_precheck`; an insert that fits runs one transaction,
+    /// `history_link_precheck` (from the transaction when a precheck read
+    /// fails); an insert that fits runs one transaction,
     /// retried as a whole on a transient error or a lost race within
     /// `HISTORY_LINK_RETRY_BUDGET`.
     pub(crate) async fn insert_mls_history_link_capped(

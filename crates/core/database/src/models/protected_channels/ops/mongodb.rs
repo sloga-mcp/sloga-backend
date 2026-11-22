@@ -58,6 +58,7 @@ const COL_GROUPS: &str = "mls_groups";
 const COL_COMMITS: &str = "mls_commits";
 const COL_HISTORY_LINKS: &str = "mls_history_links";
 const COL_JOIN_INTENTS: &str = "mls_join_intents";
+const COL_HISTORY_WIPE_LEASES: &str = "history_wipe_leases";
 const COL_MESSAGES: &str = "messages";
 const COL_E2EE_QUEUE: &str = "e2ee_queue";
 
@@ -1784,6 +1785,13 @@ impl MongoDb {
                 .await
                 .map_err(db_err("delete_many", COL_JOIN_INTENTS))?;
         }
+
+        // S4 (7.5): the `history_wipes` job's lease row; none is fine
+        self.col::<Document>(COL_HISTORY_WIPE_LEASES)
+            .delete_one(doc! { "_id": channel_id })
+            .session(&mut *session)
+            .await
+            .map_err(db_err("delete_one", COL_HISTORY_WIPE_LEASES))?;
 
         Ok(())
     }

@@ -281,6 +281,12 @@ auto_derived!(
         pub device_id: String,
         /// When the eviction was recorded
         pub at: Timestamp,
+        /// S4: the `protocol` of the rejoin intent the eviction consumed
+        /// (CLIENT-CLAIMED, as [`MlsJoinIntent::protocol`]), which the
+        /// re-Add's protocol floor reads in its place. `None` when that
+        /// intent carried none and on entries written before S4
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
     }
 );
 
@@ -343,6 +349,23 @@ auto_derived!(
         pub device_id: String,
         /// The strongest admitting rule
         pub reason: MlsRemovalReason,
+    }
+);
+
+auto_derived!(
+    /// The text protocol recorded for one device a Text commit added (S4):
+    /// from the device's stored join intent, else its `rejoin_readd` entry,
+    /// as the commit route found them. The Add consumes the intent, so the
+    /// Welcome route's protocol floor reads this instead. CLIENT-CLAIMED,
+    /// as [`MlsJoinIntent::protocol`]
+    pub struct MlsAddedProtocol {
+        /// Added user
+        pub user_id: String,
+        /// Added device
+        pub device_id: String,
+        /// The claimed protocol; `None` when neither source carried one
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub protocol: Option<u32>,
     }
 );
 
@@ -529,6 +552,13 @@ auto_derived!(
         /// `MlsCommitInfo` or any envelope.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub history_visible: Option<bool>,
+        /// Text only (S4): one entry per device this commit ADDED, written
+        /// by the commit route on every Text Add (v1 and v2 lists) and kept
+        /// as given by the Text commit transaction. Read by the Welcome
+        /// route only; NEVER part of `MlsCommitInfo` or any envelope. Empty
+        /// on Call rows and on rows written before S4
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub added_protocols: Vec<MlsAddedProtocol>,
     }
 );
 
@@ -901,6 +931,7 @@ mod removed_reasons_shape_tests {
             removed_reasons: vec![],
             welcome: None,
             history_visible: None,
+            added_protocols: vec![],
         }
     }
 
@@ -945,9 +976,10 @@ mod s2_shape_tests {
     use iso8601_timestamp::Timestamp;
 
     use super::{
-        InsertOutcome, MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent, MlsPendingDeviceRemoval,
-        MlsRejoinReadd, MlsRemovalReason, MlsSignerLost, MlsSignerLostCause,
-        HISTORY_LINK_MAX_CANDIDATES, HISTORY_LINK_MAX_CIPHERTEXT, MIN_TEXT_PROTOCOL_V2,
+        InsertOutcome, MlsAddedProtocol, MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent,
+        MlsPendingDeviceRemoval, MlsRejoinReadd, MlsRemovalReason, MlsSignerLost,
+        MlsSignerLostCause, HISTORY_LINK_MAX_CANDIDATES, HISTORY_LINK_MAX_CIPHERTEXT,
+        MIN_TEXT_PROTOCOL_V2,
     };
 
     /// A Text group exactly as an S1 build (dafb3433) stores it
@@ -1009,6 +1041,7 @@ mod s2_shape_tests {
                 user_id: "01JA00000000000000000USERC".to_string(),
                 device_id: "c".repeat(32),
                 at: at(),
+                protocol: None,
             }],
             ..group.clone()
         };
@@ -1146,6 +1179,54 @@ mod s2_shape_tests {
         let document = bson::to_document(&v2).unwrap();
         assert!(document.contains_key("protocol"));
         assert_eq!(bson::from_document::<MlsJoinIntent>(document).unwrap(), v2);
+    }
+
+    /// A `rejoin_readd` entry exactly as an S2 build stores it
+    const REJOIN_READD_S2: &str = r#"{"user_id":"01JA00000000000000000USERC","device_id":"cccccccccccccccccccccccccccccccc","at":"2026-10-04T13:00:00.000Z"}"#;
+
+    /// S4: a `rejoin_readd` entry's `protocol` and a commit's
+    /// `added_protocols` are absent when empty, so an S2 entry and an S1
+    /// commit re-encode byte-identical, and stored under their exact keys
+    /// when set
+    ///
+    /// Control: `skip_serializing_if` dropped from either.
+    #[test]
+    fn s4_rejoin_protocol_and_added_protocols_are_absent_when_empty() {
+        let entry: MlsRejoinReadd = s1_round_trip(REJOIN_READD_S2);
+        assert_eq!(entry.protocol, None);
+        let v2 = MlsRejoinReadd {
+            protocol: Some(2),
+            ..entry
+        };
+        assert_eq!(serde_json::to_value(&v2).unwrap()["protocol"], 2);
+        let document = bson::to_document(&v2).unwrap();
+        assert!(document.contains_key("protocol"));
+        assert_eq!(bson::from_document::<MlsRejoinReadd>(document).unwrap(), v2);
+
+        let commit: MlsCommit = s1_round_trip(COMMIT_S1);
+        assert!(commit.added_protocols.is_empty());
+        let added = MlsCommit {
+            added_protocols: vec![
+                MlsAddedProtocol {
+                    user_id: "01JA00000000000000000USERC".to_string(),
+                    device_id: "c".repeat(32),
+                    protocol: Some(2),
+                },
+                MlsAddedProtocol {
+                    user_id: "01JA00000000000000000USERD".to_string(),
+                    device_id: "d".repeat(32),
+                    protocol: None,
+                },
+            ],
+            ..commit
+        };
+        let value = serde_json::to_value(&added).unwrap();
+        assert_eq!(value["added_protocols"][0]["protocol"], 2);
+        assert!(value["added_protocols"][1].get("protocol").is_none());
+        assert_eq!(serde_json::from_value::<MlsCommit>(value).unwrap(), added);
+        let document = bson::to_document(&added).unwrap();
+        assert_eq!(document.get_array("added_protocols").unwrap().len(), 2);
+        assert_eq!(bson::from_document::<MlsCommit>(document).unwrap(), added);
     }
 
     /// Design §2.8: the stored link's keys, its composite `_id`, and a

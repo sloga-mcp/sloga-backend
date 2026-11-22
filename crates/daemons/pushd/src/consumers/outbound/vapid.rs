@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use crate::utils::Consumer;
+use crate::utils::{is_protected, Consumer, PROTECTED_PUSH_TITLE};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ use isahc::{
 use lapin::{message::Delivery, Channel as AMQPChannel, Connection};
 use log::{error, info, warn};
 use revolt_database::{events::rabbit::*, util::format_display_name, Database};
-use revolt_models::v0::push_endpoint_allowed;
+use revolt_models::v0::{push_endpoint_allowed, PushNotification, PROTECTED_PUSH_BODY};
 use sha2::{Digest, Sha256};
 use web_push::{
     ContentEncoding, IsahcWebPushClient, SubscriptionInfo, SubscriptionKeys, VapidSignature,
@@ -244,6 +244,22 @@ fn web_push_client(timeout: Duration, connect_timeout: Duration) -> IsahcWebPush
         .expect("web-push HTTP client")
 }
 
+/// The web-push body of a message notification. A protected-channel message
+/// (S8-O4) carries only the generic title and body, the channel as the tag
+/// and the url that opens the message; any other is the notification as is
+fn message_body(alert: &PushNotification) -> Result<String> {
+    if is_protected(alert) {
+        return Ok(serde_json::to_string(&serde_json::json!({
+            "title": PROTECTED_PUSH_TITLE,
+            "body": PROTECTED_PUSH_BODY,
+            "tag": alert.channel.id(),
+            "url": alert.url,
+        }))?);
+    }
+
+    Ok(serde_json::to_string(alert)?)
+}
+
 /// Parses the PEM and signs for this subscription, without panicking on a bad key
 fn sign(pem: &[u8], subscription: &SubscriptionInfo) -> Result<VapidSignature, WebPushError> {
     // The panic hook still runs, so a caught parser panic is still printed and sent to Sentry
@@ -396,7 +412,7 @@ impl Consumer for VapidOutboundConsumer {
                 serde_json::to_string(&body)?
             }
             PayloadKind::Generic(alert) => serde_json::to_string(&alert)?,
-            PayloadKind::MessageNotification(alert) => serde_json::to_string(&alert)?,
+            PayloadKind::MessageNotification(alert) => message_body(&alert)?,
             PayloadKind::DmCallStartEnd(alert) => {
                 let initiator_name = if let Some(server_id) =
                     self.db.fetch_channel(&alert.channel_id).await?.server()
@@ -483,6 +499,7 @@ impl Consumer for VapidOutboundConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::protected::fixtures;
 
     /// The committed default config; keys are read from it at runtime, never as literals
     const DEFAULT_CONFIG: &str = include_str!("../../../../../core/config/Revolt.toml");
@@ -824,5 +841,53 @@ mod tests {
             sign(&pem, &subscription),
             Err(WebPushError::InvalidCryptoKeys)
         ));
+    }
+
+    #[test]
+    fn vapid_protected_message_title_and_body_are_generic() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let wire: serde_json::Value =
+                serde_json::from_str(&message_body(&alert).unwrap()).unwrap();
+            // Set, so the service worker never builds "{author} in {channel}"
+            assert_eq!(wire["title"], PROTECTED_PUSH_TITLE, "{wire}");
+            assert_eq!(wire["body"], PROTECTED_PUSH_BODY, "{wire}");
+        }
+    }
+
+    #[test]
+    fn vapid_protected_message_carries_only_routing_ids() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let wire = message_body(&alert).unwrap();
+            fixtures::assert_carries_nothing_forbidden("vapid", &wire);
+
+            let wire: serde_json::Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(
+                wire,
+                serde_json::json!({
+                    "title": PROTECTED_PUSH_TITLE,
+                    "body": PROTECTED_PUSH_BODY,
+                    "tag": fixtures::CHANNEL_ID,
+                    "url": fixtures::URL,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn vapid_unprotected_message_is_unchanged() {
+        let alert = fixtures::notification(false);
+        let wire = message_body(&alert).unwrap();
+        assert_eq!(wire, serde_json::to_string(&alert).unwrap());
+        // The fixture's names and avatar do reach an unprotected push, so
+        // the protected tests above are not passing on an empty fixture
+        assert!(wire.contains(fixtures::AUTHOR_NAME));
+        assert!(wire.contains(fixtures::CHANNEL_NAME));
+        assert!(wire.contains(fixtures::AVATAR_URL));
     }
 }

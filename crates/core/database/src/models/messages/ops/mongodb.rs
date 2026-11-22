@@ -863,6 +863,11 @@ impl AbstractMessages for MongoDb {
     /// through `find_with_options`: a release build there drops a row that
     /// does not decode, and a batch that loses rows can come back empty while
     /// plaintext is left, which would let the job mark the wipe done.
+    ///
+    /// A row that does not decode fails the call with a plain `DatabaseError`.
+    /// The decode error is dropped, neither reported nor logged: its text can
+    /// quote the stored plaintext, and the job already logs the failed channel
+    /// every tick and sends it to Sentry once, with a fixed message.
     async fn fetch_history_wipe_batch(
         &self,
         channel: &str,
@@ -884,10 +889,7 @@ impl AbstractMessages for MongoDb {
 
         let mut batch = Vec::new();
         while let Some(message) = cursor.next().await {
-            let message = message.map_err(|error| {
-                revolt_config::capture_internal_error!(error);
-                create_database_error!("find", COL)
-            })?;
+            let message = message.map_err(|_| create_database_error!("find", COL))?;
             batch.push(message);
         }
 
@@ -1726,6 +1728,72 @@ mod nonce_index_tests {
                     .await,
             );
             assert_eq!(mongo.fetch_message(&stored.id).await.expect("kept"), stored);
+        });
+    }
+}
+
+/// `fetch_history_wipe_batch` over a row that does not decode. Mongo only:
+/// under `TEST_DB=REFERENCE` this returns early; the Reference driver stores
+/// typed rows.
+#[cfg(test)]
+mod history_wipe_batch_tests {
+    use bson::{doc, Document};
+    use revolt_result::ErrorType;
+
+    use crate::{AbstractMessages, Database, Message};
+
+    use super::COL;
+
+    /// The batch fails closed with a plain `DatabaseError` that never carries
+    /// the decode error, whose text quotes the stored row: the job logs this
+    /// error every tick
+    ///
+    /// Control: put the decode error into the returned error.
+    #[tokio::test]
+    async fn wipe_batch_error_never_quotes_the_row() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: wipe_batch_error_never_quotes_the_row runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let channel = "01CHANWIPE0000000000000F01";
+            let id = ulid::Ulid::from_parts(1_000, 1).to_string();
+            let secret = "SECRET-WIPE-TEXT the crab recipe";
+            // A string where `attachments` holds a list
+            mongo
+                .col::<Document>(COL)
+                .insert_one(doc! {
+                    "_id": id.as_str(),
+                    "channel": channel,
+                    "author": "01AUTHOR0000000000000000000",
+                    "attachments": secret,
+                })
+                .await
+                .expect("insert the poisoned row");
+            // Proof of the fixture: the decode error quotes the row
+            let decode = mongo
+                .col::<Message>(COL)
+                .find_one(doc! { "_id": id.as_str() })
+                .await
+                .unwrap_err();
+            assert!(format!("{decode:?}").contains(secret), "{decode:?}");
+
+            let error = db
+                .fetch_history_wipe_batch(channel, &id, 10)
+                .await
+                .expect_err("an undecodable row must fail the batch");
+            assert!(
+                matches!(
+                    &error.error_type,
+                    ErrorType::DatabaseError { operation, collection }
+                        if operation == "find" && collection == COL
+                ),
+                "{error:?}"
+            );
+            assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
+            assert!(!format!("{error}").contains("SECRET"), "{error}");
         });
     }
 }

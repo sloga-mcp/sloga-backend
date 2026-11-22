@@ -24,6 +24,7 @@ mod message_crosspost;
 mod group_add_member;
 mod group_create;
 mod group_remove_member;
+mod history_wipe;
 mod invite_create;
 mod members_fetch;
 mod message_bulk_delete;
@@ -166,6 +167,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         channel_protect::protect_channel,
         seats_put::put_seats,
         seats_fetch::fetch_seats,
+        history_wipe::wipe_history,
     ]
 }
 
@@ -196,10 +198,16 @@ mod protected_openapi_completeness {
         (Method::Put, "/{target}/protect", "protect_channel", "E2EE"),
         (Method::Put, "/{target}/seats", "put_seats", "E2EE"),
         (Method::Get, "/{target}/seats", "fetch_seats", "E2EE"),
+        (
+            Method::Post,
+            "/{target}/history_wipe",
+            "wipe_history",
+            "E2EE",
+        ),
     ];
 
-    /// The MLS routes W2 gave a Text path, and the Welcome route S2 added
-    /// (mounted under `/mls`)
+    /// The MLS routes W2 gave a Text path, the Welcome route S2 added and
+    /// the history-link routes S4 added (mounted under `/mls`)
     const MLS: &[(Method, &str, &str, &str)] = &[
         (
             Method::Put,
@@ -248,6 +256,18 @@ mod protected_openapi_completeness {
             Method::Get,
             "/groups/{group_id}/welcome",
             "fetch_welcome",
+            "MLS",
+        ),
+        (
+            Method::Put,
+            "/groups/{group_id}/history_links/{epoch}",
+            "put_history_link",
+            "MLS",
+        ),
+        (
+            Method::Get,
+            "/groups/{group_id}/history_links",
+            "fetch_history_links",
             "MLS",
         ),
     ];

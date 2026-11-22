@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap, io::Cursor, sync::Arc};
 
-use crate::utils::Consumer;
+use crate::utils::{is_protected, Consumer, PROTECTED_PUSH_TITLE};
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::{
@@ -16,7 +16,7 @@ use revolt_a2::{
     Client, ClientConfig, Endpoint, Error, ErrorBody, ErrorReason, Priority, PushType, Response,
 };
 use revolt_database::{events::rabbit::*, Database};
-use revolt_models::v0::{Channel, Message, PushNotification};
+use revolt_models::v0::{Channel, Message, PushNotification, PROTECTED_PUSH_BODY};
 use serde::Serialize;
 
 // region: payload
@@ -45,6 +45,123 @@ impl<'a> PayloadLike for MessagePayload<'a> {
     }
     fn get_options(&self) -> &NotificationOptions<'a> {
         &self.options
+    }
+}
+
+/// A protected-channel message (S8-O4): the generic alert, the channel as
+/// the thread, and the url that opens the message. No author, avatar,
+/// channel name or message object
+#[derive(Serialize, Debug)]
+struct ProtectedMessagePayload<'a> {
+    aps: APS<'a>,
+    #[serde(skip_serializing)]
+    options: NotificationOptions<'a>,
+    #[serde(skip_serializing)]
+    device_token: &'a str,
+
+    url: &'a str,
+}
+
+impl<'a> PayloadLike for ProtectedMessagePayload<'a> {
+    fn get_device_token(&self) -> &'a str {
+        self.device_token
+    }
+    fn get_options(&self) -> &NotificationOptions<'a> {
+        &self.options
+    }
+}
+
+#[derive(Debug)]
+enum MessageAlert<'a> {
+    Plain(MessagePayload<'a>),
+    Protected(ProtectedMessagePayload<'a>),
+}
+
+/// The payload of a message notification. `title` is `format_title`'s and
+/// is used only for an unprotected message
+fn message_payload<'a>(
+    alert: &'a PushNotification,
+    title: &'a str,
+    badge: Option<u32>,
+    device_token: &'a str,
+    options: NotificationOptions<'a>,
+) -> MessageAlert<'a> {
+    if is_protected(alert) {
+        return MessageAlert::Protected(ProtectedMessagePayload {
+            aps: APS {
+                alert: Some(APSAlert::Default(DefaultAlert {
+                    title: Some(PROTECTED_PUSH_TITLE),
+                    subtitle: None,
+                    body: Some(PROTECTED_PUSH_BODY),
+                    title_loc_key: None,
+                    title_loc_args: None,
+                    action_loc_key: None,
+                    loc_key: None,
+                    loc_args: None,
+                    launch_image: None,
+                })),
+                badge,
+                sound: Some(APSSound::Sound("default")),
+                thread_id: Some(alert.channel.id()),
+                content_available: None,
+                category: None,
+                mutable_content: Some(1),
+                url_args: None,
+            },
+            device_token,
+            options,
+            url: &alert.url,
+        });
+    }
+
+    MessageAlert::Plain(MessagePayload {
+        aps: APS {
+            alert: Some(APSAlert::Default(DefaultAlert {
+                title: Some(title),
+                subtitle: None,
+                body: Some(&alert.body),
+                title_loc_key: None,
+                title_loc_args: None,
+                action_loc_key: None,
+                loc_key: None,
+                loc_args: None,
+                launch_image: None,
+            })),
+            badge,
+            sound: Some(APSSound::Sound("default")),
+            thread_id: Some(alert.channel.id()),
+            content_available: None,
+            category: None,
+            mutable_content: Some(1),
+            url_args: None,
+        },
+        device_token,
+        options,
+        message: &alert.message,
+        url: &alert.url,
+        author_avatar: &alert.icon,
+        author_display_name: &alert.author,
+        channel_name: alert.channel.name().unwrap_or(title),
+    })
+}
+
+fn format_title(notification: &PushNotification) -> String {
+    // ideally this changes depending on context
+    // in a server, it would look like "Sendername, #channelname in servername"
+    // in a group, it would look like "Sendername in groupname"
+    // in a dm it should just be "Sendername".
+    // not sure how feasible all those are given the PushNotification object as it currently stands.
+
+    #[allow(deprecated)]
+    match &notification.channel {
+        Channel::DirectMessage { .. } => notification.author.clone(),
+        Channel::Group { name, .. } => format!("{}, #{}", notification.author, name),
+        Channel::TextChannel { name, .. }
+        | Channel::Thread { name, .. }
+        | Channel::Forum { name, .. } => {
+            format!("{} in #{}", notification.author, name)
+        }
+        _ => "Unknown".to_string(),
     }
 }
 
@@ -119,26 +236,6 @@ pub struct ApnsOutboundConsumer {
 }
 
 impl ApnsOutboundConsumer {
-    fn format_title(&self, notification: &PushNotification) -> String {
-        // ideally this changes depending on context
-        // in a server, it would look like "Sendername, #channelname in servername"
-        // in a group, it would look like "Sendername in groupname"
-        // in a dm it should just be "Sendername".
-        // not sure how feasible all those are given the PushNotification object as it currently stands.
-
-        #[allow(deprecated)]
-        match &notification.channel {
-            Channel::DirectMessage { .. } => notification.author.clone(),
-            Channel::Group { name, .. } => format!("{}, #{}", notification.author, name),
-            Channel::TextChannel { name, .. }
-            | Channel::Thread { name, .. }
-            | Channel::Forum { name, .. } => {
-                format!("{} in #{}", notification.author, name)
-            }
-            _ => "Unknown".to_string(),
-        }
-    }
-
     async fn get_badge_count(&self, user: &str) -> Option<u32> {
         if let Ok(unreads) = self.db.fetch_unread_mentions(user).await {
             let mut mention_count = 0;
@@ -338,42 +435,23 @@ impl Consumer for ApnsOutboundConsumer {
             }
 
             PayloadKind::MessageNotification(alert) => {
-                let title = self.format_title(&alert);
-                let apn_payload = MessagePayload {
-                    aps: APS {
-                        alert: Some(APSAlert::Default(DefaultAlert {
-                            title: Some(&title),
-                            subtitle: None,
-                            body: Some(&alert.body),
-                            title_loc_key: None,
-                            title_loc_args: None,
-                            action_loc_key: None,
-                            loc_key: None,
-                            loc_args: None,
-                            launch_image: None,
-                        })),
-                        badge: self.get_badge_count(&payload.user_id).await,
-                        sound: Some(APSSound::Sound("default")),
-                        thread_id: Some(alert.channel.id()),
-                        content_available: None,
-                        category: None,
-                        mutable_content: Some(1),
-                        url_args: None,
-                    },
-                    device_token: &payload.token,
-                    options: payload_options.clone(),
-                    message: &alert.message,
-                    url: &alert.url,
-                    author_avatar: &alert.icon,
-                    author_display_name: &alert.author,
-                    channel_name: alert.channel.name().unwrap_or(&title),
-                };
+                let title = format_title(&alert);
+                let badge = self.get_badge_count(&payload.user_id).await;
 
                 debug!(
                     "Sending message notification for user: {:}",
                     &payload.user_id
                 );
-                self.client.send(apn_payload).await
+                match message_payload(
+                    &alert,
+                    &title,
+                    badge,
+                    &payload.token,
+                    payload_options.clone(),
+                ) {
+                    MessageAlert::Plain(apn_payload) => self.client.send(apn_payload).await,
+                    MessageAlert::Protected(apn_payload) => self.client.send(apn_payload).await,
+                }
             }
 
             PayloadKind::CalendarEvent(alert) => {
@@ -489,5 +567,113 @@ impl Consumer for ApnsOutboundConsumer {
         };
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::utils::protected::fixtures::{self, *};
+
+    /// What `consume` sends to APNs for a message notification, as JSON
+    fn sent(alert: &PushNotification) -> String {
+        let title = format_title(alert);
+        match message_payload(
+            alert,
+            &title,
+            Some(3),
+            "device-token",
+            NotificationOptions::default(),
+        ) {
+            MessageAlert::Plain(apn_payload) => serde_json::to_string(&apn_payload).unwrap(),
+            MessageAlert::Protected(apn_payload) => serde_json::to_string(&apn_payload).unwrap(),
+        }
+    }
+
+    fn keys(value: &Value) -> BTreeSet<&str> {
+        value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    #[test]
+    fn apn_protected_alert_is_generic() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let wire: Value = serde_json::from_str(&sent(&alert)).unwrap();
+            let shown = &wire["aps"]["alert"];
+            assert_eq!(shown["title"], PROTECTED_PUSH_TITLE, "{wire}");
+            assert_eq!(shown["body"], PROTECTED_PUSH_BODY, "{wire}");
+            assert_eq!(keys(shown), BTreeSet::from(["title", "body"]), "{wire}");
+        }
+    }
+
+    #[test]
+    fn apn_protected_payload_carries_only_routing_ids() {
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let wire = sent(&alert);
+            fixtures::assert_carries_nothing_forbidden("apn", &wire);
+
+            let wire: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(keys(&wire), BTreeSet::from(["aps", "url"]), "{wire}");
+            assert_eq!(wire["url"], URL);
+            assert_eq!(wire["aps"]["thread-id"], CHANNEL_ID);
+        }
+    }
+
+    /// The unprotected payload is byte-identical to what the arm built
+    /// before S8-O4 (a verbatim copy of it below)
+    #[test]
+    fn apn_unprotected_payload_is_unchanged() {
+        let alert = fixtures::notification(false);
+        let title = format!("{AUTHOR_NAME} in #{CHANNEL_NAME}");
+        let legacy = MessagePayload {
+            aps: APS {
+                alert: Some(APSAlert::Default(DefaultAlert {
+                    title: Some(&title),
+                    subtitle: None,
+                    body: Some(&alert.body),
+                    title_loc_key: None,
+                    title_loc_args: None,
+                    action_loc_key: None,
+                    loc_key: None,
+                    loc_args: None,
+                    launch_image: None,
+                })),
+                badge: Some(3),
+                sound: Some(APSSound::Sound("default")),
+                thread_id: Some(alert.channel.id()),
+                content_available: None,
+                category: None,
+                mutable_content: Some(1),
+                url_args: None,
+            },
+            device_token: "device-token",
+            options: NotificationOptions::default(),
+            message: &alert.message,
+            url: &alert.url,
+            author_avatar: &alert.icon,
+            author_display_name: &alert.author,
+            channel_name: alert.channel.name().unwrap_or(&title),
+        };
+
+        let wire = sent(&alert);
+        assert_eq!(wire, serde_json::to_string(&legacy).unwrap());
+        // The fixture's names and avatar do reach an unprotected push, so
+        // the protected tests above are not passing on an empty fixture
+        assert!(wire.contains(AUTHOR_NAME) && wire.contains(CHANNEL_NAME));
+        assert!(wire.contains(AVATAR_URL) && wire.contains(AUTHOR_ID));
     }
 }

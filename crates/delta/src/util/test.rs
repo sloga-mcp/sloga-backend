@@ -1265,9 +1265,13 @@ impl TestHarness {
 
     /// Give the already protected `channel_id` the history boundary
     /// `boundary` and the wipe state `wipe`, written straight through the
-    /// driver (`update_channel`, past `Channel::update`'s guard) as protect
-    /// with a boundary and the wipe writers store it (design 2.1 "S4"; no
-    /// seat list carries it). Returns the re-read channel.
+    /// driver (`update_channel`, past `Channel::update`'s guard; no seat
+    /// list carries it). A fixture shortcut only: protect
+    /// (`protect_channel_with_wipe`) and the wipe route
+    /// (`request_history_wipe`) write it inside the seat-list driver
+    /// transaction, and the `history_wipes` job through
+    /// `complete_history_wipe` (design 2.1 "S4"); only test fixtures use
+    /// `update_channel` for it. Returns the re-read channel.
     pub async fn protect_with_history_raw(
         &self,
         channel_id: &str,

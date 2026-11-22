@@ -36,8 +36,16 @@ replaces" or "S4 extends". S4b items are marked "[S4b]" (own-device history in h
 over Olm, O-4; the native confirmation before an honest new device of a seated user walks
 history, O-17); everything else is S4a. What the plan did not settle was put to the S4-W0
 crypto-lens audit; its rulings are recorded in #283 and its fixes in #285 to #299. The S4
-index entries are #240 to #309 (section 12; #300 is the planner's 40 KiB cap ruling,
-#301 to #309 the second fix round).
+index entries are #240 to #316 (section 12; #300 is the planner's 40 KiB cap ruling,
+#301 to #309 the second fix round, #310 to #316 the S4-W2 doc pass).
+
+**S4-W2 backend doc pass (2026-11-21, #310 to #316).** Text marked "As built (S4-W2)" records
+what the S4 backend waves W1 and W2 built on `feat/protected-s4` (base `952b007b` plus the W2
+lanes), read from the code. Where it differs from earlier S4 text, the earlier text is kept
+and the difference is stated, except where a planner ruling replaces it (F1, F2 and F3 of
+the W1 wave audit's fix round; R-REJOIN, R-WELCOME and R-WIPEJOB of W2): that text is
+rewritten in place and says so. It also carries the server half of the minimum text
+protocol (the S4 plan's 2026-11-11 appendix, 8.3 "Text protocol").
 
 How to read it:
 
@@ -695,6 +703,13 @@ the existing passphrase-sealed backup (8.5). Visible history WIDENS R1 and R3 (S
   they planted, attributed to them by their pinned keys, instead of the real history of that
   span; never another user's words. If an honest candidate for the same holder also has
   evidence, the walk stops `conflict` (loud) instead.
+  **Amended in S4-W2 (L2 of the W1 wave audit, #311): the byte caps.** The per-user cap is
+  the group cap divided by five (7.1 "S4"), so five colluding seated users, or long honest
+  use of one group, can fill the GROUP cap; every later honest link of that group is then
+  refused (`FailedValidation`, 2.8) until a successor group exists, and history of the later
+  transitions is unavailable to joiners. Links already stored stay readable. A loss of
+  availability, never a forged import. Not taken: exempting the first candidate of each
+  holder epoch from the group cap.
 - **R33. A restore resets replay dedupe (S4-W0 fix F13, #297).** `mls_text_seen` is not
   restored (8.5), so a restored device does not know the `cid` bindings it made before, and
   against a hostile server a message replayed across the restore is not caught natively
@@ -751,6 +766,16 @@ HistoryWipe = None | Requested { at: Timestamp, by: String } | Done { at: Timest
 - Informational for clients: they take the boundary and the wipe state from the VERIFIED seat
   list (native `TextChannelState.history_boundary` and `pre_history`, 8.3 "S4"), never from
   this field. The server reads it for `is_servable` (7.5 "S4").
+- **As built (S4-W2): the `Box`.** The field is `Option<Box<ProtectedHistory>>` on the
+  database and the v0 `Channel::TextChannel` and on both `PartialChannel`s. The wire and
+  serde shapes are exactly the ones above. **DECISION (planner, S4-W1):** the `Box` is kept,
+  for stack margin (the deep route tests already run close to the 2 MiB test stack).
+- **As built (S4-W2): two Mongo encodings of `wipe.at`.** The protect and wipe transactions
+  and the job's `complete_history_wipe` (7.5 "S4") write `at` as Int64 unix milliseconds, the
+  encoding of every typed `Timestamp` write. A `db.update_channel(.., PartialChannel {
+  protected_history }, ..)` writes it through `$set` as an ISO 8601 string; no S4 writer uses
+  that path. Typed reads accept both. No query ranges over or compares `wipe.at`, and none
+  may: the two encodings do not compare. The Reference driver keeps the full `Timestamp`.
 
 ### 2.2 `channel_entitlements` (new collection, both drivers)
 
@@ -1201,7 +1226,7 @@ byte-identical (the field-level rule of (b) above):
 |---|---|---|
 | `MlsGroup.pending_device_removals` | `Vec<MlsPendingDeviceRemoval { user_id, device_id, created_at }>` | a SEPARATE field from `pending_removals`, so an older binary ignores it instead of reading it as user-wide (S2-D17a) |
 | `MlsGroup.signer_lost` | `Option<MlsSignerLost { user_id, device_id, cause, at }>` | the device that signed the current list was revoked (S2-D17d, 6.3). The stored `cause` is only `device_revoked` ([S2b] `user_removed`); `account_unavailable` is never stored: `GET .../text_group` derives it at read time from the signer user's account flags (`UserFlags` `SuspendedUntil`, `Deleted`, `Banned`) (#222). COPIED into every successor created while it is set; only the 4.3 step-7 seat-list write clears it (#213) |
-| `MlsGroup.rejoin_readd` | `Vec<{ user_id, device_id, at }>` | written by a rule-6 eviction, consumed by that device's re-Add; marks the re-Add as recovery (S2-D32). Never pruned today; pruning is owed before the `formats_v2` flip (6.3 "`rejoin_readd` lifetime") |
+| `MlsGroup.rejoin_readd` | `Vec<{ user_id, device_id, at, protocol }>` | written by a rule-6 eviction, consumed by that device's re-Add; marks the re-Add as recovery (S2-D32). Never pruned today; pruning is owed before the `formats_v2` flip (6.3 "`rejoin_readd` lifetime"). `protocol` is S4's (2.5 "S4", ruling R-REJOIN) |
 | `MlsGroup.member_refreshed` | [S2b] | S2-D34 |
 | `MlsCommit.removed_reasons` | exists (B48, #169) | gains `pending_device` and [S2b] `idle` (6.1) |
 | `MlsCommit.welcome` | `Option<String>` | the commit's Welcome (b64), stored on Text commits with `added`, pruned with the row, NEVER serialized into `MlsCommitInfo` or `GET .../commits` (only the Welcome route serves it, 7.2; S2-D29) |
@@ -1238,9 +1263,20 @@ migration; a Call commit leaves them untouched (the field-level rule of (b)):
 |---|---|---|
 | `MlsCommit.history_visible` | `Option<bool>` | Written with the row inside the Text commit transaction, from the AD the route already parses (3.12.2): `Some(true)` when the embedded list is v2 with `history:visible`; `Some(false)` when it is v2 with `history:hidden`, or a v1 list (O-2); `None` on rows written before S4. It is the visibility of the transition INTO the row's epoch (the row at `{G}:{e'}` is the commit `e' - 1 -> e'`). The history-link PUT reads it (6.1 "S4"): an absent row, `None` or `false` refuses. **DECISION (S4-W0):** never serialized into `MlsCommitInfo` or the envelope (members read visibility from the AD they verify) |
 | `MlsGroup.history_visible_at_create` | `Option<bool>` | The visibility of the group's epoch 0 (for a successor, of its BRIDGE transition): set by the Text create transaction from the seat list it binds (`prepare_text_group`), same rule as above, for EVERY Text create (fix F3, #287: a first group too, because the link held at epoch 1 also needs epoch 0 visible); `None` only on groups created before S4. Read by the link PUT for e' = 1 and by the bridge-link PUT. Field name **DECISION (S4-W0)** |
+| `MlsJoinIntent.protocol` (As built, S4-W2) | `Option<u32>` | The client-claimed text protocol of `DataMlsJoinIntent.protocol` (8.3 "Text protocol"), stored by the join-intent route on EVERY Text intent, v1 and v2 lists alike; always `None` on a Call intent. Unsigned (not in the 3.13 payload) and not part of any wire info built from an intent. Read by the commit route's protocol floor (6.1 "S4") |
+| `MlsRejoinReadd.protocol`, the `rejoin_readd` entry (As built, S4-W2; ruling R-REJOIN, #313) | `Option<u32>` | Copied by the commit planner from the rejoin intent a rule-6 eviction consumes (the Mongo builder carries it), because that consumption leaves the device's later re-Add no intent to read. The re-Add's protocol floor reads it instead (6.1 "S4"). `None` when that intent carried none and on entries written before S4 |
+| `MlsCommit.added_protocols` (As built, S4-W2; ruling R-WELCOME, #313) | `Vec<MlsAddedProtocol { user_id, device_id, protocol: Option<u32> }>`, `#[serde(default, skip_serializing_if = "Vec::is_empty")]` | Written with the row for EVERY Text commit with `added` (v1 and v2 lists alike), in `added` order: each added device's claimed protocol from its stored join intent, else from the group's `rejoin_readd` entry for it, else `None`; an intent without `protocol` is never topped up from the entry. The Welcome route's floor reads it (6.1 "S4"), because the Add consumes the intent (2.5 step 5). Never serialized into `MlsCommitInfo`, the envelope or `GET .../commits`; empty on rows written before S4 |
 
 - B43's commit pruning deletes `history_visible` with its row, which is why a link for a
   pruned transition can no longer be written (R9 "S4"); links already written stay (2.8).
+- **Mongo-only link sums (As built, S4-W2; fix F2 of the W1 wave audit, #311).** On Mongo the
+  `mls_groups` document of a holder group also carries `history_link_bytes` and
+  `history_link_user_bytes.<writer_user_id>`, the running sums of its links' `size` (2.8).
+  They are NOT `MlsGroup` fields: a typed read ignores them, and no path replaces a group
+  document whole. The link insert's transaction `$inc`s both after its insert; a missing
+  field reads as 0 and a field of another type fails the insert closed;
+  `delete_mls_history_links_for_group` unsets both before it deletes the rows. The Reference
+  driver keeps no sums: it adds the stored `size`s under its locks.
 - `delete_protected_channel_data` also deletes the channel's history links (2.8, 7.5 "S4").
 
 ### 2.6 `Message.encrypted`
@@ -1360,6 +1396,9 @@ collection (2.8) and its one index:
 
 The same block creates the `server_legal_holds` collection (2.9; fix F8, #292), which needs
 no index beyond `_id`.
+**As built (S4-W2).** The `history_wipe_leases` collection (2.10) is NOT in the block and has
+no index beyond `_id`: Mongo creates it on the first upsert, and the Reference driver
+registers its map. W2 leaves the block, its `<= 80` guard and `LATEST_REVISION` unchanged.
 
 Every other S4 field is an additive serde default (`Channel.protected_history`,
 `MlsCommit.history_visible`, `MlsGroup.history_visible_at_create`) and needs no migration.
@@ -1401,14 +1440,49 @@ Driver methods, both drivers (the plan's pinned contract):
   that claims the holder group document with `$inc txn_serial` (the #143 pattern), so two
   racing inserts cannot both pass a cap or the count; Reference, under the locks below. Over a
   byte cap is `FailedValidation`.
+  **Rewritten by planner ruling F2 (W1 wave audit M1 and M2; R2 and R3 of its re-review;
+  #311). As built (S4-W2):** the refusals are decided BEFORE any transaction, and only an
+  insert that fits claims the group:
+  - The holder must be a Text group, open or closed (else `NotFound`); the row id is derived
+    from the slot (`link.id` is not trusted).
+  - **Mongo precheck, no claim.** In this order: the holder group (with its Mongo-only byte
+    sums, 2.5 "S4"), the holder epoch's row count (`count_documents` on
+    `history_links_by_holder`), then the writer user's slot (read last, so a row that lands
+    in the slot meanwhile is still seen). It answers `NotFound`, `Identical`,
+    `HistoryLinkExists` (a taken slot or a sixth writer) or a cap's `FailedValidation`. Rows
+    are never updated and leave only with their group, and the count and the sums only grow,
+    so each of these answers is final, and a refusal never write-conflicts with a Text
+    commit or another link in flight. A precheck read that FAILS is no early answer: the
+    insert falls through to the transaction (R3).
+  - **Mongo transaction, only for a row that fits** (or a failed precheck read). Its FIRST
+    write claims the holder group (`find_one_and_update` with `$inc txn_serial`, returning the
+    sums as of its snapshot); it re-checks the slot, the count and both caps under the
+    claim, inserts, then `$inc`s both sums. Retried as a whole within a 10 s budget (at most
+    100 attempts; the commit step as 2.5 (c)). A duplicate key on the insert retries.
+  - **Caps:** refused only when the stored sum plus `size` exceeds the cap, the group's and
+    then the writer user's in that group; there is no zero rule (7.1 "S4").
+  - **Reference:** every rule under its locks (below), summing the stored `size`s.
 - `fetch_mls_history_links(group_id, before: Option<i64>, limit: i64) ->
   Result<Vec<MlsHistoryLink>>`: the rows of holder group `group_id` with `epoch < before`
   (every epoch when `None`), sorted by `epoch` descending, then `created_at` ascending, then
   `writer_user_id`. `limit` (`5 ..= 200`) caps ROWS, and the driver never splits a holder
   epoch: it drops a trailing epoch that does not fit whole (every candidate of one epoch
-  arrives together).
-- `delete_mls_history_links_for_group(group_id)`. `delete_protected_channel_data` calls it for
-  every Text group of the channel it deletes, open or closed, on both drivers.
+  arrives together). **As built (S4-W2; fix F2, #311):** Mongo sorts on `epoch` only, which
+  `history_links_by_holder` serves without an in-memory sort, and orders each epoch's rows in
+  Rust; `created_at` compares at millisecond precision on both drivers; an undecodable row
+  fails the fetch closed. So a page can hold fewer than `limit` rows without being the last
+  one (7.2 "History links").
+- `delete_mls_history_links_for_group(group_id)`: idempotent; on Mongo it unsets the group's
+  link sums (2.5 "S4") first, then deletes the rows, so a racing link can only leave the
+  sums above its rows. ~~`delete_protected_channel_data` calls it for every Text group of the
+  channel it deletes, open or closed, on both drivers.~~ **Rewritten (R2 of the W1
+  re-review; As built, S4-W2):** `delete_protected_channel_data` does NOT call it. It deletes
+  the links of every Text group of the channel, open or closed, INLINE: on Mongo inside its
+  own transaction, after the claim of those groups, with `group_id: { $in: <their ids> }`
+  beside the commits and join intents; on Reference under its locks (below). No other
+  production path calls the method today; only tests do. The same cascade also removes the
+  channel's `history_wipe_leases` row (2.10): on Mongo in the same transaction, on Reference
+  under that lock alone, after these removals.
 - **Retention:** the group's lifetime (O-6). B43's commit pruning never touches this
   collection. A link that changes no leaf stores about 0.85 KB (the 5.9 `link_wire_json`,
   which adds one leaf, is 1073 bytes), so a busy channel (about 5000 epochs a year) stores
@@ -1419,6 +1493,10 @@ Driver methods, both drivers (the plan's pinned contract):
   (`... mls_groups -> mls_commits -> mls_history_links -> mls_join_intents -> ...`). The PUT
   path holds `channels`, `mls_groups`, `mls_commits` and `mls_history_links`; the delete
   cascade adds it after `mls_commits`. No other path holds it.
+  **As built (S4-W2):** the PUT ROUTE holds no lock (its channel, group and commit-row reads
+  each take and drop their own); the insert takes `mls_groups -> mls_history_links` and holds
+  both for the check and the insert; the fetch takes `mls_history_links` alone; the delete
+  cascade holds it after `mls_commits`. The order above is unchanged.
 
 ### 2.9 `server_legal_holds` (S4-PA-9, O-15; the legal-hold stub until S9)
 
@@ -1439,8 +1517,63 @@ configuration). A tiny collection, both drivers, `_id` only:
   set, 4.3 "S4", 7.2 "S4"), and by the `history_wipes` job before EACH batch (7.5 "S4"). A hold
   set between the route's read and its write is caught by the job's per-batch read, which never
   marks a wipe `Done` while a hold exists.
+  **Exact rule (S4-W2 fix round, audit nit):** the sentence above overstates it. The job
+  deletes nothing in a batch that began under a hold (a hold set during a batch lets that one
+  batch finish, 7.5 "S4"), and it writes `Done` only after an EMPTY batch whose hold read
+  found none. A hold set between that read and
+  `complete_history_wipe` still lets `Done` land. That is harmless: nothing is deleted in
+  that window, and `Done` only records that no plaintext row at or below B remains.
+  **As built (S4-W2).** Protect reads it only on a first protect, after the owner check, the
+  staff refusal and the growth gate, so only the owner learns that a hold is set; an N3
+  retry of a wiped genesis is not refused (its wipe is already written, and the job stops on
+  the hold). The wipe route reads it last of its gates, after the boundary check (7.2 "S4").
+  The job reads it before every batch and, while one is set, releases its lease (2.10).
 - Server deletion deletes the row (both drivers). Reference: its own lock, never held together
   with another (every reader reads it before taking the 2.5 (d) locks).
+
+### 2.10 `history_wipe_leases` (S4-W2, ruling R-WIPEJOB; new collection, both drivers)
+
+**As built (S4-W2), #314.** The `history_wipes` job's per-channel lease (7.5 "S4"; the
+`scheduled_messages` claim precedent), so two crond replicas never wipe one channel at once.
+Type name `HistoryWipeLease`, module `models/history_wipe_leases/`:
+
+| Field | Type | Notes |
+|---|---|---|
+| `_id` | String | the channel id |
+| `holder` | String | the job run holding the lease (`crond-<ULID>`, one per task run) |
+| `expires_at` | i64 | unix ms from the caller's clock; `0` once released |
+| `count` | i64 | rows deleted over every run; kept across a release |
+
+Driver methods, both drivers (no client route reaches them):
+
+- `claim_history_wipe_lease(channel, holder, now_ms, ttl_ms) -> Result<Option<u64>>`: upserts
+  when the row is absent, expired (`expires_at <= now_ms`) or already held by `holder`, and
+  returns the running count (`Some(0)` for a new row); `None` while another holder's lease is
+  unexpired (a duplicate key on a racing upsert is `None` too).
+- `advance_history_wipe_lease(channel, holder, add, now_ms, ttl_ms) -> Result<bool>`: adds to
+  `count` and renews the expiry only while `holder` holds it; `false` means the lease was lost.
+- `release_history_wipe_lease(channel, holder)`: sets `expires_at = 0` while `holder` holds
+  it and KEEPS `count`, so a wipe stopped by a legal hold resumes its count.
+- `delete_history_wipe_lease(channel)`: after `Done`; no row is not an error.
+
+- **Lifecycle in the job (7.5 "S4").** Claimed at the start of a channel's run and advanced
+  after every batch. RELEASED (count kept) on a legal hold and on a failing channel. DELETED
+  after `Done`, when `complete_history_wipe` finds the wipe no longer `requested`, and when
+  the channel is gone or no longer `Requested` at the claim. Left alone when an advance
+  finds it lost (it belongs to the new holder).
+- **`count` is a lower bound.** The job deletes a batch, then advances the lease, so a crash
+  between the two undercounts by at most one batch; `Done { count }` and the audit entry
+  carry that lower bound.
+- **No migration, no index** beyond `_id` (2.7 "S4 migration block").
+- **Cascade.** The channel-delete cascade removes the lease row: `delete_protected_channel_data`
+  deletes the channel's `history_wipe_leases` row on both drivers. Mongo: a `delete_one({ _id:
+  channel })` inside the cascade's transaction, on the same session as the history-links
+  delete; a missing row or a missing collection is not an error. Reference: after the other
+  removals it takes the `history_wipe_leases` lock ALONE (never held with another), so there
+  the lease delete is NOT atomic with the rest of the cascade; harmless, because an orphan
+  lease is inert (nothing reads it: the job claims only leases of channels it finds with a
+  `requested` wipe, 7.5 "S4"; such a row stays until removed by hand).
+- **Reference lock:** its own, never held together with another.
 
 ---
 
@@ -2954,10 +3087,19 @@ only extends them:
   (S4-D20, O-14). `kept -> wiped` only through the wipe route (7.2 "S4") or on a genesis that
   is `wiped` from the start; `wiped` needs a boundary and never goes back (S2's rules). The wipe
   list and a wiped genesis are signed only after the native wipe dialog (4.9 "S4").
-- **Flag (7.1 "S4").** While `history_setting` is off, a non-empty boundary and `wiped` stay
-  refused on every path (S2's "until S4" rules, now keyed on that flag) and the server stores
-  no link; `history:` is still parsed and enforced as S2 says. **DECISION (S4-W0):** that
-  refusal is `FailedValidation`, the answer #218 gives a v2 genesis while `formats_v2` is off.
+- **Flag (7.1 "S4"; rewritten by planner ruling F1, #310).** While `history_setting` is off,
+  only what would INTRODUCE history is refused (S2's "until S4" rules, now keyed on that
+  flag): a genesis carrying a non-empty boundary or `wiped` (protect), the wipe write
+  (`SeatListWriteKind::Wipe`), `kept -> wiped`, and a boundary the stored list never had (the
+  last two on a seat PUT whatever the flag, 4.3 "S4" step 4c); and the server stores no link.
+  A seat PUT that carries the stored lines unchanged (the stored boundary, a stored `wiped`)
+  lands, so a channel protected with a boundary while the flag was on is not wedged once it
+  is turned back off (finding H1 of the W1 wave audit). The S4-W0 wording "stay refused on
+  every path" is replaced. `history:` is still parsed and enforced as S2 says. **DECISION
+  (S4-W0):** those refusals are `FailedValidation`, the answer #218 gives a v2 genesis while
+  `formats_v2` is off. **As built (S4-W2):** the wipe ROUTE answers `FeatureDisabled {
+  feature: "protected_history" }` before its write (7.2 "S4"), so the driver's
+  `FailedValidation` for the wipe kind is reached only past the route.
 
 ### 4.2 Seat list signature
 
@@ -3148,6 +3290,9 @@ step order above:
   `server_legal_holds`, 2.9) and sets `protected_history.wipe = Requested` inside the protect transaction,
   derived from the SIGNED `pre_history` line alone (S4-PA-7). A request whose
   `wipe_history` flag (7.2 "S4") disagrees with the signed line is `FailedValidation`.
+  **As built (S4-W2):** the route reads the hold only on a first protect, after the owner
+  check, the staff refusal and the growth gate (only the owner learns that a hold is set);
+  an N3 retry is not refused (2.9).
 - **The wipe write (S4-PA-6).** `POST /channels/:id/history_wipe` (7.2 "S4") runs as
   `SeatListWriteKind::Wipe` inside `seat_list_write_attempt` (both drivers). Every step of
   this section applies to its list (parse, owner and bound session, signature, version + 1,
@@ -3161,6 +3306,37 @@ step order above:
   seat claims, allowed in every entitlement state. After it commits: S2's
   `ProtectedChannelChanged { scope: ["seats"] }`, the `ChannelUpdate { protected_history }`
   and the audit entry (7.5 "S4").
+  **As built (S4-W2).** Not every step applies:
+  - The route runs steps 1 to 3 (strict parse, the route channel and the declared signer
+    device; the signer is the caller from a registered device this session is bound to;
+    the signature under its directory key). It also refuses, `FailedValidation`, two things
+    only it can judge: a `handover` (step 8; the wipe moves nothing but `pre_history`) and a
+    CHANGED authority (step 3b; the stored one is carried unverified, 4.4.1 rule 6).
+  - The driver runs the rest inside its transaction: the version rule with the N3 retry
+    first, step 4c turned around (`check_seat_list_wipe_lines`), the removed-users refusal of
+    4b, 5b, and the channel's stored boundary equal to the list's. No seat is claimed or
+    released.
+  - Steps 5 and 6 do not run: the list names exactly the stored list's seats and
+    `device_cap`, which passed them when that list landed.
+  - **DECISION (planner, S4-W2 fix round (a)):** `history_wipe.rs` keeps its OWN copy of the
+    route checks above instead of calling the seat validator
+    (`protected_seat_validation::validate()`): that validator's steps 5, 6 and 8 and its C1
+    (4b) pre-read are wrong or pointless for a wipe. A `SeatListWriteKind::Wipe` arm in
+    `validate()` that skips them is a follow-up.
+  - After the commit: the seat event and the `ChannelHistoryWipe` entry only when the list
+    landed, never on the N3 retry; `ChannelUpdate { protected_history }` on every success,
+    the retry included (as protect, #134). No `X-Audit-Log-Reason` is read (a wipe releases
+    nobody, step 4d), no `reconcile_channel` runs, and no `ProtectedSeatsUpdate` entry is
+    written.
+  - The route's gates (owner, staff, the available gate and `history_setting`, the boundary,
+    the hold) run BEFORE the driver's N3 check, so a byte-identical re-POST is refused once
+    the flag is off or a hold is set; the privileged refusal applies to a retry too.
+- **Reads racing the request (N2 of the W1 wave audit).** History, search and the single
+  fetch read the channel's `protected_history` BEFORE they fetch rows (the #155
+  read-then-fetch order of R15), so a read in flight when `Requested` lands can serve
+  pre-boundary plaintext once. Accepted, as R15's window is: the `ChannelUpdate {
+  protected_history }` that follows makes stoat.js purge every cached plaintext row at or
+  below B (7.5 "S4"), which covers the client.
 
 ### 4.4 Client verification and anti-rollback (`e2ee_text_seat_list_verify`)
 
@@ -4545,6 +4721,10 @@ Call path (unchanged), `kind: Text` takes this order (`groups_create.rs`
    AND the request's `device_id` is its `signer_device_id`, else `NotOwner`; that device is
    registered (else `FailedValidation`) and the session is bound to it, else
    `NotAuthenticated`.
+   **S4 (As built, S4-W2):** right after "a seat list is stored", on a v2 list, the minimum
+   text protocol (6.1 "S4"), BEFORE the id derivation (which S2 moved here: a v2 id needs
+   the stored salt, 3.1.1) and the signer check, so an S1 client sending a v1 id still gets
+   `ProtectedClientOutdated`.
 9. With `supersedes`: it names a Text group of THIS channel (an unknown id, a Call group
    and another channel's group get one answer) and `generation` is its generation + 1, else
    `FailedValidation`.
@@ -4702,11 +4882,43 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
 |---|---|
 | History link write (`PUT /mls/groups/:id/history_links/:epoch`) | The 6.1 order: kind dispatch (an unknown id AND a Call group get `as_unknown_group`: the route has no Call path, like the Welcome route), the channel, ViewChannel, `require_mls_caller`, request validation (shapes, the body's `group_id` and `epoch` equal the path, the decoded ciphertext at most 40960 bytes (40 KiB, #300) with the encoded length checked first), the available gate AND `history_setting` (else `FeatureDisabled { feature: "protected_history" }`), seated. Then: the session is bound to `writer_device_id` and `writer_user_id` is the caller (`NotAuthenticated`); the writer device is a current member of G' (else `ProtectedChannelResecuring { reason: "not_member" }`) and, for e' >= 1, its `member_added` epoch is BELOW e' (`member_added < e'`; fix F14, #298, tightened by fix round 2 LOW 7, #307: the writer must have held epoch e = e' - 1; a bridge's writer is the creator, added at epoch 0); else `InvalidOperation`; `e' <= current_epoch(G')` (`FailedValidation`). For e' >= 1: `prev_group_id == G'`, `prev_epoch == e' - 1`, and the Text-marked commit rows at `{G'}:{e'}` AND `{G'}:{e' - 1}` exist with `history_visible == Some(true)` (fix F3, #287; for e' = 1 the second is G''s `history_visible_at_create`; an absent or pruned row, `None` or `false`: `InvalidOperation`). For e' = 0: `prev_group_id` is the channel's Text group at generation g - 1, `prev_epoch <= current_epoch(G)`, the writer device is G''s creator (its `member_added` entry at epoch 0), `history_visible_at_create == Some(true)`, and G's visibility of `prev_epoch` is `Some(true)` (its commit row at that epoch, or G's `history_visible_at_create` when it is 0; fix F3) (else `InvalidOperation`). **DECISION (S4-W0):** the signature (3.14.5) must verify under the writer device's DIRECTORY identity key (`verify_payload`, a garbage filter like 4.3 step 3; members verify against the leaf-bound key, 3.14.7). Then `insert_mls_history_link` (2.8: an identical re-PUT succeeds, `HistoryLinkExists`, the caps). The optional query parameter `?contest=true` (fix F9) only adds the contest AUDIT line and the rate-limited event (3.14.6, 7.5 "S4"); it changes no rule. A closed (superseded) G' still accepts late links |
 | History link fetch (`GET /mls/groups/:id/history_links`) | The access of the commit fetch (seated AND ViewChannel, the 6.1 order, the unknown-group answer for a Call group too), the available gate only (a read never needs `history_setting`, so links stored before a flag flip-back stay readable); `before` and `limit` as 2.8. A closed group answers too (the walk crosses bridges into predecessors) |
-| Commit submit | Stores `MlsCommit.history_visible` (2.5 "S4") from the AD it already parses; no new refusal |
-| Text group create | Stores `history_visible_at_create` from the bound list for every create (2.5 "S4", fix F3) |
+| Commit submit | Stores `MlsCommit.history_visible` (2.5 "S4") from the AD it already parses. **Rewritten (S4-W2):** the S4-W0 "no new refusal" no longer holds: an Add on a v2 list meets the minimum text protocol, and every Text Add stores `added_protocols` (below; 2.5 "S4") |
+| Text group create | Stores `history_visible_at_create` from the bound list for every create (2.5 "S4", fix F3). **As built (S4-W2):** the driver's create transaction stores it (`prepare_text_group`); the route stores nothing. On a v2 list the route meets the minimum text protocol (below; "Text group create (W2 lane B5)" step 8) |
+| Join intent (As built, S4-W2) | On a v2 list, the minimum text protocol (below). Stores `MlsJoinIntent.protocol` on every Text intent (2.5 "S4") |
+| Welcome fetch (As built, S4-W2) | On a v2 list, the minimum text protocol against the serving commit's `added_protocols` (below) |
 
 Both new routes join the b1 oracle matrix (member, bot, unbound session x flags x {valid,
 malformed} body, full JSON compared; 6.1 above).
+
+**History links as built (S4-W2).** The link PUT's order is the row above. Its unnamed
+answers: the writer user is not the caller, or `writer_device_id` is not a registered device
+of the caller bound to this session, `NotAuthenticated`; a member device with no
+`member_added` entry, or whose LATEST entry's epoch is at or after e' (for e' = 0: is not 0),
+`InvalidOperation` (never assumed to be an old member); e' past `current_epoch(G')`
+`FailedValidation`; any failed holder-chain or visibility rule `InvalidOperation`; a signature
+that does not verify under the directory key `FailedValidation`. Then the store's own answers
+(2.8). The contest event's rate limit is kept per delta process (a client-claimed hint, never
+security-bearing), so each replica may emit one. The fetch defaults `limit` to 200 when it is
+absent and clamps it to `5 ..= 200`; its `next_before` is in 7.2 "History links".
+
+**Minimum text protocol (As built, S4-W2; the S4 plan's 2026-11-11 appendix "MINIMUM TEXT
+PROTOCOL", rulings R-REJOIN and R-WELCOME, #313).** On a channel whose STORED seat list is
+v2, the four routes that can bring a device into a Text group refuse a device whose text
+protocol (8.3 "Text protocol") is absent or below `MIN_TEXT_PROTOCOL_V2` (2) with
+`ProtectedClientOutdated { min: 2 }` (400, 7.6), before any write. A v1 list is never read
+for it. It is unconditional (no flag): an S1-only client gets a clean "update Sloga"
+refusal instead of being poisoned by v2 commits it cannot read. `protocol` is CLIENT-CLAIMED
+(`DataMlsJoinIntent.protocol`, `DataCreateMlsGroup.protocol`, both `Option<u32>`, serde
+default): the floor turns away an honest S1 client and protects nothing against a dishonest
+one. Every placement follows the route's access checks, so a non-viewer's answer never
+depends on the list's format (the 6.1 invariant).
+
+| Route | Placement and source |
+|---|---|
+| Join intent (Text) | After the access checks, the gate, the seat and the open check, after `bound_identity` (the session bound to the joining device) and the stored-list check (`InvalidOperation` without one), and BEFORE the signature, which an S1 client fails on a v2 channel: it gets `ProtectedClientOutdated`, not `FailedValidation`. A rejoin intent is floored too (its eviction hands the protocol to the re-Add, R-REJOIN). A Call intent stores `protocol: None` (planner ruling: Text only) |
+| Text group create (first or successor) | "Text group create (W2 lane B5)" step 8: right after "a seat list is stored", before the id derivation and the signer check. It covers recovery successors |
+| Commit submit, an Add | The LAST validity check before the write, so every earlier answer is unchanged. Each added device's protocol is its stored join intent's, else the group's `rejoin_readd` entry's (R-REJOIN), else `None`; an intent without `protocol` is never topped up from the entry. On a refusal the route re-reads the row at the epoch: a commit that took the epoch meanwhile consumed the intents it added, so the answer is that row's `Lost { winning }`, not `ProtectedClientOutdated`. Not re-checked inside the commit transaction: an intent changes only through the device's own (floored) join intent, an entry only on re-membership, and a v1 -> v2 list change fails the AD hash (3.12.2) |
+| Welcome fetch | The last step before serving, after `last_added_at` (the device is still a member whose `member_added.epoch` is that commit's epoch). The commit's `added_protocols` must hold an entry for (caller, `device_id`), and EVERY entry for that pair must be `>= 2` (none, or one without `protocol`, refuses). A missing stored list answers the unknown-group answer (no Welcome; fails closed). Rows written before S4 record nothing and are refused on a v2 channel (v2 was dark before S4, so no live rows exist). The route writes nothing |
 
 ### 6.2 Client side (native; W3). The real trust decisions.
 
@@ -5491,7 +5703,10 @@ Gates (**kind-aware**; the media gate body is unchanged and stays pinned by `fla
 | (S2, #220) growth flag off, a recovery operation (rejoin, `rejoin_readd` re-Add, successor of an existing group, `signer_lost` replacement) | Allowed (available gate and `allows_text_traffic()`) |
 | (S2, #226) growth flag off, a device that held a leaf in the predecessor generation joins the successor (intent, KeyPackage claim, Add) | OWED, not built in S2a (W2 wave audit MINOR-3): refused like a new device (fails closed). Specified: allowed as recovery; a device new to the channel is still refused |
 | (S4, #270) `history_setting` off, a history-link PUT | Refused `FeatureDisabled { feature: "protected_history" }`; history-link GETs still answer |
-| (S4) `history_setting` off, a genesis with a non-empty boundary or any list with `pre_history:wiped` (protect, the wipe route) | Refused `FailedValidation` (4.1.1 "S4") |
+| (S4) `history_setting` off, a genesis with a non-empty boundary or `pre_history:wiped` (protect) | Refused `FailedValidation` (4.1.1 "S4"). **Rewritten by planner ruling F1 (#310):** the S4-W0 row read "any list with `pre_history:wiped` (protect, the wipe route)"; only what would INTRODUCE history is refused (the next two rows) |
+| (S4) `history_setting` off, the wipe route | Refused `FeatureDisabled { feature: "protected_history" }` (As built, S4-W2; 7.2 "S4"), a byte-identical re-POST included. The driver's own refusal of the wipe kind is `FailedValidation`, reached only past the route |
+| (S4) `history_setting` off, a seat PUT on a channel with a boundary or `wiped` | Allowed when it carries the stored lines unchanged (ruling F1: the channel is not wedged). A seat PUT moving `kept -> wiped`, or setting a boundary the stored list never had, is refused `FailedValidation` whatever the flag (4.3 "S4") |
+| (S4) any flag, the minimum text protocol (6.1 "S4") | Unconditional: no flag turns it off |
 | (S4) `history_setting` off, the `history_wipes` job | **DECISION (S4-W0):** keeps running for wipes already `Requested`, so a signed wipe never stays half-done; the legal hold is the stop (7.5 "S4") |
 | (S4) any flag, a legal hold on the channel's server | The wipe route and a wiped genesis refused (`InvalidOperation`); the job pauses before its next batch |
 
@@ -5564,7 +5779,13 @@ history_wipe_batch = 1000                # S4-D22: rows per wipe batch
   alternative (dividing by `slot_cap`) would starve the member who commits most of a busy
   channel's Adds and Removes, and with it the history of those transitions. At the 40 KiB
   link cap (#300) a user's default budget still holds at least 327 maximum-size links;
-  realistic links are about 0.85 KB.
+  realistic links are about 0.85 KB. The caps have no zero rule (As built, S4-W2): a link is
+  refused only when the stored sum plus its `size` exceeds the cap, so a cap of `0` refuses
+  every link. Exhausting the group cap is residual R32 (amended).
+- **`history_wipe_batch` (As built, S4-W2).** Read only through
+  `ProtectedChannelFeatures::history_wipe_batch_size()`, which clamps it to at least 1
+  (`max(1)`), so a configured `0` never stalls the job; the job reads it on every pass (7.5
+  "S4").
 - **Legal hold (fix F8, #292; ruling (g) revised).** Stored in the database, the
   `server_legal_holds` collection (2.9), not in configuration; read by the wipe route, by
   protect with `wiped`, and before EVERY batch of the job. While a hold is set the wipe route
@@ -5837,9 +6058,12 @@ needs it (#210 OPEN item (h)).
 | `PUT /mls/groups/:group_id/history_links/:epoch` | NEW (below, 6.1 "S4", 2.8) |
 | `GET /mls/groups/:group_id/history_links?before&limit` | NEW (below, 6.1 "S4", 2.8) |
 | history, search, pinned listing, single fetch, safety snapshots | `is_servable(&ProtectedReadView)` and the query-level filter (7.5 "S4") |
-| `poll_vote`, `poll_end`, `softres_reserve`, `softres_manage` | `ChannelProtected` on a protected channel (7.4 "S4") |
-| `poll_fetch`, `poll_voters`, `softres_fetch`, `softres_export` | `NotFound` for a wipe-pending row (7.4 "S4") |
-| `commits_submit`, `groups_create` | store `history_visible` and `history_visible_at_create` (2.5 "S4") |
+| `poll_vote`, `poll_end`, `softres_reserve`, `softres_manage` | `ChannelProtected` on a protected channel (7.4 "S4"). As built (S4-W2): also `poll_unvote` (it shares `resolve_open_poll`) and `softres_unreserve` (it shares `resolve_open_sheet`); `softres_manage` is edit, lock and unlock; `poll_create` refuses since S1 and `softres_create` since W2 (7.4) |
+| `poll_fetch`, `poll_voters`, `softres_fetch`, `softres_export` | `NotFound` for a wipe-pending row (7.4 "S4"). As built (S4-W2): for any row whose parent message is not servable, and also `polls_fetch_bulk` and `softres_fetch_bulk` (which drop such rows) and the event lookup `routes/events/softres_lookup.rs` (its own "no sheet" answer) |
+| `commits_submit`, `groups_create` | store `history_visible` and `history_visible_at_create` (2.5 "S4"). As built (S4-W2): the minimum text protocol on a v2 list (6.1 "S4"); `commits_submit` stores `added_protocols`; `groups_create` reads `DataCreateMlsGroup.protocol` |
+| `join_intent`, `welcome_fetch` (As built, S4-W2) | the minimum text protocol on a v2 list (6.1 "S4"); `join_intent` reads `DataMlsJoinIntent.protocol` and stores it on the intent |
+| pushd outbound builders (`apn.rs`, `fcm.rs`, `vapid.rs`, `unifiedpush.rs`, NEW `utils/protected.rs`) and `v0::PushNotification::from_with_hosts` (As built, S4-W2) | the generic protected push (7.5 "S4", plan S8-O4) |
+| `util/softres.rs` `publish_sheet_update`, protect's carried-over close, crond `tasks/poll_expiry.rs` (As built, S4-W2 and its fix round) | no broadcast of an unservable poll or sheet (planner ruling R-FANOUT, 7.5 "S4"); `poll_expiry` closes such a poll without a `PollClose` |
 | root advert | `protected_channels.history_setting` (7.1 "S4") |
 | crond `tasks/history_wipes.rs` | NEW (7.5 "S4") |
 | events | `ChannelUpdate { protected_history }` (7.5 "S4") |
@@ -5860,6 +6084,16 @@ The protect transaction also writes `protected_history { boundary: B, wipe }` wi
 (2.1 "S4"). `ProtectHistoryMoved` is returned only AFTER the N3 byte-identical check inside the
 transaction, and nothing is written. Threads still refuse (O-11). A genesis with a boundary
 seats only the signer (4.3 "S4").
+**As built (S4-W2).** Route order: the channel and ViewChannel (one `NotFound`), the
+available gate, 4.3 steps 1 to 3 with the owner hard check, then on a first protect only the
+staff refusal, the growth gate and the legal hold for a `wiped` genesis (2.9); then the
+driver. After the commit, ON THE N3 RETRY TOO: the post-claim reconcile, the carried-over
+closes of 7.4 "S4" (a protect that landed but answered 5xx may have stopped before them, and
+each only acts on what is still open; under R-FANOUT their `PollClose` and sheet-update
+events go out only for servable rows, none after a `wiped` genesis, 7.5 "S4"), and the
+`ChannelUpdate` re-read with the stored
+`protected_history`. The `AUDIT channel_protect` log line and the `ChannelProtect` entry are
+written only by the protect that wrote.
 
 **Who can protect (S4-D19).** Unchanged: the server owner, non-privileged, an `Active`
 entitlement; the members of a busy channel become ELIGIBLE and are seated afterwards; the
@@ -5880,6 +6114,13 @@ then the seat-list write as
 Idempotent: a byte-identical re-POST returns the stored success (N3), and once `Requested` or
 `Done` nothing more is written. A non-owner, a ManageMessages member and a privileged caller
 are refused. `seats_put` refuses `kept -> wiped` (S2's rule).
+**As built (S4-W2).** The order above is kept (the hold after the boundary check). Answers:
+a viewer who is not the server owner, a ManageMessages member included, `NotOwner`; a
+privileged owner `InvalidOperation`; the flag off `FeatureDisabled { feature:
+"protected_history" }` (E2EE off: `FeatureDisabled { feature: "e2ee" }` first); no boundary
+`InvalidOperation`; a hold `InvalidOperation`. Every one of these runs before the driver's N3
+check, so they apply to a retry too. What the write checks and emits, and the steps that do
+not apply to a wipe, are in 4.3 "S4" ("The wipe write"). The job is 7.5 "S4".
 
 **History links (S4-D6).** `PUT /mls/groups/:group_id/history_links/:epoch`, body
 `HistoryLinkWire` (3.14.5); the path's `:epoch` is the holder e'; the answer is 204, an
@@ -5890,6 +6131,12 @@ answers `{ links: [HistoryLinkWire], next_before: Option<i64> }` (**DECISION (S4
 `next_before` is the lowest holder epoch on the page while more may exist, absent at the end).
 NEW `routes/mls/history_links.rs`, registered in `routes/mls/mod.rs` and the OpenAPI schema
 (one lane). Access and order: 6.1 "S4".
+**As built (S4-W2), replacing the S4-W0 `next_before` rule.** The server cannot tell "more
+may exist" from one page: the driver never splits a holder epoch, so a page can be shorter
+than `limit` without being the last (2.8). So `next_before` is the lowest holder epoch of
+EVERY non-empty page, the last one included, and is absent only on an empty page; a client
+pages with `before = next_before` until it gets an empty page, and never infers the end from
+a short page. An absent `limit` is 200; any `limit` is clamped to `5 ..= 200`.
 
 ### 7.3 Protected-channel send (`POST /channels/:id/messages`)
 
@@ -6116,9 +6363,10 @@ refusal placement above):
 | Webhooks | kept; execute and edit already refused (above); the preflight shows them inactive |
 | Follows (as target) | kept (crosspost already skips a protected follower, above) |
 | Scheduled messages pending | after the protect commit, `ScheduledMessage::cancel_all_for_channel`, best effort (the B30 delivery refusal above is the backstop) |
-| Polls | after the commit, open polls are closed (`Poll::close`); `resolve_open_poll` in `poll_vote.rs` refuses `ChannelProtected`, and so does `poll_end.rs` |
-| Softres | confirmed unchecked at `8c263217` (S4-PA-14): `softres_reserve.rs` and `softres_manage.rs` refuse `ChannelProtected`; open sheets are closed after the commit, like polls |
-| Reads during a pending wipe | `poll_fetch.rs`, `poll_voters.rs`, `softres_fetch.rs` and `softres_export.rs` answer `NotFound` for a wipe-pending row (S4-PA-14) |
+| Polls | after the commit, open polls are closed (`Poll::close`); `resolve_open_poll` in `poll_vote.rs` refuses `ChannelProtected`, and so does `poll_end.rs`. **As built (S4-W2):** `Poll::close_open_for_channel`, then one `PollClose` per closed poll (servable rows only under R-FANOUT, "Carried-over closes" below); `resolve_open_poll` serves `poll_vote` and `poll_unvote`; both refusals run right after ViewChannel and before the poll is read, so ending an already-closed poll on a protected channel is now `ChannelProtected` too; `poll_create.rs` refuses since S1 |
+| Softres | confirmed unchecked at `8c263217` (S4-PA-14): `softres_reserve.rs` and `softres_manage.rs` refuse `ChannelProtected`; open sheets are closed after the commit, like polls. **As built (S4-W2):** open sheets are LOCKED (`SoftResSheet::close_open_for_channel`, then one sheet update each, servable rows only under R-FANOUT); the refusal covers reserve and unreserve (`resolve_open_sheet`) and edit, lock and unlock (`resolve_managed_sheet`: an unlock would reopen a sheet), right after ViewChannel and before the sheet read. Answers that change: a reserve on a sheet protect locked was 410 `SoftResLocked` and is now 400 `ChannelProtected`; a non-manager's edit, lock or unlock is now `ChannelProtected` (it precedes the manage check). `softres_create.rs` refuses since W2 |
+| Reads during a pending wipe | `poll_fetch.rs`, `poll_voters.rs`, `softres_fetch.rs` and `softres_export.rs` answer `NotFound` for a wipe-pending row (S4-PA-14). **As built (S4-W2; planner ruling: the rule covers EVERY serving route):** a poll or sheet is served only while its parent message is servable under the read target's view (`ProtectedReadView::of_read_target`, a thread judged by its parent), which also refuses a stray and a missing parent. The single routes (`poll_fetch`, `poll_voters`, `softres_fetch`, `softres_export`) answer `NotFound` as for a poll or sheet of another channel; the bulk routes (`polls_fetch_bulk`, `softres_fetch_bulk`) drop it; the event lookup `GET /events/event/<id>/softres` (`routes/events/softres_lookup.rs`) answers a non-servable sheet with the same `NotFound` as "the event has no sheet", byte-identical (the error's `location` never serializes, #158), after its existing event-view and sheet-channel ViewChannel checks. Each runs after the route's ViewChannel check; `softres_export` now answers `NotFound` before its manage check (`MissingPermission`). Broadcasts follow the same rule (7.5 "S4", R-FANOUT) |
+| Carried-over closes (As built, S4-W2) | the three closes above run after every successful protect, the N3 retry included, best effort: each failure is reported to Sentry and the protect stays answered; the routes' refusals are the backstop. **Planner ruling R-FANOUT (As built, S4-W2):** the polls are still closed and the sheets still locked, but `PollClose` goes out only for polls whose parent message is servable after the protect, and the sheet update only through `publish_sheet_update`'s servability gate (7.5 "S4"); so a protect with a `wiped` genesis publishes none of them (clients purge on the `ChannelUpdate`), and a kept-history protect still publishes both |
 | Server system-message channel | the preflight lists it; the owner unsets it first (S4-PA-19; 6.3 "S4") |
 | Reactions, unread and ack state, embeds | kept |
 | Attachments | kept and served pre-boundary; `Draft.ts` refuses plaintext uploads, and encrypted channel files follow S3 (S3 plan 2.8 asks S4 to say so) |
@@ -6261,8 +6509,10 @@ refusal placement above):
     `scheduled_messages.rs` precedent; an expired lease lets another replica resume); (2)
     re-reads the legal hold (`server_legal_holds`, 2.9) before EACH batch and, while one is set, releases the lease and
     stops (the wipe stays `Requested`, never `Done`); (3) reads up to `history_wipe_batch`
-    ids from `{ channel, _id: { $lte: B }, encrypted: null }` (matches the Rust `is_some()`
-    view: an encrypted row is NEVER touched, whatever its id); (4) per batch, collects the
+    ids from `{ channel, _id: { $lte: B }, encrypted: null }` (the Rust view: plaintext =
+    `encrypted.is_none()`, so an encrypted row is NEVER touched, whatever its id; B is the
+    STORED `protected_history.boundary`, never a client value, planner ruling F3); (4) per
+    batch, collects the
     file ids of `attachments` AND `forwarded.attachments` and marks those files deleted (the
     Reference driver marks them too; its `reference.rs` TODO is closed here), closes and
     deletes the polls and softres sheets of those rows with their votes and reservations, then
@@ -6273,23 +6523,162 @@ refusal placement above):
     `channel_unreads.mentions` entries that name deleted ids, and emits the
     `ChannelUpdate`. Idempotent and resumable after a crash at any point; both drivers. Scope
     (O-14): everything in the channel at or below B (threads are already refused).
+    **As built (S4-W2; planner ruling R-WIPEJOB as amended, F3, #312, #314; verified final,
+    `history_wipes.rs` `1b2fe193`, then the fix round's FX-A at `1c14a0a6`).** Registered in
+    crond's `main.rs` and `tasks/mod.rs`.
+    Every tick (60 s) pages the ids of channels whose stored `protected_history.wipe.state` is
+    `requested` (`fetch_channel_ids_with_requested_wipe`, 100 per page in `_id` order; an
+    `_id` that is not a string fails the page closed; the scan has NO index, so it scans
+    `channels` every tick, and a partial index on `protected_history.wipe.state` is a
+    follow-up for the next migration bump, audit F7, with no S4 migration change, 2.7) and,
+    per channel:
+    1. claims the lease (2.10; holder `crond-<ULID>`, one per task run; 5-minute TTL, renewed
+       by every batch); another replica's live lease: skip the channel;
+    2. re-reads the channel: unless it is a protected `TextChannel` whose wipe is `Requested`
+       with a non-empty stored boundary B, DELETES the lease row (no run will resume it) and
+       stops. B is read from the channel row on every run, never taken from a client (F3);
+    3. per batch of `history_wipe_batch_size()` rows (7.1 "S4"), in this order:
+       1. reads the legal hold (held: releases the lease, keeping its count, and stops; the
+          wipe stays `Requested`). A hold set during a batch lets that one batch finish,
+          which is what "before EACH batch" means;
+       2. `fetch_history_wipe_batch(channel, B, n)` (`_id <= B`, `encrypted` null, `_id`
+          ascending; Mongo fails closed on an undecodable row). **(Fix round, audit F1.)**
+          The driver reports NOTHING to Sentry: an undecodable row returns a plain database
+          error and the decode error itself is dropped, neither reported nor logged (it
+          could carry message text); the job's report (step 5) is the only one;
+       3. marks the files of the rows' `attachments` and `forwarded.attachments` deleted.
+          **(Fix round, audit F4.)** The Reference `mark_attachments_as_deleted` skips an
+          unknown file id, as Mongo's update does;
+       4. deletes the rows' polls, then their softres sheets (`Poll::delete_for_messages`,
+          `SoftResSheet::delete_for_messages`): deleted only, never closed first, and no
+          events (the rows are already unservable); this replaces (4)'s "closes and deletes";
+       5. removes those ids from the channel's `channel_unreads.mentions`
+          (`remove_mentions_of_messages`, PER BATCH: by `Done` the ids are gone and the
+          lease keeps only a count; this replaces (5)'s clearing). **(Fix round, audit F3.)**
+          It runs BEFORE the delete, so a crash between the two can never leave a mention of
+          a deleted row; this supersedes the R-WIPEJOB amendment's "right after
+          `delete_messages_by_ids`" (a crash may instead leave rows whose mentions are gone,
+          which the next run deletes);
+       6. `delete_messages_by_ids(channel, B, ids)`, itself bounded by B and by `encrypted`
+          null (F3), so nothing above B and no encrypted row is ever deleted (plaintext =
+          `encrypted.is_none()`);
+       7. advances the lease by the deleted count; `false` (the lease lapsed and another
+          replica took it): stop WITHOUT releasing, the new holder carries on;
+    4. on an empty batch: `complete_history_wipe(channel, at, count)` writes `Done { at, count
+       }` ONLY over a stored `requested` (`at` in whole milliseconds), so it is written once.
+       `false` (another replica finished, or the channel went): delete the lease row and
+       nothing else. `true`, in this order: the `ChannelHistoryWipe` entry with the count (no
+       actor); `last_message_id` set to `fetch_newest_message_id` (encrypted rows count)
+       through `reset_last_message_id_after_wipe`, which writes only while the stored id is
+       absent or at or below B, so a send above B is never moved back; `ChannelUpdate {
+       protected_history }` on the server topic; the lease row deleted;
+    5. a failing channel stays `Requested` with its remaining rows: the batch read fails
+       closed on a poisoned (undecodable) row, and any database error stops it the same way.
+       Its lease is released with its count, the error is logged on every tick, and the pass
+       goes on to the next channel. **(Fix round, audit F1.)** This is the ONE Sentry report
+       of a failing channel, once per process per channel (the `reported` set): a fixed text
+       with the channel id and the source location the error was raised at, NEVER the error
+       itself, e.g. "history wipe of channel <id> failed and stays requested (raised at
+       <file:line:col>)".
+
+    `count` is a lower bound (2.10): a crash between a batch's delete and its lease advance
+    undercounts by at most one batch.
+    **Departures from R-WIPEJOB, ruled ACCEPTED by the planner:** (a) a channel that is gone
+    or no longer `Requested` after the claim has its lease row DELETED, not released (step
+    2); (b) the steps after `Done` are best effort: each failure is logged and sent to Sentry
+    and the remaining steps still run, and `Done` is never revisited (step 4); (c) a batch
+    that reads rows but deletes none is an error (`HISTORY_WIPE_STUCK`, it would otherwise
+    loop) and is handled as a poisoned row (step 5); since F3 such a batch has already removed
+    its rows' mentions, which is accepted, because those rows are unservable anyway.
+    **Coverage (fix round):** the lease-lost stop, the STUCK batch, a hold before the first
+    batch and the job running with `history_setting` off have tests.
   - **Wipe reads and purge (S4-D21).** Pre-boundary plaintext is unservable from the moment
     the wipe is `Requested`. The server emits `ChannelUpdate { protected_history }` on the
     SERVER topic (as protect, #149) when the wipe is requested and when it is done; stoat.js
     purges cached PLAINTEXT rows with an id at or below B on it (the `UserPlatformWipe`
     precedent), never encrypted rows.
+  - **Broadcasts follow the read rule (planner ruling R-FANOUT, #315).** S4-D21's
+    "unservable from the moment the wipe is `Requested`" covers BROADCASTS too: no event may
+    carry the state of a poll or a softres sheet whose carrying message is not servable
+    (`Message::is_servable` under the read target's view, as the read routes of 7.4 "S4").
+    **As built (S4-W2):**
+    - `publish_sheet_update` (`delta/src/util/softres.rs`) reads the sheet's channel,
+      resolves its permission target (a thread is judged by its parent) and returns WITHOUT
+      sending when the carrying message is not servable; the sheet stays as written (a lock
+      still lands). That gates every caller: the manage routes, the event-cancel hook
+      `lock_linked_softres_sheet` (unchanged; it already called the util) and protect's
+      carried-over close. On an unprotected channel its only extra read is the channel
+      fetch. **(S4-W2 fix round, audit F5.)** The gate (`sheet_may_be_published`) reads the
+      sheet's channel, its permission target and the carrying message. A failed read is
+      reported to Sentry and answers `Ok` with nothing sent, so the gate fails CLOSED and
+      never turns a landed edit, lock or unlock into an error. A `fetch_reserves_for_sheet`
+      error after the gate still returns as before, so in that one case a manage route can
+      still answer an error after its write. The gate's thread path is tested.
+    - Protect's carried-over close still closes the polls and locks the sheets (7.4 "S4"),
+      but publishes `PollClose` only for polls whose parent message is servable after the
+      protect (`poll_is_servable`), and the sheet updates through the gate above. So a
+      protect with a `wiped` genesis publishes no `PollClose` and no sheet update (clients
+      purge on the `ChannelUpdate` above), while a kept-history protect still publishes both.
+    - **crond `poll_expiry` (fix round, audit F2).** An expired poll is still closed, but
+      WITHOUT a `PollClose` when its parent row is not servable, judged by
+      `ProtectedReadView::of_read_target` and `Message::is_servable` (crond's own
+      `poll_is_servable`, the rule of delta's). A missing channel, thread parent or parent
+      message counts as not servable, so a missing channel's poll now closes quietly. On an
+      unprotected channel the parent message is not read, but the channel is read once per
+      expired poll. Known window: a wipe requested between the check and the close still
+      publishes that one `PollClose`; the delta routes have the same window.
+    - The sheet servability check lives in ONE helper,
+      `crate::util::softres::sheet_is_servable`, used by the fetch, export and lookup routes
+      and by `publish_sheet_update`; polls use `poll_is_servable` (`poll_fetch.rs`).
   - **Audit (S4-D19, S4-D22).** New `AuditLogAction::ChannelProtect { channel, boundary:
     Option<String>, wiped: bool }` (protect today only writes `log::info!`) and
     `ChannelHistoryWipe { channel, count: Option<u64> }`. **DECISION (S4-W0):** the wipe route
     writes `count: None` (requested; the plan's "the audit entry" of the route) and the job
     writes `Some(count)` at `Done`. Both name a protected channel, so the #221 ViewChannel
     filter of the audit-log fetch covers them; the `#[serde(other)] Unknown` catch-all stays.
+    **As built (S4-W2).** Both are unit variants of `AuditLogAction` (database and v0), and
+    their data rides on the entry, as `ProtectedSeatsUpdate`'s does: `channel` is the
+    channel; `ChannelProtect` has `changes` `[{ key: "boundary", new: String(B) }, { key:
+    "wiped", new: Bool }]` (no `new` for `boundary` without one); `ChannelHistoryWipe` has
+    `[{ key: "count", new: Int(rows) }]` from the job at `Done` and no change from the route
+    (the design's `count: None`). Protect writes its entry only when it wrote (not on N3),
+    the wipe route only when its list landed, the job only when its `Done` write landed.
   - **Delete cascades.** `delete_protected_channel_data` also deletes the channel's history
-    links (2.8), both drivers.
+    links (2.8), both drivers. **As built (S4-W2):** inline, not through
+    `delete_mls_history_links_for_group` (2.8); and the channel's `history_wipe_leases` row
+    (2.10), both drivers: on Mongo inside the cascade's transaction (a missing row or
+    collection is not an error); on Reference under the lease lock alone, after the other
+    removals, so not atomic with them (an orphan lease is inert).
   - **Events (fix F9, #293).** `ProtectedChannelChanged` gains the scope `history`, emitted
     on a PUT with `?contest=true` at most once per group per 5 minutes (a per-group timestamp;
     a suppressed contest still writes its AUDIT line). Clients treat it as a hint: the owner's
-    notice needs its own native signed-mismatch check (3.14.6).
+    notice needs its own native signed-mismatch check (3.14.6). **As built (S4-W2):** the
+    timestamp is kept per delta process, so each replica may emit one (6.1 "S4").
+  - **Generic protected push (plan S8-O4; As built, S4-W2, #316).** Defense in depth: no
+    protected message reaches pushd today (#140). pushd learns protection from the
+    notification itself, with no new field: `encrypted` present OR the channel copy is a
+    protected `TextChannel` (`pushd/src/utils/protected.rs`, `is_protected`).
+    - **Source (`v0::PushNotification::from_with_hosts`, `models/src/v0/messages.rs`;
+      amends #140).** For a protected message the queued notification carries a `TextChannel`
+      copy FLAGGED `protected: true` (so a stale unflagged copy still marks it once
+      `encrypted` is stripped), the app logo as `icon` (never the author's avatar) and no
+      `image`; other channel kinds pass unchanged (a protected DM or group cannot exist).
+    - **Builders (`apn.rs`, `fcm.rs`, `vapid.rs`, `unifiedpush.rs`).** The title is
+      `PROTECTED_PUSH_TITLE` ("New message") and the body `PROTECTED_PUSH_BODY`; no author
+      name, no `#channel` name, no avatar URL. Routing ids only, the channel id and the message
+      id: APNs `thread_id` (the channel id) and the app `url`; FCM, and UnifiedPush through
+      FCM's `notification_data`, `ProtectedMessage { message, channel, title, body }`; web push
+      `{ title, body, tag: <channel id>, url }`.
+      `render_notification_content` answers the generic body unparsed.
+    - **Amends #155 (S4-W2 fix round, audit F6).** The queued notification itself names
+      neither the author nor the channel. For a protected message, `author` is the generic
+      title "New message" (the same literal as pushd's `PROTECTED_PUSH_TITLE`; the models
+      crate cannot reach pushd's constant). The `TextChannel` copy carries `name: ""`, no
+      `description` and no `icon`, alongside the flag, the logo `icon` and no `image`. The
+      copy keeps `id`, `server` and `protected: true`; its other fields pass unchanged. The
+      #155 allowlist keeps the message's `author` id, because pushd's mass-mention fan-out
+      (`inbound/mass_mention.rs`) uses it to skip the author, and `Message.author` is a
+      non-optional `String`. pushd still forwards only the message id and the channel id.
 
 ### 7.6 New errors (`revolt_result`, all status-mapping files)
 
@@ -6306,6 +6695,7 @@ refusal placement above):
 | `ProtectedHandoverRequired` ([S2b], S2-D25) | `channel_ids: Vec<String>` | 400 |
 | `ProtectHistoryMoved` (S4, #274) | none | 409 |
 | `HistoryLinkExists` (S4, #274) | none | 409 |
+| `ProtectedClientOutdated` (S4, the minimum text protocol; As built, S4-W2, #313) | `min: u32` (`2` today, `MIN_TEXT_PROTOCOL_V2`) | 400 |
 
 `DuplicateNonce` (409, existing, `util/idempotency.rs`) is reused for a protected `cid`
 replay (3.10, #153). `MlsCallFull { max }` (existing) is reused for the Text 100-leaf cap
@@ -6329,6 +6719,13 @@ already did (2.8). Both join stoat.js's error lists and need the frontend `Error
 the history-link and wipe refusals reuse `FeatureDisabled { feature: "protected_history" }`,
 `FailedValidation`, `InvalidOperation` and `ProtectedChannelResecuring { reason: "not_member" }`
 (6.1 "S4", 7.2 "S4").
+**As built (S4-W2).** One more S4 variant, from the plan's 2026-11-11 appendix (the doc named
+it only in 8.3 "As built" and 9.2 until now): `ProtectedClientOutdated { min }` (400, a typed
+body), the refusal of the minimum text protocol by `join_intent`, Text `groups_create`, an
+Add in `commits_submit` and `welcome_fetch` on a v2 list (6.1 "S4"). It joins stoat.js's
+error lists and needs the frontend `ErrorType` cast; the client maps it to "Update Sloga"
+(9.2, S2-W4). The wipe route's `NotOwner` and the link PUT's `NotAuthenticated` are the
+existing variants (7.2 "S4", 6.1 "S4").
 
 ---
 
@@ -6575,7 +6972,8 @@ the native dialog.
   v2, Text join intents and Text group creates carry `protocol`, and `join_intent`, Text
   `groups_create`, an Add in `commits_submit` and `welcome_fetch` refuse an absent or lower
   one with `ProtectedClientOutdated { min: 2 }`, so an S1-only device is refused cleanly
-  instead of being poisoned by v2 commits. The client half (the bridge sends `protocol`,
+  instead of being poisoned by v2 commits (as built in S4-W2: 6.1 "S4" "Minimum text
+  protocol", 7.6). The client half (the bridge sends `protocol`,
   the frontend maps the error to "Update Sloga") is S2-W4. S2-W3 native and S2-W4 land as
   a PAIR: an S1 frontend leaves protocol-2 shells dark.
 - **`issued_at` across napi (OR-15).** The native wire types accept `issued_at` as a JSON
@@ -9198,6 +9596,51 @@ MEDIUM 3 and 4, LOW 5 to 8, NIT).
      recovery successor of a channel dormant past commit retention finds G's `prev_epoch`
      commit pruned and gets no bridge link, and history before it stays only on the devices
      that hold it (3.14.3, 3.14.4, 6.3).
+
+Added in the S4-W2 backend doc pass (2026-11-21; planner rulings of the S4-W1 wave audit's
+fix round and of W2, and what the W1 and W2 lanes built).
+
+310. DECISION (planner ruling F1, W1 wave audit H1): with `history_setting` off only what
+     would introduce history is refused (a genesis boundary or `wiped`, the wipe write,
+     `kept -> wiped`, a new boundary); a seat PUT carrying the stored lines lands, so turning
+     the flag off never wedges a channel; the wipe route answers `FeatureDisabled { feature:
+     "protected_history" }` (4.1.1, 4.3, 7.1).
+311. DECISION (planner ruling F2, W1 wave audit M1 and M2; R2, R3 and L2 of its re-review):
+     the history-link refusals are answered before any transaction and only a fitting insert
+     claims the holder group; the Mongo-only sums `history_link_bytes` and
+     `history_link_user_bytes.<user>`; a failed precheck read falls through to the
+     transaction; the cascade deletes links inline; R32 gains group-cap exhaustion (1.3, 2.5,
+     2.8, 7.1).
+312. DECISION (planner ruling F3, W1 wave audit L1): the wipe deletes are bounded by the
+     STORED boundary (`delete_messages_by_ids(channel, B, ids)`); the job never takes a client
+     value (7.5).
+313. S4-W2 as built: the minimum text protocol (the S4 plan's 2026-11-11 appendix) on
+     `join_intent`, Text `groups_create`, an Add in `commits_submit` and `welcome_fetch`,
+     `ProtectedClientOutdated { min }` (400), unconditional and client-claimed; rulings
+     R-REJOIN (`rejoin_readd` entries keep the consumed intent's `protocol`) and R-WELCOME
+     (`MlsCommit.added_protocols`, never served) (2.5, 6.1, 7.2, 7.6, 8.3).
+314. DECISION (planner ruling R-WIPEJOB, amended): the `history_wipes` job runs under the
+     `history_wipe_leases` lease (2.10; no migration, `count` a lower bound), writes `Done`
+     only over `requested`, clears mentions per batch, resets `last_message_id` only while it
+     is at or below B, and the channel cascade deletes the lease (2.1, 2.7, 2.10, 7.5). As
+     built and ruled ACCEPTED: polls and sheets of wiped rows are deleted, never closed; a
+     gone or no-longer-`Requested` channel's lease is deleted, not released; the steps after
+     `Done` are best effort; a batch that deletes nothing is a stall (`HISTORY_WIPE_STUCK`),
+     handled as a poisoned row. Follow-up (audit F7): a partial index for the job's scan at
+     the next migration bump.
+315. S4-W2 as built, routes: every route that serves a poll or sheet refuses an unservable
+     parent (planner ruling for `softres_lookup`; the bulk fetches), and no broadcast carries
+     one (planner ruling R-FANOUT: `publish_sheet_update`, protect's closes); `poll_unvote` and
+     `softres_unreserve` refuse with their siblings; the answers that moved; the wipe route's
+     answers and the 4.3 steps it skips (its own copy of the route checks, planner fix-round
+     decision (a); a `Wipe` arm in `validate()` is a follow-up); the protect hold placement
+     and the closes on N3;
+     `next_before` on every non-empty page (2.9, 4.3, 6.1, 7.2, 7.4).
+316. S4-W2 as built (plan S8-O4): the generic protected push; `from_with_hosts` flags the
+     channel copy, uses the logo icon and drops the image; pushd forwards only the message and
+     channel ids. Amends #140 and #155 (7.2, 7.5). Amended by the fix round (F6): the source
+     also blanks the author name and the channel copy's name, description and icon; the
+     author id stays for the mass-mention author-skip.
 
 ---
 

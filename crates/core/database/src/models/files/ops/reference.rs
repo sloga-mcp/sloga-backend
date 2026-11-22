@@ -147,15 +147,10 @@ impl AbstractAttachments for ReferenceDb {
         }
     }
 
-    /// Mark multiple attachments as having been deleted.
+    /// Mark multiple attachments as having been deleted. An id with no file
+    /// is skipped, as MongoDB's `update_many` skips it.
     async fn mark_attachments_as_deleted(&self, ids: &[String]) -> Result<()> {
         let mut files = self.files.lock().await;
-
-        for id in ids {
-            if !files.contains_key(id) {
-                return Err(create_error!(NotFound));
-            }
-        }
 
         for id in ids {
             if let Some(file) = files.get_mut(id) {

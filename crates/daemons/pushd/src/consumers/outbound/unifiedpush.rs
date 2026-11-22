@@ -1270,6 +1270,41 @@ mod tests {
         );
     }
 
+    /// UnifiedPush shares FCM's mapping, so a protected message goes out
+    /// with the generic title and body and the routing ids only (S8-O4)
+    #[tokio::test]
+    async fn unifiedpush_protected_message_is_generic() {
+        use crate::utils::{protected::fixtures, PROTECTED_PUSH_TITLE};
+        use revolt_models::v0::PROTECTED_PUSH_BODY;
+
+        for alert in [
+            fixtures::notification(true),
+            fixtures::encrypted_on_unflagged_channel(),
+        ] {
+            let data = notification_data(PayloadKind::MessageNotification(alert))
+                .await
+                .unwrap()
+                .expect("UnifiedPush sends message pushes");
+            let (ty, bytes) = encode_payload(data).unwrap();
+            assert_eq!(ty, "push.message");
+
+            let wire = String::from_utf8(bytes).unwrap();
+            fixtures::assert_carries_nothing_forbidden("unifiedpush", &wire);
+
+            let json: Value = serde_json::from_str(&wire).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "type": "push.message",
+                    "message": fixtures::MESSAGE_ID,
+                    "channel": fixtures::CHANNEL_ID,
+                    "author_name": PROTECTED_PUSH_TITLE,
+                    "body": PROTECTED_PUSH_BODY,
+                })
+            );
+        }
+    }
+
     /// Longest any test waits on a send, a lookup or a listener. Longer than
     /// the client's own 10 s timeout, so a broken send fails instead of hangs.
     const WAIT: Duration = Duration::from_secs(15);

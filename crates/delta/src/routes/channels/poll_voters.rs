@@ -7,6 +7,8 @@ use revolt_result::{create_error, Result};
 use rocket::serde::json::Json;
 use rocket::State;
 
+use super::poll_fetch::poll_is_servable;
+
 /// # Fetch Poll Voters
 ///
 /// Lists the users who voted for a given answer. Restricted to the poll
@@ -31,8 +33,12 @@ pub async fn poll_voters(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // The poll of a wipe-pending row answers like a poll of another channel
+    // (design 7.4 "S4"), before the author check
     let poll = db.fetch_poll(&poll_id).await?;
-    if poll.channel != channel.id() {
+    if poll.channel != channel.id()
+        || !poll_is_servable(db, &channel, &permission_channel, &poll).await?
+    {
         return Err(create_error!(NotFound));
     }
 
@@ -158,6 +164,78 @@ mod test {
             response.status(),
             Status::Ok,
             "non-author must not list voters"
+        );
+    }
+}
+
+/// Protected channels (S4): a poll of a wipe-pending row has no voters list
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::Value;
+
+    use crate::routes::channels::poll_fetch::protected_fixture::{
+        assert_refused, request, request_the_wipe, world, World,
+    };
+
+    /// The owner (the polls' author) lists the voters of answer 0
+    async fn voters(world: &World, channel_id: &str, poll_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.owner_session,
+            Method::Get,
+            format!("/channels/{channel_id}/polls/{poll_id}/voters?answer_id=0"),
+            None,
+        )
+        .await
+    }
+
+    #[track_caller]
+    fn assert_lists_the_member(world: &World, answer: &(Status, Value), case: &str) {
+        assert_eq!(answer.0, Status::Ok, "{case}: {}", answer.1);
+        assert_eq!(
+            answer.1["users"][0]["_id"],
+            world.member.id.as_str(),
+            "{case}: {}",
+            answer.1
+        );
+        assert_eq!(
+            answer.1["users"].as_array().map(Vec::len),
+            Some(1),
+            "{case}: {}",
+            answer.1
+        );
+    }
+
+    /// Design 7.4 "S4": while the history is kept, the poll of the
+    /// pre-boundary row B lists its voters; from `Requested` on it answers
+    /// exactly as a poll of another channel. The ordinary channel's poll
+    /// lists its voters throughout.
+    #[test]
+    fn a_wipe_pending_poll_has_no_voters_list() {
+        crate::util::test::rt().block_on(Box::pin(a_wipe_pending_poll_has_no_voters_list_case()))
+    }
+
+    async fn a_wipe_pending_poll_has_no_voters_list_case() {
+        let w = world().await;
+        let channel_id = w.protected.channel.id();
+
+        assert_lists_the_member(&w, &voters(&w, channel_id, &w.poll.id).await, "kept");
+
+        request_the_wipe(&w).await;
+
+        let foreign = voters(&w, channel_id, &w.ordinary_poll.id).await;
+        assert_refused(&foreign, Status::NotFound, "NotFound", "a foreign poll");
+        assert_eq!(
+            voters(&w, channel_id, &w.poll.id).await,
+            foreign,
+            "wipe pending"
+        );
+
+        assert_lists_the_member(
+            &w,
+            &voters(&w, w.ordinary.id(), &w.ordinary_poll.id).await,
+            "ordinary",
         );
     }
 }

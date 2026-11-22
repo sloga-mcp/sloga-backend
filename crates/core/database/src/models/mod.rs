@@ -34,6 +34,7 @@ mod safety_snapshots;
 mod server_bans;
 mod server_boosts;
 mod server_legal_holds;
+mod history_wipe_leases;
 mod protected_channels;
 mod server_members;
 mod servers;
@@ -89,6 +90,7 @@ pub use safety_snapshots::*;
 pub use server_bans::*;
 pub use server_boosts::*;
 pub use server_legal_holds::*;
+pub use history_wipe_leases::*;
 pub use protected_channels::*;
 pub use server_members::*;
 pub use servers::*;
@@ -149,6 +151,7 @@ pub trait AbstractDatabase:
     + server_bans::AbstractServerBans
     + server_boosts::AbstractServerBoosts
     + server_legal_holds::AbstractServerLegalHolds
+    + history_wipe_leases::AbstractHistoryWipeLeases
     + protected_channels::AbstractProtectedChannels
     + server_members::AbstractServerMembers
     + servers::AbstractServers

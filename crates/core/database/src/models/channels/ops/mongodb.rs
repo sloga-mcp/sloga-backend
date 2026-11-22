@@ -2,6 +2,7 @@ use super::AbstractChannels;
 use crate::{AbstractServers, Channel, FieldsChannel, IntoDocumentPath, MongoDb, PartialChannel, util::ChunkedDatabaseGenerator};
 use bson::{Bson, Document};
 use futures::{StreamExt, TryStreamExt};
+use iso8601_timestamp::Timestamp;
 use mongodb::options::ReadConcern;
 use revolt_permissions::OverrideField;
 use revolt_result::Result;
@@ -498,6 +499,105 @@ impl AbstractChannels for MongoDb {
             // NotFound for a missing parent; any other error as is.
             Err(error) => Err(error),
         }
+    }
+
+    /// Fetch the ids of channels with a requested wipe; see the trait.
+    /// No index: the `history_wipes` job pages through these rarely.
+    async fn fetch_channel_ids_with_requested_wipe(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+        let mut filter = doc! { "protected_history.wipe.state": "requested" };
+        if let Some(after) = after {
+            filter.insert("_id", doc! { "$gt": after });
+        }
+        let rows: Vec<Document> = self
+            .col::<Document>(COL)
+            .find(filter)
+            .sort(doc! { "_id": 1_i32 })
+            .limit(limit)
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        // A row whose `_id` is not a string fails the page closed: the job
+        // must never skip a channel silently
+        rows.iter()
+            .map(|row| {
+                row.get_str("_id")
+                    .map(str::to_string)
+                    .map_err(|_| create_database_error!("find", COL))
+            })
+            .collect()
+    }
+
+    /// A field-level write filtered on the stored `requested` state. `at` is
+    /// Int64 unix milliseconds, the encoding of the wipe route's `Requested`
+    /// write and of every typed write of a `Timestamp`.
+    async fn complete_history_wipe(
+        &self,
+        channel_id: &str,
+        at: Timestamp,
+        count: u64,
+    ) -> Result<bool> {
+        let count = i64::try_from(count).map_err(|_| create_error!(InternalError))?;
+        let at = at
+            .duration_since(Timestamp::UNIX_EPOCH)
+            .whole_milliseconds() as i64;
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": channel_id,
+                    "channel_type": "TextChannel",
+                    "protected_history.wipe.state": "requested"
+                },
+                doc! {
+                    "$set": {
+                        "protected_history.wipe": {
+                            "state": "done",
+                            "at": Bson::Int64(at),
+                            "count": count
+                        }
+                    }
+                },
+            )
+            .await
+            .map(|result| result.matched_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    /// Filtered on the stored id; see the trait.
+    async fn reset_last_message_id_after_wipe(
+        &self,
+        channel_id: &str,
+        boundary: &str,
+        newest_remaining: Option<String>,
+    ) -> Result<bool> {
+        let update = match newest_remaining {
+            Some(message_id) => doc! { "$set": { "last_message_id": message_id } },
+            None => doc! { "$unset": { "last_message_id": 1_i32 } },
+        };
+        self.col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": channel_id,
+                    "channel_type": "TextChannel",
+                    // `$not/$gt` matches a missing field, null, or an id at
+                    // or below the boundary
+                    "last_message_id": { "$not": { "$gt": boundary } }
+                },
+                update,
+            )
+            .await
+            .map(|result| result.matched_count == 1)
+            .map_err(|_| create_database_error!("update_one", COL))
     }
 }
 

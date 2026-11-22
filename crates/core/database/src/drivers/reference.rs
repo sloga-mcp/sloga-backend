@@ -7,7 +7,7 @@ use crate::{
     ChannelFollow, ChannelSeat, ChannelUnread,
     AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
-    EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
+    EventRsvpKey, File, FileHash, HistoryWipeLease, Interaction, Invite, Member, MemberCompositeKey, Message,
     MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll,
     PollVote, RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
     ReminderSentKey, Report, Respect, ScheduledMessage, SeatList, Server, ServerBan, ServerBoost,
@@ -67,6 +67,9 @@ database_derived!(
         /// Keyed by server id; its own lock, never held with another
         /// (design 2.9)
         pub server_legal_holds: Arc<Mutex<HashMap<String, ServerLegalHold>>>,
+        /// Keyed by channel id; its own lock, never held with another (the
+        /// `history_wipes` job's lease, design 7.5 "S4")
+        pub history_wipe_leases: Arc<Mutex<HashMap<String, HistoryWipeLease>>>,
         pub channel_entitlements: Arc<Mutex<HashMap<String, ChannelEntitlement>>>,
         pub channel_seats: Arc<Mutex<HashMap<String, ChannelSeat>>>,
         pub channel_seat_lists: Arc<Mutex<HashMap<String, SeatList>>>,

@@ -1760,6 +1760,7 @@ async fn text_commit_stream(
             removed_reasons: vec![],
             welcome: None,
             history_visible: None,
+            added_protocols: vec![],
         };
         match db.insert_mls_text_commit(&commit, &hash, 0).await {
             Ok(crate::MlsCommitOutcome::Won) => {
@@ -3335,6 +3336,7 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
         removed_reasons: vec![],
         welcome: None,
         history_visible: None,
+        added_protocols: vec![],
     }
 }
 
@@ -3499,6 +3501,7 @@ async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &Ml
         removed_reasons: vec![],
         welcome: None,
         history_visible: None,
+        added_protocols: vec![],
     };
     let outcome = db
         .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)
@@ -7052,6 +7055,7 @@ async fn a_successor_copies_signer_lost_and_starts_with_empty_pending_lists() {
             user_id: USER_B.to_string(),
             device_id: DEVICE_B.to_string(),
             at: at(0),
+            protocol: None,
         }];
         db.create_text_mls_group(&first, None).await.unwrap();
         let stored = open_group(&db, CHANNEL).await;
