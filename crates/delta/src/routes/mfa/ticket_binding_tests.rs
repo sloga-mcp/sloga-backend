@@ -46,6 +46,13 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
     ),
     ("admin/prot_adjust.rs", "foreign_ticket_admin_prot_adjust"),
     ("admin/prot_orders.rs", "foreign_ticket_admin_prot_orders"),
+    (
+        "admin/takedown_common.rs",
+        "takedown_ticket_is_spent_by_one_action",
+    ),
+    ("admin/takedown_holds.rs", "foreign_ticket_takedown_holds"),
+    ("admin/takedown_remove.rs", "foreign_ticket_takedown_remove"),
+    ("admin/takedown_review.rs", "foreign_ticket_takedown_review"),
     ("e2ee/delete_backup.rs", "foreign_ticket_delete_backup"),
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
@@ -877,6 +884,167 @@ async fn foreign_ticket_admin_prot_orders_case() {
     assert_eq!(status, Status::Forbidden, "admin_prot_orders");
     pair.assert_unchanged("admin_prot_orders", &before).await;
     pair.assert_ticket_kept("admin_prot_orders").await;
+}
+
+// ------------------------------------------------------------------------
+// Take It Down staff actions
+// ------------------------------------------------------------------------
+
+/// Every Take It Down staff action that takes a ticket: its route file, its
+/// path segment and a body. A refusal never reads the body.
+const TAKEDOWN_ACTIONS: &[(&str, &str, &str)] = &[
+    ("takedown_review.rs", "decline", r#"{"reason":"other"}"#),
+    ("takedown_review.rs", "needs-info", ""),
+    ("takedown_review.rs", "close", ""),
+    ("takedown_holds.rs", "child-safety", ""),
+    ("takedown_holds.rs", "unhide", r#"{"files":[]}"#),
+    ("takedown_holds.rs", "restore", ""),
+    ("takedown_remove.rs", "remove", r#"{"files":[]}"#),
+];
+
+/// `pair()`, with the victim a reviewer who passes every other gate:
+/// privileged, on `[features.takedown] reviewers`, TOTP on. Sets the config
+/// once per process, so these tests need nextest like `takedown_tests.rs`.
+/// The takedown settings are read per request, so setting them after the
+/// harness is built is enough.
+async fn takedown_pair() -> Pair {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+
+    let reviewer = pair.victim_user.id.clone();
+    revolt_config::overwrite_config(move |settings| {
+        settings.features.takedown.enabled = true;
+        settings.features.takedown.data_key =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+        settings.features.takedown.reviewers = vec![reviewer];
+        settings.features.takedown.restore_enabled = true;
+    })
+    .await;
+
+    pair
+}
+
+/// A Take It Down action request on request `id`, with a reason and a body.
+fn takedown_action<'c>(
+    harness: &'c TestHarness,
+    id: &str,
+    action: &str,
+    body: &str,
+) -> LocalRequest<'c> {
+    let request = harness
+        .client
+        .post(format!("/admin/takedown/requests/{}/{}", id, action))
+        .header(ContentType::JSON)
+        .header(Header::new("X-Audit-Log-Reason", "takedown review"));
+    if body.is_empty() {
+        request
+    } else {
+        request.body(body.to_string())
+    }
+}
+
+/// The attacker's ticket on every action of one route file: each must be
+/// refused by the guard, so the ticket survives every attempt. With the
+/// binding gone the shared gate's own account check would still answer 403,
+/// but only after the ticket was spent.
+async fn foreign_ticket_takedown_file(file: &str) {
+    let pair = takedown_pair().await;
+    let before = victim_state(&pair).await;
+    let id = ulid::Ulid::new().to_string();
+
+    let actions: Vec<_> = TAKEDOWN_ACTIONS
+        .iter()
+        .filter(|(action_file, _, _)| *action_file == file)
+        .collect();
+    assert!(!actions.is_empty(), "{}: no actions listed", file);
+
+    for (_, action, body) in actions {
+        let route = format!("takedown {}", action);
+        let status = pair
+            .forged(takedown_action(&pair.harness, &id, action, body))
+            .dispatch()
+            .await
+            .status();
+
+        assert_eq!(status, Status::Forbidden, "{}", route);
+        pair.assert_unchanged(&route, &before).await;
+        pair.assert_ticket_kept(&route).await;
+    }
+}
+
+#[test]
+fn foreign_ticket_takedown_review() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_review.rs"))
+}
+
+#[test]
+fn foreign_ticket_takedown_holds() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_holds.rs"))
+}
+
+#[test]
+fn foreign_ticket_takedown_remove() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_remove.rs"))
+}
+
+#[test]
+fn takedown_ticket_is_spent_by_one_action() {
+    rt().block_on(takedown_ticket_is_spent_by_one_action_case())
+}
+
+/// `takedown_common.rs` holds the gate every action shares. The victim's own
+/// ticket passes it once: the first action claims the ticket (this unknown
+/// request then answers 404), and the same ticket is refused on every other
+/// action, so one MFA check never authorizes a second action.
+async fn takedown_ticket_is_spent_by_one_action_case() {
+    let pair = takedown_pair().await;
+    let id = ulid::Ulid::new().to_string();
+    let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
+
+    let status = with_ticket(
+        takedown_action(&pair.harness, &id, "needs-info", ""),
+        &pair.victim_session,
+        &own,
+    )
+    .dispatch()
+    .await
+    .status();
+    assert_eq!(
+        status,
+        Status::NotFound,
+        "the victim's own ticket passes the gate"
+    );
+    assert!(
+        !ticket_exists(&pair.harness, &own).await,
+        "the first action claims the ticket"
+    );
+
+    for (_, action, body) in TAKEDOWN_ACTIONS {
+        let status = with_ticket(
+            takedown_action(&pair.harness, &id, action, body),
+            &pair.victim_session,
+            &own,
+        )
+        .dispatch()
+        .await
+        .status();
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "takedown {}: a spent ticket authorized it",
+            action
+        );
+    }
 }
 
 // ------------------------------------------------------------------------
