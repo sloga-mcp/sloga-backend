@@ -124,9 +124,23 @@ fn with_ticket<'c>(
 }
 
 async fn pair() -> Pair {
+    pair_as(None).await
+}
+
+/// `pair()`, with the victim's user id fixed when `victim_id` is set.
+async fn pair_as(victim_id: Option<String>) -> Pair {
     let harness = TestHarness::new().await;
 
-    let (mut victim, victim_session, victim_user) = harness.new_user().await;
+    let (mut victim, victim_session, victim_user) = match victim_id {
+        None => harness.new_user().await,
+        Some(id) => {
+            let user = User::create(&harness.db, TestHarness::rand_string(), Some(id), None)
+                .await
+                .expect("victim `User`");
+            let (account, session) = harness.account_from_user(user.id.clone()).await;
+            (account, session, user)
+        }
+    };
     victim.mfa.totp_token = Totp::Enabled {
         secret: "secret".to_string(),
     };
@@ -903,12 +917,23 @@ const TAKEDOWN_ACTIONS: &[(&str, &str, &str)] = &[
 ];
 
 /// `pair()`, with the victim a reviewer who passes every other gate:
-/// privileged, on `[features.takedown] reviewers`, TOTP on. Sets the config
-/// once per process, so these tests need nextest like `takedown_tests.rs`.
-/// The takedown settings are read per request, so setting them after the
-/// harness is built is enough.
+/// privileged, on `[features.takedown] reviewers`, TOTP on. The config is
+/// set before the harness is built, as `config()` is cached for 30 s from
+/// the harness's first read, so the reviewer's id is chosen first. Once per
+/// process: these tests need nextest, like `takedown_tests.rs`.
 async fn takedown_pair() -> Pair {
-    let mut pair = pair().await;
+    let reviewer = ulid::Ulid::new().to_string();
+    let listed = reviewer.clone();
+    revolt_config::overwrite_config(move |settings| {
+        settings.features.takedown.enabled = true;
+        settings.features.takedown.data_key =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+        settings.features.takedown.reviewers = vec![listed];
+        settings.features.takedown.restore_enabled = true;
+    })
+    .await;
+
+    let mut pair = pair_as(Some(reviewer)).await;
     pair.victim_user
         .update(
             &pair.harness.db,
@@ -921,15 +946,24 @@ async fn takedown_pair() -> Pair {
         .await
         .expect("promote the victim");
 
-    let reviewer = pair.victim_user.id.clone();
-    revolt_config::overwrite_config(move |settings| {
-        settings.features.takedown.enabled = true;
-        settings.features.takedown.data_key =
-            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string();
-        settings.features.takedown.reviewers = vec![reviewer];
-        settings.features.takedown.restore_enabled = true;
-    })
-    .await;
+    // Every other gate passes, so a refusal is the ticket's doing
+    let settings = revolt_config::config().await;
+    assert_eq!(
+        settings.features.takedown.reviewers,
+        vec![pair.victim_user.id.clone()],
+        "setup: the victim is the listed reviewer"
+    );
+    let stored = pair
+        .harness
+        .db
+        .fetch_user(&pair.victim_user.id)
+        .await
+        .expect("victim `User`");
+    assert!(stored.privileged, "setup: the victim is privileged");
+    assert!(
+        pair.victim_account().await.mfa.is_active(),
+        "setup: the victim's TOTP is on"
+    );
 
     pair
 }
@@ -1011,18 +1045,20 @@ async fn takedown_ticket_is_spent_by_one_action_case() {
     let id = ulid::Ulid::new().to_string();
     let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
 
-    let status = with_ticket(
+    let response = with_ticket(
         takedown_action(&pair.harness, &id, "needs-info", ""),
         &pair.victim_session,
         &own,
     )
     .dispatch()
-    .await
-    .status();
+    .await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
     assert_eq!(
         status,
         Status::NotFound,
-        "the victim's own ticket passes the gate"
+        "the victim's own ticket passes the gate: {}",
+        text
     );
     assert!(
         !ticket_exists(&pair.harness, &own).await,
