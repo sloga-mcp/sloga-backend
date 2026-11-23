@@ -455,6 +455,7 @@ mod tests {
             mfa: Default::default(),
             google_id: None,
             apple_id: None,
+            password_absent: false,
         })
         .await
         .unwrap();

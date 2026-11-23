@@ -261,6 +261,49 @@ pub struct E2EEOnlyFeature {
     pub enforced: bool,
 }
 
+/// # Passkeys
+///
+/// What this node offers, not what its config asks for: every field is
+/// false while passkeys are off or their configuration is refused.
+#[derive(Serialize, JsonSchema, Debug, PartialEq)]
+pub struct PasskeysFeature {
+    /// Whether passkey sign-in, adding and removing passkeys, and confirming
+    /// with a passkey are on
+    pub available: bool,
+    /// Whether an account can be created with a passkey
+    pub signup: bool,
+    /// Whether such an account can be created without an email address
+    pub signup_without_email: bool,
+    /// Whether a passkey can unlock the encrypted backup
+    pub backup_unlock: bool,
+}
+
+/// The passkey advert for `[features.passkeys]`.
+///
+/// `usable` is the verifier's own answer for this config
+/// (`util::passkey::assert_available`), so the advert never offers what
+/// every passkey route would refuse. Nothing is advertised without it,
+/// whatever the config asks for. The relying party id, the origin list and
+/// the hourly cap stay on the server.
+pub fn passkeys_feature(
+    passkeys: &revolt_config::PasskeyFeatures,
+    usable: bool,
+) -> PasskeysFeature {
+    let available = usable && passkeys.available;
+    let signup = available && passkeys.signup;
+
+    PasskeysFeature {
+        available,
+        signup,
+        // A sign-up without an email is still a sign-up, and a cap of 0
+        // allows none
+        signup_without_email: signup
+            && passkeys.signup_without_email
+            && passkeys.signup_without_email_per_hour > 0,
+        backup_unlock: available && passkeys.backup_unlock,
+    }
+}
+
 /// # Feature Configuration
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct RevoltFeatures {
@@ -313,6 +356,9 @@ pub struct RevoltFeatures {
     pub e2ee: E2EEFeature,
     /// Prot configuration
     pub prot: ProtFeature,
+    /// Passkeys. Always sent by a server that has them; a reader that finds
+    /// it missing must treat every field as false
+    pub passkeys: PasskeysFeature,
 }
 
 /// # Limits For Users
@@ -451,12 +497,19 @@ pub struct RevoltConfig {
 #[openapi(tag = "Core")]
 #[get("/")]
 pub async fn root() -> Result<Json<RevoltConfig>> {
-    Ok(Json(root_config(config().await)))
+    // Asked of the verifier and not read from the config: with a refused
+    // rp_id or origin list every passkey route answers FeatureDisabled, and
+    // the advert has to say the same
+    let passkeys_usable = crate::util::passkey::assert_available().await.is_ok();
+
+    Ok(Json(root_config(config().await, passkeys_usable)))
 }
 
 /// The body of `GET /` for a config. Kept apart from the route so tests can
-/// check the wire shape without a database
-pub fn root_config(config: Settings) -> RevoltConfig {
+/// check the wire shape without a database.
+///
+/// `passkeys_usable`: see [`passkeys_feature`].
+pub fn root_config(config: Settings, passkeys_usable: bool) -> RevoltConfig {
     // Same overlay as `User::limits()`, so the advertised perk limits always
     // match the enforced ones.
     let perk = config.features.limits.perk.as_ref().map(|p| {
@@ -470,6 +523,7 @@ pub fn root_config(config: Settings) -> RevoltConfig {
 
     // Built before the literal below, which moves fields out of `config`
     let prot = prot_feature(&config);
+    let passkeys = passkeys_feature(&config.features.passkeys, passkeys_usable);
 
     RevoltConfig {
         revolt: env!("CARGO_PKG_VERSION").to_string(),
@@ -584,6 +638,7 @@ pub fn root_config(config: Settings) -> RevoltConfig {
                 },
             },
             prot,
+            passkeys,
         },
         ws: config.hosts.events,
         app: config.hosts.app,
@@ -1096,7 +1151,7 @@ mod test {
     }
 
     fn ios_call_e2ee_json(config: revolt_config::Settings) -> serde_json::Value {
-        serde_json::to_value(super::root_config(config)).unwrap()["features"]["ios_call_e2ee"]
+        serde_json::to_value(super::root_config(config, false)).unwrap()["features"]["ios_call_e2ee"]
             .clone()
     }
 
@@ -1128,7 +1183,8 @@ mod test {
     }
 
     fn livekit_json(config: revolt_config::Settings) -> serde_json::Value {
-        serde_json::to_value(super::root_config(config)).unwrap()["features"]["livekit"].clone()
+        serde_json::to_value(super::root_config(config, false)).unwrap()["features"]["livekit"]
+            .clone()
     }
 
     /// The ring length is on the wire under
@@ -1239,7 +1295,7 @@ mod test {
     }
 
     fn e2ee_only_json(config: revolt_config::Settings) -> serde_json::Value {
-        serde_json::to_value(super::root_config(config)).unwrap()["features"]["e2ee"]["only"]
+        serde_json::to_value(super::root_config(config, false)).unwrap()["features"]["e2ee"]["only"]
             .clone()
     }
 
@@ -1305,5 +1361,240 @@ mod test {
         // The shipped defaults: nobody can turn it on, and marks are enforced
         assert_eq!(body["features"]["e2ee"]["only"]["available"], false);
         assert_eq!(body["features"]["e2ee"]["only"]["enforced"], true);
+    }
+
+    /// The passkey advert for every combination of the four switches, the
+    /// hourly cap and the verifier's answer.
+    ///
+    /// Fails if: a sub-flag stops depending on `available`, `available`
+    /// stops depending on the verifier's answer, or `signup_without_email`
+    /// stops depending on the cap or on `signup`.
+    #[test]
+    fn passkeys_advert_table() {
+        let base = crate::util::test::rt()
+            .block_on(revolt_config::config())
+            .features
+            .passkeys;
+
+        let mut rows = 0;
+        let mut advertised_without_email = 0;
+        for usable in [false, true] {
+            for available in [false, true] {
+                for signup in [false, true] {
+                    for without_email in [false, true] {
+                        for backup_unlock in [false, true] {
+                            for per_hour in [0u32, 1, 25] {
+                                let mut passkeys = base.clone();
+                                passkeys.available = available;
+                                passkeys.signup = signup;
+                                passkeys.signup_without_email = without_email;
+                                passkeys.backup_unlock = backup_unlock;
+                                passkeys.signup_without_email_per_hour = per_hour;
+
+                                let on = usable && available;
+                                let expected = super::PasskeysFeature {
+                                    available: on,
+                                    signup: on && signup,
+                                    signup_without_email: on
+                                        && signup
+                                        && without_email
+                                        && per_hour > 0,
+                                    backup_unlock: on && backup_unlock,
+                                };
+
+                                let advert = super::passkeys_feature(&passkeys, usable);
+                                assert_eq!(
+                                    advert,
+                                    expected,
+                                    "usable {usable}, available {available}, signup {signup}, \
+                                     without email {without_email}, backup {backup_unlock}, \
+                                     per hour {per_hour}"
+                                );
+
+                                // Stated outright as well, not only through
+                                // the expression above
+                                if !advert.available {
+                                    assert!(
+                                        !advert.signup
+                                            && !advert.signup_without_email
+                                            && !advert.backup_unlock
+                                    );
+                                }
+                                if per_hour == 0 {
+                                    assert!(!advert.signup_without_email);
+                                }
+
+                                rows += 1;
+                                if advert.signup_without_email {
+                                    advertised_without_email += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(rows, 96);
+        // usable, available, signup and the switch all on, either backup
+        // state, and a cap of 1 or 25
+        assert_eq!(advertised_without_email, 4);
+    }
+
+    /// The wire shape: exactly the four switches, as booleans
+    #[test]
+    fn passkeys_advert_carries_four_booleans_and_nothing_else() {
+        let mut config = crate::util::test::rt().block_on(revolt_config::config());
+        let passkeys = &mut config.features.passkeys;
+        passkeys.available = true;
+        passkeys.signup = true;
+        passkeys.signup_without_email = true;
+        passkeys.backup_unlock = true;
+        passkeys.signup_without_email_per_hour = 3_999_999_979;
+        passkeys.rp_id = "rp-id-marker.example".to_string();
+        passkeys.origins = vec!["https://origin-marker.example".to_string()];
+
+        for usable in [false, true] {
+            let body = serde_json::to_value(super::root_config(config.clone(), usable)).unwrap();
+            assert_eq!(
+                body["features"]["passkeys"],
+                serde_json::json!({
+                    "available": usable,
+                    "signup": usable,
+                    "signup_without_email": usable,
+                    "backup_unlock": usable,
+                })
+            );
+
+            // Nothing else about the passkey config is on the wire
+            let text = body.to_string();
+            for kept in ["rp-id-marker", "origin-marker", "3999999979", "per_hour"] {
+                assert!(!text.contains(kept), "GET / carries `{kept}`");
+            }
+        }
+    }
+
+    /// 43 base64url characters that decode to 32 bytes: a well-formed
+    /// Android app origin
+    const ANDROID_ORIGIN: &str = "android:apk-key-hash:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// `GET /` with every passkey switch on, a cap of `per_hour` and the
+    /// given origins. Every case is its own `#[test]`: `overwrite_config`
+    /// runs once per process (nextest)
+    async fn passkeys_advert(
+        available: bool,
+        origins: &[&str],
+        per_hour: u32,
+    ) -> serde_json::Value {
+        let origins: Vec<String> = origins.iter().map(|origin| origin.to_string()).collect();
+        revolt_config::overwrite_config(move |settings| {
+            let passkeys = &mut settings.features.passkeys;
+            passkeys.available = available;
+            passkeys.signup = true;
+            passkeys.signup_without_email = true;
+            passkeys.backup_unlock = true;
+            passkeys.signup_without_email_per_hour = per_hour;
+            passkeys.rp_id = "app.sloga.gg".to_string();
+            passkeys.origins = origins;
+        })
+        .await;
+
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let advert = body["features"]["passkeys"].clone();
+
+        // The advert and the routes' own gate agree, whatever the config
+        assert_eq!(
+            advert["available"].as_bool(),
+            Some(crate::util::passkey::assert_available().await.is_ok()),
+            "the advert disagrees with `assert_available`"
+        );
+
+        advert
+    }
+
+    fn passkeys_json(
+        available: bool,
+        signup: bool,
+        signup_without_email: bool,
+        backup_unlock: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "available": available,
+            "signup": signup,
+            "signup_without_email": signup_without_email,
+            "backup_unlock": backup_unlock,
+        })
+    }
+
+    /// Fails if: the advert reads a sub-flag without `available`.
+    #[test]
+    fn passkeys_advert_is_all_false_while_switched_off() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(false, &["https://app.sloga.gg"], 25).await,
+                passkeys_json(false, false, false, false)
+            );
+        })
+    }
+
+    /// The control for the refusals below: a good config is advertised.
+    #[test]
+    fn passkeys_advert_follows_a_valid_config() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &["https://app.sloga.gg", ANDROID_ORIGIN], 25).await,
+                passkeys_json(true, true, true, true)
+            );
+        })
+    }
+
+    /// Fails if: the advert offers sign-up without an email under a cap of 0.
+    #[test]
+    fn passkeys_advert_without_an_hourly_cap_offers_no_emailless_signup() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &["https://app.sloga.gg"], 0).await,
+                passkeys_json(true, true, false, true)
+            );
+        })
+    }
+
+    /// Fails if: `root` reads `available` from the config instead of asking
+    /// the verifier (one bad origin switches passkeys off for the process).
+    #[test]
+    fn passkeys_advert_is_all_false_with_an_origin_off_the_relying_party() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &["https://app.sloga.gg", "https://evil.example"], 25).await,
+                passkeys_json(false, false, false, false)
+            );
+        })
+    }
+
+    #[test]
+    fn passkeys_advert_is_all_false_with_an_empty_origin_list() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &[], 25).await,
+                passkeys_json(false, false, false, false)
+            );
+        })
+    }
+
+    /// An app origin alone is not enough: at least one https origin is needed
+    #[test]
+    fn passkeys_advert_is_all_false_without_an_https_origin() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &[ANDROID_ORIGIN], 25).await,
+                passkeys_json(false, false, false, false)
+            );
+        })
     }
 }

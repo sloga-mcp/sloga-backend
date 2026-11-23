@@ -48,6 +48,12 @@ pub async fn web_with_stripe(stripe: Arc<dyn StripeApi>) -> Rocket<Build> {
     // Ensure environment variables are present
     config.preflight_checks();
 
+    // Passkeys: have `[features.passkeys]` checked now. A refused rp_id or
+    // origin list keeps passkeys off for the whole process either way; asking
+    // here puts the one error line about it in the boot log instead of at
+    // the first passkey request. Off, or valid, it says nothing.
+    let _ = util::passkey::assert_available().await;
+
     // Setup database
     let db = revolt_database::DatabaseInfo::Auto.connect().await.unwrap();
     db.migrate_database().await.unwrap();

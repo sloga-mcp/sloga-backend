@@ -56,6 +56,34 @@ pub(crate) fn e2ee_removed_devices_index() -> bson::Document {
     }
 }
 
+/// Collection of WebAuthn passkeys, one row per credential
+pub(crate) const PASSKEYS_COLLECTION: &str = "passkeys";
+
+/// The `passkeys` indexes, as the "indexes" array of a `createIndexes`.
+///
+/// The one spec for this file and the passkeys migration block.
+pub(crate) fn passkeys_indexes() -> Vec<bson::Document> {
+    vec![
+        // Serves an account's passkey list, its count and the
+        // account-deletion cascade.
+        doc! {
+            "key": {
+                "user_id": 1_i32
+            },
+            "name": "user_id"
+        },
+        // ENFORCES one row per WebAuthn credential across all accounts, and
+        // serves the discoverable login's lookup by credential id.
+        doc! {
+            "key": {
+                "credential_id": 1_i32
+            },
+            "name": "credential_id",
+            "unique": true
+        },
+    ]
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -189,6 +217,10 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection(E2EE_REMOVED_DEVICES_COLLECTION)
         .await
         .expect("Failed to create e2ee_removed_devices collection.");
+
+    db.create_collection(PASSKEYS_COLLECTION)
+        .await
+        .expect("Failed to create passkeys collection.");
 
     db.create_collection("mls_key_packages")
         .await
@@ -1223,6 +1255,14 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create e2ee_removed_devices index.");
+
+    // The same spec the passkeys migration block builds
+    db.run_command(doc! {
+        "createIndexes": PASSKEYS_COLLECTION,
+        "indexes": passkeys_indexes()
+    })
+    .await
+    .expect("Failed to create passkeys indexes.");
 
     db.run_command(doc! {
         "createIndexes": "calendar_events",

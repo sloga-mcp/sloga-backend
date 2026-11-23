@@ -12,15 +12,21 @@
 //! C. Every route file that takes a ticket guard is listed in
 //!    `TICKET_ROUTES`, and each listed route has its test here.
 //!
-//! Only APIs that exist at 05b50d57 are used, so this file also compiles on
-//! the unfixed tree, where every A and B test fails.
+//! D. A passkey as the ticket factor (`PUT /auth/mfa/ticket`): the same
+//!    attacker cannot mint a ticket for the victim with a passkey of their
+//!    own, a challenge stays with the session that started it, and a ticket
+//!    minted with a passkey is bound like any other.
+//!
+//! Up to the passkey routes, only APIs that exist at 05b50d57 are used: with
+//! the passkey rows, their tests and section D taken out, this file also
+//! compiles on the unfixed tree, where every A and B test fails.
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
 use revolt_database::{prot_key_admin, prot_user_account};
 use revolt_database::{
-    Account, MFATicket, Member, PartialUser, Session, Totp, UnvalidatedTicket, User,
+    Account, MFATicket, Member, PartialUser, Passkey, Session, Totp, UnvalidatedTicket, User,
     ValidatedTicket,
 };
 use revolt_models::v0;
@@ -28,6 +34,8 @@ use rocket::http::{ContentType, Header, Status};
 use rocket::local::asynchronous::{Client, LocalRequest};
 
 use crate::routes::e2ee::tests::{publish_device, TestDevice};
+use crate::util::passkey;
+use crate::util::passkey_soft::SoftPasskey;
 use crate::util::test::{rt, without_comments, without_whitespace, TestHarness};
 
 /// Every route file under `src/routes` that takes a ticket guard, with the
@@ -61,9 +69,15 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
         "mfa/totp_generate_secret.rs",
         "foreign_ticket_totp_generate_secret",
     ),
+    ("passkey/manage.rs", "foreign_ticket_passkey_remove"),
+    (
+        "passkey/register.rs",
+        "foreign_ticket_passkey_register_finish",
+    ),
     ("servers/server_edit.rs", "foreign_ticket_server_edit"),
     ("session/revoke.rs", "foreign_ticket_session_revoke"),
     ("session/revoke_all.rs", "foreign_ticket_session_revoke_all"),
+    ("users/change_username.rs", "foreign_ticket_change_username"),
 ];
 
 /// The victim's correct current password (`TestHarness::account_from_user`).
@@ -929,6 +943,240 @@ async fn foreign_ticket_admin_prot_orders_case() {
     pair.assert_ticket_kept("admin_prot_orders").await;
 }
 
+#[test]
+fn foreign_ticket_change_username() {
+    rt().block_on(foreign_ticket_change_username_case())
+}
+
+/// PATCH /users/@me/username takes `Option<ValidatedTicket>` and reads it
+/// only for an account that has no password, where the ticket is the whole
+/// proof. So the victim here has none (the body carries the old one all the
+/// same). The guard yields no ticket: InvalidCredentials (401). The closing
+/// control sends the victim's own ticket, so the refusal was the binding's.
+///
+/// Fails if: `Option<ValidatedTicket>` yields a ticket of another account,
+/// or the route lets a `password_absent` account through without one.
+async fn foreign_ticket_change_username_case() {
+    let pair = pair().await;
+    let db = &pair.harness.db;
+
+    let mut victim = pair.victim_account().await;
+    victim.password_absent = true;
+    victim.save(db).await.expect("victim without a password");
+
+    let before = victim_state(&pair).await;
+    let username = pair.victim_user.username.clone();
+    let body = json!({
+        "username": TestHarness::rand_string(),
+        "password": VICTIM_PASSWORD,
+    })
+    .to_string();
+
+    let status = pair
+        .forged(pair.harness.client.patch("/users/@me/username"))
+        .header(ContentType::JSON)
+        .body(body.clone())
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Unauthorized, "change_username");
+    assert_eq!(
+        db.fetch_user(&pair.victim_user.id)
+            .await
+            .expect("victim `User`")
+            .username,
+        username,
+        "change_username: the victim was renamed"
+    );
+    pair.assert_unchanged("change_username", &before).await;
+    pair.assert_ticket_kept("change_username").await;
+
+    // The control: the same request with the victim's own ticket
+    let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
+    let status = with_ticket(
+        pair.harness.client.patch("/users/@me/username"),
+        &pair.victim_session,
+        &own,
+    )
+    .header(ContentType::JSON)
+    .body(body)
+    .dispatch()
+    .await
+    .status();
+
+    assert_eq!(status, Status::Ok, "change_username: the victim's own ticket");
+    assert_ne!(
+        db.fetch_user(&pair.victim_user.id)
+            .await
+            .expect("victim `User`")
+            .username,
+        username
+    );
+}
+
+/// The one origin `pair_with_passkeys` configures
+const PASSKEY_ORIGIN: &str = "https://app.sloga.gg";
+
+/// `pair()` with passkeys switched on. The switch is process-wide and set
+/// once, before the harness reads the config: every test that calls this
+/// needs its own process (nextest).
+async fn pair_with_passkeys() -> Pair {
+    revolt_config::overwrite_config(|settings| {
+        let passkeys = &mut settings.features.passkeys;
+        passkeys.available = true;
+        passkeys.rp_id = "app.sloga.gg".to_string();
+        passkeys.origins = vec![PASSKEY_ORIGIN.to_string()];
+    })
+    .await;
+
+    let pair = pair().await;
+    passkey::assert_available()
+        .await
+        .expect("setup: passkeys are on");
+    pair
+}
+
+#[test]
+fn foreign_ticket_passkey_register_finish() {
+    rt().block_on(foreign_ticket_passkey_register_finish_case())
+}
+
+/// POST /auth/passkey/register/finish takes `Option<ValidatedTicket>`. The
+/// guard yields no ticket, and the victim (authenticator code on) may not
+/// add a passkey without one: NotPrivileged (403), before the verifier sees
+/// the ceremony. The ceremony is a real one started on the victim's session
+/// (the start step takes no ticket), so the ticket is all that is missing,
+/// as the closing control shows.
+///
+/// Fails if: `Option<ValidatedTicket>` yields a ticket of another account,
+/// or the finish step stores a passkey before its gate.
+async fn foreign_ticket_passkey_register_finish_case() {
+    const FINISH: &str = "/auth/passkey/register/finish";
+
+    let pair = pair_with_passkeys().await;
+    let db = &pair.harness.db;
+    let before = victim_state(&pair).await;
+
+    let response = pair
+        .harness
+        .client
+        .post("/auth/passkey/register/start")
+        .header(Header::new(
+            "x-session-token",
+            pair.victim_session.token.clone(),
+        ))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "setup: register/start");
+    let started = response
+        .into_json::<v0::ResponsePasskeyOptions>()
+        .await
+        .expect("`ResponsePasskeyOptions`");
+
+    // The attacker's own authenticator answers the victim's challenge
+    let credential = SoftPasskey::new().create(&started.options, PASSKEY_ORIGIN);
+    let body = json!({
+        "challenge_id": started.challenge_id,
+        "credential": credential,
+        "name": "Planted",
+    })
+    .to_string();
+
+    let status = pair
+        .forged(pair.harness.client.post(FINISH))
+        .header(ContentType::JSON)
+        .body(body.clone())
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "passkey register/finish");
+    assert_eq!(
+        db.count_passkeys(&pair.victim.id).await.expect("count"),
+        0,
+        "passkey register/finish: a passkey was planted on the victim"
+    );
+    pair.assert_unchanged("passkey register/finish", &before)
+        .await;
+    pair.assert_ticket_kept("passkey register/finish").await;
+
+    // The control: the same ceremony with the victim's own ticket is stored
+    let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
+    let status = with_ticket(pair.harness.client.post(FINISH), &pair.victim_session, &own)
+        .header(ContentType::JSON)
+        .body(body)
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(
+        status,
+        Status::Ok,
+        "passkey register/finish: the victim's own ticket"
+    );
+    assert_eq!(db.count_passkeys(&pair.victim.id).await.expect("count"), 1);
+}
+
+#[test]
+fn foreign_ticket_passkey_remove() {
+    rt().block_on(foreign_ticket_passkey_remove_case())
+}
+
+/// DELETE /auth/passkey/<id> would remove the victim's passkey.
+///
+/// Fails if: the route loses its `ValidatedTicket` guard, or the guard
+/// accepts a ticket of another account.
+async fn foreign_ticket_passkey_remove_case() {
+    let pair = pair_with_passkeys().await;
+    let db = &pair.harness.db;
+
+    // Listed and removable; its credential is never verified here
+    let stored = Passkey::new(
+        pair.victim.id.clone(),
+        format!("credential-{}", TestHarness::rand_string()),
+        // A v4 UUID, as the verifier stores and parses it
+        webauthn_rs::prelude::Uuid::new_v4().to_string(),
+        "{}".to_string(),
+        "Phone".to_string(),
+    );
+    db.insert_passkey(&stored).await.expect("victim's passkey");
+    let path = format!("/auth/passkey/{}", stored.id);
+    let before = victim_state(&pair).await;
+
+    let status = pair
+        .forged(pair.harness.client.delete(path.clone()))
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "passkey remove");
+    assert!(
+        db.fetch_passkey(&pair.victim.id, &stored.id).await.is_ok(),
+        "passkey remove: the victim's passkey was removed"
+    );
+    pair.assert_unchanged("passkey remove", &before).await;
+    pair.assert_ticket_kept("passkey remove").await;
+
+    // The control: the victim's own ticket removes it
+    let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
+    let status = with_ticket(
+        pair.harness.client.delete(path),
+        &pair.victim_session,
+        &own,
+    )
+    .dispatch()
+    .await
+    .status();
+
+    assert_eq!(
+        status,
+        Status::NoContent,
+        "passkey remove: the victim's own ticket"
+    );
+    assert_eq!(db.count_passkeys(&pair.victim.id).await.expect("count"), 0);
+}
+
 // ------------------------------------------------------------------------
 // Positive controls: the same setup, with the victim's own ticket
 // ------------------------------------------------------------------------
@@ -984,6 +1232,266 @@ async fn own_ticket_fetch_recovery_succeeds_case() {
     assert_eq!(codes, pair.victim.mfa.recovery_codes);
     assert!(
         !ticket_exists(&pair.harness, &own).await,
+        "a validated ticket is consumed on use"
+    );
+}
+
+// ========================================================================
+// D. A passkey as the ticket factor
+// ========================================================================
+
+/// A real passkey for `account`, registered through the verifier from
+/// `session`
+async fn registered_passkey(
+    harness: &TestHarness,
+    account: &Account,
+    session: &Session,
+) -> SoftPasskey {
+    let mut soft = SoftPasskey::new();
+    let started = passkey::start_registration(&harness.db, account, &session.id)
+        .await
+        .expect("setup: registration options");
+    let credential = soft.create(&started.options, PASSKEY_ORIGIN);
+    passkey::finish_registration(
+        &harness.db,
+        account,
+        &session.id,
+        &started.challenge_id,
+        credential,
+        Some("Phone".to_string()),
+    )
+    .await
+    .expect("setup: a registered passkey");
+    soft
+}
+
+/// Start an assertion over HTTP from `session` and sign it with `soft`: the
+/// body `PUT /auth/mfa/ticket` takes
+async fn signed_assertion(
+    harness: &TestHarness,
+    session: &Session,
+    soft: &SoftPasskey,
+) -> serde_json::Value {
+    let response = harness
+        .client
+        .post("/auth/passkey/assert/start")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok, "setup: assert/start");
+
+    let started = response
+        .into_json::<v0::ResponsePasskeyOptions>()
+        .await
+        .expect("`ResponsePasskeyOptions`");
+    json!({
+        "passkey_response": {
+            "challenge_id": started.challenge_id,
+            "credential": soft.get(&started.options, PASSKEY_ORIGIN),
+        }
+    })
+}
+
+async fn put_ticket(
+    harness: &TestHarness,
+    session: &Session,
+    body: &serde_json::Value,
+) -> (Status, String) {
+    let response = harness
+        .client
+        .put("/auth/mfa/ticket")
+        .header(Header::new("x-session-token", session.token.clone()))
+        .body(body.to_string())
+        .dispatch()
+        .await;
+
+    (
+        response.status(),
+        response.into_string().await.unwrap_or_default(),
+    )
+}
+
+fn assert_no_ticket(status: Status, body: &str, what: &str) {
+    assert_ne!(status, Status::Ok, "{what}: {body}");
+    assert!(
+        serde_json::from_str::<v0::MFATicket>(body).is_err(),
+        "{what}: a ticket came back: {body}"
+    );
+}
+
+fn minted_ticket(status: Status, body: &str, what: &str) -> v0::MFATicket {
+    assert_eq!(status, Status::Ok, "{what}: {body}");
+    let ticket = serde_json::from_str::<v0::MFATicket>(body).expect("`MFATicket`");
+    assert!(ticket.validated, "{what}");
+    ticket
+}
+
+/// `request` with a session token and a ticket as the API returned it
+fn with_minted<'c>(
+    request: LocalRequest<'c>,
+    session: &Session,
+    ticket: &v0::MFATicket,
+) -> LocalRequest<'c> {
+    request
+        .header(Header::new("x-session-token", session.token.clone()))
+        .header(Header::new("x-mfa-ticket", ticket.token.clone()))
+}
+
+/// The attacker's account, a session of its own, and a real passkey on it
+async fn attacker_with_passkey(pair: &Pair) -> (Account, Session, SoftPasskey) {
+    let db = &pair.harness.db;
+    let attacker = db
+        .fetch_account(&pair.attacker_ticket.account_id)
+        .await
+        .expect("attacker `Account`");
+    let session = attacker
+        .create_session(db, String::new())
+        .await
+        .expect("attacker's `Session`");
+    let soft = registered_passkey(&pair.harness, &attacker, &session).await;
+    (attacker, session, soft)
+}
+
+#[test]
+fn foreign_passkey_mints_no_ticket_for_the_victim() {
+    rt().block_on(foreign_passkey_mints_no_ticket_for_the_victim_case())
+}
+
+/// The attacker holds the victim's session token and a passkey of their
+/// own. `PUT /auth/mfa/ticket` on the victim's session mints nothing from
+/// it, whichever session the challenge was started on. The victim has a
+/// passkey too, so a passkey is one of the victim's ticket methods and each
+/// refusal is about whose passkey signed.
+///
+/// Fails if: `finish_assertion` stops checking that the challenge belongs
+/// to the calling account (first half), or accepts a signature from a
+/// credential that is not one of that account's (second half).
+async fn foreign_passkey_mints_no_ticket_for_the_victim_case() {
+    let pair = pair_with_passkeys().await;
+    let harness = &pair.harness;
+
+    let victim_passkey = registered_passkey(harness, &pair.victim, &pair.victim_session).await;
+    let (attacker, attacker_session, mut attacker_passkey) = attacker_with_passkey(&pair).await;
+    let before = victim_state(&pair).await;
+
+    // A challenge the attacker started on their own session, signed by
+    // their own passkey, sent from the victim's session
+    let signed = signed_assertion(harness, &attacker_session, &attacker_passkey).await;
+    let (status, body) = put_ticket(harness, &pair.victim_session, &signed).await;
+    assert_no_ticket(status, &body, "the attacker's challenge");
+
+    // A challenge started on the victim's session. Its options name the
+    // victim's passkey; the attacker's authenticator signs anyway
+    attacker_passkey.ignore_allow_list = true;
+    let signed = signed_assertion(harness, &pair.victim_session, &attacker_passkey).await;
+    let (status, body) = put_ticket(harness, &pair.victim_session, &signed).await;
+    assert_no_ticket(status, &body, "the victim's challenge, the attacker's passkey");
+
+    pair.assert_unchanged("passkey ticket", &before).await;
+
+    // The control: the attacker's passkey does mint, for the attacker
+    let signed = signed_assertion(harness, &attacker_session, &attacker_passkey).await;
+    let (status, body) = put_ticket(harness, &attacker_session, &signed).await;
+    assert_eq!(
+        minted_ticket(status, &body, "the attacker's own session").account_id,
+        attacker.id
+    );
+
+    // The control: and the victim's passkey mints for the victim
+    let signed = signed_assertion(harness, &pair.victim_session, &victim_passkey).await;
+    let (status, body) = put_ticket(harness, &pair.victim_session, &signed).await;
+    assert_eq!(
+        minted_ticket(status, &body, "the victim's own passkey").account_id,
+        pair.victim.id
+    );
+}
+
+#[test]
+fn passkey_challenge_stays_with_its_session() {
+    rt().block_on(passkey_challenge_stays_with_its_session_case())
+}
+
+/// A challenge started on one session of the victim cannot be finished on
+/// another session of the same account, even with the right passkey.
+///
+/// Fails if: `finish_assertion` stops comparing the session that finishes
+/// with the session that started the challenge.
+async fn passkey_challenge_stays_with_its_session_case() {
+    let pair = pair_with_passkeys().await;
+    let harness = &pair.harness;
+    let soft = registered_passkey(harness, &pair.victim, &pair.victim_session).await;
+    let before = victim_state(&pair).await;
+
+    let signed = signed_assertion(harness, &pair.victim_session, &soft).await;
+    let (status, body) = put_ticket(harness, &pair.victim_other_session, &signed).await;
+    assert_no_ticket(status, &body, "a challenge from another session");
+
+    // Spent by that attempt: the session that started it cannot use it now
+    let (status, body) = put_ticket(harness, &pair.victim_session, &signed).await;
+    assert_no_ticket(status, &body, "a challenge that was already tried");
+
+    pair.assert_unchanged("passkey ticket", &before).await;
+
+    // The control: started and finished on one session, it mints
+    let signed = signed_assertion(harness, &pair.victim_other_session, &soft).await;
+    let (status, body) = put_ticket(harness, &pair.victim_other_session, &signed).await;
+    assert_eq!(
+        minted_ticket(status, &body, "one session").account_id,
+        pair.victim.id
+    );
+}
+
+#[test]
+fn passkey_minted_ticket_is_bound_to_its_account() {
+    rt().block_on(passkey_minted_ticket_is_bound_to_its_account_case())
+}
+
+/// A ticket minted with a passkey is an ordinary ticket: next to the
+/// victim's session it is refused like the saved one in section A, and it
+/// is not burned by the attempt.
+///
+/// Fails if: the passkey arm of `create_ticket` mints for any account but
+/// the session's own, or `ValidatedTicket` stops binding the ticket.
+async fn passkey_minted_ticket_is_bound_to_its_account_case() {
+    let pair = pair_with_passkeys().await;
+    let harness = &pair.harness;
+    let (attacker, attacker_session, attacker_passkey) = attacker_with_passkey(&pair).await;
+
+    let signed = signed_assertion(harness, &attacker_session, &attacker_passkey).await;
+    let (status, body) = put_ticket(harness, &attacker_session, &signed).await;
+    let ticket = minted_ticket(status, &body, "the attacker's own ticket");
+    assert_eq!(ticket.account_id, attacker.id);
+
+    let before = victim_state(&pair).await;
+
+    let status = with_minted(
+        harness.client.delete("/auth/mfa/totp"),
+        &pair.victim_session,
+        &ticket,
+    )
+    .dispatch()
+    .await
+    .status();
+    assert_eq!(status, Status::Forbidden, "a passkey-minted foreign ticket");
+    assert!(pair.victim_account().await.mfa.is_active());
+    pair.assert_unchanged("passkey-minted ticket", &before).await;
+    assert!(
+        harness.db.fetch_ticket_by_token(&ticket.token).await.is_ok(),
+        "the attacker's ticket was consumed by a request it could not authorize"
+    );
+
+    // The control: on the attacker's own session the same ticket is good
+    let status = with_minted(
+        harness.client.post("/auth/mfa/recovery"),
+        &attacker_session,
+        &ticket,
+    )
+    .dispatch()
+    .await
+    .status();
+    assert_eq!(status, Status::Ok);
+    assert!(
+        harness.db.fetch_ticket_by_token(&ticket.token).await.is_err(),
         "a validated ticket is consumed on use"
     );
 }

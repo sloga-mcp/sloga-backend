@@ -195,6 +195,14 @@ hmac = "0.12"
 subtle = "2.6"
 futures-lite = "2.6.1"
 
+# Passkeys (WebAuthn). `conditional-ui` = discoverable sign-in;
+# `danger-allow-state-serialisation` = ceremony state kept in Redis between
+# start and finish (server-side only, never sent to a client)
+webauthn-rs = { version = "0.6.2", features = ["conditional-ui", "danger-allow-state-serialisation"] }
+# Test only: signs for the software authenticator in delta's
+# `util/passkey_soft.rs`. The same p256 generation webauthn-rs links
+p256 = "0.14.0"
+
 # Build Dependencies
 vergen = "7.5.0"
 

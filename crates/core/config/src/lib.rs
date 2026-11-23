@@ -2032,6 +2032,229 @@ impl E2EEFeatures {
     }
 }
 
+/// `[features.passkeys]`: passkey switches and the WebAuthn relying party,
+/// read at process start. Ships OFF: a config without the table, or without
+/// a key, keeps that part off. Prod sets it in Revolt.overrides.toml under
+/// an explicit `[features.passkeys]` header (env form
+/// `REVOLT__FEATURES__PASSKEYS__...`, double underscores), then RESTARTS
+/// delta.
+#[derive(Deserialize, Debug, Clone)]
+pub struct PasskeyFeatures {
+    /// Passkey sign-in, add/remove, and the passkey ticket factor
+    #[serde(default = "PasskeyFeatures::default_available")]
+    pub available: bool,
+
+    /// Passkey sign-up
+    #[serde(default = "PasskeyFeatures::default_signup")]
+    pub signup: bool,
+
+    /// Sign-up with no email. Also needs `signup_without_email_per_hour`
+    /// above 0
+    #[serde(default = "PasskeyFeatures::default_signup_without_email")]
+    pub signup_without_email: bool,
+
+    /// Passkey-unlocked E2EE backup (step 3)
+    #[serde(default = "PasskeyFeatures::default_backup_unlock")]
+    pub backup_unlock: bool,
+
+    /// WebAuthn relying party ID for sign-in passkeys. Final once the first
+    /// passkey exists: changing it orphans every stored credential
+    #[serde(default = "PasskeyFeatures::default_rp_id")]
+    pub rp_id: String,
+
+    /// Every accepted WebAuthn origin, `android:apk-key-hash:...` entries
+    /// included; an origin not listed is refused. A TOML list, or one
+    /// comma-separated string (the environment form; see `takedown_list`).
+    /// Setting the key replaces the whole list
+    #[serde(
+        default = "PasskeyFeatures::default_origins",
+        deserialize_with = "takedown_list"
+    )]
+    pub origins: Vec<String>,
+
+    /// Site-wide cap on sign-ups with no email, per hour. 0 = none allowed,
+    /// whatever `signup_without_email` says
+    #[serde(default = "PasskeyFeatures::default_signup_without_email_per_hour")]
+    pub signup_without_email_per_hour: u32,
+}
+
+impl Default for PasskeyFeatures {
+    fn default() -> Self {
+        Self {
+            available: Self::default_available(),
+            signup: Self::default_signup(),
+            signup_without_email: Self::default_signup_without_email(),
+            backup_unlock: Self::default_backup_unlock(),
+            rp_id: Self::default_rp_id(),
+            origins: Self::default_origins(),
+            signup_without_email_per_hour: Self::default_signup_without_email_per_hour(),
+        }
+    }
+}
+
+impl PasskeyFeatures {
+    fn default_available() -> bool {
+        false
+    }
+
+    fn default_signup() -> bool {
+        false
+    }
+
+    fn default_signup_without_email() -> bool {
+        false
+    }
+
+    fn default_backup_unlock() -> bool {
+        false
+    }
+
+    fn default_rp_id() -> String {
+        "app.sloga.gg".to_string()
+    }
+
+    fn default_origins() -> Vec<String> {
+        vec!["https://app.sloga.gg".to_string()]
+    }
+
+    fn default_signup_without_email_per_hour() -> u32 {
+        0
+    }
+
+    /// Why `rp_id` / `origins` cannot be used, whatever `available` says;
+    /// None when they can. A fixed sentence that names no configured value.
+    pub fn config_fault(&self) -> Option<&'static str> {
+        if !is_passkey_domain(&self.rp_id) {
+            return Some("the relying party id is not a bare lower-case domain name");
+        }
+
+        if self.origins.is_empty() {
+            return Some("the origin list is empty");
+        }
+
+        for origin in &self.origins {
+            if let Err(fault) = validate_passkey_origin(&self.rp_id, origin) {
+                return Some(fault);
+            }
+        }
+
+        // An android origin alone cannot be the relying party's primary origin
+        if !self
+            .origins
+            .iter()
+            .any(|origin| origin.starts_with(PASSKEY_HTTPS_PREFIX))
+        {
+            return Some("the origin list has no https origin");
+        }
+
+        None
+    }
+
+    /// Passkeys are switched on AND the relying party config is valid. The
+    /// one answer every surface uses (routes, ticket methods, MFA status,
+    /// the advert). Pure: no I/O, no logging.
+    pub fn usable(&self) -> bool {
+        self.available && self.config_fault().is_none()
+    }
+}
+
+const PASSKEY_HTTPS_PREFIX: &str = "https://";
+
+/// Origin form Android's Credential Manager reports
+const PASSKEY_ANDROID_ORIGIN_PREFIX: &str = "android:apk-key-hash:";
+
+/// Ok for exactly `https://<rp_id or a subdomain of it>` (no port, path,
+/// query, fragment, credentials, trailing slash or upper case), or for
+/// exactly `android:apk-key-hash:` followed by the 43 base64url characters
+/// of a 32-byte certificate hash.
+///
+/// Checked by hand: this crate has no URL or base64 dependency. It is
+/// stricter than a URL parser on purpose (no IP address, no IDN label).
+pub fn validate_passkey_origin(rp_id: &str, origin: &str) -> std::result::Result<(), &'static str> {
+    if let Some(hash) = origin.strip_prefix(PASSKEY_ANDROID_ORIGIN_PREFIX) {
+        return if is_passkey_certificate_hash(hash) {
+            Ok(())
+        } else {
+            Err("an android origin is not android:apk-key-hash: plus the 43 base64url characters of a 32-byte certificate hash")
+        };
+    }
+
+    if !is_passkey_domain(rp_id) {
+        return Err("the relying party id is not a bare lower-case domain name");
+    }
+
+    let host = origin
+        .strip_prefix(PASSKEY_HTTPS_PREFIX)
+        .ok_or("an origin is neither https nor an android app origin")?;
+
+    // Only a domain name may follow the scheme. A port, a path, a query, a
+    // fragment and credentials all need a character no label can hold.
+    if !is_passkey_domain(host) {
+        return Err("an origin is not written exactly as https://host (no port, path, query, fragment or credentials)");
+    }
+
+    if host != rp_id && !host.ends_with(&format!(".{rp_id}")) {
+        return Err("an origin is not on the relying party id or a subdomain of it");
+    }
+
+    Ok(())
+}
+
+/// A bare lower-case domain name: dot-separated labels of `a-z`, `0-9` and
+/// `-`. Refused as well: a label with `--` in third place (IDN, which a URL
+/// parser may rewrite or reject) and a last label that starts with a digit
+/// (a URL parser reads that host as an IP address).
+fn is_passkey_domain(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 {
+        return false;
+    }
+
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.get(2..4) != Some("--")
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    };
+    if !name.split('.').all(label_ok) {
+        return false;
+    }
+
+    name.rsplit('.')
+        .next()
+        .and_then(|last| last.bytes().next())
+        .map_or(false, |first| !first.is_ascii_digit())
+}
+
+/// 43 base64url characters that decode to exactly 32 bytes
+fn is_passkey_certificate_hash(hash: &str) -> bool {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = hash.as_bytes();
+    if bytes.len() != 43 || bytes.iter().any(|byte| sextet(*byte).is_none()) {
+        return false;
+    }
+
+    // 43 characters carry 258 bits: 32 bytes and two spare bits. A hash with
+    // a spare bit set can never equal what a phone reports.
+    bytes
+        .last()
+        .and_then(|byte| sextet(*byte))
+        .map_or(false, |last| last & 0b11 == 0)
+}
+
 /// `[features.takedown]`: Take It Down Act requests (public form, reviewer
 /// queue, crond alerts and clean-up).
 ///
@@ -2163,8 +2386,8 @@ impl std::fmt::Debug for FeaturesTakedown {
     }
 }
 
-/// `reviewers` and `staff_alert_emails` from a list, or from one
-/// comma-separated string (an environment variable cannot carry a list).
+/// `reviewers`, `staff_alert_emails` and the passkey `origins` from a list,
+/// or from one comma-separated string (an environment variable cannot carry a list).
 /// Entries are trimmed and empty ones dropped, so an empty string is an empty
 /// list.
 fn takedown_list<'de, D: serde::Deserializer<'de>>(
@@ -2329,6 +2552,11 @@ pub struct Features {
     /// default
     #[serde(default)]
     pub e2ee: E2EEFeatures,
+
+    /// Passkeys (ships off; see PasskeyFeatures docs); a missing table
+    /// keeps every default
+    #[serde(default)]
+    pub passkeys: PasskeyFeatures,
 
     /// Take It Down requests (ships off; see FeaturesTakedown docs); a
     /// missing table keeps every default. Boxed for the same stack reason
@@ -3377,6 +3605,352 @@ mod e2ee_only_switch_tests {
             Some(("REVOLT__FEATURES__E2EE__ONLY_ENFORCED", "false")),
         );
         assert!(!settings.features.e2ee.only_enforced);
+    }
+}
+
+#[cfg(test)]
+mod passkey_features_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{PasskeyFeatures, Settings};
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.passkeys]\n";
+
+    fn build(toml: &str, env: &[(&str, &str)]) -> Settings {
+        let mut builder = Config::builder().add_source(File::from_str(toml, FileFormat::Toml));
+        if !env.is_empty() {
+            builder = builder.add_source(
+                Environment::with_prefix("REVOLT").separator("__").source(Some(
+                    env.iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                )),
+            );
+        }
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.passkeys]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(!cut.contains("rp_id"), "the cut left a key behind");
+        assert!(!cut.contains("backup_unlock"), "the cut left a key behind");
+        cut
+    }
+
+    /// Everything off, the sloga relying party, and no sign-up without an
+    /// email
+    fn assert_defaults(passkeys: &PasskeyFeatures) {
+        assert!(!passkeys.available);
+        assert!(!passkeys.signup);
+        assert!(!passkeys.signup_without_email);
+        assert!(!passkeys.backup_unlock);
+        assert_eq!(passkeys.rp_id, "app.sloga.gg");
+        assert_eq!(passkeys.origins, ["https://app.sloga.gg"]);
+        assert_eq!(passkeys.signup_without_email_per_hour, 0);
+    }
+
+    #[test]
+    fn the_code_default_is_all_off() {
+        assert_defaults(&PasskeyFeatures::default());
+    }
+
+    /// The embedded table must not drift from the code default
+    #[test]
+    fn the_embedded_config_is_all_off() {
+        assert_defaults(&build(EMBEDDED, &[]).features.passkeys);
+    }
+
+    /// A prod override file (or any config) without the table, or with an
+    /// empty one, reads the serde defaults
+    #[test]
+    fn a_config_without_the_table_takes_the_defaults() {
+        let without_table = embedded_without_the_table();
+        assert_defaults(&build(&without_table, &[]).features.passkeys);
+
+        let empty_table = format!("{without_table}\n{TABLE}");
+        assert_defaults(&build(&empty_table, &[]).features.passkeys);
+    }
+
+    #[test]
+    fn explicit_values_in_the_table_are_read() {
+        let toml = format!(
+            "{}\n{TABLE}{}",
+            embedded_without_the_table(),
+            concat!(
+                "available = true\n",
+                "signup = true\n",
+                "signup_without_email = true\n",
+                "backup_unlock = true\n",
+                "rp_id = \"sloga.gg\"\n",
+                "origins = [\"https://sloga.gg\", \"android:apk-key-hash:AbC_dEf-123\"]\n",
+                "signup_without_email_per_hour = 25\n",
+            )
+        );
+        let passkeys = build(&toml, &[]).features.passkeys;
+        assert!(passkeys.available);
+        assert!(passkeys.signup);
+        assert!(passkeys.signup_without_email);
+        assert!(passkeys.backup_unlock);
+        assert_eq!(passkeys.rp_id, "sloga.gg");
+        assert_eq!(
+            passkeys.origins,
+            ["https://sloga.gg", "android:apk-key-hash:AbC_dEf-123"]
+        );
+        assert_eq!(passkeys.signup_without_email_per_hour, 25);
+    }
+
+    /// Each key on its own is read and leaves the others at their defaults
+    #[test]
+    fn one_key_leaves_the_others_at_their_defaults() {
+        let only = |line: &str| {
+            let toml = format!("{}\n{TABLE}{line}\n", embedded_without_the_table());
+            build(&toml, &[]).features.passkeys
+        };
+        let on = |passkeys: &PasskeyFeatures| {
+            [
+                passkeys.available,
+                passkeys.signup,
+                passkeys.signup_without_email,
+                passkeys.backup_unlock,
+            ]
+        };
+
+        for (line, expected) in [
+            ("available = true", [true, false, false, false]),
+            ("signup = true", [false, true, false, false]),
+            ("signup_without_email = true", [false, false, true, false]),
+            ("backup_unlock = true", [false, false, false, true]),
+        ] {
+            let passkeys = only(line);
+            assert_eq!(on(&passkeys), expected, "{line}");
+            assert_eq!(passkeys.rp_id, "app.sloga.gg", "{line}");
+            assert_eq!(passkeys.origins, ["https://app.sloga.gg"], "{line}");
+            assert_eq!(passkeys.signup_without_email_per_hour, 0, "{line}");
+        }
+
+        let passkeys = only("rp_id = \"sloga.gg\"");
+        assert_eq!(passkeys.rp_id, "sloga.gg");
+        assert_eq!(on(&passkeys), [false; 4]);
+        assert_eq!(passkeys.origins, ["https://app.sloga.gg"]);
+
+        // The list is replaced, not appended to
+        let passkeys = only("origins = [\"https://sloga.gg\"]");
+        assert_eq!(passkeys.origins, ["https://sloga.gg"]);
+        assert_eq!(passkeys.rp_id, "app.sloga.gg");
+        assert_eq!(on(&passkeys), [false; 4]);
+
+        // The cap alone turns nothing on
+        let passkeys = only("signup_without_email_per_hour = 3");
+        assert_eq!(passkeys.signup_without_email_per_hour, 3);
+        assert_eq!(on(&passkeys), [false; 4]);
+    }
+
+    /// The documented environment form (double underscores); origins come
+    /// as one comma-separated string
+    #[test]
+    fn the_environment_overrides_are_read() {
+        let passkeys = build(
+            EMBEDDED,
+            &[
+                ("REVOLT__FEATURES__PASSKEYS__AVAILABLE", "true"),
+                ("REVOLT__FEATURES__PASSKEYS__SIGNUP", "true"),
+                ("REVOLT__FEATURES__PASSKEYS__SIGNUP_WITHOUT_EMAIL", "true"),
+                ("REVOLT__FEATURES__PASSKEYS__BACKUP_UNLOCK", "true"),
+                ("REVOLT__FEATURES__PASSKEYS__RP_ID", "sloga.gg"),
+                (
+                    "REVOLT__FEATURES__PASSKEYS__ORIGINS",
+                    "https://sloga.gg, android:apk-key-hash:AbC_dEf-123,",
+                ),
+                ("REVOLT__FEATURES__PASSKEYS__SIGNUP_WITHOUT_EMAIL_PER_HOUR", "25"),
+            ],
+        )
+        .features
+        .passkeys;
+        assert!(passkeys.available);
+        assert!(passkeys.signup);
+        assert!(passkeys.signup_without_email);
+        assert!(passkeys.backup_unlock);
+        assert_eq!(passkeys.rp_id, "sloga.gg");
+        assert_eq!(
+            passkeys.origins,
+            ["https://sloga.gg", "android:apk-key-hash:AbC_dEf-123"]
+        );
+        assert_eq!(passkeys.signup_without_email_per_hour, 25);
+
+        // One variable on a config without the table
+        let passkeys = build(
+            &embedded_without_the_table(),
+            &[("REVOLT__FEATURES__PASSKEYS__AVAILABLE", "true")],
+        )
+        .features
+        .passkeys;
+        assert!(passkeys.available);
+        assert!(!passkeys.signup);
+        assert_eq!(passkeys.origins, ["https://app.sloga.gg"]);
+    }
+
+    /// An empty origins list accepts nothing; it does not fall back to the
+    /// default origin
+    #[test]
+    fn an_empty_origins_list_stays_empty() {
+        let toml = format!("{}\n{TABLE}origins = []\n", embedded_without_the_table());
+        assert!(build(&toml, &[]).features.passkeys.origins.is_empty());
+
+        let passkeys = build(EMBEDDED, &[("REVOLT__FEATURES__PASSKEYS__ORIGINS", "")])
+            .features
+            .passkeys;
+        assert!(passkeys.origins.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod passkey_usable_tests {
+    use super::{validate_passkey_origin, PasskeyFeatures};
+
+    const RP_ID: &str = "app.sloga.gg";
+    const WEB: &str = "https://app.sloga.gg";
+
+    /// base64url of the 32 bytes 0x00..=0x1f
+    const HASH: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+    fn android() -> String {
+        format!("android:apk-key-hash:{HASH}")
+    }
+
+    fn features(available: bool, rp_id: &str, origins: &[&str]) -> PasskeyFeatures {
+        PasskeyFeatures {
+            available,
+            rp_id: rp_id.to_string(),
+            origins: origins.iter().map(|origin| origin.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Fails if: `usable` drops the switch, the RP ID check, the empty-list
+    /// check, the per-origin check or the need for one https origin.
+    #[test]
+    fn usable_table() {
+        let android = android();
+        let android = android.as_str();
+
+        let rows: [(&str, bool, &str, &[&str], bool); 14] = [
+            ("good, web only", true, RP_ID, &[WEB], true),
+            ("good, web and android", true, RP_ID, &[WEB, android], true),
+            ("good, android listed first", true, RP_ID, &[android, WEB], true),
+            ("good, a subdomain", true, RP_ID, &["https://sub.app.sloga.gg"], true),
+            ("switched off", false, RP_ID, &[WEB, android], false),
+            ("empty list", true, RP_ID, &[], false),
+            ("android only: no https origin", true, RP_ID, &[android], false),
+            ("a foreign origin", true, RP_ID, &[WEB, "https://evil.example"], false),
+            ("plain http", true, RP_ID, &[WEB, "http://app.sloga.gg"], false),
+            ("an explicit port", true, RP_ID, &[WEB, "https://app.sloga.gg:8443"], false),
+            ("a bad android hash", true, RP_ID, &[WEB, "android:apk-key-hash:AAAA"], false),
+            ("empty rp id", true, "", &[WEB], false),
+            ("upper-case rp id", true, "APP.sloga.gg", &["https://APP.sloga.gg"], false),
+            ("rp id with a port", true, "app.sloga.gg:443", &[WEB], false),
+        ];
+
+        for (what, available, rp_id, origins, expected) in rows {
+            let features = features(available, rp_id, origins);
+            assert_eq!(features.usable(), expected, "{what}");
+        }
+
+        // The shipped default is valid and off: the switch alone turns it on
+        let mut shipped = PasskeyFeatures::default();
+        assert!(!shipped.usable());
+        assert_eq!(shipped.config_fault(), None);
+        shipped.available = true;
+        assert!(shipped.usable());
+
+        // The fault is reported whatever the switch says
+        assert!(features(false, RP_ID, &[]).config_fault().is_some());
+        assert!(features(true, RP_ID, &[]).config_fault().is_some());
+    }
+
+    /// Fails if: `validate_passkey_origin` drops any one of its checks
+    /// (scheme, host shape, host suffix with the dot, hash length, alphabet,
+    /// the spare bits of the last hash character).
+    #[test]
+    fn origin_table() {
+        let android = android();
+
+        for origin in [WEB, "https://sub.app.sloga.gg", "https://a.b.app.sloga.gg", android.as_str()] {
+            assert_eq!(validate_passkey_origin(RP_ID, origin), Ok(()), "{origin}");
+        }
+
+        // 43 characters whose last one sets a spare bit
+        let spare_bit = format!("android:apk-key-hash:{}B", &HASH[..42]);
+        let bad = [
+            String::new(),
+            "app.sloga.gg".to_string(),
+            "https://".to_string(),
+            "http://app.sloga.gg".to_string(),
+            "https://app.sloga.gg:8443".to_string(),
+            "https://app.sloga.gg:443".to_string(),
+            "https://app.sloga.gg:".to_string(),
+            "https://app.sloga.gg/".to_string(),
+            "https://app.sloga.gg/path".to_string(),
+            "https://app.sloga.gg?x=1".to_string(),
+            "https://app.sloga.gg#frag".to_string(),
+            "https://user@app.sloga.gg".to_string(),
+            "https://user:pass@app.sloga.gg".to_string(),
+            "https://APP.sloga.gg".to_string(),
+            "HTTPS://app.sloga.gg".to_string(),
+            "https://app.sloga.gg.".to_string(),
+            "https://.app.sloga.gg".to_string(),
+            "https://a..app.sloga.gg".to_string(),
+            "https://-a.app.sloga.gg".to_string(),
+            "https://xn--80ak6aa92e.app.sloga.gg".to_string(),
+            "https://sloga.gg".to_string(),
+            "https://evilapp.sloga.gg".to_string(),
+            "https://app.sloga.gg.evil.example".to_string(),
+            "https://evil.example".to_string(),
+            "https://127.0.0.1".to_string(),
+            " https://app.sloga.gg".to_string(),
+            "https://app.sloga.gg ".to_string(),
+            "wss://app.sloga.gg".to_string(),
+            "capacitor://localhost".to_string(),
+            "ios:bundle-id:gg.sloga.app".to_string(),
+            "android:apk-key-hash:".to_string(),
+            format!("android:apk-key-hash:{}", &HASH[..42]),
+            format!("{android}A"),
+            format!("{android}="),
+            format!("android:apk-key-hash:{}+", &HASH[..42]),
+            format!("android:apk-key-hash:{}/", &HASH[..42]),
+            spare_bit,
+            format!("android:apk-key-hash-sha256:{HASH}"),
+            format!("Android:apk-key-hash:{HASH}"),
+            format!(" {android}"),
+        ];
+        for origin in &bad {
+            assert!(
+                validate_passkey_origin(RP_ID, origin).is_err(),
+                "accepted {origin:?}"
+            );
+        }
+
+        // A relying party id that is not a domain name accepts no https origin
+        for rp_id in ["", "127.0.0.1", "APP.sloga.gg", "app.sloga.gg:443", "a b"] {
+            let origin = format!("https://{rp_id}");
+            assert!(
+                validate_passkey_origin(rp_id, &origin).is_err(),
+                "rp id {rp_id:?}"
+            );
+        }
+
+        // An android origin does not depend on the relying party id
+        assert_eq!(validate_passkey_origin("", &android), Ok(()));
     }
 }
 

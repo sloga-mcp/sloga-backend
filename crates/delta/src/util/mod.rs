@@ -1,6 +1,7 @@
 pub mod boosts;
 pub mod dice;
 pub mod interactions;
+pub mod passkey;
 pub mod polls;
 pub mod ratelimits;
 pub mod slowmode;
@@ -10,5 +11,7 @@ pub mod threads;
 
 #[cfg(test)]
 mod auth_guard_tests;
+#[cfg(test)]
+pub mod passkey_soft;
 #[cfg(test)]
 pub mod test;

@@ -1578,6 +1578,10 @@ impl User {
         // design; they die with the account.
         db.delete_all_e2ee_removed_devices(&self.id).await?;
 
+        // Passkeys die with the account: a deleted account keeps no
+        // credential, and a discoverable login must not resolve to it.
+        db.delete_passkeys_for_user(&self.id).await?;
+
         // The encrypted DM fan-out signal's own Redis keys (who this account
         // wrote to, who wrote to it) die with the account. Best-effort: they
         // expire on their own anyway.
@@ -2635,6 +2639,58 @@ mod tests {
                     .await
                     .unwrap(),
                 "another account's tombstone was removed"
+            );
+        });
+    }
+
+    /// Deleting the account removes its passkeys, and no other account's
+    #[tokio::test]
+    async fn delete_removes_the_accounts_passkeys() {
+        database_test!(|db| async move {
+            const OTHER: &str = "01JA00000000000000000OTHPK";
+            let mut user = User {
+                id: "01JA0000000000000000000PKD".to_string(),
+                username: "Passkeyed".to_string(),
+                discriminator: "1004".to_string(),
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+
+            for (user_id, n) in [(user.id.as_str(), 1), (user.id.as_str(), 2), (OTHER, 1)] {
+                db.insert_passkey(&crate::Passkey::new(
+                    user_id.to_string(),
+                    format!("credential-{user_id}-{n}"),
+                    format!("handle-{user_id}"),
+                    "{}".to_string(),
+                    format!("Passkey {n}"),
+                ))
+                .await
+                .unwrap();
+            }
+            assert_eq!(
+                db.count_passkeys(&user.id).await.unwrap(),
+                2,
+                "the control: the passkeys are stored"
+            );
+
+            user.delete(&db).await.unwrap();
+
+            assert_eq!(
+                db.count_passkeys(&user.id).await.unwrap(),
+                0,
+                "the deleted account kept a passkey"
+            );
+            assert!(
+                db.fetch_passkey_by_credential_id(&format!("credential-{}-1", user.id))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a passkey login must not resolve to the deleted account"
+            );
+            assert_eq!(
+                db.count_passkeys(OTHER).await.unwrap(),
+                1,
+                "another account's passkey was removed"
             );
         });
     }

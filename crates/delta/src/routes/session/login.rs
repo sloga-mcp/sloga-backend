@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::{email::normalise_email, password::assert_safe},
-    Account, Database, DeletionInfo, EmailVerification, MFATicket,
+    Account, Database, DeletionInfo, EmailVerification, MFATicket, MfaPurpose,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -39,19 +39,22 @@ pub async fn login(
                 .fetch_account_by_normalised_email(&email_normalised)
                 .await?
             {
+                // An account with no password (created through Google or
+                // Apple) answers as a missing email does: there is nothing
+                // to verify, and counting the attempt would let anyone who
+                // knows the email lock its owner out. This sits before the
+                // lockout check, so the answer is the same while locked.
+                if account.password_absent {
+                    return Err(create_error!(InvalidCredentials));
+                }
+
                 // Verification and password strength are only checked once
                 // the password is proven (below): before that, an existing
                 // email must get the same answer as a missing one
 
                 // Check for account lockout (read-only; a request that
                 // arrives while locked does not extend the lockout)
-                if let Some(lockout) = &account.lockout {
-                    if let Some(expiry) = lockout.expiry {
-                        if expiry > Timestamp::now_utc() {
-                            return Err(create_error!(LockedOut));
-                        }
-                    }
-                }
+                assert_not_locked_out(&account)?;
 
                 // Attempts are counted atomically in the database (3 free,
                 // then locked for 1 minute, 5 minutes on the 4th and 1 hour
@@ -121,13 +124,7 @@ pub async fn login(
             let mut account = db.fetch_account(&ticket.account_id).await?;
 
             // Check for account lockout (read-only), before either path
-            if let Some(lockout) = &account.lockout {
-                if let Some(expiry) = lockout.expiry {
-                    if expiry > Timestamp::now_utc() {
-                        return Err(create_error!(LockedOut));
-                    }
-                }
-            }
+            assert_not_locked_out(&account)?;
 
             // Verify the MFA response
             if let Some(mfa_response) = mfa_response {
@@ -135,7 +132,7 @@ pub async fn login(
                 // atomically; on success the ticket is already claimed
                 // (single use) and the lockout cleared
                 account
-                    .consume_mfa_response(db, mfa_response, Some(&ticket))
+                    .consume_mfa_response(db, mfa_response, MfaPurpose::LoginStep(&ticket))
                     .await?;
             } else if ticket.authorised {
                 // Single use: of two concurrent requests only one claims
@@ -149,6 +146,54 @@ pub async fn login(
         }
     };
 
+    // The proof is checked: the rest is the shared gate
+    complete_login(db, account, name).await.map(Json)
+}
+
+/// Refuses an account that is locked out. Read-only: a request that arrives
+/// while locked does not extend the lockout.
+///
+/// With `complete_login`, this is the one shared login gate. Every sign-in
+/// path whose proof can be guessed (password, MFA ticket) must call
+/// `assert_not_locked_out` BEFORE it checks any proof and `complete_login`
+/// AFTER the proof passes, and must never build a session any other way.
+///
+/// A passkey sign-in (`routes/passkey/login.rs`) calls `complete_login`
+/// only: a signature cannot be guessed, and honouring the lockout there
+/// would let anyone who knows the email keep a passkey user out.
+///
+/// Counting attempts (`reserve_lockout_attempt`, `bump_lockout_count`,
+/// `set_lockout`) differs per kind of proof and stays with the caller.
+pub(crate) fn assert_not_locked_out(account: &Account) -> Result<()> {
+    if let Some(lockout) = &account.lockout {
+        if let Some(expiry) = lockout.expiry {
+            if expiry > Timestamp::now_utc() {
+                return Err(create_error!(LockedOut));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Finishes a sign-in whose proof has already been checked: refuses an
+/// account that is being deleted or is disabled (lifting a timed suspension
+/// that has expired), and only then creates the session.
+///
+/// With `assert_not_locked_out`, this is the one shared login gate. Every
+/// sign-in path (password, MFA ticket, passkey) must call `complete_login`
+/// AFTER the proof passes, and must never build a session any other way;
+/// the password and MFA ticket paths also call `assert_not_locked_out`
+/// BEFORE they check any proof (a passkey sign-in does not, see there).
+///
+/// `assert_login_allowed` (verification, password strength) is not part of
+/// this gate: it needs the password, so the password path runs it itself.
+/// The passkey path checks verification itself, for the same answer.
+pub(crate) async fn complete_login(
+    db: &Database,
+    account: Account,
+    name: Option<String>,
+) -> Result<v0::ResponseLogin> {
     // Generate a session name
     let name = name.unwrap_or_else(|| "Unknown".to_string());
 
@@ -162,10 +207,7 @@ pub async fn login(
         account.deletion,
         Some(DeletionInfo::Scheduled { .. } | DeletionInfo::Deleted)
     ) {
-        return Ok(Json(v0::ResponseLogin::Disabled {
-            user_id: account.id,
-            suspended_until: None,
-        }));
+        return Ok(login_refused(account.id, None));
     }
 
     // Prevent disabled accounts from logging in;
@@ -184,17 +226,23 @@ pub async fn login(
 
         // Unless the suspension just expired, refuse the login
         if suspended_until.is_some() || db.fetch_account(&account.id).await?.disabled {
-            return Ok(Json(v0::ResponseLogin::Disabled {
-                user_id: account.id,
-                suspended_until,
-            }));
+            return Ok(login_refused(account.id, suspended_until));
         }
     }
 
     // Create and return a new session
-    Ok(Json(v0::ResponseLogin::Success(
+    Ok(v0::ResponseLogin::Success(
         account.create_session(db, name).await?.into(),
-    )))
+    ))
+}
+
+/// The answer a deleted, disabled or suspended account gets instead of a
+/// session
+fn login_refused(user_id: String, suspended_until: Option<Timestamp>) -> v0::ResponseLogin {
+    v0::ResponseLogin::Disabled {
+        user_id,
+        suspended_until,
+    }
 }
 
 /// Checks that only an existing account can fail, so they run once its
@@ -213,10 +261,14 @@ async fn assert_login_allowed(account: &Account, password: &str) -> Result<()> {
 mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
-        Account, DeletionInfo, EmailVerification, Lockout, MFATicket, Totp,
+        Account, DeletionInfo, EmailVerification, Lockout, MFAMethod, MFATicket, PartialUser,
+        Passkey, Totp,
         events::client::EventV1,
     };
-    use crate::{rocket, util::test::{Mail, TestHarness}};
+    use crate::{
+        rocket,
+        util::test::{without_comments, without_whitespace, Mail, TestHarness},
+    };
     use rocket::http::{ContentType, Status};
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
@@ -689,6 +741,125 @@ mod tests {
         assert!(serde_json::from_str::<v0::Session>(&res.into_string().await.unwrap()).is_ok());
     }
 
+    /// R8: the password step of a login never offers a passkey. An account
+    /// with TOTP, recovery codes and a stored passkey is told exactly
+    /// `[Totp, Recovery]`; old apps would render a blank row for anything
+    /// else.
+    #[test]
+    fn mfa_login_never_offers_a_stored_passkey() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (mut account, _, _) = harness.new_user().await;
+
+            account.mfa.totp_token = Totp::Enabled {
+                secret: "secret".to_string(),
+            };
+            account.mfa.recovery_codes = vec!["abcde-fghjk".to_string()];
+            account.save(&harness.db).await.unwrap();
+
+            harness
+                .db
+                .insert_passkey(&Passkey::new(
+                    account.id.clone(),
+                    format!("credential-{}", TestHarness::rand_string()),
+                    format!("handle-{}", account.id),
+                    "{}".to_string(),
+                    "Phone".to_string(),
+                ))
+                .await
+                .unwrap();
+
+            // The control: the stored account has TOTP, recovery codes and a
+            // passkey. (Passkeys are off in this test's config, so the list
+            // that mints a ticket would not show the passkey either.)
+            let stored = harness.db.fetch_account(&account.id).await.unwrap();
+            assert_eq!(
+                stored.mfa.get_methods(),
+                vec![MFAMethod::Totp, MFAMethod::Recovery],
+                "the control: the stored account has TOTP and recovery codes"
+            );
+            assert_eq!(
+                harness.db.count_passkeys(&account.id).await.unwrap(),
+                1,
+                "the control: the passkey is stored"
+            );
+
+            let (status, body) = sec009_login(&harness, &account.email, "password_insecure").await;
+            assert_eq!(status, Status::Ok, "login refused: {}", body);
+
+            match serde_json::from_str::<v0::ResponseLogin>(&body).expect("`ResponseLogin`") {
+                v0::ResponseLogin::MFA {
+                    allowed_methods, ..
+                } => assert_eq!(
+                    allowed_methods,
+                    vec![v0::MFAMethod::Totp, v0::MFAMethod::Recovery],
+                    "the login MFA step offers exactly TOTP and recovery"
+                ),
+                other => panic!("expected `ResponseLogin::MFA`, got {:?}", other),
+            }
+        })
+    }
+
+    /// The code that ships in `source`: everything above its test module,
+    /// if it has one, without comments or whitespace. So neither a comment
+    /// nor this test module's own text can satisfy or trip a pin below.
+    fn r8_shipping(source: &str) -> String {
+        let shipping = source.find("#[cfg(test)]").map_or(source, |end| &source[..end]);
+        without_whitespace(&without_comments(shipping))
+    }
+
+    /// R8, for every route that answers a login with `ResponseLogin::MFA`:
+    /// `allowed_methods` is built from `account.mfa.get_methods()` and
+    /// nothing else, and `ticket_methods` (which offers a passkey) is not
+    /// used in the file at all.
+    #[test]
+    fn mfa_login_responses_are_built_from_get_methods() {
+        const BUILT: &str =
+            "allowed_methods:account.mfa.get_methods().into_iter().map(Into::into).collect()";
+
+        for (file, source) in [
+            ("session/login.rs", include_str!("login.rs")),
+            (
+                "oauth/google_callback.rs",
+                include_str!("../oauth/google_callback.rs"),
+            ),
+            (
+                "oauth/apple_callback.rs",
+                include_str!("../oauth/apple_callback.rs"),
+            ),
+        ] {
+            let code = r8_shipping(source);
+
+            assert!(
+                !code.contains("ticket_methods("),
+                "{file}: a login route must not call `ticket_methods`"
+            );
+
+            let fields = code.matches("allowed_methods:").count();
+            assert!(fields > 0, "{file}: no `allowed_methods` field found");
+            assert_eq!(
+                code.matches(BUILT).count(),
+                fields,
+                "{file}: every `allowed_methods` must come from `account.mfa.get_methods()`"
+            );
+        }
+    }
+
+    /// The control for the pin above: the same checks refuse a route that
+    /// builds the list from `ticket_methods`, and a comment does not count
+    #[test]
+    fn r8_shipping_reads_code_only() {
+        let bad = r8_shipping(
+            "allowed_methods: account\n    .ticket_methods(db)\n    .await?\n    .into_iter()\n    .map(Into::into)\n    .collect(),\n#[cfg(test)]\nmod tests { account.mfa.get_methods() }",
+        );
+        assert!(bad.contains("ticket_methods("));
+        assert_eq!(bad.matches("allowed_methods:").count(), 1);
+        assert!(!bad.contains("get_methods()"), "the test module is cut off");
+
+        let commented = r8_shipping("// account.ticket_methods(db)\nlet a = 1;");
+        assert_eq!(commented, "leta=1;");
+    }
+
     /// Status and raw body of an email login
     async fn sec009_login(harness: &TestHarness, email: &str, password: &str) -> (Status, String) {
         let res = harness
@@ -1097,6 +1268,382 @@ mod tests {
                 "the cancel must not depend on the email"
             );
             assert_eq!(session_ids(&harness, &account.id).await, vec![session.id]);
+        })
+    }
+
+    /// Run the shared gate on the account as stored, expecting a session
+    async fn gate_succeeds(harness: &TestHarness, account_id: &str, row: &str) -> v0::Session {
+        let stored = harness.db.fetch_account(account_id).await.unwrap();
+        super::assert_not_locked_out(&stored)
+            .unwrap_or_else(|error| panic!("{}: locked out: {:?}", row, error));
+
+        match super::complete_login(&harness.db, stored, None).await {
+            Ok(v0::ResponseLogin::Success(session)) => {
+                assert_eq!(session.user_id, account_id, "{}", row);
+                session
+            }
+            other => panic!("{}: expected `Success`, got {:?}", row, other),
+        }
+    }
+
+    /// Run the shared gate on the account as stored, expecting a refusal;
+    /// returns its `suspended_until`
+    async fn gate_refuses(harness: &TestHarness, account_id: &str, row: &str) -> Option<Timestamp> {
+        let stored = harness.db.fetch_account(account_id).await.unwrap();
+        super::assert_not_locked_out(&stored)
+            .unwrap_or_else(|error| panic!("{}: locked out: {:?}", row, error));
+
+        match super::complete_login(&harness.db, stored, None).await {
+            Ok(v0::ResponseLogin::Disabled {
+                user_id,
+                suspended_until,
+            }) => {
+                assert_eq!(user_id, account_id, "{}", row);
+                suspended_until
+            }
+            other => panic!("{}: expected `Disabled`, got {:?}", row, other),
+        }
+    }
+
+    /// Session ids in a stable order, so two reads compare
+    async fn gate_sessions(harness: &TestHarness, account_id: &str) -> Vec<String> {
+        let mut ids = session_ids(harness, account_id).await;
+        ids.sort();
+        ids
+    }
+
+    /// An account with a user row (and so one session already), disabled,
+    /// whose user carries `suspended_until`
+    ///
+    /// Returns the account id and the sessions it starts with.
+    async fn gate_suspended_account(
+        harness: &TestHarness,
+        suspended_until: Timestamp,
+    ) -> (String, Vec<String>) {
+        let (mut account, session, mut user) = harness.new_user().await;
+
+        account.disabled = true;
+        account.save(&harness.db).await.unwrap();
+
+        user.update(
+            &harness.db,
+            PartialUser {
+                suspended_until: Some(suspended_until),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let before = gate_sessions(harness, &account.id).await;
+        assert_eq!(before, vec![session.id], "the seed has one session");
+        (account.id, before)
+    }
+
+    /// The shared login gate (`assert_not_locked_out` + `complete_login`),
+    /// driven directly, as every sign-in path drives it. Each row that
+    /// reaches `complete_login` checks the stored sessions, so a gate that
+    /// is skipped shows up as a session that should not exist. Row (b) only
+    /// calls `assert_not_locked_out`, which cannot store one.
+    #[test]
+    fn login_gate_table() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            // (a) A plain account signs in, under the default session name
+            {
+                let account = sec009_account(&harness, "password_insecure", false, false).await;
+                let session = gate_succeeds(&harness, &account.id, "a").await;
+
+                let sessions = harness.db.fetch_sessions(&account.id).await.unwrap();
+                assert_eq!(sessions.len(), 1, "a: exactly one session is stored");
+                assert_eq!(sessions[0].id, session.id, "a");
+                assert_eq!(sessions[0].name, "Unknown", "a");
+            }
+
+            // (b) A lockout that has not expired refuses, before any proof
+            {
+                let account = sec009_account(&harness, "password_insecure", false, false).await;
+                harness
+                    .db
+                    .set_lockout(
+                        &account.id,
+                        Some(Lockout {
+                            attempts: 3,
+                            expiry: Some(soon()),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+
+                let stored = harness.db.fetch_account(&account.id).await.unwrap();
+                assert!(stored.lockout.is_some(), "b: the seed must be stored");
+                match super::assert_not_locked_out(&stored) {
+                    Err(error) => assert!(
+                        matches!(error.error_type, ErrorType::LockedOut),
+                        "b: expected `LockedOut`, got {:?}",
+                        error
+                    ),
+                    Ok(()) => panic!("b: a live lockout must refuse"),
+                }
+            }
+
+            // (c) An expired lockout does not refuse
+            {
+                let account = sec009_account(&harness, "password_insecure", false, false).await;
+                harness
+                    .db
+                    .set_lockout(
+                        &account.id,
+                        Some(Lockout {
+                            attempts: 3,
+                            expiry: Some(long_ago()),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+
+                let stored = harness.db.fetch_account(&account.id).await.unwrap();
+                assert!(stored.lockout.is_some(), "c: the seed must be stored");
+                let session = gate_succeeds(&harness, &account.id, "c").await;
+                assert_eq!(
+                    session_ids(&harness, &account.id).await,
+                    vec![session.id],
+                    "c"
+                );
+            }
+
+            // (d) + (e) A confirmed or finished deletion refuses with
+            // `disabled` still false, and stores no session
+            for (row, deletion) in [
+                ("d", DeletionInfo::Scheduled { after: soon() }),
+                ("e", DeletionInfo::Deleted),
+            ] {
+                let account = deletion_account(&harness, Some(deletion)).await;
+                assert!(!account.disabled, "{}", row);
+
+                assert_eq!(gate_refuses(&harness, &account.id, row).await, None, "{}", row);
+                assert!(
+                    session_ids(&harness, &account.id).await.is_empty(),
+                    "{}: a refused login must store no session",
+                    row
+                );
+
+                // `account` is the stored copy, so this compares like with like
+                let stored = harness.db.fetch_account(&account.id).await.unwrap();
+                assert_eq!(stored.deletion, account.deletion, "{}", row);
+                assert!(!stored.disabled, "{}", row);
+            }
+
+            // (f) A pending deletion is cancelled by signing in
+            {
+                let account = deletion_account(&harness, pending(soon())).await;
+                let session = gate_succeeds(&harness, &account.id, "f").await;
+
+                assert_eq!(
+                    stored_deletion(&harness, &account.id).await,
+                    None,
+                    "f: signing in must cancel the pending deletion"
+                );
+                assert_eq!(
+                    session_ids(&harness, &account.id).await,
+                    vec![session.id],
+                    "f"
+                );
+
+                // The cancel email; taking it also cleans the mailbox up
+                let (mail, _) = harness.assert_email(&account.email).await;
+                assert_eq!(mail.subject, "deletion_cancelled", "f");
+            }
+
+            // (g) Disabled, with no suspension to lift (no user row at all)
+            {
+                let mut account =
+                    sec009_account(&harness, "password_insecure", false, false).await;
+                account.disabled = true;
+                account.save(&harness.db).await.unwrap();
+
+                assert_eq!(gate_refuses(&harness, &account.id, "g").await, None, "g");
+                assert!(
+                    session_ids(&harness, &account.id).await.is_empty(),
+                    "g: a refused login must store no session"
+                );
+                assert!(
+                    harness.db.fetch_account(&account.id).await.unwrap().disabled,
+                    "g: a refused login changes nothing"
+                );
+            }
+
+            // (h) Disabled under a suspension that has expired: `unsuspend`
+            // re-enables the account and clears the user's suspension, and
+            // the login goes through
+            {
+                let (account_id, before) = gate_suspended_account(&harness, long_ago()).await;
+                let session = gate_succeeds(&harness, &account_id, "h").await;
+
+                assert!(
+                    !harness.db.fetch_account(&account_id).await.unwrap().disabled,
+                    "h: the expired suspension must be lifted"
+                );
+                assert_eq!(
+                    harness.db.fetch_user(&account_id).await.unwrap().suspended_until,
+                    None,
+                    "h"
+                );
+
+                let mut expected = before;
+                expected.push(session.id);
+                expected.sort();
+                assert_eq!(
+                    gate_sessions(&harness, &account_id).await,
+                    expected,
+                    "h: exactly one session is added"
+                );
+            }
+
+            // (i) Disabled under a suspension still running: refused with
+            // that timestamp, as stored (MongoDB keeps milliseconds only)
+            {
+                let (account_id, before) = gate_suspended_account(&harness, soon()).await;
+
+                let stored_until = harness
+                    .db
+                    .fetch_user(&account_id)
+                    .await
+                    .unwrap()
+                    .suspended_until
+                    .expect("i: the seed must be stored");
+                assert!(stored_until > Timestamp::now_utc(), "i");
+
+                assert_eq!(
+                    gate_refuses(&harness, &account_id, "i").await,
+                    Some(stored_until),
+                    "i"
+                );
+                assert_eq!(
+                    gate_sessions(&harness, &account_id).await,
+                    before,
+                    "i: a refused login must store no session"
+                );
+                assert!(
+                    harness.db.fetch_account(&account_id).await.unwrap().disabled,
+                    "i: a running suspension is not lifted"
+                );
+                assert_eq!(
+                    harness.db.fetch_user(&account_id).await.unwrap().suspended_until,
+                    Some(stored_until),
+                    "i"
+                );
+            }
+        })
+    }
+
+    /// The stored lockout as plain values, so two reads compare
+    async fn r9_lockout(
+        harness: &TestHarness,
+        account_id: &str,
+    ) -> Option<(i32, Option<Timestamp>)> {
+        let stored = harness.db.fetch_account(account_id).await.unwrap();
+        stored.lockout.map(|lockout| (lockout.attempts, lockout.expiry))
+    }
+
+    /// An account whose stored hash IS of `password_insecure`, flagged as
+    /// having no password. So a row that sends that password proves the
+    /// hash is never consulted, not merely that it did not match.
+    async fn r9_account(harness: &TestHarness, totp: bool) -> Account {
+        let mut account = sec009_account(harness, "password_insecure", false, totp).await;
+        account.password_absent = true;
+        account.save(&harness.db).await.unwrap();
+
+        let stored = harness.db.fetch_account(&account.id).await.unwrap();
+        assert!(stored.password_absent, "the seed must be stored");
+        assert!(
+            stored.verify_password("password_insecure").is_ok(),
+            "the control: the stored hash matches the password the rows send"
+        );
+        stored
+    }
+
+    /// R9: a password login against an account with no password answers as
+    /// a missing email does, whatever the password, and writes nothing: no
+    /// lockout attempt, no ticket, no session.
+    #[test]
+    fn r9_password_absent_login_table() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            // (control) A wrong password on an ordinary account IS counted,
+            // so the unchanged lockouts below mean something
+            {
+                let account = sec009_account(&harness, "password_insecure", false, false).await;
+                assert_eq!(r9_lockout(&harness, &account.id).await, None, "control");
+                sec009_assert_matches_unknown_email(&harness, &account, "wrong_password").await;
+                assert!(
+                    r9_lockout(&harness, &account.id).await.is_some(),
+                    "control: a wrong password on a password account is counted"
+                );
+            }
+
+            // (a) + (b) The password the hash matches, and a wrong one
+            for (row, password) in [("a", "password_insecure"), ("b", "wrong_password")] {
+                let account = r9_account(&harness, false).await;
+
+                sec009_assert_matches_unknown_email(&harness, &account, password).await;
+                assert_eq!(
+                    r9_lockout(&harness, &account.id).await,
+                    None,
+                    "{}: no lockout attempt is written",
+                    row
+                );
+                assert!(
+                    session_ids(&harness, &account.id).await.is_empty(),
+                    "{}: no session is stored",
+                    row
+                );
+            }
+
+            // (c) With TOTP on: the same answer, so no ticket is handed out
+            // and nothing is counted
+            {
+                let account = r9_account(&harness, true).await;
+
+                sec009_assert_matches_unknown_email(&harness, &account, "password_insecure").await;
+                sec009_assert_matches_unknown_email(&harness, &account, "wrong_password").await;
+                assert_eq!(
+                    r9_lockout(&harness, &account.id).await,
+                    None,
+                    "c: no lockout attempt is written"
+                );
+                assert!(session_ids(&harness, &account.id).await.is_empty(), "c");
+            }
+
+            // (d) While locked out: still the missing-email answer, not
+            // `LockedOut`, and the lockout is left exactly as it was
+            {
+                let account = r9_account(&harness, false).await;
+                harness
+                    .db
+                    .set_lockout(
+                        &account.id,
+                        Some(Lockout {
+                            attempts: 3,
+                            expiry: Some(soon()),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let before = r9_lockout(&harness, &account.id).await;
+                assert!(before.is_some(), "d: the seed must be stored");
+
+                sec009_assert_matches_unknown_email(&harness, &account, "password_insecure").await;
+                assert_eq!(
+                    r9_lockout(&harness, &account.id).await,
+                    before,
+                    "d: the lockout is neither extended nor cleared"
+                );
+                assert!(session_ids(&harness, &account.id).await.is_empty(), "d");
+            }
         })
     }
 }

@@ -26,7 +26,7 @@ struct MigrationInfo {
     revision: i32,
 }
 
-pub const LATEST_REVISION: i32 = 78; // MUST BE +1 to last migration
+pub const LATEST_REVISION: i32 = 83; // MUST BE +1 to last migration
 
 pub async fn migrate_database(db: &MongoDb) {
     let migrations = db.col::<Document>("migrations");
@@ -3078,6 +3078,40 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create e2ee_removed_devices index.");
     }
 
+    // Passkeys. Slot reserved with the merge steward: 78-81 are held by the
+    // protected-servers chain and are not in this tree, so this guard follows
+    // the 77 block directly, as its own top-level guard. The number lives in
+    // three places: this guard, LATEST_REVISION, and the literal in the
+    // `latest_revision_is_pinned` test. A renumber changes those three and
+    // nothing else.
+    //
+    // This block creates the passkeys collection and its indexes, nothing
+    // else. It does not mark existing accounts as having no password: the
+    // stored data cannot tell an account created through Google or Apple
+    // from a password account that linked one later, and a wrongly marked
+    // account would have its real password refused. Only accounts created
+    // through OAuth from now on get the flag, at creation.
+    if revision <= 82 {
+        info!("Running migration [passkeys / 22-11-2026]: Create passkeys collection");
+
+        // Same contract as the collection migrations above: every step is
+        // idempotent and a failure panics, so the revision is not advanced
+        // without the unique credential_id index, and the next boot re-runs
+        // the whole block.
+        db.db()
+            .create_collection(super::init::PASSKEYS_COLLECTION)
+            .await
+            .ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": super::init::PASSKEYS_COLLECTION,
+                "indexes": super::init::passkeys_indexes()
+            })
+            .await
+            .expect("Failed to create passkeys indexes.");
+    }
+
     // Reminder to update LATEST_REVISION when adding new migrations.
     LATEST_REVISION.max(revision)
 }
@@ -3716,24 +3750,27 @@ mod afk_backfill_tests {
         }
     }
 
+    /// The one literal pin on `LATEST_REVISION`: bumping the constant without
+    /// meaning to fails here. Every other test reads the constant.
     #[test]
-    fn latest_revision_is_78() {
+    fn latest_revision_is_pinned() {
         assert_eq!(
-            LATEST_REVISION, 78,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, E2EE removal tombstones 77"
+            LATEST_REVISION, 83,
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, E2EE removal tombstones 77; 78 to 81 are reserved for the protected-servers chain; the passkeys block is the last one"
         );
     }
 
-    /// Revision 77 (E2EE removal tombstones) is the last migration: exactly
-    /// one `if revision <= 77` block, at the top level of `run_migrations`
-    /// after the 76 (Prot) block closes (the nesting trap the 72 to 76 pins
-    /// describe), and `LATEST_REVISION - 1`.
+    /// Revision 77 (E2EE removal tombstones): exactly one
+    /// `if revision <= 77` block, at the top level of `run_migrations` after
+    /// the 76 (Prot) block closes (the nesting trap the 72 to 76 pins
+    /// describe). It was the last migration when it landed; which block is
+    /// last is pinned through `LATEST_REVISION` in `passkeys_migration_tests`.
     #[test]
-    fn revision_77_is_one_top_level_block_after_76_and_the_last_migration() {
+    fn revision_77_is_one_top_level_block_after_76() {
         let needle_76 = format!("if revision <= 76 {OPEN}");
         let needle_77 = format!("if revision <= 77 {OPEN}");
         assert_eq!(shipping().matches(&needle_77).count(), 1, "exactly one `{needle_77}`");
-        assert_eq!(LATEST_REVISION - 1, 77, "LATEST_REVISION MUST BE +1 to the last migration");
+        assert!(LATEST_REVISION > 77, "LATEST_REVISION MUST BE past revision 77");
 
         let at_76 = shipping().find(&needle_76).expect("the 76 guard");
         let at_77 = shipping().find(&needle_77).expect("the 77 guard");
@@ -5570,6 +5607,163 @@ mod tests {
         db.drop_database().await;
         guard.disarm();
     }
+
+    /// Every `passkeys` index as listIndexes reports it, by name
+    async fn passkeys_indexes(mongo: &crate::MongoDb) -> Vec<Document> {
+        let listed = mongo
+            .db()
+            .run_command(doc! { "listIndexes": "passkeys" })
+            .await
+            .expect("listIndexes");
+        let mut indexes: Vec<Document> = listed
+            .get_document("cursor")
+            .and_then(|cursor| cursor.get_array("firstBatch"))
+            .expect("a listIndexes first batch")
+            .iter()
+            .filter_map(|index| index.as_document().cloned())
+            .collect();
+        indexes.sort_by(|a, b| a.get_str("name").ok().cmp(&b.get_str("name").ok()));
+        indexes
+    }
+
+    /// The two passkeys indexes, spelled out here rather than read from
+    /// `init::passkeys_indexes()`, so a drift in the shared spec fails
+    fn assert_are_the_passkeys_indexes(indexes: &[Document]) {
+        let names: Vec<&str> = indexes
+            .iter()
+            .map(|index| index.get_str("name").expect("name"))
+            .collect();
+        assert_eq!(names, ["_id_", "credential_id", "user_id"], "{indexes:?}");
+
+        let key = |index: &Document| -> Vec<(String, Bson)> {
+            index
+                .get_document("key")
+                .expect("key")
+                .iter()
+                .map(|(field, order)| (field.clone(), order.clone()))
+                .collect()
+        };
+
+        let credential = &indexes[1];
+        assert_eq!(
+            key(credential),
+            vec![("credential_id".to_string(), Bson::Int32(1))],
+            "{credential:?}"
+        );
+        assert_eq!(
+            credential.get_bool("unique").ok(),
+            Some(true),
+            "one row per credential: {credential:?}"
+        );
+
+        let user = &indexes[2];
+        assert_eq!(
+            key(user),
+            vec![("user_id".to_string(), Bson::Int32(1))],
+            "{user:?}"
+        );
+        assert_ne!(
+            user.get_bool("unique").ok(),
+            Some(true),
+            "an account may hold several passkeys: {user:?}"
+        );
+    }
+
+    /// A fresh database (init.rs) carries the passkeys collection and both
+    /// of its indexes
+    #[tokio::test]
+    async fn init_creates_the_passkeys_indexes() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_init_passkeys".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            super::super::init::create_database(&mongo).await;
+            assert_are_the_passkeys_indexes(&passkeys_indexes(&mongo).await);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// The passkeys block takes a database at 77 to LATEST_REVISION, creates
+    /// both indexes, is a no-op when re-run on its own, and the unique index
+    /// then refuses a second row for one credential id
+    #[tokio::test]
+    async fn the_passkeys_migration_creates_the_indexes_and_is_rerunnable() {
+        let db = crate::DatabaseInfo::Test("migration_passkeys_indexes".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // From 77: the slots between it and the passkeys block are
+            // reserved for blocks that are not in this tree.
+            assert_eq!(
+                super::run_migrations(&mongo, 77).await,
+                super::LATEST_REVISION
+            );
+            assert_are_the_passkeys_indexes(&passkeys_indexes(&mongo).await);
+
+            let passkeys = mongo.col::<Document>("passkeys");
+            passkeys
+                .insert_one(doc! { "_id": "P1", "user_id": "U", "credential_id": "C" })
+                .await
+                .expect("a first passkey");
+
+            // The passkeys block alone: a database one short of the latest
+            assert_eq!(
+                super::run_migrations(&mongo, super::LATEST_REVISION - 1).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            assert_are_the_passkeys_indexes(&passkeys_indexes(&mongo).await);
+
+            assert!(
+                passkeys
+                    .insert_one(doc! { "_id": "P2", "user_id": "V", "credential_id": "C" })
+                    .await
+                    .is_err(),
+                "the unique index must refuse a second row for credential C"
+            );
+            passkeys
+                .insert_one(doc! { "_id": "P3", "user_id": "U", "credential_id": "D" })
+                .await
+                .expect("a second passkey for the same user");
+            assert_eq!(passkeys.count_documents(doc! {}).await.expect("count"), 2);
+
+            // A database already at the latest revision runs nothing
+            assert_eq!(
+                super::run_migrations(&mongo, super::LATEST_REVISION).await,
+                super::LATEST_REVISION
+            );
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
 }
 
 #[cfg(test)]
@@ -5870,5 +6064,200 @@ mod prot_migration_tests {
         ] {
             assert!(init.contains(needle), "init.rs must contain {needle}");
         }
+    }
+}
+
+/// The passkeys block is found through `LATEST_REVISION - 1`, never through
+/// its own number: the merge steward may renumber it at land time, and then
+/// only the guard and the constant change.
+#[cfg(test)]
+mod passkeys_migration_tests {
+    use super::LATEST_REVISION;
+
+    const SOURCE: &str = include_str!("scripts.rs");
+    const INIT: &str = include_str!("init.rs");
+    const OPEN: char = '\u{7b}';
+    const CLOSE: char = '\u{7d}';
+
+    /// Everything above the first test module: the shipping source.
+    fn shipping(source: &'static str) -> &'static str {
+        let end = source.find("#[cfg(test)]").unwrap_or(source.len());
+        &source[..end]
+    }
+
+    /// Text from the brace at `open` through its matching close.
+    fn braced(text: &str, open: usize) -> &str {
+        let mut depth = 0i64;
+        for (i, ch) in text[open..].char_indices() {
+            if ch == OPEN {
+                depth += 1;
+            } else if ch == CLOSE {
+                depth -= 1;
+                if depth == 0 {
+                    return &text[open..=open + i];
+                }
+            }
+        }
+        panic!("unbalanced braces from byte {open}");
+    }
+
+    /// Brace depth of the shipping source at byte `at`.
+    fn depth_at(at: usize) -> i64 {
+        shipping(SOURCE)[..at]
+            .chars()
+            .map(|ch| match ch {
+                OPEN => 1,
+                CLOSE => -1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Where the one guard for `revision` starts, and its opening brace.
+    fn guard(revision: i32) -> (usize, usize) {
+        let needle = format!("if revision <= {revision} {OPEN}");
+        let text = shipping(SOURCE);
+        assert_eq!(text.matches(&needle).count(), 1, "exactly one `{needle}`");
+        let at = text.find(&needle).expect("the guard");
+        (at, at + needle.len() - 1)
+    }
+
+    /// The last migration block: the one guarded by `LATEST_REVISION - 1`.
+    fn last_block() -> &'static str {
+        let (_, open) = guard(LATEST_REVISION - 1);
+        braced(shipping(SOURCE), open)
+    }
+
+    /// Every numeric revision guard of `run_migrations`, in source order.
+    fn guards() -> Vec<i32> {
+        let text = shipping(SOURCE);
+        text.match_indices("if revision <= ")
+            .map(|(at, needle)| {
+                let digits: String = text[at + needle.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().expect("a numeric revision guard")
+            })
+            .collect()
+    }
+
+    /// `LATEST_REVISION` is one past the highest guard, that guard exists
+    /// exactly once, and it is the last one in the source. Holds with the
+    /// reserved gap between 77 and the passkeys block, and after a renumber.
+    #[test]
+    fn latest_revision_is_one_past_the_last_guard() {
+        let guards = guards();
+        assert_eq!(
+            guards.iter().max(),
+            Some(&(LATEST_REVISION - 1)),
+            "LATEST_REVISION MUST BE +1 to the last migration"
+        );
+        assert_eq!(
+            guards.last(),
+            Some(&(LATEST_REVISION - 1)),
+            "the highest guard must be the last block of run_migrations"
+        );
+        assert_eq!(
+            guards
+                .iter()
+                .filter(|guard| **guard == LATEST_REVISION - 1)
+                .count(),
+            1,
+            "exactly one block for the last revision"
+        );
+    }
+
+    /// The nesting trap of the earlier pins, for the last block: nested
+    /// inside the 77 block, a database already past 77 would never create
+    /// the passkeys collection. 77 is named because it is the block this one
+    /// follows in this tree; the last guard itself is read from the constant.
+    #[test]
+    fn the_last_guard_is_a_top_level_sibling_after_the_77_block() {
+        let text = shipping(SOURCE);
+        let (at_77, open_77) = guard(77);
+        let (at_last, _) = guard(LATEST_REVISION - 1);
+        assert!(LATEST_REVISION - 1 > 77, "the passkeys block comes after 77");
+
+        let block_77 = braced(text, open_77);
+        assert!(
+            !block_77.contains("PASSKEYS_COLLECTION"),
+            "the passkeys block must not be nested inside the 77 block"
+        );
+        assert!(
+            at_last > open_77 + block_77.len(),
+            "the last guard must come after the 77 block closes"
+        );
+
+        let body = text
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + text[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_77), depth_at(at_last)),
+            (top_level, top_level),
+            "the 77 and last guards must both sit at the top level of run_migrations"
+        );
+    }
+
+    /// The block builds the collection and both indexes from the spec
+    /// init.rs uses; a failed createIndexes panics, so the revision is never
+    /// advanced without the unique credential_id index.
+    #[test]
+    fn the_passkeys_block_builds_the_shared_spec() {
+        let block = last_block();
+        let needles = [
+            ".create_collection(super::init::PASSKEYS_COLLECTION)",
+            "\"createIndexes\": super::init::PASSKEYS_COLLECTION",
+            "\"indexes\": super::init::passkeys_indexes()",
+            ".expect(\"Failed to create passkeys indexes.\")",
+        ];
+        let mut from = 0;
+        for needle in needles {
+            let at = block[from..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("the passkeys block must contain, in order: {needle}"));
+            from += at + needle.len();
+        }
+    }
+
+    /// Fresh databases skip the migrations, so init.rs must build the same
+    /// passkeys schema from the same spec.
+    #[test]
+    fn init_builds_the_passkeys_schema_from_the_shared_spec() {
+        let init = shipping(INIT);
+        for needle in [
+            "db.create_collection(PASSKEYS_COLLECTION)",
+            "\"createIndexes\": PASSKEYS_COLLECTION",
+            "\"indexes\": passkeys_indexes()",
+            ".expect(\"Failed to create passkeys indexes.\")",
+        ] {
+            assert!(init.contains(needle), "init.rs must contain {needle}");
+        }
+    }
+
+    /// The block must not mark existing accounts as having no password. The
+    /// stored data cannot tell an account created through Google or Apple
+    /// from a password account that linked one later, and a wrongly marked
+    /// account would have its real password refused. So the block may not
+    /// name the flag or the collection at all, in code or in a comment, and
+    /// no helper elsewhere in the shipping source may name the flag either.
+    #[test]
+    fn the_passkeys_block_never_touches_accounts() {
+        let block = last_block().to_lowercase();
+        for needle in ["password_absent", "accounts"] {
+            assert!(
+                !block.contains(needle),
+                "the passkeys block must only create the passkeys indexes; found {needle}"
+            );
+        }
+
+        // A backfill moved into a helper the block calls would slip past the
+        // scan above; no migration code has a reason to name the flag.
+        assert!(
+            !shipping(SOURCE).to_lowercase().contains("password_absent"),
+            "no migration may write the flag onto existing documents"
+        );
     }
 }

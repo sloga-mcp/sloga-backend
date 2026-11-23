@@ -41,6 +41,7 @@ mod users;
 mod watch;
 mod accounts;
 mod mfa_tickets;
+mod passkeys;
 mod sessions;
 
 pub use bots::*;
@@ -86,4 +87,5 @@ pub use users::*;
 pub use watch::*;
 pub use accounts::*;
 pub use mfa_tickets::*;
+pub use passkeys::*;
 pub use sessions::*;

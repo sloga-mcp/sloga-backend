@@ -16,7 +16,7 @@ use crate::{
     SoftResReserveRow, SoftResSheet, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
-    MFATicket
+    MFATicket, Passkey
 };
 use crate::{
     CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
@@ -81,6 +81,7 @@ database_derived!(
         pub account_invites: Arc<Mutex<HashMap<String, AccountInvite>>>,
         pub sessions: Arc<Mutex<HashMap<String, Session>>>,
         pub tickets: Arc<Mutex<HashMap<String, MFATicket>>>,
+        pub passkeys: Arc<Mutex<HashMap<String, Passkey>>>,
         pub e2ee_identities: Arc<Mutex<HashMap<String, E2EEIdentity>>>,
         pub e2ee_one_time_keys: Arc<Mutex<HashMap<String, E2EEOneTimeKey>>>,
         pub e2ee_queue: Arc<Mutex<HashMap<String, E2EEEnvelope>>>,

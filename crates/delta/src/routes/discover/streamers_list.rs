@@ -595,6 +595,7 @@ mod test {
                 verification: EmailVerification::Verified,
                 google_id: None,
                 apple_id: None,
+                password_absent: false,
             })
             .await
             .expect("save account");
@@ -1204,6 +1205,7 @@ mod test {
             verification: EmailVerification::Verified,
             google_id: None,
             apple_id: None,
+            password_absent: false,
         };
 
         assert!(matches!(

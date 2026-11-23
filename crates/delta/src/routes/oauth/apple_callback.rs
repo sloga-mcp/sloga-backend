@@ -213,13 +213,17 @@ async fn callback_inner(
             allowed_methods: account.mfa.get_methods().into_iter().map(Into::into).collect(),
         }
     } else {
-        v0::ResponseLogin::Success(
-            account
-                .create_session(db, "Apple OAuth".to_string())
-                .await
-                .map_err(|_| "internal")?
-                .into(),
-        )
+        let session = account
+            .create_session(db, "Apple OAuth".to_string())
+            .await
+            .map_err(|_| "internal")?;
+
+        // Written here, by the server, so the first-passkey rule can tell a
+        // session Apple just signed in from any other session of a linked
+        // account. Best effort: a failure costs the shortcut, not the login.
+        crate::util::passkey::mark_oauth_session(&session.id).await;
+
+        v0::ResponseLogin::Success(session.into())
     };
 
     // Hand the login response to the client via a one-time code so the

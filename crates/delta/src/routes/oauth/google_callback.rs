@@ -180,13 +180,17 @@ async fn callback_inner(
             allowed_methods: account.mfa.get_methods().into_iter().map(Into::into).collect(),
         }
     } else {
-        v0::ResponseLogin::Success(
-            account
-                .create_session(db, "Google OAuth".to_string())
-                .await
-                .map_err(|_| "internal")?
-                .into(),
-        )
+        let session = account
+            .create_session(db, "Google OAuth".to_string())
+            .await
+            .map_err(|_| "internal")?;
+
+        // Written here, by the server, so the first-passkey rule can tell a
+        // session Google just signed in from any other session of a linked
+        // account. Best effort: a failure costs the shortcut, not the login.
+        crate::util::passkey::mark_oauth_session(&session.id).await;
+
+        v0::ResponseLogin::Success(session.into())
     };
 
     // Hand the login response to the client via a one-time code so the
@@ -228,4 +232,113 @@ async fn fetch_by_google_id(
     db.fetch_account_by_google_id(google_id)
         .await
         .map_err(|_| "internal")
+}
+
+#[cfg(test)]
+mod tests {
+    //! The callbacks cannot be driven here: they exchange a code with Google
+    //! or Apple. So the marker is pinned on the source of every file in this
+    //! directory instead.
+    use std::path::Path;
+
+    use crate::util::test::{without_comments, without_whitespace};
+
+    const CREATE: &str = ".create_session(";
+    const BOUND: &str = "letsession=account";
+    const MARK: &str = "crate::util::passkey::mark_oauth_session(&session.id).await;";
+
+    /// The code that ships in `source`: everything above its test module,
+    /// without comments or whitespace
+    fn shipping(source: &str) -> String {
+        let shipping = source.find("#[cfg(test)]").map_or(source, |end| &source[..end]);
+        without_whitespace(&without_comments(shipping))
+    }
+
+    /// How many sessions `code` creates, and how many of them are bound to
+    /// `session` and marked in the very next statement
+    fn created_and_marked(code: &str) -> (usize, usize) {
+        let mut created = 0;
+        let mut marked = 0;
+
+        for (at, _) in code.match_indices(CREATE) {
+            created += 1;
+
+            let after = &code[at..];
+            let next_statement = after.find(';').map_or("", |end| &after[end + 1..]);
+            if code[..at].ends_with(BOUND) && next_statement.starts_with(MARK) {
+                marked += 1;
+            }
+        }
+
+        (created, marked)
+    }
+
+    /// Fails if: a callback creates a session and does not call
+    /// `mark_oauth_session` on it straight away, or a new `create_session`
+    /// appears anywhere under `routes/oauth/` without the marker.
+    #[test]
+    fn every_oauth_session_is_marked() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/routes/oauth"));
+        let mut per_file = Vec::new();
+
+        for entry in std::fs::read_dir(dir).expect("routes/oauth") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {}", path.display(), error));
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("a file name")
+                .to_string();
+            let (created, marked) = created_and_marked(&shipping(&source));
+
+            assert_eq!(
+                created, marked,
+                "{name}: a session is created without the OAuth marker"
+            );
+            if created > 0 {
+                per_file.push((name, created));
+            }
+        }
+
+        // The control: the scan saw the two callbacks, one session each
+        per_file.sort();
+        assert_eq!(
+            per_file,
+            vec![
+                ("apple_callback.rs".to_string(), 1),
+                ("google_callback.rs".to_string(), 1),
+            ]
+        );
+    }
+
+    /// The scan itself: it counts a marked session, and tells apart one
+    /// that is not marked, marked late, or marked only in a comment
+    #[test]
+    fn the_scan_tells_marked_from_unmarked() {
+        let good = shipping(
+            "let session = account\n    .create_session(db, name)\n    .await?;\n\n\
+             // why\ncrate::util::passkey::mark_oauth_session(&session.id).await;\n\
+             #[cfg(test)]\nmod tests { a.create_session(db, name); }",
+        );
+        assert_eq!(created_and_marked(&good), (1, 1));
+
+        for bad in [
+            "let session = account.create_session(db, name).await?;\nOk(session)",
+            "let session = account.create_session(db, name).await?;\n\
+             // crate::util::passkey::mark_oauth_session(&session.id).await;\nOk(session)",
+            "let session = account.create_session(db, name).await?;\nsave(&session).await?;\n\
+             crate::util::passkey::mark_oauth_session(&session.id).await;",
+            "let session = account.create_session(db, name).await?;\n\
+             let _ = crate::util::passkey::mark_oauth_session(&other.id);",
+            "respond(account.create_session(db, name).await?.into());\n\
+             crate::util::passkey::mark_oauth_session(&session.id).await;",
+        ] {
+            assert_eq!(created_and_marked(&shipping(bad)), (1, 0), "{bad}");
+        }
+    }
 }

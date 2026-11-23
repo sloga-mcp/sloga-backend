@@ -2341,6 +2341,18 @@ impl From<crate::MFAMethod> for MFAMethod {
             crate::MFAMethod::Password => MFAMethod::Password,
             crate::MFAMethod::Recovery => MFAMethod::Recovery,
             crate::MFAMethod::Totp => MFAMethod::Totp,
+            crate::MFAMethod::Passkey => MFAMethod::Passkey,
+        }
+    }
+}
+
+impl From<MFAMethod> for crate::MFAMethod {
+    fn from(value: MFAMethod) -> Self {
+        match value {
+            MFAMethod::Password => crate::MFAMethod::Password,
+            MFAMethod::Recovery => crate::MFAMethod::Recovery,
+            MFAMethod::Totp => crate::MFAMethod::Totp,
+            MFAMethod::Passkey => crate::MFAMethod::Passkey,
         }
     }
 }

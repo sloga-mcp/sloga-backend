@@ -1,20 +1,4 @@
 auto_derived!(
-    /// # Change Email Data
-    pub struct DataChangeEmail {
-        /// Valid email address
-        pub email: String,
-        /// Current password
-        pub current_password: String,
-    }
-
-    /// # Change Data
-    pub struct DataChangePassword {
-        /// New password
-        pub password: String,
-        /// Current password
-        pub current_password: String,
-    }
-
     /// # Account Deletion Token
     pub struct DataAccountDeletion {
         /// Deletion token

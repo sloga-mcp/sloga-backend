@@ -40,6 +40,9 @@ jsonwebtoken = { workspace = true }
 # constant-time secret comparison
 subtle = { workspace = true }
 
+# passkeys (WebAuthn verifier, `util/passkey.rs`)
+webauthn-rs = { workspace = true }
+
 # serde
 serde_json = { workspace = true }
 serde = { workspace = true }
@@ -106,6 +109,9 @@ revolt-database = { workspace = true, features = ["test-teardown"] }
 # `MockStripe` for `TestHarness::stripe`, so route tests script Stripe
 # instead of reaching the network. Test builds only.
 revolt-payments = { workspace = true, features = ["test-mock"] }
+# ES256 signing for the software passkey authenticator the verifier tests
+# use (`util/passkey_soft.rs`). Test builds only.
+p256 = { workspace = true }
 
 [build-dependencies]
 vergen = { workspace = true }

@@ -320,6 +320,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                     ("audit_log", Some(id))
                 }
                 ("servers", Some(id), _) => ("servers", Some(id)),
+                // Passkey ceremonies and passkey management (/auth/passkey/*)
+                // get one counter of their own, so a burst of them neither
+                // spends nor is starved by the login and MFA budget in
+                // "auth". Sign-in (login/start, login/finish) carries no
+                // session and is keyed by address, as password login is.
+                // Every method, DELETE included: removing a passkey must not
+                // ride the generous auth_delete counter. This arm must sit
+                // ABOVE the ("auth", _, _) arm, which would otherwise swallow
+                // it.
+                ("auth", Some("passkey"), _) => ("passkey", None),
                 ("auth", _, _) => {
                     if request.method() == Method::Delete {
                         ("auth_delete", None)
@@ -477,6 +487,11 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             "servers" => 5,
             "auth" => 15,
             "auth_delete" => 255,
+            // Passkeys: sized like "auth". A ceremony is two requests (start,
+            // finish), and the settings page adds a list read or two, so 15
+            // is ample for a person. Named here so it never falls to the
+            // default below.
+            "passkey" => 15,
             "default_avatar" => 255,
             "swagger" => 100,
             "safety" => 15,
@@ -1695,5 +1710,131 @@ mod tests {
             Status::Ok
         );
         assert_eq!(client.get("/sync/settings").dispatch().status(), Status::Ok);
+    }
+
+    #[rocket::post("/passkey/login/start")]
+    fn passkey_login_start() {}
+
+    #[rocket::post("/passkey/login/finish")]
+    fn passkey_login_finish() {}
+
+    #[rocket::delete("/passkey/<_id>")]
+    fn passkey_remove(_id: &str) {}
+
+    #[rocket::post("/session/login")]
+    fn session_login() {}
+
+    /// The passkey routes next to password login, on the same database-free
+    /// Rocket as `client()`
+    fn passkey_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount(
+                "/auth",
+                rocket::routes![
+                    passkey_login_start,
+                    passkey_login_finish,
+                    passkey_remove,
+                    session_login
+                ],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Fails if: the passkey arm is dropped or moved below the auth arm (the
+    /// rows read "auth" / "auth_delete"), the limit is left to the default
+    /// (20), or a passkey route gets a counter of its own (the burst below
+    /// would not run out).
+    #[test]
+    fn passkey_routes_have_their_own_bucket() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = passkey_client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/auth/passkey/register/start", "passkey"),
+            ("POST", "/auth/passkey/register/finish", "passkey"),
+            ("POST", "/auth/passkey/login/start", "passkey"),
+            ("POST", "/auth/passkey/login/finish", "passkey"),
+            ("POST", "/auth/passkey/assert/start", "passkey"),
+            ("GET", "/auth/passkey", "passkey"),
+            ("PATCH", "/auth/passkey/01ABC", "passkey"),
+            // Not the generous sign-out counter
+            ("DELETE", "/auth/passkey/01ABC", "passkey"),
+            ("POST", "/0.8/auth/passkey/login/start", "passkey"),
+            ("POST", "/0.8/auth/passkey/login/finish", "passkey"),
+            ("DELETE", "/0.8/auth/passkey/01ABC", "passkey"),
+            // A route that may come later still lands here
+            ("POST", "/auth/passkey/signup/start", "passkey"),
+            // The rest of /auth is as it was
+            ("POST", "/auth/session/login", "auth"),
+            ("PUT", "/auth/mfa/ticket", "auth"),
+            ("POST", "/auth/account/create", "auth"),
+            ("DELETE", "/auth/session/01ABC", "auth_delete"),
+            // A whole segment is matched, not a prefix
+            ("POST", "/auth/passkeys/login/start", "auth"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                "PUT" => client.put(path),
+                "PATCH" => client.patch(path),
+                "DELETE" => client.delete(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("passkey"), 15);
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket_limit("passkey"),
+            DeltaRatelimits.resolve_bucket_limit("auth"),
+            "sized like the auth bucket"
+        );
+
+        // Through the fairing, with no session: both sign-in steps and the
+        // removal spend one counter, keyed by the caller's address, and
+        // password login keeps its own
+        let start = client.post("/auth/passkey/login/start").dispatch();
+        assert_eq!(start.status(), Status::Ok);
+        assert_eq!(limit(&start), 15);
+        let finish = client.post("/auth/passkey/login/finish").dispatch();
+        assert_eq!(finish.status(), Status::Ok);
+        assert_eq!(bucket(&finish), bucket(&start));
+        assert_eq!(
+            finish.headers().get_one("X-RateLimit-Remaining"),
+            Some("13"),
+            "the second step spent the first step's counter"
+        );
+        let login = client.post("/auth/session/login").dispatch();
+        assert_eq!(login.status(), Status::Ok);
+        assert_ne!(bucket(&login), bucket(&start));
+
+        // Two spent; thirteen more fit the window, then every passkey route
+        // is refused before it runs
+        for _ in 0..13 {
+            assert_eq!(
+                client.post("/auth/passkey/login/finish").dispatch().status(),
+                Status::Ok
+            );
+        }
+        for refused in [
+            client.post("/auth/passkey/login/finish"),
+            client.post("/auth/passkey/login/start"),
+            client.delete("/auth/passkey/01ABC"),
+        ] {
+            assert_eq!(refused.dispatch().status(), Status::TooManyRequests);
+        }
+
+        // Password login is untouched
+        assert_eq!(
+            client.post("/auth/session/login").dispatch().status(),
+            Status::Ok
+        );
     }
 }

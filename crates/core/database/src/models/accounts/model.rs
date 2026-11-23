@@ -62,6 +62,14 @@ auto_derived_partial!(
         /// Apple user id (id_token `sub`), if linked to Sign in with Apple
         #[serde(skip_serializing_if = "Option::is_none", default)]
         pub apple_id: Option<String>,
+
+        /// Whether the account has no usable password: it was created with a
+        /// random one (OAuth) and none has been set since
+        ///
+        /// Always serialised: `save_account` writes a `$set`, which can only
+        /// turn this off again if `false` is part of the document
+        #[serde(default)]
+        pub password_absent: bool,
     },
     "PartialAccount"
 );
@@ -148,6 +156,8 @@ auto_derived!(
         Password,
         Recovery,
         Totp,
+        // Never returned by `get_methods`, so the login MFA step never offers it
+        Passkey,
     }
 
     #[derive(Default)]
@@ -162,6 +172,27 @@ auto_derived!(
         Enabled { secret: String },
     }
 );
+
+/// What an MFA response is being checked for
+///
+/// Every caller of [`Account::consume_mfa_response`] names one of these, and
+/// the allowed methods follow from it. There is no default: a new caller has
+/// to choose.
+#[derive(Clone, Copy)]
+pub enum MfaPurpose<'a> {
+    /// The second step of a login, authorising this login ticket
+    /// (`routes/session/login.rs`). Allowed methods are
+    /// `account.mfa.get_methods()`, which never offers a passkey. One
+    /// attempt is counted against the ticket, the code stored on it at
+    /// creation is accepted, and a success claims it (single use).
+    LoginStep(&'a MFATicket),
+    /// Minting a validated ticket from a signed-in session, to confirm a
+    /// sensitive action (`PUT /auth/mfa/ticket`,
+    /// `routes/mfa/create_ticket.rs`). Allowed methods are
+    /// [`Account::ticket_methods`]. No ticket exists yet, so none is
+    /// counted or claimed.
+    MintTicket,
+}
 
 impl MultiFactorAuthentication {
     // Check whether MFA is in-use
@@ -331,6 +362,7 @@ impl Account {
                 mfa: Default::default(),
                 google_id: None,
                 apple_id: None,
+                password_absent: false,
             };
 
             // Send email verification, then insert the account; the
@@ -404,6 +436,8 @@ impl Account {
             mfa: Default::default(),
             google_id,
             apple_id,
+            // The hash above is of a random string nobody knows
+            password_absent: true,
         };
 
         account.save(db).await?;
@@ -739,11 +773,84 @@ impl Account {
             .map_err(|_| create_error!(InvalidCredentials))?
     }
 
+    /// The factors that may mint a ticket for this account, that is, confirm
+    /// a sensitive action from a signed-in session
+    ///
+    /// Not the login second step: that keeps `self.mfa.get_methods()`, which
+    /// never offers a passkey (old apps would render a blank row for it).
+    ///
+    /// | account                          | result                          |
+    /// |----------------------------------|---------------------------------|
+    /// | password                         | `[Password]`                    |
+    /// | password + passkey               | `[Password, Passkey]`           |
+    /// | TOTP (+ recovery codes)          | `[Totp, Recovery?]`             |
+    /// | TOTP (+ recovery codes) + passkey| `[Totp, Recovery?, Passkey]`    |
+    /// | no password, no passkey          | `[]`                            |
+    /// | no password + passkey            | `[Passkey]`                     |
+    ///
+    /// A passkey may stand in for the authenticator code. `Passkey` is always
+    /// last. The result MAY BE EMPTY (an account created through OAuth that
+    /// has no passkey): such an account cannot mint a ticket at all.
+    ///
+    /// While passkeys are not usable (`PasskeyFeatures::usable`: switched
+    /// off, or switched on with an invalid relying party or origin list) a
+    /// stored passkey counts for nothing: each "+ passkey" row reads as the
+    /// row without one. The passkey routes refuse on the same predicate.
+    pub async fn ticket_methods(&self, db: &Database) -> Result<Vec<MFAMethod>> {
+        let passkeys_available = config().await.features.passkeys.usable();
+
+        self.ticket_methods_with(db, passkeys_available).await
+    }
+
+    /// [`Account::ticket_methods`] for a given state of the passkey switch.
+    ///
+    /// With the switch off nothing verifies a passkey, so listing one would
+    /// offer a method that can never mint a ticket.
+    async fn ticket_methods_with(
+        &self,
+        db: &Database,
+        passkeys_available: bool,
+    ) -> Result<Vec<MFAMethod>> {
+        let mut methods = self.mfa.get_methods();
+
+        if self.password_absent {
+            methods.retain(|method| method != &MFAMethod::Password);
+        }
+
+        if passkeys_available && db.count_passkeys(&self.id).await? > 0 {
+            methods.push(MFAMethod::Passkey);
+        }
+
+        Ok(methods)
+    }
+
+    /// The methods `verify_mfa_attempt` accepts for this call
+    ///
+    /// The caller states the purpose; nothing is inferred from what else it
+    /// passes. See [`MfaPurpose`].
+    async fn allowed_mfa_methods(
+        &self,
+        db: &Database,
+        purpose: MfaPurpose<'_>,
+    ) -> Result<Vec<MFAMethod>> {
+        match purpose {
+            // Login second step: unchanged, and never a passkey
+            MfaPurpose::LoginStep(_) => Ok(self.mfa.get_methods()),
+            MfaPurpose::MintTicket => self.ticket_methods(db).await,
+        }
+    }
+
     /// Validate an MFA response
     ///
-    /// One ticket attempt (if a ticket is given) and one account lockout
+    /// `purpose` says what the response is for, and with it which methods
+    /// are allowed: `self.mfa.get_methods()` for the login second step,
+    /// `ticket_methods` for minting a ticket (see [`MfaPurpose`]).
+    ///
+    /// One ticket attempt (for the login step) and one account lockout
     /// attempt are counted atomically BEFORE the response is verified, so
-    /// concurrent guesses never share a stale counter. A failure deletes a
+    /// concurrent guesses never share a stale counter. A response that is
+    /// refused outright (see `verify_mfa_attempt`) counts the ticket attempt
+    /// but no lockout attempt. A failure deletes a
     /// ticket that has used its last attempt. A success claims the ticket
     /// (single use), consumes the recovery code if one was used and clears
     /// the lockout. The account document is never saved whole here.
@@ -751,26 +858,30 @@ impl Account {
         &mut self,
         db: &Database,
         response: v0::MFAResponse,
-        ticket: Option<&MFATicket>,
+        purpose: MfaPurpose<'_>,
     ) -> Result<()> {
         // Count one attempt against the ticket, and check that the driver
-        // returned this ticket and that it belongs to this account
-        let ticket = if let Some(ticket) = ticket {
-            let reserved = db.reserve_ticket_attempt(&ticket.id).await?;
-            if reserved.id != ticket.id || reserved.account_id != self.id {
-                return Err(create_error!(InvalidToken));
-            }
+        // returned this ticket and that it belongs to this account. From
+        // here on the login step works on the ticket as the driver returned
+        // it
+        let reserved;
+        let purpose = match purpose {
+            MfaPurpose::LoginStep(ticket) => {
+                reserved = db.reserve_ticket_attempt(&ticket.id).await?;
+                if reserved.id != ticket.id || reserved.account_id != self.id {
+                    return Err(create_error!(InvalidToken));
+                }
 
-            Some(reserved)
-        } else {
-            None
+                MfaPurpose::LoginStep(&reserved)
+            }
+            MfaPurpose::MintTicket => MfaPurpose::MintTicket,
         };
 
-        let recovery_code = match self.verify_mfa_attempt(db, response, ticket.as_ref()).await {
+        let recovery_code = match self.verify_mfa_attempt(db, response, purpose).await {
             Ok(recovery_code) => recovery_code,
             Err(error) => {
                 // Burn a ticket that has no attempts left
-                if let Some(ticket) = &ticket {
+                if let MfaPurpose::LoginStep(ticket) = purpose {
                     if ticket.attempts >= MFA_TICKET_MAX_ATTEMPTS {
                         let _ = db.delete_ticket(&ticket.id).await;
                     }
@@ -781,7 +892,7 @@ impl Account {
         };
 
         // Single use: a request that loses the race for the ticket fails here
-        if let Some(ticket) = &ticket {
+        if let MfaPurpose::LoginStep(ticket) = purpose {
             ticket.claim(db).await?;
         }
 
@@ -801,15 +912,40 @@ impl Account {
     ///
     /// Returns the recovery code to consume if the response used one. Writes
     /// nothing besides the lockout attempt; the caller handles the rest.
+    ///
+    /// Two responses are refused before the lockout attempt is counted, so
+    /// they write nothing at all: a password on an account that has none
+    /// (there is nothing to guess, and counting it would let anyone lock the
+    /// owner out), and a passkey, which is never verified here.
     async fn verify_mfa_attempt(
         &self,
         db: &Database,
         response: v0::MFAResponse,
-        ticket: Option<&MFATicket>,
+        purpose: MfaPurpose<'_>,
     ) -> Result<Option<String>> {
-        db.reserve_lockout_attempt(&self.id).await?;
+        match &response {
+            v0::MFAResponse::Password { .. } if self.password_absent => {
+                return Err(create_error!(DisallowedMFAMethod));
+            }
+            // Refused for both purposes, for good. A passkey that mints a
+            // ticket is verified in delta (`routes/mfa/create_ticket.rs`),
+            // which takes that response itself and never passes it here.
+            // What does arrive here is a passkey offered to the login second
+            // step, and that step must never accept one (plan rule R8). No
+            // lockout attempt is counted for it.
+            v0::MFAResponse::Passkey { .. } => {
+                return Err(create_error!(DisallowedMFAMethod));
+            }
+            v0::MFAResponse::Password { .. }
+            | v0::MFAResponse::Totp { .. }
+            | v0::MFAResponse::Recovery { .. } => {}
+        }
 
-        let allowed_methods = self.mfa.get_methods();
+        // Read before the attempt is counted: if the passkey count cannot be
+        // read, the request fails without costing the account an attempt
+        let allowed_methods = self.allowed_mfa_methods(db, purpose).await?;
+
+        db.reserve_lockout_attempt(&self.id).await?;
 
         match response {
             v0::MFAResponse::Password { password } => {
@@ -828,8 +964,8 @@ impl Account {
                 }
 
                 // Use TOTP code at generation if applicable
-                if let Some(code) = ticket.and_then(|ticket| ticket.last_totp_code.as_ref()) {
-                    if code == &totp_code {
+                if let MfaPurpose::LoginStep(ticket) = purpose {
+                    if ticket.last_totp_code.as_ref() == Some(&totp_code) {
                         return Ok(None);
                     }
                 }
@@ -853,6 +989,8 @@ impl Account {
                     Err(create_error!(DisallowedMFAMethod))
                 }
             }
+            // Refused above, before the lockout attempt was counted
+            v0::MFAResponse::Passkey { .. } => Err(create_error!(DisallowedMFAMethod)),
         }
     }
 
@@ -923,6 +1061,13 @@ impl Account {
         self.google_id = None;
         self.apple_id = None;
 
+        // A deleted account keeps no credential. `User::delete` removes the
+        // passkeys too; this covers an account that reaches here another
+        // way. Before `Deleted` is stored, for the same reason as above.
+        // `password_absent` is left as it is: the password hash is not
+        // touched here either, and the flag only describes that hash.
+        db.delete_passkeys_for_user(&self.id).await?;
+
         // `save_account` never writes `deletion`
         db.set_account_deletion(&self.id, Some(DeletionInfo::Deleted))
             .await?;
@@ -935,9 +1080,13 @@ impl Account {
 #[cfg(test)]
 mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_models::v0;
     use revolt_result::ErrorType;
 
-    use crate::{Account, DeletionInfo, E2EEIdentity, E2EESignedKey, EmailVerification};
+    use crate::{
+        util::password::hash_password, Account, DeletionInfo, E2EEIdentity, E2EESignedKey,
+        EmailVerification, MFAMethod, MFATicket, MfaPurpose, Passkey, Totp,
+    };
 
     /// An identity row for the session bookkeeping below; the keys are never
     /// verified on this path
@@ -983,6 +1132,7 @@ mod tests {
                 mfa: Default::default(),
                 google_id: None,
                 apple_id: None,
+                password_absent: false,
             };
 
             let kept = identity(&account.id, "a", "S_current");
@@ -1035,6 +1185,7 @@ mod tests {
             mfa: Default::default(),
             google_id: None,
             apple_id: None,
+            password_absent: false,
         }
     }
 
@@ -1412,6 +1563,554 @@ mod tests {
                 due.iter().any(|due| due.id == id),
                 "the purge must still find the account"
             );
+        });
+    }
+
+    fn password_response(password: &str) -> v0::MFAResponse {
+        v0::MFAResponse::Password {
+            password: password.to_string(),
+        }
+    }
+
+    fn passkey_response() -> v0::MFAResponse {
+        v0::MFAResponse::Passkey {
+            passkey_response: v0::PasskeyTicketResponse {
+                challenge_id: "01CHALLENGE".to_string(),
+                credential: serde_json::json!({ "id": "abc", "type": "public-key" }),
+            },
+        }
+    }
+
+    async fn lockout_attempts(db: &crate::Database, id: &str) -> Option<i32> {
+        db.fetch_account(id)
+            .await
+            .unwrap()
+            .lockout
+            .map(|lockout| lockout.attempts)
+    }
+
+    /// The control for the two tests below: a wrong password on an account
+    /// that has one IS counted, so the lockout read can see a write
+    #[tokio::test]
+    async fn a_wrong_password_response_counts_a_lockout_attempt() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMFAPASSWORDWRONG0";
+            let mut acct = account(id);
+            db.save_account(&acct).await.unwrap();
+            assert_eq!(lockout_attempts(&db, id).await, None);
+
+            let error = acct
+                .consume_mfa_response(&db, password_response("guess"), MfaPurpose::MintTicket)
+                .await
+                .expect_err("a wrong password must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidCredentials),
+                "expected InvalidCredentials, got {:?}",
+                error.error_type
+            );
+            assert_eq!(lockout_attempts(&db, id).await, Some(1));
+        });
+    }
+
+    /// R9: an account without a password refuses a password response
+    /// before anything is counted, however often it is tried
+    #[tokio::test]
+    async fn a_password_response_without_a_password_writes_no_lockout() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMFAPASSWORDABSENT";
+            let mut acct = account(id);
+            acct.password_absent = true;
+            db.save_account(&acct).await.unwrap();
+
+            for _ in 0..5 {
+                let error = acct
+                    .consume_mfa_response(&db, password_response("guess"), MfaPurpose::MintTicket)
+                    .await
+                    .expect_err("an account without a password must refuse one");
+                assert!(
+                    matches!(error.error_type, ErrorType::DisallowedMFAMethod),
+                    "expected DisallowedMFAMethod, got {:?}",
+                    error.error_type
+                );
+            }
+
+            assert_eq!(lockout_attempts(&db, id).await, None);
+        });
+    }
+
+    /// A passkey response is always refused here, like any method the
+    /// account does not have, and counts nothing. The passkey ticket factor
+    /// is verified in delta's `mfa/create_ticket.rs`, never by this function
+    #[tokio::test]
+    async fn a_passkey_response_is_refused_and_writes_no_lockout() {
+        database_test!(|db| async move {
+            for (id, password_absent) in [
+                ("01ACCOUNTMFAPASSKEYPASSWD0", false),
+                ("01ACCOUNTMFAPASSKEYABSENT0", true),
+            ] {
+                let mut acct = account(id);
+                acct.password_absent = password_absent;
+                db.save_account(&acct).await.unwrap();
+
+                let error = acct
+                    .consume_mfa_response(&db, passkey_response(), MfaPurpose::MintTicket)
+                    .await
+                    .expect_err("a passkey response is never verified here");
+                assert!(
+                    matches!(error.error_type, ErrorType::DisallowedMFAMethod),
+                    "{id}: expected DisallowedMFAMethod, got {:?}",
+                    error.error_type
+                );
+                assert_eq!(lockout_attempts(&db, id).await, None, "{id}");
+            }
+        });
+    }
+
+    /// The login MFA step keeps offering what it offered before (R8)
+    #[test]
+    fn get_methods_never_offers_a_passkey() {
+        let mut acct = account("01ACCOUNTMFAGETMETHODS0000");
+        acct.password_absent = true;
+        assert_eq!(acct.mfa.get_methods(), vec![crate::MFAMethod::Password]);
+
+        acct.mfa.totp_token = crate::Totp::Enabled {
+            secret: "secret".to_string(),
+        };
+        acct.mfa.recovery_codes = vec!["abcde-fghjk".to_string()];
+        assert_eq!(
+            acct.mfa.get_methods(),
+            vec![crate::MFAMethod::Totp, crate::MFAMethod::Recovery]
+        );
+    }
+
+    /// Only the OAuth constructors store a password nobody knows
+    #[tokio::test]
+    async fn only_oauth_accounts_start_without_a_password() {
+        database_test!(|db| async move {
+            let google = Account::new_from_google(
+                &db,
+                "pk-google@example.test".to_string(),
+                "google-sub-password-absent".to_string(),
+            )
+            .await
+            .unwrap();
+            let apple = Account::new_from_apple(
+                &db,
+                "pk-apple@example.test".to_string(),
+                "apple-sub-password-absent".to_string(),
+            )
+            .await
+            .unwrap();
+            let plain = Account::new(
+                &db,
+                "pk-plain@example.test".to_string(),
+                "password_insecure".to_string(),
+                false,
+            )
+            .await
+            .unwrap();
+
+            for (acct, expected) in [(&google, true), (&apple, true), (&plain, false)] {
+                assert_eq!(acct.password_absent, expected, "{}: in memory", acct.email);
+                assert_eq!(
+                    db.fetch_account(&acct.id).await.unwrap().password_absent,
+                    expected,
+                    "{}: stored",
+                    acct.email
+                );
+            }
+        });
+    }
+
+    /// An account document written before the field existed has a password
+    #[test]
+    fn a_stored_account_without_the_field_has_a_password() {
+        let acct: Account = serde_json::from_value(serde_json::json!({
+            "_id": "01ACCOUNTOLDDOCUMENT000000",
+            "email": "old@example.test",
+            "email_normalised": "old@example.test",
+            "password": "hash",
+            "verification": { "status": "Verified" },
+            "mfa": {}
+        }))
+        .expect("an account document that predates the field");
+        assert!(!acct.password_absent);
+
+        // Written out as `false`, so a `$set` can turn the flag off again
+        assert_eq!(
+            serde_json::to_value(&acct).unwrap()["password_absent"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    /// Store passkey `n` of `user_id`; the credential is never verified here
+    async fn add_passkey(db: &crate::Database, user_id: &str, n: u32) {
+        db.insert_passkey(&Passkey::new(
+            user_id.to_string(),
+            format!("credential-{user_id}-{n}"),
+            format!("handle-{user_id}"),
+            "{}".to_string(),
+            format!("Passkey {n}"),
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn with_totp(mut acct: Account, recovery: bool) -> Account {
+        acct.mfa.totp_token = Totp::Enabled {
+            secret: "secret".to_string(),
+        };
+        if recovery {
+            acct.mfa.recovery_codes = vec!["abcde-fghjk".to_string()];
+        }
+        acct
+    }
+
+    fn without_password(mut acct: Account) -> Account {
+        acct.password_absent = true;
+        acct
+    }
+
+    /// The table in the `ticket_methods` doc comment, row by row, for both
+    /// states of the passkey switch. The switch is passed in: this crate's
+    /// tests cannot overwrite the config.
+    ///
+    /// Fails if: `ticket_methods_with` lists a passkey without
+    /// `passkeys_available` (the second assertion of every "+ passkey" row).
+    #[tokio::test]
+    async fn ticket_methods_follow_the_table() {
+        use MFAMethod::{Passkey as PasskeyMethod, Password, Recovery, Totp as TotpMethod};
+
+        database_test!(|db| async move {
+            // Somebody else's passkey, present throughout: it must never
+            // show up in another account's list
+            add_passkey(&db, "01ACCOUNTTICKETOTHER000000", 1).await;
+
+            let cases: Vec<(Account, u32, Vec<MFAMethod>)> = vec![
+                (account("01ACCOUNTTICKETPLAIN00000"), 0, vec![Password]),
+                (
+                    account("01ACCOUNTTICKETPLAINPK000"),
+                    1,
+                    vec![Password, PasskeyMethod],
+                ),
+                // Two passkeys are still one method
+                (
+                    account("01ACCOUNTTICKETPLAINPK2X0"),
+                    2,
+                    vec![Password, PasskeyMethod],
+                ),
+                (
+                    with_totp(account("01ACCOUNTTICKETTOTP000000"), false),
+                    0,
+                    vec![TotpMethod],
+                ),
+                (
+                    with_totp(account("01ACCOUNTTICKETTOTPREC000"), true),
+                    0,
+                    vec![TotpMethod, Recovery],
+                ),
+                (
+                    with_totp(account("01ACCOUNTTICKETTOTPPK0000"), false),
+                    1,
+                    vec![TotpMethod, PasskeyMethod],
+                ),
+                (
+                    with_totp(account("01ACCOUNTTICKETTOTPRECPK0"), true),
+                    1,
+                    vec![TotpMethod, Recovery, PasskeyMethod],
+                ),
+                (
+                    without_password(account("01ACCOUNTTICKETABSENT0000")),
+                    0,
+                    vec![],
+                ),
+                (
+                    without_password(account("01ACCOUNTTICKETABSENTPK00")),
+                    1,
+                    vec![PasskeyMethod],
+                ),
+                // TOTP does not depend on the password
+                (
+                    without_password(with_totp(account("01ACCOUNTTICKETABSENTTOTP"), true)),
+                    1,
+                    vec![TotpMethod, Recovery, PasskeyMethod],
+                ),
+            ];
+
+            for (acct, passkeys, expected) in cases {
+                for n in 0..passkeys {
+                    add_passkey(&db, &acct.id, n).await;
+                }
+
+                assert_eq!(
+                    acct.ticket_methods_with(&db, true).await.unwrap(),
+                    expected,
+                    "{}: passkeys on",
+                    acct.id
+                );
+
+                // Switched off, a stored passkey is not a method, and
+                // nothing else changes
+                let without_passkey: Vec<MFAMethod> = expected
+                    .iter()
+                    .filter(|method| **method != PasskeyMethod)
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    acct.ticket_methods_with(&db, false).await.unwrap(),
+                    without_passkey,
+                    "{}: passkeys off",
+                    acct.id
+                );
+            }
+        });
+    }
+
+    /// `ticket_methods` takes the switch from `PasskeyFeatures::usable`.
+    ///
+    /// Fails if: `ticket_methods` passes a constant instead of the config
+    /// value. (Seen only while the two states differ from that constant:
+    /// the test config ships with passkeys off, so a hard-coded `true` fails
+    /// here.)
+    #[tokio::test]
+    async fn ticket_methods_read_the_passkey_switch() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTTICKETSWITCH0000");
+            add_passkey(&db, &acct.id, 1).await;
+
+            // The control: for this account the two states differ
+            assert_eq!(
+                acct.ticket_methods_with(&db, true).await.unwrap(),
+                vec![MFAMethod::Password, MFAMethod::Passkey]
+            );
+            assert_eq!(
+                acct.ticket_methods_with(&db, false).await.unwrap(),
+                vec![MFAMethod::Password]
+            );
+
+            let available = revolt_config::config().await.features.passkeys.usable();
+            assert_eq!(
+                acct.ticket_methods(&db).await.unwrap(),
+                acct.ticket_methods_with(&db, available).await.unwrap(),
+                "passkeys available: {available}"
+            );
+            assert_eq!(
+                acct.allowed_mfa_methods(&db, MfaPurpose::MintTicket)
+                    .await
+                    .unwrap(),
+                acct.ticket_methods_with(&db, available).await.unwrap(),
+                "minting a ticket follows the switch too"
+            );
+        });
+    }
+
+    /// R8: the login second step's allowed methods are `get_methods()`
+    /// whatever passkeys exist. The same account minting a ticket is offered
+    /// the passkey, which is the control that the passkey is really stored.
+    #[tokio::test]
+    async fn the_login_step_allows_what_get_methods_offers() {
+        database_test!(|db| async move {
+            let totp = with_totp(account("01ACCOUNTLOGINSTEPTOTPPK0"), true);
+            let absent = without_password(account("01ACCOUNTLOGINSTEPABSENTPK"));
+
+            for acct in [&totp, &absent] {
+                add_passkey(&db, &acct.id, 1).await;
+                let ticket = MFATicket::new(acct.id.clone(), false);
+
+                assert_eq!(
+                    acct.allowed_mfa_methods(&db, MfaPurpose::LoginStep(&ticket))
+                        .await
+                        .unwrap(),
+                    acct.mfa.get_methods(),
+                    "{}: the login step",
+                    acct.id
+                );
+                assert_eq!(
+                    acct.allowed_mfa_methods(&db, MfaPurpose::MintTicket)
+                        .await
+                        .unwrap(),
+                    acct.ticket_methods(&db).await.unwrap(),
+                    "{}: minting a ticket",
+                    acct.id
+                );
+            }
+
+            // The control, with the switch passed in: minting a ticket now
+            // follows `features.passkeys.available`, which is off in this
+            // crate's test config
+            assert_eq!(
+                totp.ticket_methods_with(&db, true).await.unwrap(),
+                vec![MFAMethod::Totp, MFAMethod::Recovery, MFAMethod::Passkey]
+            );
+            assert_eq!(
+                absent.ticket_methods_with(&db, true).await.unwrap(),
+                vec![MFAMethod::Passkey]
+            );
+        });
+    }
+
+    /// The login second step of a TOTP account that also has a passkey
+    /// still passes on the authenticator code, and claims its ticket
+    #[tokio::test]
+    async fn the_login_step_still_verifies_totp_with_a_passkey_stored() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTLOGINSTEPTOTPOK00";
+            let mut acct = with_totp(account(id), true);
+            db.save_account(&acct).await.unwrap();
+            add_passkey(&db, id, 1).await;
+
+            // As the login route builds it. The code sent is the one stored
+            // on the ticket, so a 30-second boundary cannot fail the test
+            let mut ticket = MFATicket::new(id.to_string(), false);
+            ticket.populate(&acct.mfa).await;
+            ticket.save(&db).await.unwrap();
+            let totp_code = ticket.last_totp_code.clone().expect("a TOTP code");
+
+            // A passkey is not a login second step, and costs the account
+            // nothing
+            let error = acct
+                .consume_mfa_response(&db, passkey_response(), MfaPurpose::LoginStep(&ticket))
+                .await
+                .expect_err("the login step takes no passkey");
+            assert!(
+                matches!(error.error_type, ErrorType::DisallowedMFAMethod),
+                "expected DisallowedMFAMethod, got {:?}",
+                error.error_type
+            );
+            assert_eq!(lockout_attempts(&db, id).await, None);
+
+            acct.consume_mfa_response(
+                &db,
+                v0::MFAResponse::Totp { totp_code },
+                MfaPurpose::LoginStep(&ticket),
+            )
+            .await
+            .expect("the authenticator code must pass");
+
+            assert!(
+                db.fetch_ticket_by_token(&ticket.token).await.is_err(),
+                "the login ticket is single use"
+            );
+            assert_eq!(lockout_attempts(&db, id).await, None);
+            assert_eq!(
+                db.count_passkeys(id).await.unwrap(),
+                1,
+                "the control: the passkey was stored all along"
+            );
+        });
+    }
+
+    /// Adding a passkey takes nothing away: the password still mints a
+    /// ticket on an account without TOTP
+    #[tokio::test]
+    async fn a_password_still_mints_a_ticket_with_a_passkey_stored() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMINTPASSWORDPK000";
+            let mut acct = account(id);
+            acct.password = hash_password("password_insecure".to_string()).unwrap();
+            db.save_account(&acct).await.unwrap();
+            add_passkey(&db, id, 1).await;
+            assert_eq!(
+                acct.ticket_methods_with(&db, true).await.unwrap(),
+                vec![MFAMethod::Password, MFAMethod::Passkey]
+            );
+
+            // The control: the password is really checked
+            let error = acct
+                .consume_mfa_response(&db, password_response("guess"), MfaPurpose::MintTicket)
+                .await
+                .expect_err("a wrong password must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidCredentials),
+                "expected InvalidCredentials, got {:?}",
+                error.error_type
+            );
+            assert_eq!(lockout_attempts(&db, id).await, Some(1));
+
+            acct.consume_mfa_response(
+                &db,
+                password_response("password_insecure"),
+                MfaPurpose::MintTicket,
+            )
+            .await
+            .expect("the password must still be allowed");
+            assert_eq!(lockout_attempts(&db, id).await, None);
+        });
+    }
+
+    /// A passkey does not bring the password back on a TOTP account
+    #[tokio::test]
+    async fn a_password_mints_no_ticket_on_a_totp_account_with_a_passkey() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMINTTOTPPASSWORD0";
+            let mut acct = with_totp(account(id), false);
+            acct.password = hash_password("password_insecure".to_string()).unwrap();
+            db.save_account(&acct).await.unwrap();
+            add_passkey(&db, id, 1).await;
+
+            let error = acct
+                .consume_mfa_response(
+                    &db,
+                    password_response("password_insecure"),
+                    MfaPurpose::MintTicket,
+                )
+                .await
+                .expect_err("TOTP is on, so the password is not a ticket method");
+            assert!(
+                matches!(error.error_type, ErrorType::DisallowedMFAMethod),
+                "expected DisallowedMFAMethod, got {:?}",
+                error.error_type
+            );
+        });
+    }
+
+    /// A deleted account keeps no credential, and nobody else loses theirs
+    #[tokio::test]
+    async fn mark_deleted_removes_the_accounts_passkeys() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMARKDELETEDPK0000";
+            let other = "01ACCOUNTMARKDELETEDPKOTHR";
+
+            let mut oauth = without_password(account(id));
+            oauth.google_id = Some("google-sub-mark-deleted-pk".to_string());
+            db.save_account(&oauth).await.unwrap();
+            db.set_account_deletion(id, Some(DeletionInfo::Scheduled { after: long_ago() }))
+                .await
+                .unwrap();
+
+            add_passkey(&db, id, 1).await;
+            add_passkey(&db, id, 2).await;
+            add_passkey(&db, other, 1).await;
+            assert_eq!(
+                db.count_passkeys(id).await.unwrap(),
+                2,
+                "the control: the passkeys are stored"
+            );
+
+            let mut acct = db.fetch_account(id).await.unwrap();
+            acct.mark_deleted(&db).await.unwrap();
+
+            assert_eq!(db.count_passkeys(id).await.unwrap(), 0);
+            assert!(db.fetch_passkeys(id).await.unwrap().is_empty());
+            assert!(
+                db.fetch_passkey_by_credential_id(&format!("credential-{id}-1"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a passkey login must not resolve to the deleted account"
+            );
+            assert_eq!(
+                db.count_passkeys(other).await.unwrap(),
+                1,
+                "another account's passkey was removed"
+            );
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert_eq!(stored.deletion, Some(DeletionInfo::Deleted));
+            // The password hash is left alone, and so is the flag about it
+            assert_eq!(stored.password, "hash-original");
+            assert!(stored.password_absent);
+            assert!(acct.ticket_methods(&db).await.unwrap().is_empty());
         });
     }
 }

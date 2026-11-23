@@ -625,6 +625,25 @@ claim_lock = true
 only_available = false
 only_enforced = true
 
+[features.passkeys]
+# Passkeys. Everything ships OFF, and a config without a key keeps that part
+# off. Prod sets these in Revolt.overrides.toml under an explicit
+# [features.passkeys] header, or with REVOLT__FEATURES__PASSKEYS__AVAILABLE
+# (and __SIGNUP, __SIGNUP_WITHOUT_EMAIL, __BACKUP_UNLOCK, __RP_ID, __ORIGINS,
+# __SIGNUP_WITHOUT_EMAIL_PER_HOUR), then RESTARTS delta.
+available = false                 # passkey sign-in, add/remove, ticket factor
+signup = false                    # passkey sign-up
+signup_without_email = false      # sign-up with no email (needs the hourly cap below > 0)
+backup_unlock = false             # passkey-unlocked E2EE backup (step 3)
+# WebAuthn relying party ID for sign-in passkeys. Final once the first passkey
+# exists: changing it orphans every stored credential.
+rp_id = "app.sloga.gg"
+# Full list of accepted WebAuthn origins, incl. android:apk-key-hash:...
+# entries; an origin not listed is refused. Setting the key replaces the whole
+# list. The environment form is one comma-separated string.
+origins = ["https://app.sloga.gg"]
+signup_without_email_per_hour = 0    # site-wide cap; 0 = none allowed (fails closed)
+
 [features.takedown]
 # Take It Down Act requests. Ships OFF; prod sets it in Revolt.overrides.toml under an explicit
 # [features.takedown] header, then restarts delta AND crond. It stays off until data_key is 64 hex

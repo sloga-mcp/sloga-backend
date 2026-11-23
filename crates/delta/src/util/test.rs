@@ -380,6 +380,7 @@ impl TestHarness {
             verification: EmailVerification::Verified,
             google_id: None,
             apple_id: None,
+            password_absent: false,
         };
 
         self.db.save_account(&account).await.expect("`Account`");

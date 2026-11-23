@@ -46,6 +46,7 @@ mod accounts;
 mod account_invites;
 mod sessions;
 mod mfa_tickets;
+mod passkeys;
 mod payment_events;
 mod payment_orders;
 mod cipher_numbers;
@@ -103,6 +104,7 @@ pub use accounts::*;
 pub use account_invites::*;
 pub use sessions::*;
 pub use mfa_tickets::*;
+pub use passkeys::*;
 pub use payment_events::*;
 pub use payment_orders::*;
 pub use cipher_numbers::*;
@@ -165,6 +167,7 @@ pub trait AbstractDatabase:
     + account_invites::AbstractAccountInvites
     + sessions::AbstractSessions
     + mfa_tickets::AbstractMFATickets
+    + passkeys::AbstractPasskeys
     + payment_events::AbstractPaymentEvents
     + payment_orders::AbstractPaymentOrders
     + cipher_numbers::AbstractCipherNumbers
