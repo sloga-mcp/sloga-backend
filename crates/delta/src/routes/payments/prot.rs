@@ -11,7 +11,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use validator::Validate;
 
-use super::checkout::RequestCountry;
+use super::checkout::{require_confirmed_email, RequestCountry};
 
 /// Refuse a checkout from a country Prot is not sold to
 /// (`prot_blocked_countries`). An unknown country passes: fulfilment voids
@@ -40,7 +40,8 @@ fn prot_choice(data: &v0::DataProtCheckout) -> Result<ProtChoice> {
 /// pay-exact amount and return the hosted page to send the user to. The
 /// server prices the order from its own config; the body only names the
 /// pack or the amount. Bots cannot buy. Refused with `ProtRegionUnavailable`
-/// from a country Prot is not sold to.
+/// from a country Prot is not sold to, and with `InvalidOperation` for an
+/// account that has no confirmed email.
 #[openapi(tag = "Payments")]
 #[post("/prot/checkout", data = "<data>")]
 pub async fn prot_checkout(
@@ -66,6 +67,10 @@ pub async fn prot_checkout(
     let settings = PaymentsSettings::load().await?;
     let ps = ProtSalesSettings::load().await?;
     refuse_blocked_prot_region(&ps, country.0.as_deref())?;
+
+    // Before the engine, as for a Cipher checkout: nothing is stored or
+    // sent to Stripe for an account with no confirmed email
+    require_confirmed_email(db, &user.id).await?;
     let choice = prot_choice(&data)?;
 
     // The engine owns every other gate: payments and Prot enabled, the sale
@@ -109,7 +114,8 @@ pub async fn prot_me(db: &State<Database>, user: User) -> Result<Json<v0::ProtMe
 
 #[cfg(test)]
 mod tests {
-    use revolt_database::{now_ms, Bot, Database, OrderState, PaymentOrder};
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{now_ms, Bot, Database, EmailVerification, OrderState, PaymentOrder};
     use revolt_models::v0;
     use revolt_payments::catalog::ProtChoice;
     use revolt_payments::engine;
@@ -250,6 +256,71 @@ mod tests {
 
         assert_eq!(harness.stripe.call_count(CREATE_SESSION), 0);
         assert_eq!(orders_of(&harness.db, &bot.id).await, 0);
+    }
+
+    /// Fails if: the Prot checkout of an account with no email, or of one
+    /// whose address still waits for its first verification, reaches the
+    /// engine (an order stored, a Stripe call made) instead of being refused
+    /// with `InvalidOperation`, for a pack or a pay-exact amount; or an
+    /// account that has a confirmed email is refused.
+    #[test]
+    fn prot_checkout_refuses_an_account_with_no_confirmed_email() {
+        crate::util::test::rt()
+            .block_on(prot_checkout_refuses_an_account_with_no_confirmed_email_case())
+    }
+
+    async fn prot_checkout_refuses_an_account_with_no_confirmed_email_case() {
+        let harness = TestHarness::new().await;
+        let ps = open_prot_settings().await;
+
+        // No email at all, as a passkey sign-up without one leaves it
+        let (account, session, user) = harness.new_no_email_user().await;
+        assert_eq!(account.real_email(), None, "the control: no email");
+
+        // An address that was never confirmed. At most two requests per
+        // session below: the checkout bucket ("payments") allows 3 requests
+        // per 10 s per session
+        let (mut unconfirmed, unconfirmed_session, unconfirmed_user) = harness.new_user().await;
+        unconfirmed.verification = EmailVerification::Pending {
+            token: "token".to_string(),
+            expiry: Timestamp::now_utc(),
+        };
+        harness.db.save_account(&unconfirmed).await.expect("saved");
+        assert!(!unconfirmed.has_confirmed_email(), "the control: unconfirmed");
+
+        for (token, body) in [
+            (&session.token, json!({ "pack": "p25", "return_to": "web" })),
+            (
+                &session.token,
+                json!({ "exact_cents": ps.exact_min_cents, "return_to": "web" }),
+            ),
+            (
+                &unconfirmed_session.token,
+                json!({ "pack": "p25", "return_to": "web" }),
+            ),
+        ] {
+            let response = prot_checkout_with(&harness, session_auth(token), body).await;
+            assert_refused(response, Status::BadRequest, "InvalidOperation").await;
+        }
+
+        assert_eq!(harness.stripe.call_count(CREATE_SESSION), 0);
+        assert_eq!(orders_of(&harness.db, &user.id).await, 0);
+        assert_eq!(orders_of(&harness.db, &unconfirmed_user.id).await, 0);
+
+        // The control: the same request from an account with a confirmed
+        // email
+        let (_, session, user) = harness.new_user().await;
+        url_of(
+            prot_checkout_with(
+                &harness,
+                session_auth(&session.token),
+                json!({ "pack": "p25", "return_to": "web" }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(harness.stripe.call_count(CREATE_SESSION), 1);
+        assert_eq!(orders_of(&harness.db, &user.id).await, 1);
     }
 
     /// A pack is priced from the server's config: price and Prot fields the

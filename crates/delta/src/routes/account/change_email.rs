@@ -630,4 +630,49 @@ mod tests {
             assert_eq!(attempts(&after), None, "no attempt may be counted");
         })
     }
+
+    /// Fails if: an account can move to a new address under `.invalid` (at
+    /// the stand-in domain or anywhere else): with SMTP off, as here, the
+    /// move would be applied at once.
+    #[test]
+    fn a_move_to_an_invalid_address_is_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = harness_without_smtp().await;
+            let (account, session, _) = harness.new_user().await;
+
+            for email in ["new@sloga.invalid", "new@noemail.invalid", "new@Other.INVALID"] {
+                let (status, error) = send(
+                    &harness,
+                    &session,
+                    None,
+                    json!({ "email": email, "current_password": "password_insecure" }),
+                )
+                .await;
+                assert_eq!(status, Status::BadRequest, "{email}");
+                assert!(
+                    matches!(error, Some(ErrorType::IncorrectData { .. })),
+                    "{email}: {error:?}"
+                );
+            }
+
+            let after = stored(&harness, &account).await;
+            assert_eq!(after.email, account.email);
+            assert!(
+                matches!(after.verification, EmailVerification::Verified),
+                "no move is pending"
+            );
+
+            // The control: the same request with an ordinary address moves
+            let moved = format!("{}@valid.com", TestHarness::rand_string());
+            let (status, _) = send(
+                &harness,
+                &session,
+                None,
+                json!({ "email": moved, "current_password": "password_insecure" }),
+            )
+            .await;
+            assert_eq!(status, Status::NoContent, "the control");
+            assert_eq!(stored(&harness, &account).await.email, moved);
+        })
+    }
 }

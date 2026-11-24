@@ -51,7 +51,7 @@ pub async fn email_add_start(
 
     let v0::DataEmailAddStart { email } = data.into_inner();
 
-    // Format, the `.invalid` stand-in domain and the disposable list. Says
+    // Format, no address under `.invalid`, and the disposable list. Says
     // nothing about any account.
     validate_email(&email)?;
 
@@ -510,11 +510,14 @@ mod tests {
             assert_eq!(again, (Status::NoContent, Value::Null));
             assert_eq!(mail_count(&address).await, 0, "no second mail");
 
-            // An address nobody may type
-            let (status, body) =
-                start_with_ticket(&harness, &account, &session, "someone@noemail.invalid").await;
-            assert_eq!(status, Status::BadRequest, "{}", body);
-            assert_eq!(kind(&body), "IncorrectData");
+            // Addresses nobody may type: the stand-in domain, and any other
+            // new address under `.invalid`
+            for refused in ["someone@noemail.invalid", "new@sloga.invalid"] {
+                let (status, body) =
+                    start_with_ticket(&harness, &account, &session, refused).await;
+                assert_eq!(status, Status::BadRequest, "{refused}: {}", body);
+                assert_eq!(kind(&body), "IncorrectData", "{refused}");
+            }
 
             // The first code still works
             let (status, body) = send(finish(&harness, &code), &session, None).await;

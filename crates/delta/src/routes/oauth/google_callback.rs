@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use nanoid::nanoid;
 use redis_kiss::{get_connection, redis, AsyncCommands};
 use revolt_config::config;
-use revolt_database::util::email::is_placeholder_email;
+use revolt_database::util::email::is_invalid_tld_address;
 use revolt_database::{Account, Database, EmailVerification, MFATicket};
 use revolt_models::v0;
 use rocket::response::Redirect;
@@ -238,15 +238,16 @@ async fn fetch_by_google_id(
 ///
 /// Shared by the Google and Apple callbacks. An account that has no email is
 /// never the answer: the lookup goes through `Account::fetch_by_email`, which
-/// cannot match one, and what it returns is checked again here. A `.invalid`
-/// address is where such accounts keep their stand-in, so a sign-in that
-/// claims one is refused outright (`email_unverified`) and neither links nor
-/// creates anything.
+/// cannot match one, and what it returns is checked again here. `.invalid`
+/// is where such accounts keep their stand-in, and no provider can have
+/// verified an address there, so a sign-in that claims any `.invalid` address
+/// is refused outright (`email_unverified`) and neither links nor creates
+/// anything.
 pub(super) async fn account_for_verified_email(
     db: &Database,
     email: &str,
 ) -> std::result::Result<Option<Account>, &'static str> {
-    if is_placeholder_email(email) {
+    if is_invalid_tld_address(email) {
         return Err("email_unverified");
     }
 
@@ -396,6 +397,7 @@ mod tests {
                 // learned about which ones exist
                 format!("{}@noemail.invalid", TestHarness::rand_string()),
                 format!("{}@elsewhere.invalid", TestHarness::rand_string()),
+                format!("{}@sloga.invalid", TestHarness::rand_string()),
             ] {
                 let answer = super::account_for_verified_email(&harness.db, &claimed).await;
                 assert!(

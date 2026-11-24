@@ -132,6 +132,19 @@ impl AbstractAccounts for ReferenceDb {
             }
         }
 
+        // The MongoDB driver's two unique email indexes: a save that would
+        // give this account an address another account holds, in either
+        // field, fails with the error that driver's write gives, and stores
+        // nothing.
+        let taken = accounts.values().any(|other| {
+            other.id != account.id
+                && (same_address(&other.email, &account.email)
+                    || same_address(&other.email_normalised, &account.email_normalised))
+        });
+        if taken {
+            return Err(create_database_error!("find_one", "accounts"));
+        }
+
         accounts.insert(account.id.to_string(), account);
         Ok(())
     }

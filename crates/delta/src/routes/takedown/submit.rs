@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use revolt_database::{util::captcha::check_captcha, Database, SealedRequester, TakedownSource};
+use revolt_database::{
+    util::{captcha::check_captcha, email::is_invalid_tld_address},
+    Database, SealedRequester, TakedownSource,
+};
 use revolt_models::v0;
 use revolt_result::Result;
 use rocket::{serde::json::Json, State};
@@ -34,6 +37,13 @@ pub async fn submit_request(
     data.email = data.email.trim().to_string();
     data.validate().map_err(|_| invalid_takedown_body())?;
     if data.description.trim().is_empty() || data.signature.trim().is_empty() {
+        return Err(invalid_takedown_body());
+    }
+
+    // The contact address is where the answers go. Nothing can be mailed to
+    // a `.invalid` address, and the stand-in of an account with no email
+    // lives there, so one is refused like any other bad address.
+    if is_invalid_tld_address(&data.email) {
         return Err(invalid_takedown_body());
     }
 
@@ -375,6 +385,10 @@ mod test {
         })
     }
 
+    /// Fails if: a body that must be refused is stored or answered with
+    /// anything but the one fixed error, the answer repeats something that
+    /// was sent, or a `.invalid` contact address (the stand-in domain, or
+    /// any other) is accepted.
     #[test]
     fn invalid_bodies_get_one_fixed_error_that_echoes_nothing() {
         crate::util::test::rt().block_on(async {
@@ -396,7 +410,26 @@ mod test {
             let mut too_many = body("SECRET-ADDRESS@example.com", vec![]);
             too_many["locations"] = json!(vec!["SECRET-LINK"; 21]);
 
-            let cases = [unticked, bad_email, blank_signature, bad_role, too_many];
+            let stand_in = body("SECRET-ADDRESS@noemail.invalid", vec![]);
+            let invalid_tld = body("SECRET-ADDRESS@Sloga.INVALID", vec![]);
+            let padded_invalid_tld = body("  SECRET-ADDRESS@sloga.invalid ", vec![]);
+
+            // The rate limiter runs in the harness: this route is in the
+            // "takedown" bucket, 10 requests per 10 s for one address, and
+            // every request of this test comes from the same one. The 8
+            // cases below and the body that is not JSON make 9. An 11th
+            // request would be answered 429 and fail the status check, so
+            // a test that needs more cases gets a second harness.
+            let cases = [
+                unticked,
+                bad_email,
+                blank_signature,
+                bad_role,
+                too_many,
+                stand_in,
+                invalid_tld,
+                padded_invalid_tld,
+            ];
             let mut answers = vec![];
             for case in &cases {
                 let (status, answer) = submit(&harness, case).await;

@@ -7,7 +7,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 use rocket_empty::EmptyResponse;
 use revolt_result::Result;
-use revolt_database::{Account, Database, util::{email::validate_email, captcha::check_captcha}};
+use revolt_database::{Account, Database, util::{email::validate_lookup_email, captcha::check_captcha}};
 use revolt_models::v0;
 
 /// # Send Password Reset
@@ -27,8 +27,10 @@ pub async fn send_password_reset(
     // Check Captcha token
     check_captcha(data.captcha.as_deref()).await?;
 
-    // Make sure email is valid and not blocked
-    validate_email(&data.email)?;
+    // Make sure email is valid and not blocked. The address is only used
+    // to find an account, so of `.invalid` just the stand-in domain is
+    // refused: an account that stores another `.invalid` address is found.
+    validate_lookup_email(&data.email)?;
 
     // From this point on, do not report failure to the
     // remote client, as this will open us up to user enumeration.
@@ -260,11 +262,11 @@ mod tests {
     }
 
     /// Fails if: typing the stand-in address of an account with no email
-    /// (as stored, or in another case) answers differently from a `.invalid`
+    /// (as stored, or in another case) answers differently from a stand-in
     /// address nobody holds, stores a reset token on that account, or mails
-    /// it. `validate_email` refuses every `.invalid` address before the
-    /// lookup, so the answer compared here is that refusal; the lookup is
-    /// pinned by `the_lookup_goes_through_the_wrapper`.
+    /// it. `validate_lookup_email` refuses every `noemail.invalid` address
+    /// before the lookup, so the answer compared here is that refusal; the
+    /// lookup is pinned by `the_lookup_goes_through_the_wrapper`.
     #[test]
     fn typed_placeholder_gets_the_unknown_address_answer() {
         crate::util::test::rt().block_on(async {
@@ -318,5 +320,82 @@ mod tests {
         assert!(code.contains("Account::fetch_by_email(db,&data.email)"));
         assert!(!code.contains("fetch_account_by_normalised_email"));
         assert!(!code.contains("normalise_email"));
+    }
+
+    /// Fails if: an account that stores a `.invalid` address outside the
+    /// stand-in domain (one exists in production) is refused at the reset
+    /// form, gets no reset token or no mail, cannot set a new password with
+    /// the token, cannot sign in with it, or cannot change it afterwards.
+    #[test]
+    fn an_ordinary_invalid_address_resets_and_changes_its_password() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            // Seeded as an ordinary account, then given the old address
+            let local = TestHarness::rand_string();
+            let email = format!("{local}@sloga.invalid");
+            let mut account = Account::new(
+                &harness.db,
+                format!("{local}@smtp.test"),
+                "first password".into(),
+                false,
+            )
+            .await
+            .unwrap();
+            account.email = email.clone();
+            account.email_normalised = email.clone();
+            account.save(&harness.db).await.unwrap();
+
+            assert_eq!(
+                request_reset(&harness, &email).await,
+                (Status::NoContent, String::new())
+            );
+
+            let stored = harness.db.fetch_account(&account.id).await.unwrap();
+            assert!(stored.password_reset.is_some(), "a reset token is stored");
+
+            let (_, code) = harness.assert_email(&email).await;
+            let res = harness
+                .client
+                .patch("/auth/account/reset_password")
+                .header(ContentType::JSON)
+                .body(json!({ "token": code, "password": "valid password" }).to_string())
+                .dispatch()
+                .await;
+            assert_eq!(res.status(), Status::NoContent);
+
+            let res = harness
+                .client
+                .post("/auth/session/login")
+                .header(ContentType::JSON)
+                .body(json!({ "email": email, "password": "valid password" }).to_string())
+                .dispatch()
+                .await;
+            assert_eq!(res.status(), Status::Ok);
+            let session: v0::Session =
+                serde_json::from_str(&res.into_string().await.unwrap()).expect("a session");
+
+            let res = harness
+                .client
+                .patch("/auth/account/change/password")
+                .header(ContentType::JSON)
+                .header(rocket::http::Header::new("X-Session-Token", session.token))
+                .body(
+                    json!({
+                        "password": "new password",
+                        "current_password": "valid password"
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(res.status(), Status::NoContent);
+
+            let stored = harness.db.fetch_account(&account.id).await.unwrap();
+            stored
+                .verify_password("new password")
+                .expect("the changed password is stored");
+            assert_eq!(stored.email, email);
+        })
     }
 }

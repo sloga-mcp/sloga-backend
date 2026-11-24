@@ -7645,6 +7645,7 @@ dependencies = [
  "futures",
  "handlebars",
  "hmac 0.12.1",
+ "idna 1.1.0",
  "indexmap 2.14.0",
  "isahc",
  "iso8601-timestamp",

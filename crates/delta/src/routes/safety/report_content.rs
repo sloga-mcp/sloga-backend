@@ -1,6 +1,6 @@
 use revolt_database::{
     events::client::EventV1,
-    util::{email::is_placeholder_email, permissions::DatabasePermissionQuery},
+    util::{email::is_invalid_tld_address, permissions::DatabasePermissionQuery},
     Channel, Database, Message, Report, SealedRequester, Snapshot, SnapshotContent,
     TakedownSource, TakedownTarget, UnresolvableKind, User,
 };
@@ -475,7 +475,7 @@ async fn prepare_in_app_request(
     } = takedown;
 
     let email = match email.filter(|email| !email.trim().is_empty()) {
-        Some(email) if is_placeholder_email(&email) => return Err(invalid_takedown_body()),
+        Some(email) if is_invalid_tld_address(&email) => return Err(invalid_takedown_body()),
         Some(email) => email,
         None => match db.fetch_account(&user.id).await?.real_email() {
             Some(email) => email.to_string(),

@@ -9,8 +9,8 @@ use crate::{
     events::client::EventV1,
     util::{
         email::{
-            email_templates, generate_placeholder_email, is_placeholder_email, normalise_email,
-            send_email,
+            email_templates, generate_placeholder_email, is_invalid_tld_address,
+            is_no_email_address, normalise_email, send_email,
         },
         password::hash_password,
     },
@@ -335,14 +335,17 @@ impl Account {
     /// The account's email address, if it has one
     ///
     /// `None` when the account has no email (`email_absent`), when it was
-    /// deleted, or when the stored address is a stand-in. Together with
+    /// deleted, or when the stored address is a stand-in at
+    /// `noemail.invalid`. Any other stored address is the account's own,
+    /// another `.invalid` one included: accounts older than the stand-in
+    /// hold such addresses and sign in with them. Together with
     /// `EmailVerification::Verified` this is the only test for "has a
     /// confirmed email". Nothing may be mailed to, shown from or looked up by
     /// the `email` field directly.
     pub fn real_email(&self) -> Option<&str> {
         if self.email_absent
             || matches!(self.deletion, Some(DeletionInfo::Deleted))
-            || is_placeholder_email(&self.email)
+            || is_no_email_address(&self.email)
         {
             None
         } else {
@@ -383,15 +386,16 @@ impl Account {
     /// Find the account that holds this email address
     ///
     /// The one lookup by email: it normalises the address itself, and it
-    /// never matches an account that has no email. A `.invalid` address
-    /// finds nothing without a query.
+    /// never matches an account that has no email. An address at
+    /// `noemail.invalid` finds nothing without a query; any other address,
+    /// another `.invalid` one included, is looked up as usual.
     pub async fn fetch_by_email(db: &Database, email: &str) -> Result<Option<Account>> {
-        if is_placeholder_email(email) {
+        if is_no_email_address(email) {
             return Ok(None);
         }
 
         let normalised = normalise_email(email.to_string());
-        if is_placeholder_email(&normalised) {
+        if is_no_email_address(&normalised) {
             return Ok(None);
         }
 
@@ -411,7 +415,7 @@ impl Account {
     /// address is refused with `IncorrectData`.
     pub fn new_passkey_signup(confirmed_email: Option<String>) -> Result<Account> {
         let (email, email_absent) = match confirmed_email {
-            Some(email) if is_placeholder_email(&email) => {
+            Some(email) if is_invalid_tld_address(&email) => {
                 return Err(create_error!(IncorrectData {
                     with: "email".to_string()
                 }));
@@ -454,12 +458,12 @@ impl Account {
     /// if the account already has an email, was deleted, or another account
     /// holds the address. A `.invalid` address is `Ok(false)` as well.
     pub async fn set_first_email(&mut self, db: &Database, email: String) -> Result<bool> {
-        if is_placeholder_email(&email) {
+        if is_invalid_tld_address(&email) {
             return Ok(false);
         }
 
         let email_normalised = normalise_email(email.clone());
-        if is_placeholder_email(&email_normalised) {
+        if is_invalid_tld_address(&email_normalised) {
             return Ok(false);
         }
 
@@ -483,8 +487,32 @@ impl Account {
         plaintext_password: String,
         verify_email: bool,
     ) -> Result<Account> {
-        // `.invalid` is where accounts with no email keep their stand-in
-        if is_placeholder_email(&email) {
+        Account::new_with_id(
+            db,
+            ulid::Ulid::new().to_string(),
+            email,
+            plaintext_password,
+            verify_email,
+        )
+        .await
+    }
+
+    /// Create a new account under an id the caller made beforehand
+    ///
+    /// As [`Account::new`]. For a caller that had to name the account
+    /// before it exists (password sign-up claims its invite under the id
+    /// first). When the address already has an account, that account is
+    /// returned and `id` is not used: compare the ids to tell.
+    pub async fn new_with_id(
+        db: &Database,
+        id: String,
+        email: String,
+        plaintext_password: String,
+        verify_email: bool,
+    ) -> Result<Account> {
+        // No new address under `.invalid`: the stand-in of an account with
+        // no email lives there
+        if is_invalid_tld_address(&email) {
             return Err(create_error!(IncorrectData {
                 with: "email".to_string()
             }));
@@ -509,7 +537,7 @@ impl Account {
 
             // Create a new account
             let mut account = Account {
-                id: ulid::Ulid::new().to_string(),
+                id,
 
                 email,
                 email_normalised,
@@ -574,12 +602,22 @@ impl Account {
     }
 
     /// Shared OAuth account construction
+    ///
+    /// A `.invalid` address is refused with `IncorrectData` and nothing is
+    /// stored, whatever the caller checked beforehand.
     async fn new_from_oauth(
         db: &Database,
         email: String,
         google_id: Option<String>,
         apple_id: Option<String>,
     ) -> Result<Account> {
+        // No new address under `.invalid`, as in `new_with_id`
+        if is_invalid_tld_address(&email) {
+            return Err(create_error!(IncorrectData {
+                with: "email".to_string()
+            }));
+        }
+
         let email_normalised = normalise_email(email.clone());
         let password = hash_password(nanoid!(64))?;
 
@@ -806,8 +844,8 @@ impl Account {
             return Err(create_error!(InvalidOperation));
         }
 
-        // Nobody moves to a stand-in address
-        if is_placeholder_email(&new_email) {
+        // Nobody moves to a `.invalid` address
+        if is_invalid_tld_address(&new_email) {
             return Err(create_error!(IncorrectData {
                 with: "email".to_string()
             }));
@@ -2328,7 +2366,7 @@ mod no_email_tests {
     use revolt_result::ErrorType;
     use serde_json::json;
 
-    use crate::{util::email::is_placeholder_email, Account, DeletionInfo, EmailVerification};
+    use crate::{util::email::is_no_email_address, Account, DeletionInfo, EmailVerification};
 
     fn account(id: &str, email: &str, email_normalised: &str) -> Account {
         Account {
@@ -2388,6 +2426,15 @@ mod no_email_tests {
         let mut unflagged = absent.clone();
         unflagged.email_absent = false;
         assert_eq!(unflagged.real_email(), None);
+
+        // Only the stand-in domain: another `.invalid` address stored on an
+        // account is that account's address
+        for stored in ["tester@sloga.invalid", "Someone@Other.INVALID"] {
+            let ordinary = account("01ACCOUNTREALEMAIL00000002", stored, &stored.to_lowercase());
+            assert_eq!(ordinary.real_email(), Some(stored));
+            assert!(ordinary.has_confirmed_email(), "{stored}");
+            assert!(ordinary.can_sign_in_without_passkey(), "{stored}");
+        }
 
         // Deleted: as `mark_deleted` leaves it, and with the address intact
         let mut deleted = normal.clone();
@@ -2603,7 +2650,7 @@ mod no_email_tests {
 
             // The stand-in fills both fields, unchanged by normalisation
             assert_eq!(account.email, account.email_normalised);
-            assert!(is_placeholder_email(&account.email));
+            assert!(is_no_email_address(&account.email));
             assert!(account.email.ends_with("@noemail.invalid"));
             assert_eq!(account.email.len(), 32 + "@noemail.invalid".len());
             assert!(!account.email.contains(&account.id.to_lowercase()));
@@ -2628,7 +2675,11 @@ mod no_email_tests {
         assert_eq!(with_email.email_normalised, "someone@example.test");
         assert_eq!(with_email.real_email(), Some("Some.One+tag@Example.test"));
 
-        for refused in ["someone@noemail.invalid", "someone@Other.INVALID"] {
+        for refused in [
+            "someone@noemail.invalid",
+            "someone@Other.INVALID",
+            "new@sloga.invalid",
+        ] {
             let error = Account::new_passkey_signup(Some(refused.to_string()))
                 .expect_err("a .invalid address must be refused");
             assert!(
@@ -2641,7 +2692,8 @@ mod no_email_tests {
 
     /// Fails if: the lookup finds an account by its stand-in address (typed
     /// in full, or reached through the flag being ignored), or stops finding
-    /// an ordinary account by any spelling of its address.
+    /// an ordinary account by any spelling of its address, an account that
+    /// stores a `.invalid` address outside the stand-in domain included.
     #[tokio::test]
     async fn fetch_by_email_never_matches_an_account_with_no_email() {
         database_test!(|db| async move {
@@ -2663,6 +2715,14 @@ mod no_email_tests {
                 "realperson@example.test",
             );
             db.save_account(&real).await.unwrap();
+
+            // Older than the stand-in: an ordinary account at `.invalid`
+            let legacy = account(
+                "01ACCOUNTLOOKUPLEGACY00000",
+                "Tester@sloga.invalid",
+                "tester@sloga.invalid",
+            );
+            db.save_account(&legacy).await.unwrap();
 
             // The control: the plain op does find both, so it is the wrapper
             // that refuses
@@ -2706,6 +2766,30 @@ mod no_email_tests {
                         .unwrap()
                         .map(|found| found.id),
                     Some(real.id.clone()),
+                    "{typed}"
+                );
+            }
+
+            for typed in [
+                "Tester@sloga.invalid",
+                "tester@sloga.invalid",
+                "t.ester+tag@SLOGA.invalid",
+            ] {
+                assert_eq!(
+                    Account::fetch_by_email(&db, typed)
+                        .await
+                        .unwrap()
+                        .map(|found| found.id),
+                    Some(legacy.id.clone()),
+                    "{typed}"
+                );
+            }
+
+            // A `.invalid` address nobody stores finds nothing
+            for typed in ["unknown@sloga.invalid", "tester@noemail.invalid"] {
+                assert_eq!(
+                    Account::fetch_by_email(&db, typed).await.unwrap(),
+                    None,
                     "{typed}"
                 );
             }
@@ -2777,6 +2861,76 @@ mod no_email_tests {
         });
     }
 
+    /// Fails if: an account made from a Google or Apple sign-in can be
+    /// stored with a `.invalid` address (the constructor leans on its
+    /// callers to have refused it), in any spelling; or an ordinary address
+    /// is refused.
+    #[tokio::test]
+    async fn an_oauth_account_is_never_made_with_an_invalid_address() {
+        database_test!(|db| async move {
+            for (n, refused) in [
+                "oauth@sloga.invalid",
+                "oauth@noemail.invalid",
+                "oauth@Other.INVALID",
+                "oauth@sloga.\u{FF49}\u{FF4E}\u{FF56}\u{FF41}\u{FF4C}\u{FF49}\u{FF44}",
+                "oauth@noemail\u{3002}invalid",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let google_id = format!("google-invalid-{n}");
+                let error = Account::new_from_google(&db, refused.to_string(), google_id.clone())
+                    .await
+                    .expect_err("a .invalid address must be refused");
+                assert!(
+                    matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                    "{refused}: {:?}",
+                    error.error_type
+                );
+                assert!(
+                    db.fetch_account_by_google_id(&google_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{refused}: no account may be stored"
+                );
+
+                let apple_id = format!("apple-invalid-{n}");
+                let error = Account::new_from_apple(&db, refused.to_string(), apple_id.clone())
+                    .await
+                    .expect_err("a .invalid address must be refused");
+                assert!(
+                    matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                    "{refused}: {:?}",
+                    error.error_type
+                );
+                assert!(
+                    db.fetch_account_by_apple_id(&apple_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{refused}: no account may be stored"
+                );
+            }
+
+            // The control: an ordinary address still makes the account
+            let made = Account::new_from_google(
+                &db,
+                "oauth-control@example.test".to_string(),
+                "google-invalid-control".to_string(),
+            )
+            .await
+            .expect("an ordinary address");
+            assert_eq!(
+                db.fetch_account_by_google_id("google-invalid-control")
+                    .await
+                    .unwrap()
+                    .map(|account| account.id),
+                Some(made.id)
+            );
+        });
+    }
+
     /// Fails if: `set_first_email` writes a `.invalid` address, leaves this
     /// copy stale after a write, or changes it after a refusal.
     #[tokio::test]
@@ -2828,7 +2982,7 @@ mod no_email_tests {
             let placeholder = acct.email.clone();
             let placeholder_normalised = acct.email_normalised.clone();
             assert!(
-                is_placeholder_email(&placeholder),
+                is_no_email_address(&placeholder),
                 "the control: a stand-in is stored"
             );
 

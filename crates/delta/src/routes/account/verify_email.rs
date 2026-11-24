@@ -2,7 +2,7 @@
 //! POST /verify/<code>
 use rocket::{serde::json::Json, State};
 use revolt_database::{
-    util::email::{is_placeholder_email, normalise_email},
+    util::email::{is_invalid_tld_address, normalise_email},
     Account, Database, EmailVerification, MFATicket,
 };
 use revolt_result::{create_error, Result};
@@ -37,14 +37,14 @@ pub async fn verify_email(
 
     // Update account email
     let response = if let EmailVerification::Moving { new_email, .. } = &account.verification {
-        // Nobody moves to a stand-in address
-        if is_placeholder_email(new_email) {
+        // Nobody moves to a `.invalid` address
+        if is_invalid_tld_address(new_email) {
             return Err(create_error!(InvalidToken));
         }
 
         // Another account may have taken the address since the link was
-        // mailed. Saving would then fail on the unique index with a server
-        // error (and the reference driver has no such index at all), so
+        // mailed. Saving would then fail with a server error (on the unique
+        // index, or the reference driver's same check in `save_account`), so
         // look first and answer as an unknown token does.
         if let Some(holder) = Account::fetch_by_email(db, new_email).await? {
             if holder.id != account.id {

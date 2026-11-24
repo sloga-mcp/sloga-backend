@@ -52,6 +52,11 @@ pub trait AbstractAccounts: Sync + Send {
     // `set_account_email_if_absent`, and a copy loaded before that write
     // must not put the stand-in back. So a save can clear `email_absent`
     // but never set it on a stored row.
+    //
+    // A save that would leave two accounts with one address, in `email` or
+    // in `email_normalised` and without regard to letter case, fails with a
+    // database error and stores nothing: the unique indexes on MongoDB, the
+    // same check in the reference driver.
     async fn save_account(&self, account: &Account) -> Result<()>;
 
     /// Overwrite the deletion state, and nothing else
@@ -1571,6 +1576,132 @@ mod tests {
                 .await
                 .unwrap());
             assert!(!db.fetch_account(&acct.id).await.unwrap().email_absent);
+        });
+    }
+
+    /// Fails if: a save stores a second account under an address another
+    /// account holds, in either field or in another letter case (the
+    /// reference driver without its check, or MongoDB without its unique
+    /// indexes); or the refused save changes the holder or an account that
+    /// tried to move onto the address.
+    #[tokio::test]
+    async fn save_refuses_an_address_another_account_holds() {
+        database_test!(|db| async move {
+            // On MongoDB the unique indexes are what refuse
+            db.migrate_database().await.expect("schema");
+
+            let holder = Account {
+                email: "Ta.ken@example.test".to_string(),
+                email_normalised: "taken@example.test".to_string(),
+                ..account("01ACCOUNTSAVEDUPHOLDER0000")
+            };
+            db.save_account(&holder).await.unwrap();
+
+            for (row, (email, email_normalised)) in [
+                // The same address in both fields
+                ("Ta.ken@example.test", "taken@example.test"),
+                // The same normalised address behind another spelling
+                ("taken+alias@example.test", "taken@example.test"),
+                ("T.aken@example.test", "TAKEN@EXAMPLE.TEST"),
+                // The same typed address, in the same and in another case
+                ("Ta.ken@example.test", "other@example.test"),
+                ("ta.KEN@example.test", "other@example.test"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = format!("01ACCOUNTSAVEDUPSECOND000{row}");
+                let second = Account {
+                    email: email.to_string(),
+                    email_normalised: email_normalised.to_string(),
+                    ..account(&id)
+                };
+
+                let error = db
+                    .save_account(&second)
+                    .await
+                    .expect_err("a second account under one address");
+                assert!(
+                    matches!(error.error_type, ErrorType::DatabaseError { .. }),
+                    "{email} / {email_normalised}: {:?}",
+                    error.error_type
+                );
+                assert!(
+                    db.fetch_account(&id).await.is_err(),
+                    "{email} / {email_normalised}: the refused account is stored"
+                );
+            }
+
+            // An account that exists cannot be moved onto the address either,
+            // and keeps what it had
+            let mover = account("01ACCOUNTSAVEDUPMOVER00000");
+            db.save_account(&mover).await.unwrap();
+            let mut moved = mover.clone();
+            moved.email = "TA.KEN@example.test".to_string();
+            moved.password = "hash-changed".to_string();
+            db.save_account(&moved)
+                .await
+                .expect_err("a move onto a held address");
+            assert_eq!(db.fetch_account(&mover.id).await.unwrap(), mover);
+
+            assert_eq!(db.fetch_account(&holder.id).await.unwrap(), holder);
+            assert_eq!(
+                db.fetch_account_by_normalised_email("taken@example.test")
+                    .await
+                    .unwrap()
+                    .map(|found| found.id),
+                Some(holder.id.clone())
+            );
+        });
+    }
+
+    /// Fails if: the duplicate check refuses an account its own address
+    /// when it is saved again, refuses two accounts with no email (each has
+    /// its own stand-in), or refuses a stale no-email copy whose address
+    /// fields are not written anyway.
+    #[tokio::test]
+    async fn save_accepts_a_resave_and_accounts_with_no_email() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+
+            let mut acct = Account {
+                email: "Re.Save@example.test".to_string(),
+                email_normalised: "resave@example.test".to_string(),
+                ..account("01ACCOUNTSAVEDUPRESAVE0000")
+            };
+            db.save_account(&acct).await.unwrap();
+
+            // Unchanged, then with another field changed, then with its own
+            // address in another letter case
+            db.save_account(&acct).await.unwrap();
+            acct.password = "hash-changed".to_string();
+            db.save_account(&acct).await.unwrap();
+            acct.email = "RE.SAVE@example.test".to_string();
+            db.save_account(&acct).await.unwrap();
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap(), acct);
+
+            let first = no_email_account("01ACCOUNTSAVEDUPNOEMAIL001");
+            let second = no_email_account("01ACCOUNTSAVEDUPNOEMAIL002");
+            assert_ne!(first.email, second.email, "the control: two stand-ins");
+            db.save_account(&first).await.unwrap();
+            db.save_account(&second).await.unwrap();
+            assert_eq!(db.fetch_account(&first.id).await.unwrap(), first);
+            assert_eq!(db.fetch_account(&second.id).await.unwrap(), second);
+
+            // A no-email copy that carries a held address in its fields: the
+            // fields of a stored row are not written, so nothing clashes
+            let mut stale = second.clone();
+            stale.email = acct.email.clone();
+            stale.email_normalised = acct.email_normalised.clone();
+            stale.disabled = true;
+            db.save_account(&stale).await.unwrap();
+            assert_eq!(
+                db.fetch_account(&second.id).await.unwrap(),
+                Account {
+                    disabled: true,
+                    ..second.clone()
+                }
+            );
         });
     }
 

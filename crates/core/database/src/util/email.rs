@@ -55,16 +55,55 @@ pub fn generate_placeholder_email() -> String {
     format!("{:032x}@{}", rand::random::<u128>(), NO_EMAIL_DOMAIN)
 }
 
-/// Whether this is a stand-in address, or any other address under the
-/// reserved `.invalid` top-level domain. No such address is ever accepted
-/// from a client, looked up, or mailed.
-pub fn is_placeholder_email(email: &str) -> bool {
-    let Some((_, domain)) = email.trim().rsplit_once('@') else {
-        return false;
-    };
+/// The characters IDNA reads as the dot between two labels of a domain
+const LABEL_DOTS: [char; 4] = ['.', '\u{3002}', '\u{FF0E}', '\u{FF61}'];
 
-    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-    domain == "invalid" || domain.ends_with(".invalid")
+/// A domain in its IDNA to-ASCII form, the form the format check
+/// (`validator::validate_email`) and a mail server read it in: fullwidth
+/// letters become the ASCII letters they stand for, an ideographic full
+/// stop becomes a dot, upper case becomes lower case.
+///
+/// A domain to-ASCII refuses as a whole is taken label by label, and a
+/// label it refuses stays as it was written: one bad label must not hide
+/// the labels next to it from the comparison.
+fn ascii_domain(domain: &str) -> String {
+    if let Ok(ascii) = idna::domain_to_ascii(domain) {
+        return ascii;
+    }
+
+    domain
+        .split(LABEL_DOTS)
+        .map(|label| idna::domain_to_ascii(label).unwrap_or_else(|_| label.to_string()))
+        .collect::<Vec<String>>()
+        .join(".")
+}
+
+/// The domain of an address in the form it is compared in: trimmed, IDNA
+/// to-ASCII (see `ascii_domain`), trailing dot dropped, lower-cased
+fn address_domain(email: &str) -> Option<String> {
+    let (_, domain) = email.trim().rsplit_once('@')?;
+    Some(
+        ascii_domain(domain)
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+    )
+}
+
+/// Whether this address is at `NO_EMAIL_DOMAIN`, the stand-in domain of an
+/// account that has no email. Such an address is never looked up or mailed.
+///
+/// Exact: another `.invalid` address stored on an account is an ordinary
+/// address. Use `is_invalid_tld_address` where a new address is taken in.
+pub fn is_no_email_address(email: &str) -> bool {
+    address_domain(email).is_some_and(|domain| domain == NO_EMAIL_DOMAIN)
+}
+
+/// Whether this address is anywhere under the reserved `.invalid` top-level
+/// domain, the stand-in domain included. No such address is ever accepted
+/// as a new address for an account.
+pub fn is_invalid_tld_address(email: &str) -> bool {
+    address_domain(email)
+        .is_some_and(|domain| domain == "invalid" || domain.ends_with(".invalid"))
 }
 
 /// Email template
@@ -748,7 +787,21 @@ fn deliver_safe(
         })
 }
 
+/// Checks an address that is about to be STORED on an account (sign-up,
+/// change email, add email). Refuses every `.invalid` address.
 pub fn validate_email(email: &str) -> Result<()> {
+    check_email(email, is_invalid_tld_address)
+}
+
+/// Checks an address that is only used to FIND an account (password reset
+/// send, resend verification). Same format and blocklist checks as
+/// `validate_email`, but only the stand-in domain is refused: an account
+/// that already stores another `.invalid` address must still be found.
+pub fn validate_lookup_email(email: &str) -> Result<()> {
+    check_email(email, is_no_email_address)
+}
+
+fn check_email(email: &str, reserved: fn(&str) -> bool) -> Result<()> {
     // Make sure this is an actual email
     if !validator::validate_email(email) {
         return Err(create_error!(IncorrectData {
@@ -756,9 +809,9 @@ pub fn validate_email(email: &str) -> Result<()> {
         }));
     }
 
-    // `.invalid` is where accounts with no email keep their stand-in
+    // `noemail.invalid` is where accounts with no email keep their stand-in
     // address; nobody may type one in
-    if is_placeholder_email(email) {
+    if reserved(email) {
         return Err(create_error!(IncorrectData {
             with: "email".to_string()
         }));
@@ -917,8 +970,8 @@ mod placeholder_tests {
     use revolt_result::ErrorType;
 
     use super::{
-        generate_placeholder_email, is_placeholder_email, normalise_email, validate_email,
-        NO_EMAIL_DOMAIN,
+        generate_placeholder_email, is_invalid_tld_address, is_no_email_address, normalise_email,
+        validate_email, validate_lookup_email, NO_EMAIL_DOMAIN,
     };
 
     /// Fails if: the stand-in address is not 32 lower-case hex characters at
@@ -943,39 +996,140 @@ mod placeholder_tests {
 
             // Stored in `email` and `email_normalised` alike
             assert_eq!(normalise_email(placeholder.clone()), placeholder);
-            assert!(is_placeholder_email(&placeholder));
+            assert!(is_no_email_address(&placeholder));
+            assert!(is_invalid_tld_address(&placeholder));
             assert!(seen.insert(placeholder), "a placeholder repeated");
         }
     }
 
-    /// Fails if: the predicate stops at the exact stand-in domain, is case
-    /// sensitive, or starts matching real domains.
+    /// Addresses at the stand-in domain, however they are written
+    const AT_THE_STAND_IN_DOMAIN: [&str; 9] = [
+        "0123456789abcdef0123456789abcdef@noemail.invalid",
+        "someone@noemail.invalid",
+        "someone@NoEmail.INVALID",
+        "someone@noemail.invalid.",
+        "  someone@noemail.invalid\n",
+        // Spellings IDNA reads as the stand-in domain: an ideographic full
+        // stop (U+3002) for the dot, in the middle and at the end, a
+        // fullwidth full stop (U+FF0E), fullwidth letters
+        "x@noemail\u{3002}invalid",
+        "x@noemail.invalid\u{3002}",
+        "x@noemail\u{FF0E}invalid",
+        "x@\u{FF4E}\u{FF4F}\u{FF45}\u{FF4D}\u{FF41}\u{FF49}\u{FF4C}.invalid",
+    ];
+
+    /// Addresses under `.invalid` that are not at the stand-in domain
+    const ELSEWHERE_UNDER_INVALID: [&str; 9] = [
+        "someone@other.invalid",
+        "tester@sloga.invalid",
+        "someone@Sloga.INVALID",
+        "someone@invalid",
+        "someone@sub.noemail.invalid",
+        "someone@xnoemail.invalid",
+        // `sloga.invalid` with the top-level domain in fullwidth letters
+        "new@sloga.\u{FF49}\u{FF4E}\u{FF56}\u{FF41}\u{FF4C}\u{FF49}\u{FF44}",
+        "new@sloga\u{3002}invalid",
+        // A label IDNA refuses (it starts with a combining mark) next to
+        // the reserved one
+        "someone@\u{301}bad\u{3002}invalid",
+    ];
+
+    const NOT_UNDER_INVALID: [&str; 12] = [
+        "someone@example.com",
+        "invalid@example.com",
+        "noemail.invalid@example.com",
+        "someone@invalid.example.com",
+        "someone@notinvalid",
+        "someone@example.invalidx",
+        "noemail.invalid",
+        "Deleted User 01ACCOUNT",
+        "",
+        // Real domains outside ASCII, and the reserved word as a label
+        // that is not the last one
+        "someone@b\u{FC}cher.example",
+        "someone@invalid\u{3002}example.com",
+        "someone@\u{FF49}\u{FF4E}\u{FF56}\u{FF41}\u{FF4C}\u{FF49}\u{FF44}.example.com",
+    ];
+
+    /// Fails if: `address_domain` compares the domain as it was typed, so a
+    /// spelling the format check and a mail server read as `.invalid`
+    /// (fullwidth letters, an ideographic full stop) passes for an ordinary
+    /// address; or a plain ASCII domain no longer comes back as it was.
     #[test]
-    fn the_predicate_matches_every_invalid_address_and_nothing_else() {
-        for placeholder in [
-            "0123456789abcdef0123456789abcdef@noemail.invalid",
-            "someone@noemail.invalid",
-            "someone@NoEmail.INVALID",
-            "someone@other.invalid",
-            "someone@invalid",
-            "someone@noemail.invalid.",
-            "  someone@noemail.invalid\n",
+    fn the_domain_is_compared_in_its_ascii_form() {
+        use super::address_domain;
+
+        for (address, domain) in [
+            (
+                "new@sloga.\u{FF49}\u{FF4E}\u{FF56}\u{FF41}\u{FF4C}\u{FF49}\u{FF44}",
+                "sloga.invalid",
+            ),
+            ("x@noemail\u{3002}invalid", "noemail.invalid"),
+            ("x@NoEmail\u{FF0E}INVALID\u{3002}", "noemail.invalid"),
+            ("someone@Example.COM.", "example.com"),
+            ("someone@b\u{FC}cher.example", "xn--bcher-kva.example"),
         ] {
-            assert!(is_placeholder_email(placeholder), "{placeholder:?}");
+            assert_eq!(address_domain(address).as_deref(), Some(domain), "{address:?}");
         }
 
-        for real in [
-            "someone@example.com",
-            "invalid@example.com",
-            "someone@invalid.example.com",
-            "someone@notinvalid",
-            "someone@example.invalidx",
-            "noemail.invalid",
-            "Deleted User 01ACCOUNT",
-            "",
-        ] {
-            assert!(!is_placeholder_email(real), "{real:?}");
+        assert_eq!(address_domain("no at sign"), None);
+    }
+
+    /// Fails if: the exact predicate matches a `.invalid` address outside
+    /// the stand-in domain (an account storing one would lose its email
+    /// again), is case sensitive, or misses a way of writing the stand-in
+    /// domain, a non-ASCII spelling of it included.
+    #[test]
+    fn the_exact_predicate_matches_the_stand_in_domain_and_nothing_else() {
+        for placeholder in AT_THE_STAND_IN_DOMAIN {
+            assert!(is_no_email_address(placeholder), "{placeholder:?}");
         }
+
+        for ordinary in ELSEWHERE_UNDER_INVALID.iter().chain(&NOT_UNDER_INVALID) {
+            assert!(!is_no_email_address(ordinary), "{ordinary:?}");
+        }
+    }
+
+    /// Fails if: the broad predicate stops at the exact stand-in domain, is
+    /// case sensitive, or starts matching real domains.
+    #[test]
+    fn the_broad_predicate_matches_every_invalid_address_and_nothing_else() {
+        for reserved in AT_THE_STAND_IN_DOMAIN.iter().chain(&ELSEWHERE_UNDER_INVALID) {
+            assert!(is_invalid_tld_address(reserved), "{reserved:?}");
+        }
+
+        for real in NOT_UNDER_INVALID {
+            assert!(!is_invalid_tld_address(real), "{real:?}");
+        }
+    }
+
+    /// Fails if: `validate_lookup_email` accepts a stand-in address, refuses
+    /// another `.invalid` address (the account storing one could no longer
+    /// ask for a reset mail), or drops the format check.
+    #[test]
+    fn validate_lookup_email_refuses_only_the_stand_in_domain() {
+        for refused in [
+            generate_placeholder_email(),
+            "someone@noemail.invalid".to_string(),
+            "someone@NOEMAIL.INVALID".to_string(),
+            "x@noemail\u{3002}invalid".to_string(),
+            "not an address".to_string(),
+        ] {
+            let error = validate_lookup_email(&refused).expect_err("must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                "{refused}: {:?}",
+                error.error_type
+            );
+        }
+
+        for accepted in ["tester@sloga.invalid", "someone@other.invalid", "someone@sloga.gg"] {
+            validate_lookup_email(accepted).expect(accepted);
+        }
+
+        // The control: the same addresses as new addresses
+        validate_email("tester@sloga.invalid").expect_err("a new .invalid address");
+        validate_email("someone@other.invalid").expect_err("a new .invalid address");
     }
 
     /// Fails if: `validate_email` accepts an address nobody may type in.
@@ -986,6 +1140,8 @@ mod placeholder_tests {
             "someone@noemail.invalid".to_string(),
             "someone@NOEMAIL.INVALID".to_string(),
             "someone@other.invalid".to_string(),
+            "new@sloga.\u{FF49}\u{FF4E}\u{FF56}\u{FF41}\u{FF4C}\u{FF49}\u{FF44}".to_string(),
+            "x@noemail\u{3002}invalid".to_string(),
         ] {
             let error = validate_email(&refused).expect_err("must be refused");
             assert!(

@@ -160,7 +160,8 @@ impl AbstractPasskeys for MongoDb {
         // and that is logged and answered with the database error; (3) two
         // removals racing for the last two passkeys both put theirs back and
         // both are refused; (4) a change to the account after the second
-        // look is not seen.
+        // look is not seen. How to find and repair an account left by (1)
+        // or (2): `docs/passkeys-operator-notes.md`.
         let filter = doc! {
             "_id": id,
             "user_id": user_id

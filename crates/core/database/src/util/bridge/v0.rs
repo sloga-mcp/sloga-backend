@@ -3027,4 +3027,18 @@ mod account_info_tests {
         assert_eq!(info.email, "Some.One@example.test");
         assert!(!info.email_absent);
     }
+
+    /// Fails if: an account that stores a `.invalid` address outside the
+    /// stand-in domain is shown with an empty address, as if it had none.
+    #[test]
+    fn an_ordinary_invalid_address_is_shown_as_it_is() {
+        let mut legacy =
+            crate::Account::new_passkey_signup(Some("legacy@example.test".to_string())).unwrap();
+        legacy.email = "Tester@sloga.invalid".to_string();
+        legacy.email_normalised = "tester@sloga.invalid".to_string();
+
+        let info: v0::AccountInfo = legacy.into();
+        assert_eq!(info.email, "Tester@sloga.invalid");
+        assert!(!info.email_absent);
+    }
 }

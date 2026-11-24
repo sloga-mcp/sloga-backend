@@ -37,6 +37,7 @@ sentry = "0.31.5"
 # Data Validation
 regex = "1.12.3"
 validator = "0.16"
+idna = "1.1.0"
 
 # Data Types
 uuid = "1.19.0"

@@ -59,6 +59,7 @@ deadqueue = { workspace = true }
 linkify = { workspace = true, optional = true }
 url-escape = { workspace = true, optional = true }
 validator = { workspace = true, features = ["derive"] }
+idna = { workspace = true }
 isahc = { workspace = true, features = ["json"], optional = true }
 base32 = { workspace = true }
 sha1 = { workspace = true }

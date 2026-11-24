@@ -1724,4 +1724,44 @@ mod tests {
             );
         })
     }
+
+    /// Fails if: `Account::real_email` or `Account::fetch_by_email` treat
+    /// every `.invalid` address as "no email" again, so an account that
+    /// stores one outside the stand-in domain (one exists in production)
+    /// can no longer sign in with its password.
+    #[test]
+    fn an_ordinary_invalid_address_signs_in_with_its_password() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            // Seeded as an ordinary account, then given the old address
+            let local = TestHarness::rand_string();
+            let email = format!("{local}@sloga.invalid");
+            let mut account = Account::new(
+                &harness.db,
+                format!("{local}@validemail.com"),
+                "password_insecure".into(),
+                false,
+            )
+            .await
+            .unwrap();
+            account.email = email.clone();
+            account.email_normalised = email.clone();
+            account.save(&harness.db).await.unwrap();
+
+            // The control: a wrong password is refused and stores nothing
+            let (status, _) = sec009_login(&harness, &email, "wrong_password").await;
+            assert_eq!(status, Status::Unauthorized);
+            assert!(session_ids(&harness, &account.id).await.is_empty());
+
+            for (row, typed) in [email.clone(), email.to_uppercase()].iter().enumerate() {
+                let (status, body) = sec009_login(&harness, typed, "password_insecure").await;
+                assert_eq!(status, Status::Ok, "{typed}: {body}");
+
+                let session: v0::Session = serde_json::from_str(&body).expect("a session");
+                assert_eq!(session.user_id, account.id, "{typed}");
+                assert_eq!(session_ids(&harness, &account.id).await.len(), row + 1);
+            }
+        })
+    }
 }

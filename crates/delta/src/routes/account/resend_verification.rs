@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 use revolt_result::Result;
-use revolt_database::{Account, Database, util::{email::validate_email, captcha::check_captcha}, EmailVerification};
+use revolt_database::{Account, Database, util::{email::validate_lookup_email, captcha::check_captcha}, EmailVerification};
 use revolt_models::v0;
 
 /// # Resend Verification
@@ -26,8 +26,10 @@ pub async fn resend_verification(
     // Check Captcha token
     check_captcha(data.captcha.as_deref()).await?;
 
-    // Make sure email is valid and not blocked
-    validate_email(&data.email)?;
+    // Make sure email is valid and not blocked. The address is only used
+    // to find an account, so of `.invalid` just the stand-in domain is
+    // refused: an account that stores another `.invalid` address is found.
+    validate_lookup_email(&data.email)?;
 
     // From this point on, do not report failure to the
     // remote client, as this will open us up to user enumeration.
@@ -203,12 +205,13 @@ mod tests {
     }
 
     /// Fails if: typing the stand-in address of an account with no email
-    /// (as stored, or in another case) answers differently from a `.invalid`
+    /// (as stored, or in another case) answers differently from a stand-in
     /// address nobody holds, or sends that account the password reset a
     /// `Verified` account gets here (a stored token or a mail), or touches
-    /// its verification. `validate_email` refuses every `.invalid` address
-    /// before the lookup, so the answer compared here is that refusal; the
-    /// lookup is pinned by `the_lookup_goes_through_the_wrapper`.
+    /// its verification. `validate_lookup_email` refuses every
+    /// `noemail.invalid` address before the lookup, so the answer compared
+    /// here is that refusal; the lookup is pinned by
+    /// `the_lookup_goes_through_the_wrapper`.
     #[test]
     fn typed_placeholder_gets_the_unknown_address_answer() {
         crate::util::test::rt().block_on(async {
@@ -266,5 +269,49 @@ mod tests {
         assert!(code.contains("Account::fetch_by_email(db,&data.email)"));
         assert!(!code.contains("fetch_account_by_normalised_email"));
         assert!(!code.contains("normalise_email"));
+    }
+
+    /// Fails if: an account that stores a `.invalid` address outside the
+    /// stand-in domain is refused at this form or gets no mail: the address
+    /// typed here only finds an account, it is not a new address.
+    #[test]
+    fn an_ordinary_invalid_address_gets_its_verification_resent() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            // Seeded as an ordinary account, then given the old address
+            let local = TestHarness::rand_string();
+            let email = format!("{local}@sloga.invalid");
+            let mut account = Account::new(
+                &harness.db,
+                format!("{local}@smtp.test"),
+                "password".into(),
+                false,
+            )
+            .await
+            .unwrap();
+            account.email = email.clone();
+            account.email_normalised = email.clone();
+            account.verification = EmailVerification::Pending {
+                token: "".into(),
+                expiry: Timestamp::now_utc(),
+            };
+            account.save(&harness.db).await.unwrap();
+
+            assert_eq!(
+                request_resend(&harness, &email).await,
+                (Status::NoContent, String::new())
+            );
+
+            let (_, code) = harness.assert_email(&email).await;
+            let stored = harness.db.fetch_account(&account.id).await.unwrap();
+            assert!(
+                matches!(
+                    &stored.verification,
+                    EmailVerification::Pending { token, .. } if *token == code
+                ),
+                "the mailed token is the stored one"
+            );
+        })
     }
 }
