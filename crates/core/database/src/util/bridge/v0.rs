@@ -2608,9 +2608,24 @@ impl crate::MlsJoinIntent {
     }
 }
 
+/// Largest `created_at` a served commit carries: `2^53 - 1` ms, the largest
+/// integer every JSON reader holds exactly (the native reader refuses more)
+const MAX_COMMIT_CREATED_MS: i128 = (1 << 53) - 1;
+
+/// A stored commit's `created_at` as whole milliseconds since the Unix
+/// epoch (truncated: Mongo keeps milliseconds, the Reference driver keeps
+/// nanoseconds), held to `0 ..= 2^53 - 1`
+fn mls_commit_created_ms(at: &Timestamp) -> i64 {
+    at.duration_since(Timestamp::UNIX_EPOCH)
+        .whole_milliseconds()
+        .clamp(0, MAX_COMMIT_CREATED_MS) as i64
+}
+
 impl crate::MlsCommit {
     /// Wire form of a stored winning commit. `channel_id` is the commit's
     /// group's channel; it fills each rejoin intent's `channel_id`.
+    /// `created_at` is the row's server-stamped store time in milliseconds,
+    /// always set.
     pub fn into_commit_info(self, channel_id: &str) -> MlsCommitInfo {
         MlsCommitInfo {
             group_id: self.group_id,
@@ -2625,6 +2640,7 @@ impl crate::MlsCommit {
                 .map(|intent| intent.into_rejoin_intent_info(channel_id))
                 .collect(),
             removed_reasons: self.removed_reasons.into_iter().map(Into::into).collect(),
+            created_at: Some(mls_commit_created_ms(&self.created_at)),
         }
     }
 }
@@ -3093,6 +3109,61 @@ mod protected_channel_bridge_tests {
             assert!(!json.contains("history_visible"), "{json}");
             assert!(!json.contains("visible"), "{json}");
             assert_eq!(info, unset);
+        }
+    }
+
+    /// S4 (R-W3-4): the wire commit carries the row's `created_at` as whole
+    /// milliseconds since the Unix epoch: always present, a JSON integer,
+    /// the LAST key. Sub-millisecond digits are dropped, the epoch itself
+    /// is `0` (present, not skipped) and a time before it is held to `0`
+    ///
+    /// Control: `created_at: None` in the bridge, or the field serialized
+    /// as a string.
+    #[test]
+    fn commit_info_carries_created_at_as_integer_ms() {
+        let row = |created_at: Timestamp| crate::MlsCommit {
+            id: crate::MlsCommit::composite_id(&format!("{}1", "0".repeat(63)), 8),
+            group_id: format!("{}1", "0".repeat(63)),
+            epoch: 8,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![],
+            created_at,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+            welcome: None,
+            history_visible: None,
+            added_protocols: vec![],
+        };
+        let at = |text: &str| -> Timestamp {
+            serde_json::from_str(&format!("\"{text}\"")).expect("a timestamp")
+        };
+
+        for (stored, want) in [
+            ("2026-10-04T12:00:00.000Z", 1_791_115_200_000i64),
+            ("2026-10-04T12:00:00.123Z", 1_791_115_200_123),
+            // What the Reference driver can hold: nanoseconds, truncated
+            ("2026-10-04T12:00:00.123999999Z", 1_791_115_200_123),
+            ("1970-01-01T00:00:00.000Z", 0),
+            ("1969-12-31T23:59:59.000Z", 0),
+        ] {
+            let info = row(at(stored)).into_commit_info("01JA0000000000000000CHANNEL");
+            assert_eq!(info.created_at, Some(want), "{stored}");
+
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(
+                json.ends_with(&format!(r#","created_at":{want}}}"#)),
+                "{stored}: {json}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(value["created_at"].is_i64(), "{stored}: {json}");
+            assert_eq!(value["created_at"].as_i64(), Some(want), "{stored}");
+            assert_eq!(
+                serde_json::from_str::<v0::MlsCommitInfo>(&json).unwrap(),
+                info
+            );
         }
     }
 

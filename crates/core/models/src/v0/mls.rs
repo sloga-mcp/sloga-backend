@@ -299,6 +299,13 @@ auto_derived!(
         /// (absent = empty; never present on Call commits)
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub removed_reasons: Vec<MlsRemovedReasonInfo>,
+        /// Server-stamped store time of the commit: whole milliseconds since
+        /// the Unix epoch, always a JSON integer in `0 ..= 2^53 - 1`. Every
+        /// served commit carries it (S4: a client caps a history link's
+        /// `observed_at` with it); `None` only for a body written before
+        /// the field existed. Kept LAST, matching the native reader
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_at: Option<i64>,
     }
 
     /// Response to a commit submission — 200 on win, 409 on lose (the loser
@@ -618,6 +625,82 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<MlsCommitInfo>(value).unwrap(),
                 info
+            );
+        }
+    }
+
+    /// S4 (R-W3-4): `created_at` is the LAST key of a served commit and a
+    /// JSON integer. A body from before the field parses as `None` and
+    /// serializes without the key (`removed_reasons_are_optional_and_snake_case`
+    /// pins those bytes); a reader that predates the field still parses a
+    /// body carrying it; a string, a fraction and a `Timestamp` are refused
+    ///
+    /// Control: the field serialized as a string, or never serialized.
+    #[test]
+    fn commit_created_at_is_a_trailing_integer() {
+        /// `MlsCommitInfo` as it was before `created_at`, field for field
+        #[derive(serde::Deserialize)]
+        struct CommitInfoBefore {
+            group_id: String,
+            epoch: i64,
+            committer: super::MlsMemberDevice,
+            commit: String,
+            added: Vec<super::MlsMemberDevice>,
+            removed: Vec<super::MlsMemberDevice>,
+            #[serde(default)]
+            rejoin_intents: Vec<MlsRejoinIntentInfo>,
+            #[serde(default)]
+            removed_reasons: Vec<MlsRemovedReasonInfo>,
+        }
+
+        let before: MlsCommitInfo = serde_json::from_str(COMMIT_INFO_AT_4206ADD3).unwrap();
+        assert_eq!(before.created_at, None);
+
+        for at in [0i64, 1_760_000_000_123, 9_007_199_254_740_991] {
+            let info = MlsCommitInfo {
+                created_at: Some(at),
+                ..before.clone()
+            };
+            let json = serde_json::to_string(&info).unwrap();
+            // The old bytes, then the new key, last
+            let expected = format!(
+                r#"{},"created_at":{}}}"#,
+                COMMIT_INFO_AT_4206ADD3.strip_suffix('}').unwrap(),
+                at
+            );
+            assert_eq!(json, expected);
+
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(value["created_at"].is_i64(), "{json}");
+            assert_eq!(value["created_at"].as_i64(), Some(at));
+            assert_eq!(serde_json::from_str::<MlsCommitInfo>(&json).unwrap(), info);
+
+            // A reader from before the field ignores it and reads the rest
+            let old: CommitInfoBefore = serde_json::from_str(&json).unwrap();
+            assert_eq!(old.group_id, info.group_id);
+            assert_eq!(old.epoch, info.epoch);
+            assert_eq!(old.committer, info.committer);
+            assert_eq!(old.commit, info.commit);
+            assert_eq!(old.added, info.added);
+            assert_eq!(old.removed, info.removed);
+            assert_eq!(old.rejoin_intents, info.rejoin_intents);
+            assert_eq!(old.removed_reasons, info.removed_reasons);
+        }
+
+        for refused in [
+            r#""1760000000123""#,
+            r#""2026-10-04T12:00:00.000Z""#,
+            "1760000000123.5",
+            "true",
+        ] {
+            let json = format!(
+                r#"{},"created_at":{}}}"#,
+                COMMIT_INFO_AT_4206ADD3.strip_suffix('}').unwrap(),
+                refused
+            );
+            assert!(
+                serde_json::from_str::<MlsCommitInfo>(&json).is_err(),
+                "{refused}"
             );
         }
     }

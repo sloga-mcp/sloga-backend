@@ -1298,6 +1298,77 @@ mod tests {
         assert_eq!(keys, ["commits", "current_epoch"]);
     }
 
+    /// S4 (R-W3-4): every served commit, Text and Call, carries the stored
+    /// row's `created_at` as integer milliseconds since the Unix epoch
+    ///
+    /// Control: `created_at: None` in the bridge, or the field serialized
+    /// as a string.
+    #[test]
+    fn every_served_commit_carries_its_stored_created_at() {
+        crate::util::test::rt().block_on(every_served_commit_carries_its_stored_created_at_case())
+    }
+
+    async fn every_served_commit_carries_its_stored_created_at_case() {
+        let fixture = fixture().await;
+        let db = &fixture.harness.db;
+
+        let text_rows = db
+            .fetch_mls_text_commits_from(&fixture.text_group_id, 0, 10)
+            .await
+            .expect("text commit read");
+        assert_eq!(text_rows.len(), 2);
+        let call_rows = db
+            .fetch_mls_commits_from(&fixture.call_group_id, 0, 10)
+            .await
+            .expect("call commit read");
+        assert_eq!(call_rows.len(), 1);
+
+        for (case, group_id, rows) in [
+            ("Text", &fixture.text_group_id, text_rows),
+            ("Call", &fixture.call_group_id, call_rows),
+        ] {
+            let page = fetch(db, &fixture.owner, &fixture.owner_session, group_id, 0)
+                .await
+                .expect("the owner is served");
+            assert_eq!(page.commits.len(), rows.len(), "{case}");
+
+            let body = serde_json::to_string(&page).expect("JSON");
+            let wire: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+            for (index, row) in rows.iter().enumerate() {
+                let stored_ms = row
+                    .created_at
+                    .duration_since(Timestamp::UNIX_EPOCH)
+                    .whole_milliseconds() as i64;
+                assert!(stored_ms > 0, "{case} epoch {}", row.epoch);
+
+                let served = &page.commits[index];
+                assert_eq!(served.epoch, row.epoch, "{case}");
+                assert_eq!(
+                    served.created_at,
+                    Some(stored_ms),
+                    "{case} epoch {}",
+                    row.epoch
+                );
+
+                let value = &wire["commits"][index]["created_at"];
+                assert!(value.is_i64(), "{case} epoch {}: {}", row.epoch, body);
+                assert_eq!(
+                    value.as_i64(),
+                    Some(stored_ms),
+                    "{case} epoch {}",
+                    row.epoch
+                );
+                // The last key of its commit object
+                assert!(
+                    body.contains(&format!(r#","created_at":{stored_ms}}}"#)),
+                    "{case} epoch {}: {}",
+                    row.epoch,
+                    body
+                );
+            }
+        }
+    }
+
     /// S2-D29: only the Welcome route serves a stored Welcome. The
     /// fixture's epoch 1 Text Add and its Call commit both store one; no
     /// commit fetch carries a `welcome` key or the Welcome's bytes.
