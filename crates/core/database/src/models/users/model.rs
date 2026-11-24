@@ -1296,10 +1296,9 @@ impl User {
     ) -> Result<()> {
         let mut account = db.fetch_account(&self.id).await?;
 
-        account.disable(db).await?;
-
-        account.delete_all_sessions(db, None).await?;
-
+        // The suspension is persisted before any device is revoked: a failed
+        // revocation below then fails the call with the user already
+        // suspended, never plain-disabled without `suspended_until`
         self.update(
             db,
             PartialUser {
@@ -1312,6 +1311,10 @@ impl User {
             vec![],
         )
         .await?;
+
+        account.disable(db).await?;
+
+        account.delete_all_sessions(db, None).await?;
 
         // An account with no email gets no mail: the suspension above is
         // already applied and stands
@@ -1494,7 +1497,8 @@ impl User {
     ///   server memberships; a failed release aborts the deletion with the
     ///   memberships intact. A second release after the memberships are
     ///   cleared catches a seat granted in between; its failure aborts the
-    ///   deletion too
+    ///   deletion too. Each release that succeeded announces its channels
+    ///   (`ProtectedChannelChanged`, 7.5)
     /// - clears relationships
     pub async fn delete(&mut self, db: &Database) -> Result<()> {
         for bot in db.fetch_bots_by_user(&self.id).await? {
@@ -1512,9 +1516,12 @@ impl User {
         // and before the memberships go, so a failure never leaves a
         // non-member holding a seat. Servers this account owns, and their
         // protected channels, were deleted above. The released seat rows
-        // are kept.
-        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+        // are kept. Each release announces what it released at once (7.5),
+        // as a later step may still fail and a retry would announce nothing.
+        let released = db
+            .release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
             .await?;
+        crate::Member::publish_seat_release(&released).await;
         db.clear_memberships(&self.id).await?;
         // Second release, as `Member::remove` runs one (decision 11 (W2),
         // audit C6): a seat PUT that landed between the first release and
@@ -1523,8 +1530,10 @@ impl User {
         // is not marked deleted, and the retry (crond's next run) releases
         // first again. Unlike `Member::remove`'s, its error is not kept:
         // `clear_memberships` sends no leave event that has to go out first.
-        db.release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
+        let released = db
+            .release_channel_seats_for_user(&self.id, None, Timestamp::now_utc())
             .await?;
+        crate::Member::publish_seat_release(&released).await;
         // Calendar cascade (slice F): `clear_memberships` bypasses `Member::remove`,
         // so the per-server RSVP cascade never runs — drop every RSVP row the account
         // holds, or attendee lists would keep a ghost user id forever.
@@ -2364,7 +2373,8 @@ mod tests {
 
         use crate::{
             Channel, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
-            Database, Member, MemberCompositeKey, SeatListBody, SeatListSubmission, Server, User,
+            ChannelSeat, Database, Member, MemberCompositeKey, SeatListBody, SeatListSubmission,
+            Server, User,
         };
 
         pub const CHANNEL: &str = "01J9Z3K4M5N6P7Q8R9S0T1V2W3";
@@ -2453,6 +2463,7 @@ mod tests {
                     signer_user_id: OWNER.to_string(),
                     signer_device_id: OWNER_DEVICE.to_string(),
                     seats: vec![OWNER.to_string(), SEATED.to_string()],
+                    v2: None,
                 }
                 .build()
                 .unwrap(),
@@ -2461,6 +2472,7 @@ mod tests {
                 signature: format!("B{}", "A".repeat(85)),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 handover: None,
+                authority: None,
             };
             db.protect_channel(CHANNEL, &submission, at_base())
                 .await
@@ -2481,6 +2493,40 @@ mod tests {
 
             user
         }
+
+        /// Stamp `SEATED`'s `keys_received_at` in the store, as the Text
+        /// commit adding the user's first device does (2.3): a forced
+        /// release of the seat then cools 14 days instead of freeing it
+        /// (S2-D21)
+        pub async fn mark_keys_received(db: &Database) {
+            let id = ChannelSeat::composite_id(CHANNEL, SEATED);
+            match db {
+                Database::Reference(reference) => {
+                    reference
+                        .channel_seats
+                        .lock()
+                        .await
+                        .get_mut(&id)
+                        .expect("a seat row")
+                        .keys_received_at = Some(at_base());
+                }
+                #[cfg(feature = "mongodb")]
+                Database::MongoDb(mongo) => {
+                    let collection = mongo.col::<ChannelSeat>("channel_seats");
+                    let mut seat = collection
+                        .find_one(bson::doc! { "_id": &id })
+                        .await
+                        .unwrap()
+                        .expect("a seat row");
+                    seat.keys_received_at = Some(at_base());
+                    let result = collection
+                        .replace_one(bson::doc! { "_id": &id }, &seat)
+                        .await
+                        .unwrap();
+                    assert_eq!(result.matched_count, 1);
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2489,6 +2535,7 @@ mod tests {
 
         database_test!(|db| async move {
             let mut user = protected::seated_user(&db).await;
+            protected::mark_keys_received(&db).await;
 
             user.delete(&db).await.unwrap();
 
@@ -2508,6 +2555,72 @@ mod tests {
 
             assert!(db.fetch_all_memberships(SEATED).await.unwrap().is_empty());
             assert!(db.fetch_member(SERVER, OWNER).await.is_ok());
+        });
+    }
+
+    /// 7.5 / S2-D18 (W2 audit MAJOR-1): deleting a seated account announces
+    /// the channel once, on the CHANNEL topic (viewers only), naming both
+    /// scopes and no user. Control: the first release's announcement
+    /// dropped.
+    #[tokio::test]
+    async fn delete_announces_the_released_channel() {
+        use protected::{CHANNEL, SEATED};
+
+        database_test!(|db| async move {
+            let mut user = protected::seated_user(&db).await;
+
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            deleted.unwrap();
+
+            assert!(
+                db.fetch_channel_seats(CHANNEL)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|seat| seat.user_id == SEATED && !seat.is_active()),
+                "precondition: the deletion released the seat"
+            );
+            assert_eq!(
+                sent,
+                vec![(
+                    CHANNEL.to_string(),
+                    format!(
+                        r#"{{"type":"ProtectedChannelChanged","id":"{CHANNEL}","scope":["seats","text_group"]}}"#
+                    ),
+                )],
+                "a deletion that released a seat announces its channel once (7.5)"
+            );
+        });
+    }
+
+    /// 2.3 (S2-D21): deleting an account whose seat never received the keys
+    /// releases it with `DeviceNeverJoined` and no cooldown
+    #[tokio::test]
+    async fn delete_frees_a_never_joined_seat_at_once() {
+        use protected::{CHANNEL, OWNER, SEATED};
+
+        database_test!(|db| async move {
+            let mut user = protected::seated_user(&db).await;
+
+            user.delete(&db).await.unwrap();
+
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            let seat = |user_id: &str| {
+                seats
+                    .iter()
+                    .find(|seat| seat.user_id == user_id)
+                    .expect("seat rows are kept")
+            };
+            assert!(!seat(SEATED).is_active(), "{:?}", seat(SEATED));
+            assert_eq!(
+                seat(SEATED).release_cause,
+                Some(crate::SeatReleaseCause::DeviceNeverJoined),
+                "{:?}",
+                seat(SEATED)
+            );
+            assert_eq!(seat(SEATED).cooldown_until, None, "{:?}", seat(SEATED));
+            assert!(seat(OWNER).is_active(), "another user's seat was released");
         });
     }
 
@@ -2543,10 +2656,13 @@ mod tests {
                 .await
                 .expect("insert the undecodable seat row");
 
-            let err = user
-                .delete(&db)
-                .await
-                .expect_err("an undecodable seat row must fail the deletion");
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            let err = deleted.expect_err("an undecodable seat row must fail the deletion");
+            assert!(
+                sent.is_empty(),
+                "a failed release must announce nothing (7.5): {sent:?}"
+            );
             assert!(
                 matches!(
                     &err.error_type,
@@ -2615,6 +2731,9 @@ mod tests {
                     seat_list_ad_sha256: None,
                     pending_removals: vec![],
                     member_added: vec![],
+                    pending_device_removals: vec![],
+                    signer_lost: None,
+                    rejoin_readd: vec![],
                 })
                 .await
                 .unwrap();
@@ -2639,10 +2758,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            let err = user
-                .delete(&db)
-                .await
-                .expect_err("a failed second release must fail the deletion");
+            let (deleted, sent) =
+                crate::Member::capture_seat_release_events(user.delete(&db)).await;
+            let err = deleted.expect_err("a failed second release must fail the deletion");
+            assert_eq!(
+                sent,
+                vec![(
+                    CHANNEL.to_string(),
+                    format!(
+                        r#"{{"type":"ProtectedChannelChanged","id":"{CHANNEL}","scope":["seats","text_group"]}}"#
+                    ),
+                )],
+                "the first release is announced, the failed second one is not (7.5)"
+            );
             assert!(
                 matches!(
                     &err.error_type,

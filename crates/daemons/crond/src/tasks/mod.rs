@@ -11,6 +11,7 @@ pub mod import_http;
 pub mod payments_reconcile;
 pub mod poll_expiry;
 pub mod prot_cipher_backfill;
+pub mod protected_access_sweep;
 pub mod prune_audit_log;
 pub mod prune_dangling_files;
 pub mod prune_large_attachments;

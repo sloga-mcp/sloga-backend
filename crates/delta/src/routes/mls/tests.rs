@@ -272,6 +272,8 @@ async fn full_flow_create_join_commit_fanout_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -543,6 +545,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -601,6 +605,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -618,6 +624,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -650,6 +658,8 @@ fn rejoin_outstanding_policy_requires_every_member_fresh() {
             key_package_ref: "ref0".to_string(),
             signature: "c2ln".to_string(),
             created_at: now.checked_sub(Duration::seconds(age_seconds)).unwrap(),
+            generation: None,
+            issued_at: None,
         }
     }
 
@@ -748,6 +758,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -790,6 +802,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -813,6 +827,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -833,6 +849,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -1266,6 +1284,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             device_id: device_b.device.device_id.clone(),
             key_package_ref: "b0".to_string(),
             signature: STANDARD_NO_PAD.encode([0u8; 64]),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1296,6 +1316,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             device_id: second_device.device.device_id.clone(),
             key_package_ref: "a20".to_string(),
             signature: second_device.join_signature(&user_a.id, &gid, "a20"),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1307,6 +1329,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
         device_id: device_b.device.device_id.clone(),
         key_package_ref: "b0".to_string(),
         signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+        generation: None,
+        issued_at: None,
     })
     .unwrap();
 
@@ -1936,6 +1960,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-c"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1965,6 +1991,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-b2"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -2026,11 +2054,13 @@ fn framed_text_commit(group_id: &str, epoch: i64, ad: &[u8]) -> String {
 
 /// Media E2EE AND protected-channel growth off, E2EE on. Every Call route
 /// and every unknown group id answers `FeatureDisabled { media_e2ee }`.
-/// Every Text growth route (Text create, join intent, KeyPackage claim, an
-/// Add commit) answers `FeatureDisabled { protected_channels }` to a seated,
-/// session-bound viewer; the Text maintenance routes (text group read,
-/// Update commit, commit fetch) still work, and the Text send refusal is
-/// unchanged (decisions 3 and 5 (W2)). Each answer is compared whole.
+/// Every Text growth route (Text create, a new device's join intent,
+/// KeyPackage claim, an Add commit) answers `FeatureDisabled
+/// { protected_channels }` to a seated, session-bound viewer; the Text
+/// maintenance routes (text group read, a rejoin intent, which is recovery
+/// (S2-D32), Update commit, commit fetch) still work, and the Text send
+/// refusal is unchanged (decisions 3 and 5 (W2)). Each answer is compared
+/// whole.
 async fn flag_off_rejects_every_route_case() {
     // overwrite_config is once-per-process and must run BEFORE the harness
     // primes the config cache (the create_account.rs test convention) —
@@ -2133,7 +2163,7 @@ async fn flag_off_rejects_every_route_case() {
 
     // --- The Text plane: a seated owner, its device bound to its session ---
 
-    let (_account_owner, session_owner, owner) = harness.new_user().await;
+    let (account_owner, session_owner, owner) = harness.new_user().await;
     let protected = harness
         .new_protected_channel(&owner, &session_owner, &[])
         .await;
@@ -2171,16 +2201,6 @@ async fn flag_off_rejects_every_route_case() {
             .unwrap(),
         ),
         (
-            "text join intent",
-            format!("/mls/groups/{}/join_intent", text.id),
-            serde_json::to_string(&v0::DataMlsJoinIntent {
-                device_id: owner_device.device_id.clone(),
-                key_package_ref: "a".to_string(),
-                signature: "a".to_string(),
-            })
-            .unwrap(),
-        ),
-        (
             "text key package claim",
             "/mls/key_packages/claim".to_string(),
             serde_json::to_string(&v0::DataClaimMlsKeyPackages {
@@ -2212,6 +2232,36 @@ async fn flag_off_rejects_every_route_case() {
         );
     }
 
+    // A join intent is growth only for a NEW device (S2-D32): a second
+    // device of the owner, bound to a second session of the owner and in
+    // no group, gets the gate's answer
+    let session_owner_new = account_owner
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("a second owner session");
+    let new_owner_device = harness
+        .new_e2ee_device(&owner, &session_owner_new.id, 0x80)
+        .await;
+    let response = post_json(
+        &harness,
+        &session_owner_new,
+        format!("/mls/groups/{}/join_intent", text.id),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: new_owner_device.device_id.clone(),
+            key_package_ref: "a".to_string(),
+            signature: "a".to_string(),
+            generation: None,
+            issued_at: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        feature_disabled("protected_channels"),
+        "text join intent (new device)"
+    );
+
     // Maintenance: the growth flag never stops these (decision 5 (W2))
     let response = harness
         .client
@@ -2222,6 +2272,35 @@ async fn flag_off_rejects_every_route_case() {
     let (status, body) = whole_answer(response).await;
     assert_eq!(status, Status::Ok, "text group read: {body}");
     assert_eq!(body["group_id"], text.id.as_str(), "text group read");
+
+    // A rejoin (the owner's member device) is recovery (S2-D32, doc #220):
+    // it passes the gate with growth off and reaches the signature check,
+    // which refuses the dummy signature
+    let response = post_json(
+        &harness,
+        &session_owner,
+        format!("/mls/groups/{}/join_intent", text.id),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: owner_device.device_id.clone(),
+            key_package_ref: "a".to_string(),
+            signature: "a".to_string(),
+            generation: None,
+            issued_at: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        (
+            Status::BadRequest,
+            serde_json::json!({
+                "type": "FailedValidation",
+                "error": "invalid join intent signature"
+            })
+        ),
+        "text rejoin intent"
+    );
 
     // An Update commit (no Adds) wins with growth off; the refused Add
     // above stored nothing, so epoch 1 is still free

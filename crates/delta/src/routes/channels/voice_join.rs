@@ -749,6 +749,9 @@ mod test {
                     seat_list_ad_sha256: None,
                     pending_removals: vec![],
                     member_added: vec![],
+                    pending_device_removals: vec![],
+                    signer_lost: None,
+                    rejoin_readd: vec![],
                 },
                 None,
             )
@@ -854,6 +857,9 @@ mod test {
                     seat_list_ad_sha256: None,
                     pending_removals: vec![],
                     member_added: vec![],
+                    pending_device_removals: vec![],
+                    signer_lost: None,
+                    rejoin_readd: vec![],
                 },
                 None,
             )

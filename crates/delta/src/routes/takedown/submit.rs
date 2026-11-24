@@ -443,7 +443,9 @@ mod test {
                 .client
                 .post("/takedown/requests")
                 .header(ContentType::JSON)
-                .body("{\"email\": \"SECRET-ADDRESS@example.com\", ")
+                // `\u{7b}` is the opening brace: a raw one here, never closed,
+                // breaks the brace-counting source scan in `voice_join.rs`
+                .body("\u{7b}\"email\": \"SECRET-ADDRESS@example.com\", ")
                 .dispatch()
                 .await;
             assert_eq!(response.status(), Status::BadRequest);

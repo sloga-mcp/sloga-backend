@@ -3224,12 +3224,14 @@ mod encrypted_payload_tests {
                 signer_user_id: OWNER.to_string(),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 seats: vec![OWNER.to_string()],
+                v2: None,
             }
             .build()
             .expect("seat list body"),
             signature: format!("B{}", "A".repeat(85)),
             signer_device_id: OWNER_DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 

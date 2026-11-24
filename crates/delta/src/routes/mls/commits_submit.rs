@@ -2,10 +2,12 @@ use std::collections::HashSet;
 
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
-    events::client::EventV1, is_valid_device_id, mls_text_enforced_device_cap, Channel, Database,
-    E2EEContentType, E2EEEnvelope, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
-    MlsJoinIntent, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, SeatListBody, Session,
-    User, E2EE_PROTOCOL_VERSION, MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    events::client::EventV1, is_valid_device_id, mls_text_enforced_device_cap,
+    mls_text_rejoin_window_seconds, retain_member_pending_device_removals, Channel,
+    ChannelEntitlement, Database, E2EEContentType, E2EEEnvelope, MlsCommit, MlsCommitOutcome,
+    MlsEnvelopeRejoinIntent, MlsGroup, MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody,
+    Session, User, E2EE_PROTOCOL_VERSION, MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    PROTECTED_SCOPE_TEXT_GROUP,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -16,7 +18,7 @@ use crate::routes::e2ee::{require_e2ee_deliver_eligible, MAX_QUEUE_BYTES, MAX_QU
 
 use super::{
     encoded_len, text, Arbitrated, GroupDispatch, TextGate, MAX_MLS_COMMIT_RAW_SIZE,
-    MAX_MLS_WELCOME_RAW_SIZE, REJOIN_OUTSTANDING_WINDOW_SECONDS,
+    MAX_MLS_WELCOME_RAW_SIZE,
 };
 
 /// # Submit MLS Commit
@@ -38,8 +40,9 @@ use super::{
 /// commit from the device its session is bound to; a commit row already at
 /// the epoch answers before any validity check; the commit's
 /// `authenticated_data` must be the channel's newest stored seat list;
-/// Adds need the growth flag, an Active entitlement and eligible, seated
-/// targets within the device and leaf caps; Removes follow the Remove rule.
+/// Adds need the growth flag (recovery Adds do not), an entitlement that
+/// allows text traffic and eligible, seated targets within the device and
+/// leaf caps; Removes follow the Remove rule.
 /// Its commit envelopes carry the declarations (`committer`, `added`,
 /// `removed`, `rejoin_intents`) receivers bind the commit to.
 #[openapi(tag = "MLS")]
@@ -251,6 +254,7 @@ async fn submit_call_commit(
         rejoin_intents: vec![],
         // Nor removal reasons (Text-only, B48): never serialized for Call
         removed_reasons: vec![],
+        welcome: None,
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -333,10 +337,11 @@ async fn submit_call_commit(
 ///    BEFORE every validity check, so an identical resubmit stays
 ///    idempotent after the group, the seat list or the growth flag moved on
 ///    (W0-fix8, §11);
-/// 5. validity: open; the AD binding; for Adds the growth gate, an Active
-///    entitlement and no pending removal; the Remove rule; the Add targets
-///    and caps. The commit transaction checks them again on its own read,
-///    and that check is the one that binds.
+/// 5. validity: open; the AD binding; for Adds the growth gate (unless every
+///    Add is a recovery Add), an entitlement that allows text traffic and
+///    Add-clears-pending; the Remove rule; the Add targets and caps. The
+///    commit transaction checks them again on its own read, and that check
+///    is the one that binds.
 async fn submit_text_commit(
     db: &Database,
     user: User,
@@ -443,25 +448,44 @@ async fn submit_text_commit(
         .collect();
 
     // Growth is Adds only: Remove and Update commits go on with the flag
-    // off (decision 5 (W2)). Adds also need an Active entitlement
-    // (decision 7) and no pending removal (W0-fix3).
+    // off (decision 5 (W2)) and in every entitlement state. A recovery Add
+    // passes without the flag (S2-D32): the available gate above and the
+    // entitlement check here are its gate. Every Add needs an entitlement
+    // that allows text traffic (decision 7, #220), and Add-clears-pending
+    // (S2-D17b).
     if !added.is_empty() {
-        super::require_text_gate(TextGate::Growth).await?;
-        if !entitlement
-            .as_ref()
-            .is_some_and(|entitlement| entitlement.is_active())
-        {
+        if !is_recovery_add(db, &group, &stored, &added).await? {
+            super::require_text_gate(TextGate::Growth).await?;
+        }
+        if !allows_text_traffic(entitlement.as_ref()) {
             return Err(create_error!(InvalidOperation));
         }
-        if !group.pending_removals.is_empty() {
+        // While the signer device is lost only the signer user's devices may
+        // be added (S2-D17d). This answers before `pending_removal`, as the
+        // commit transaction (W1 note (t)) and the encrypted send do
+        if let Some(lost) = &group.signer_lost {
+            if added.iter().any(|target| target.user_id != lost.user_id) {
+                return Err(resecuring("owner_device_lost"));
+            }
+        }
+        if !add_clears_pending(&group, &removed) {
             return Err(resecuring("pending_removal"));
         }
     }
 
     let now = Timestamp::now_utc();
-    // Advisory only (B48): stored on the row and fanned out, never read
-    // for admission
-    let removed_reasons = check_removals(db, &group, &signed, &committer, &removed, now).await?;
+    let rejoin_window_seconds =
+        mls_text_rejoin_window_seconds(config.features.protected_channels.text_rejoin_window_secs);
+    check_removals(
+        db,
+        &group,
+        &signed,
+        &committer,
+        &removed,
+        now,
+        rejoin_window_seconds,
+    )
+    .await?;
 
     if !added.is_empty() {
         for target in &added {
@@ -507,9 +531,14 @@ async fn submit_text_commit(
         added,
         removed,
         created_at: now,
-        // Filled by the commit transaction from the stored intents
+        // Both filled by the commit transaction from its own reads: the
+        // stored intents, and the reasons stamped in the §6.1 S2 order
+        // (`removal_reason_rank`, #222)
         rejoin_intents: vec![],
-        removed_reasons,
+        removed_reasons: vec![],
+        // Stored on the row for the Welcome route (S2-D29); never part of
+        // a commit fetch or a 409 body
+        welcome: welcome.clone(),
     };
 
     match db
@@ -523,6 +552,19 @@ async fn submit_text_commit(
             }),
         }),
         MlsCommitOutcome::Won => {
+            // 7.5 (S2-D18, W2 audit MAJOR-1): a won commit that cleared a
+            // pending entry is announced on the channel topic (viewers
+            // only), first, so a failed read or fan-out below cannot lose
+            // it. A lost or an unchanged commit announces nothing.
+            if commit_clears_pending(&group, &commit) {
+                EventV1::ProtectedChannelChanged {
+                    id: group.channel_id.clone(),
+                    scope: vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()],
+                }
+                .p(group.channel_id.clone())
+                .await;
+            }
+
             // The declarations come from the STORED row: the transaction
             // filled its `rejoin_intents`. Receivers treat a Text commit
             // envelope without them as a mismatch, so nothing goes out
@@ -603,38 +645,160 @@ async fn submit_text_commit(
     }
 }
 
-/// Rank of a Remove rule for the advisory `removed_reasons` (B48): the
-/// strongest admitting rule is stamped, `pending_removal` > `off_list` >
-/// `revoked` > `own_user` > `rejoin`
-fn removal_priority(reason: MlsRemovalReason) -> u8 {
-    match reason {
-        MlsRemovalReason::PendingRemoval => 5,
-        MlsRemovalReason::OffList => 4,
-        MlsRemovalReason::Revoked => 3,
-        MlsRemovalReason::OwnUser => 2,
-        MlsRemovalReason::Rejoin => 1,
+/// The entitlement predicate every Text Add needs, a new device and a
+/// recovery Add alike (design §6.3 "Recovery gates", #220): S5's
+/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`) replaces
+/// this at its merge. Remove and Update commits never read it.
+fn allows_text_traffic(entitlement: Option<&ChannelEntitlement>) -> bool {
+    entitlement.is_some_and(|entitlement| entitlement.is_active())
+}
+
+/// Whether every added device is a recovery Add (design §6.1 "S2
+/// additions", S2-D32, §6.3 "Recovery gates"), decided from the stored
+/// group, list and directory, never from the request: the re-Add of a
+/// device whose rule-6 eviction `rejoin_readd` records, or a replacement
+/// device of the stored list's signer user (a device of that user that is
+/// not a member of the group) while the signer's recovery is open
+/// ([`signer_recovery_open`]). One Add of any other device makes the commit
+/// a growth Add. The join-intent and KeyPackage-claim routes decide the
+/// same way.
+///
+/// The group is the route's read. A stale read cannot turn a growth Add
+/// into a recovery one: a `rejoin_readd` entry goes only with that device's
+/// re-Add (the device is then a member, which the transaction refuses), and
+/// `signer_lost` clears only in a seat-list write, which moves the AD hash
+/// the transaction filters on. Not here yet: the Add of a device that held
+/// a leaf in the predecessor generation (#226).
+async fn is_recovery_add(
+    db: &Database,
+    group: &MlsGroup,
+    seat_list: &SeatList,
+    added: &[MlsMemberDevice],
+) -> Result<bool> {
+    let readd = |target: &MlsMemberDevice| {
+        group
+            .rejoin_readd
+            .iter()
+            .any(|entry| entry.user_id == target.user_id && entry.device_id == target.device_id)
+    };
+    if added.is_empty() {
+        return Ok(false);
+    }
+    if added.iter().all(|target| readd(target)) {
+        return Ok(true);
+    }
+
+    let replacement = |target: &MlsMemberDevice| {
+        target.user_id == seat_list.signer_user_id
+            && !group.has_member(&target.user_id, &target.device_id)
+    };
+    if !added
+        .iter()
+        .all(|target| readd(target) || replacement(target))
+    {
+        return Ok(false);
+    }
+
+    signer_recovery_open(db, group, seat_list).await
+}
+
+/// Whether the signer user's recovery is open (§6.1, widened in #213): the
+/// group carries `signer_lost`, OR the stored list's signer device has no
+/// registered E2EE identity. The second is the server's own directory, so
+/// recovery never depends on `signer_lost` having been written. A read
+/// error other than an absent identity is returned, so it refuses (fails
+/// closed).
+async fn signer_recovery_open(
+    db: &Database,
+    group: &MlsGroup,
+    seat_list: &SeatList,
+) -> Result<bool> {
+    if group.signer_lost.is_some() {
+        return Ok(true);
+    }
+
+    match db
+        .fetch_e2ee_identity(&seat_list.signer_user_id, &seat_list.signer_device_id)
+        .await
+    {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(true),
+        Err(error) => Err(error),
     }
 }
 
-/// The Remove rule (design §3.12.2), checked by the route on the group and
-/// seat list it read; the commit transaction checks it again on its own
-/// read. `signed` is the newest stored list, `now` the commit's time.
+/// Add-clears-pending (design §6.1 "S2 additions", S2-D17b), as the commit
+/// transaction's planner checks it: a commit with Adds must remove every
+/// member device of each pending-removal user and every member device in
+/// `pending_device_removals`. An entry naming no member is satisfied. A
+/// partial clear is refused.
+fn add_clears_pending(group: &MlsGroup, removed: &[MlsMemberDevice]) -> bool {
+    let removes = |user_id: &str, device_id: &str| {
+        removed
+            .iter()
+            .any(|device| device.user_id == user_id && device.device_id == device_id)
+    };
+
+    group.pending_removals.iter().all(|pending| {
+        group
+            .member_devices_of(&pending.user_id)
+            .all(|device| removes(&device.user_id, &device.device_id))
+    }) && group.pending_device_removals.iter().all(|pending| {
+        !group.has_member(&pending.user_id, &pending.device_id)
+            || removes(&pending.user_id, &pending.device_id)
+    })
+}
+
+/// Whether the won `commit` cleared a pending entry (design 2.5 "Clearing",
+/// 7.5), by the commit transaction's own clearing rule on the route's group
+/// read: a pending-removal user left with no member device, or a pending
+/// device entry whose device holds no leaf after the commit. Only a read at
+/// `epoch - 1` is the pre-commit group (the fan-out's check). A read that
+/// raced another commit cannot tell, so a commit with Removes then counts
+/// as clearing: a needless refetch costs less than a channel left paused
+/// until someone opens it. No new read: the transaction's outcome carries
+/// no clearing.
+fn commit_clears_pending(group: &MlsGroup, commit: &MlsCommit) -> bool {
+    if group.current_epoch + 1 != commit.epoch {
+        return !commit.removed.is_empty();
+    }
+
+    let mut after = MlsGroup {
+        members: group
+            .members
+            .iter()
+            .filter(|member| !commit.removed.contains(member))
+            .chain(commit.added.iter())
+            .cloned()
+            .collect(),
+        ..group.clone()
+    };
+    let users_cleared = group
+        .pending_removals
+        .iter()
+        .any(|pending| after.member_devices_of(&pending.user_id).next().is_none());
+    retain_member_pending_device_removals(&mut after);
+    users_cleared || after.pending_device_removals.len() < group.pending_device_removals.len()
+}
+
+/// The Remove rule (design §3.12.2, §6.1 "S2 additions"), the route's
+/// pre-check on the group and seat list it read. It admits a device exactly
+/// when the commit transaction's planner would on the same reads; the
+/// transaction checks again on its own read, and that check is the one that
+/// binds. It stamps nothing: the transaction stamps `removed_reasons` from
+/// its own reads (#222). `signed` is the newest stored list, `now` the
+/// commit's time, `rejoin_window_seconds` the Text rule-6 window.
 ///
-/// The current list signer's device may be removed only in the rejoin case.
-/// Any other device may be removed when it belongs to the committer's own
-/// user, its user is pending removal, its identity is revoked, its user is
-/// off the list and the committer is the signer's device, or in the rejoin
-/// case.
-///
-/// Returns one advisory reason per removed device, in `removed` order: the
-/// strongest rule that admits it (B48). The reasons never change admission:
-/// a device is admitted exactly when some rule admits it. Every rule but
-/// rejoin is evaluated for every device. Rejoin is the weakest, so it can
-/// never be the strongest when another rule admits; it is evaluated only
-/// when none does, as before, so its intent read never runs, and never
-/// fails, for a device another rule already admits. An identity read error
-/// is no evidence of revocation: it refuses only when no other rule admits
-/// the device, as before.
+/// The current list signer's device may be removed only in the rejoin case
+/// (rule 1). Any other device may be removed when it belongs to the
+/// committer's own user (2), its user is pending removal (3), it is in
+/// `pending_device_removals` (3a), its identity is revoked (4), its user is
+/// off the list and the committer is the signer's device (5), or in the
+/// rejoin case (6). Every device stops at the first rule that admits it, so
+/// the intent read runs only for a device no other rule admits. An identity
+/// read error is no evidence of revocation: it refuses only when rejoin does
+/// not admit the device either.
 async fn check_removals(
     db: &Database,
     group: &MlsGroup,
@@ -642,18 +806,18 @@ async fn check_removals(
     committer: &MlsMemberDevice,
     removed: &[MlsMemberDevice],
     now: Timestamp,
-) -> Result<Vec<MlsRemovedReason>> {
+    rejoin_window_seconds: i64,
+) -> Result<()> {
     if removed.is_empty() {
-        return Ok(vec![]);
+        return Ok(());
     }
 
     let committer_is_signer = committer.user_id == signed.signer_user_id
         && committer.device_id == signed.signer_device_id;
     let window_start = now
-        .checked_sub(Duration::seconds(REJOIN_OUTSTANDING_WINDOW_SECONDS))
+        .checked_sub(Duration::seconds(rejoin_window_seconds))
         .ok_or_else(|| failed("invalid commit time"))?;
     let mut intents: Option<Vec<MlsJoinIntent>> = None;
-    let mut reasons = Vec::with_capacity(removed.len());
 
     for device in removed {
         if !group.has_member(&device.user_id, &device.device_id) {
@@ -667,17 +831,20 @@ async fn check_removals(
         let is_signer_device =
             device.user_id == signed.signer_user_id && device.device_id == signed.signer_device_id;
 
-        // Rules 2 to 5, all of them; none applies to the signer's device
-        let mut admitting: Vec<MlsRemovalReason> = Vec::new();
+        // Rules 2 to 5 and 3a; none applies to the signer's device
+        let mut identity_error = None;
         if !is_signer_device {
-            if group.has_pending_removal(&device.user_id) {
-                admitting.push(MlsRemovalReason::PendingRemoval);
-            }
-            if committer_is_signer && !signed.seats.iter().any(|seat| *seat == device.user_id) {
-                admitting.push(MlsRemovalReason::OffList);
-            }
-            if device.user_id == committer.user_id {
-                admitting.push(MlsRemovalReason::OwnUser);
+            let pending_device = group.pending_device_removals.iter().any(|pending| {
+                pending.user_id == device.user_id && pending.device_id == device.device_id
+            });
+            let off_list =
+                committer_is_signer && !signed.seats.iter().any(|seat| *seat == device.user_id);
+            if group.has_pending_removal(&device.user_id)
+                || device.user_id == committer.user_id
+                || pending_device
+                || off_list
+            {
+                continue;
             }
 
             // Revoked = no identity row; a read error is no evidence
@@ -686,29 +853,14 @@ async fn check_removals(
                 .await
             {
                 Ok(_) => {}
-                Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
-                    admitting.push(MlsRemovalReason::Revoked)
-                }
-                Err(error) if admitting.is_empty() => return Err(error),
-                Err(_) => {}
+                Err(error) if matches!(error.error_type, ErrorType::NotFound) => continue,
+                Err(error) => identity_error = Some(error),
             }
         }
 
-        if let Some(reason) = admitting
-            .into_iter()
-            .max_by_key(|reason| removal_priority(*reason))
-        {
-            reasons.push(MlsRemovedReason {
-                user_id: device.user_id.clone(),
-                device_id: device.device_id.clone(),
-                reason,
-            });
-            continue;
-        }
-
-        // Rejoin case: a stored intent of this device, outstanding and
-        // newer than the device's latest Add (no `member_added` entry =
-        // refused, never "added at time zero")
+        // Rejoin case, for every device: a stored intent of this device,
+        // inside the Text window and newer than the device's latest Add (no
+        // `member_added` entry = refused, never "added at time zero")
         if intents.is_none() {
             intents = Some(db.fetch_mls_join_intents_for_group(&group.id).await?);
         }
@@ -727,16 +879,11 @@ async fn check_removals(
                     .is_some_and(|at| intent.created_at >= window_start && intent.created_at > at)
         });
         if !outstanding {
-            return Err(failed("removal not permitted"));
+            return Err(identity_error.unwrap_or_else(|| failed("removal not permitted")));
         }
-        reasons.push(MlsRemovedReason {
-            user_id: device.user_id.clone(),
-            device_id: device.device_id.clone(),
-            reason: MlsRemovalReason::Rejoin,
-        });
     }
 
-    Ok(reasons)
+    Ok(())
 }
 
 /// One ADDED device (design §6.1 "Commit with `added`", decision 7 (W2)): a
@@ -889,11 +1036,11 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
-        Account, BotInformation, ChannelEntitlementState, Database, E2EEContentType, E2EEEnvelope,
-        MemberCompositeKey, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
-        MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsMemberDevice, MlsRemovalReason,
-        MlsRemovedReason, PartialChannel, PartialMember, PartialUser, RelationshipStatus, SeatList,
-        Session, User,
+        events::client::EventV1, Account, BotInformation, ChannelEntitlementState, Database,
+        E2EEContentType, E2EEEnvelope, MemberCompositeKey, MlsCommit, MlsCommitOutcome,
+        MlsEnvelopeRejoinIntent, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent,
+        MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, PartialChannel, PartialMember,
+        PartialUser, RelationshipStatus, SeatList, Session, User, PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1646,6 +1793,7 @@ mod tests {
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
+                    welcome: None,
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -1793,6 +1941,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         };
         let ad = current_ad(&setup.harness, setup.channel_id()).await;
         let at = |epoch: i64| {
@@ -2137,6 +2286,7 @@ mod tests {
             signature: next.signature,
             handovers: vec![],
             updated_at: Timestamp::now_utc(),
+            authority: None,
         }
         .commit_ad_sha256()
         .expect("hash");
@@ -2645,6 +2795,475 @@ mod tests {
         );
     }
 
+    /// Never-plaintext and removal safety (S5b): Remove and Update commits
+    /// are never gated on the entitlement, in Frozen and Deleted too, while
+    /// an Add in the same state is refused
+    #[test]
+    fn remove_and_update_commits_pass_in_frozen_and_deleted() {
+        crate::util::test::rt()
+            .block_on(remove_and_update_commits_pass_in_frozen_and_deleted_case())
+    }
+
+    async fn remove_and_update_commits_pass_in_frozen_and_deleted_case() {
+        let setup = setup(3).await;
+        let db = setup.db();
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![setup.members[0].device(), setup.members[1].device()],
+                vec![],
+            )
+            .await,
+            "two Adds while Active",
+        );
+
+        for (state, revoked) in [
+            (ChannelEntitlementState::Frozen, &setup.members[0]),
+            (ChannelEntitlementState::Deleted, &setup.members[1]),
+        ] {
+            let case = format!("{state:?}");
+            set_entitlement(db, setup.channel_id(), Some(state)).await;
+
+            let error = refusal(
+                commit_next(
+                    &setup,
+                    &setup.owner,
+                    vec![setup.members[2].device()],
+                    vec![],
+                )
+                .await,
+                &case,
+            );
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{}: {:?}",
+                case,
+                error
+            );
+            assert_route_refusal(&error, &case);
+
+            assert_won(
+                commit_next(&setup, &setup.owner, vec![], vec![]).await,
+                &format!("an Update, {case}"),
+            );
+
+            // A Remove (a revoked device, rule 4)
+            assert!(db
+                .delete_e2ee_device(&revoked.user.id, &revoked.device_id)
+                .await
+                .expect("revoke"));
+            assert_won(
+                commit_next(&setup, &setup.owner, vec![], vec![revoked.device()]).await,
+                &format!("a Remove, {case}"),
+            );
+            assert!(!db
+                .fetch_mls_group(&setup.group_id)
+                .await
+                .expect("the group")
+                .has_member(&revoked.user.id, &revoked.device_id));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Recovery Adds (S2-D32): the available gate and the entitlement, no
+    // growth flag
+    // ---------------------------------------------------------------------
+
+    /// The owner's device Adds `devices` at the group's next epoch through
+    /// the commit transaction, which reads no flag: the state an Add made
+    /// with growth on leaves, for a test that runs with growth off
+    async fn add_through_the_transaction(setup: &Setup, devices: &[&Party]) {
+        let db = setup.db();
+        let epoch = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .current_epoch
+            + 1;
+        let stored = db
+            .fetch_seat_list(setup.channel_id())
+            .await
+            .expect("seat list read")
+            .expect("a seat list");
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let commit = framed_commit(&setup.group_id, epoch, &ad);
+        let outcome = db
+            .insert_mls_text_commit(
+                &MlsCommit {
+                    id: MlsCommit::composite_id(&setup.group_id, epoch),
+                    group_id: setup.group_id.clone(),
+                    epoch,
+                    committer: member_device(&setup.owner.user.id, &setup.owner.device_id),
+                    size: (commit.len() * 3 / 4) as i64,
+                    commit,
+                    added: devices
+                        .iter()
+                        .map(|party| member_device(&party.user.id, &party.device_id))
+                        .collect(),
+                    removed: vec![],
+                    created_at: Timestamp::now_utc(),
+                    rejoin_intents: vec![],
+                    removed_reasons: vec![],
+                    welcome: Some(STANDARD_NO_PAD.encode(b"opaque welcome")),
+                },
+                &stored.commit_ad_sha256().expect("hash"),
+                FIXTURE_DEVICE_CAP,
+            )
+            .await
+            .expect("the Adds");
+        assert!(matches!(outcome, MlsCommitOutcome::Won));
+    }
+
+    /// S2-D32: the re-Add of a device whose rule-6 eviction `rejoin_readd`
+    /// records is a recovery Add. With growth off it passes and consumes the
+    /// entry; it still needs an entitlement that allows text traffic; a new
+    /// device, alone or beside the re-Add, still needs growth
+    #[test]
+    fn a_rejoin_readd_re_add_passes_with_growth_off() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            a_rejoin_readd_re_add_passes_with_growth_off_case().await
+        })
+    }
+
+    async fn a_rejoin_readd_re_add_passes_with_growth_off_case() {
+        let setup = setup(2).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let rejoining = &setup.members[1];
+        add_through_the_transaction(&setup, &[committer, rejoining]).await;
+
+        // The rule-6 eviction is a Remove: it goes on with growth off
+        db.upsert_mls_join_intent(&rejoin_intent(&setup, rejoining, Timestamp::now_utc()))
+            .await
+            .expect("the rejoin intent");
+        assert_won(
+            commit_next(&setup, committer, vec![], vec![rejoining.device()]).await,
+            "the rule-6 eviction",
+        );
+        let readd = |group: &MlsGroup| {
+            group.rejoin_readd.iter().any(|entry| {
+                entry.user_id == rejoining.user.id && entry.device_id == rejoining.device_id
+            })
+        };
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(readd(&group), "the eviction records the re-Add");
+        assert!(!group.has_member(&rejoining.user.id, &rejoining.device_id));
+
+        let new_device = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x64)
+            .await;
+        let new_device = device_of(&committer.user, &new_device.device_id);
+        for (case, added) in [
+            ("a new device", vec![new_device.clone()]),
+            (
+                "the re-Add beside a new device",
+                vec![rejoining.device(), new_device.clone()],
+            ),
+        ] {
+            let error = refusal(commit_next(&setup, committer, added, vec![]).await, case);
+            assert_disabled(&error, "protected_channels", case);
+            assert_route_refusal(&error, case);
+        }
+
+        // Recovery still needs an entitlement that allows text traffic
+        set_entitlement(
+            db,
+            setup.channel_id(),
+            Some(ChannelEntitlementState::Frozen),
+        )
+        .await;
+        let error = refusal(
+            commit_next(&setup, committer, vec![rejoining.device()], vec![]).await,
+            "the re-Add, frozen",
+        );
+        assert!(
+            matches!(error.error_type, ErrorType::InvalidOperation),
+            "{:?}",
+            error
+        );
+        assert_route_refusal(&error, "the re-Add, frozen");
+        set_entitlement(
+            db,
+            setup.channel_id(),
+            Some(ChannelEntitlementState::Active),
+        )
+        .await;
+
+        assert_won(
+            commit_next(&setup, committer, vec![rejoining.device()], vec![]).await,
+            "the re-Add with growth off",
+        );
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.has_member(&rejoining.user.id, &rejoining.device_id));
+        assert!(!readd(&group), "the re-Add consumes the entry");
+    }
+
+    /// How a test loses the list signer's (the owner's) device
+    #[derive(Debug, Clone, Copy)]
+    enum SignerLoss {
+        /// The revocation's pending pass set `signer_lost`; the identity
+        /// is still there
+        Flagged,
+        /// The identity is gone and nothing set `signer_lost` (#213)
+        IdentityGone,
+    }
+
+    async fn lose_the_signer_device(setup: &Setup, loss: SignerLoss) {
+        let db = setup.db();
+        let owner = &setup.owner;
+        match loss {
+            SignerLoss::Flagged => {
+                // `signer_lost`, never a pending entry (S2-D15)
+                let touched = db
+                    .add_pending_device_removal(
+                        &owner.user.id,
+                        &owner.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                    .expect("the pending pass");
+                assert_eq!(touched, vec![setup.channel_id().to_string()]);
+                let group = db
+                    .fetch_mls_group(&setup.group_id)
+                    .await
+                    .expect("the group");
+                assert_eq!(
+                    group.signer_lost.as_ref().map(|lost| lost.user_id.as_str()),
+                    Some(owner.user.id.as_str())
+                );
+                assert!(!group
+                    .pending_device_removals
+                    .iter()
+                    .any(|pending| pending.device_id == owner.device_id));
+            }
+            SignerLoss::IdentityGone => {
+                assert!(db
+                    .delete_e2ee_device(&owner.user.id, &owner.device_id)
+                    .await
+                    .expect("revoke"));
+                assert!(db
+                    .fetch_mls_group(&setup.group_id)
+                    .await
+                    .expect("the group")
+                    .signer_lost
+                    .is_none());
+            }
+        }
+    }
+
+    /// S2-D17d, S2-D32, #213, growth off: the signer user's replacement (a
+    /// device of the stored list's signer user that is not in the group) is
+    /// growth until the signer device is lost, then recovery, whether the
+    /// loss is flagged or only the identity is gone. A device of the signer
+    /// user that is already a member is never a replacement, and another
+    /// user's Add stays growth
+    async fn the_signer_users_replacement_is_recovery(loss: SignerLoss) {
+        let setup = setup(2).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let other = &setup.members[1];
+        add_through_the_transaction(&setup, &[committer]).await;
+        let replacement = setup
+            .harness
+            .new_e2ee_device(&setup.owner.user, &Ulid::new().to_string(), 0x51)
+            .await;
+        let replacement = device_of(&setup.owner.user, &replacement.device_id);
+        let growth = |error: Error, case: &str| {
+            assert_disabled(&error, "protected_channels", case);
+            assert_route_refusal(&error, case);
+        };
+
+        growth(
+            refusal(
+                commit_next(&setup, committer, vec![replacement.clone()], vec![]).await,
+                "the replacement before the loss",
+            ),
+            "the replacement before the loss",
+        );
+
+        lose_the_signer_device(&setup, loss).await;
+
+        growth(
+            refusal(
+                commit_next(&setup, committer, vec![setup.owner.device()], vec![]).await,
+                "a member device of the signer user",
+            ),
+            "a member device of the signer user",
+        );
+        growth(
+            refusal(
+                commit_next(&setup, committer, vec![other.device()], vec![]).await,
+                "another user's Add",
+            ),
+            "another user's Add",
+        );
+
+        assert_won(
+            commit_next(&setup, committer, vec![replacement.clone()], vec![]).await,
+            "the replacement after the loss",
+        );
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_member(&setup.owner.user.id, &replacement.device_id));
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_while_signer_lost() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::Flagged).await
+        })
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_when_its_identity_is_gone() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::IdentityGone).await
+        })
+    }
+
+    /// S2-D17d with growth on: while `signer_lost` is set the route itself
+    /// refuses another user's Add with `owner_device_lost` (planner fix
+    /// round: the route answers it before `pending_removal`, so it no
+    /// longer leaves it to the transaction), and the signer user's
+    /// replacement goes through
+    #[test]
+    fn other_users_adds_are_refused_while_signer_lost() {
+        crate::util::test::rt().block_on(other_users_adds_are_refused_while_signer_lost_case())
+    }
+
+    async fn other_users_adds_are_refused_while_signer_lost_case() {
+        let setup = setup(2).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let other = &setup.members[1];
+        assert_won(
+            commit_next(&setup, &setup.owner, vec![committer.device()], vec![]).await,
+            "an Add",
+        );
+        lose_the_signer_device(&setup, SignerLoss::Flagged).await;
+
+        let error = refusal(
+            commit_next(&setup, committer, vec![other.device()], vec![]).await,
+            "another user's Add",
+        );
+        assert_resecuring(&error, "owner_device_lost", "another user's Add");
+        assert_route_refusal(&error, "another user's Add");
+
+        let replacement = setup
+            .harness
+            .new_e2ee_device(&setup.owner.user, &Ulid::new().to_string(), 0x51)
+            .await;
+        assert_won(
+            commit_next(
+                &setup,
+                committer,
+                vec![device_of(&setup.owner.user, &replacement.device_id)],
+                vec![],
+            )
+            .await,
+            "the signer user's replacement device",
+        );
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_member(&setup.owner.user.id, &replacement.device_id));
+    }
+
+    /// Refusal order (W1 note (t), as the commit transaction and the
+    /// encrypted send): with `signer_lost` and a pending entry both
+    /// standing, another user's Add answers `owner_device_lost`, never
+    /// `pending_removal`. The signer user's replacement then meets
+    /// Add-clears-pending, and goes through once it removes the pending
+    /// device
+    #[test]
+    fn owner_device_lost_answers_before_pending_removal() {
+        crate::util::test::rt().block_on(owner_device_lost_answers_before_pending_removal_case())
+    }
+
+    async fn owner_device_lost_answers_before_pending_removal_case() {
+        let setup = setup(3).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let pending = &setup.members[1];
+        let other = &setup.members[2];
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![committer.device(), pending.device()],
+                vec![],
+            )
+            .await,
+            "two Adds",
+        );
+        db.add_pending_device_removal(&pending.user.id, &pending.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+        lose_the_signer_device(&setup, SignerLoss::Flagged).await;
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.signer_lost.is_some());
+        assert!(group.has_member(&pending.user.id, &pending.device_id));
+        assert_eq!(group.pending_device_removals.len(), 1);
+
+        let error = refusal(
+            commit_next(&setup, committer, vec![other.device()], vec![]).await,
+            "another user's Add, both standing",
+        );
+        assert_resecuring(
+            &error,
+            "owner_device_lost",
+            "another user's Add, both standing",
+        );
+        assert_route_refusal(&error, "another user's Add, both standing");
+
+        let replacement = setup
+            .harness
+            .new_e2ee_device(&setup.owner.user, &Ulid::new().to_string(), 0x52)
+            .await;
+        let replacement = device_of(&setup.owner.user, &replacement.device_id);
+        let error = refusal(
+            commit_next(&setup, committer, vec![replacement.clone()], vec![]).await,
+            "the replacement beside the pending device",
+        );
+        assert_resecuring(
+            &error,
+            "pending_removal",
+            "the replacement beside the pending device",
+        );
+        assert_route_refusal(&error, "the replacement beside the pending device");
+
+        assert_won(
+            commit_next(&setup, committer, vec![replacement], vec![pending.device()]).await,
+            "the replacement removing the pending device",
+        );
+    }
+
     // ---------------------------------------------------------------------
     // The Remove rule (design §3.12.2), route side
     // ---------------------------------------------------------------------
@@ -2698,6 +3317,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -2740,6 +3361,8 @@ mod tests {
                 device_id: setup.owner.device_id.clone(),
                 key_package_ref: intent.key_package_ref.clone(),
                 signature: intent.signature.clone(),
+                generation: None,
+                issued_at: None,
             }]
         );
     }
@@ -2879,6 +3502,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at,
+            generation: None,
+            issued_at: None,
         };
         db.upsert_mls_join_intent(&intent(before_add))
             .await
@@ -2919,6 +3544,556 @@ mod tests {
             commit_next(&setup, committer, vec![], vec![target.device()]).await,
             "a fresh rejoin intent",
         );
+    }
+
+    /// Rule 3a (design §6.1 "S2 additions"): any member may remove a device
+    /// in `pending_device_removals`, a seated user's live device included.
+    /// Without the entry the route refuses that very removal; with it the
+    /// transaction stamps `pending_device` and the clearing drops the entry
+    #[test]
+    fn a_pending_device_is_removed_by_any_member() {
+        crate::util::test::rt().block_on(a_pending_device_is_removed_by_any_member_case())
+    }
+
+    async fn a_pending_device_is_removed_by_any_member_case() {
+        let setup = setup(2).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let target = &setup.members[1];
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![committer.device(), target.device()],
+                vec![],
+            )
+            .await,
+            "two Adds",
+        );
+
+        let error = refusal(
+            commit_next(&setup, committer, vec![], vec![target.device()]).await,
+            "without a pending entry",
+        );
+        assert_failed_validation(&error, "without a pending entry");
+        assert_route_refusal(&error, "without a pending entry");
+
+        let touched = db
+            .add_pending_device_removal(&target.user.id, &target.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+        assert_eq!(touched, vec![setup.channel_id().to_string()]);
+        assert_removal_stamped(
+            &setup,
+            committer,
+            &setup.owner,
+            target,
+            MlsRemovalReason::PendingDevice,
+            "pending_device",
+        )
+        .await;
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .pending_device_removals
+            .is_empty());
+    }
+
+    /// Add-clears-pending (S2-D17b): while a pending list names a member
+    /// device, an Add that leaves it in the group is refused by the route
+    /// (`pending_removal`), a partial clear too; the same Add removing every
+    /// such device in the same commit goes through, for a pending device and
+    /// for a pending-removal user alike
+    #[test]
+    fn an_add_that_clears_every_pending_entry_goes_through() {
+        crate::util::test::rt().block_on(an_add_that_clears_every_pending_entry_goes_through_case())
+    }
+
+    async fn an_add_that_clears_every_pending_entry_goes_through_case() {
+        let setup = setup(4).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let pending_device = &setup.members[0];
+        let pending_user = &setup.members[1];
+        let pending_user_other = setup
+            .harness
+            .new_e2ee_device(&pending_user.user, &Ulid::new().to_string(), 0x66)
+            .await;
+        let pending_user_other = Party {
+            user: pending_user.user.clone(),
+            session: pending_user.session.clone(),
+            device_id: pending_user_other.device_id,
+        };
+        let first_joiner = &setup.members[2];
+        let second_joiner = &setup.members[3];
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![
+                    pending_device.device(),
+                    pending_user.device(),
+                    pending_user_other.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "three Adds",
+        );
+
+        let refused = |error: Error, case: &str| {
+            assert_resecuring(&error, "pending_removal", case);
+            assert_route_refusal(&error, case);
+        };
+
+        // A pending device
+        db.add_pending_device_removal(
+            &pending_device.user.id,
+            &pending_device.device_id,
+            Timestamp::now_utc(),
+        )
+        .await
+        .expect("the pending pass");
+        refused(
+            refusal(
+                commit_next(&setup, owner, vec![first_joiner.device()], vec![]).await,
+                "an Add beside a pending device",
+            ),
+            "an Add beside a pending device",
+        );
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![first_joiner.device()],
+                vec![pending_device.device()],
+            )
+            .await,
+            "an Add removing the pending device",
+        );
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.has_member(&first_joiner.user.id, &first_joiner.device_id));
+        assert!(group.pending_device_removals.is_empty());
+
+        // A pending-removal user with two devices
+        setup
+            .harness
+            .put_seats_with_db(
+                &setup.protected.channel,
+                &setup.protected.owner_device.seat_list(
+                    setup.channel_id(),
+                    2,
+                    FIXTURE_DEVICE_CAP,
+                    &[
+                        &owner.user.id,
+                        &pending_device.user.id,
+                        &first_joiner.user.id,
+                        &second_joiner.user.id,
+                    ],
+                ),
+            )
+            .await;
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_pending_removal(&pending_user.user.id));
+        refused(
+            refusal(
+                commit_next(
+                    &setup,
+                    owner,
+                    vec![second_joiner.device()],
+                    vec![pending_user.device()],
+                )
+                .await,
+                "an Add with a partial clear",
+            ),
+            "an Add with a partial clear",
+        );
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![second_joiner.device()],
+                vec![pending_user.device(), pending_user_other.device()],
+            )
+            .await,
+            "an Add removing every device of the pending user",
+        );
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.has_member(&second_joiner.user.id, &second_joiner.device_id));
+        assert!(group.pending_removals.is_empty());
+    }
+
+    /// The 7.5 event a won commit that cleared a pending entry publishes
+    fn text_group_changed(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+        move |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                if id == channel_id
+                    && *scope == vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()])
+        }
+    }
+
+    /// Buffer every event published so far: a marker on `user_id`'s private
+    /// topic is published and awaited. The harness reads every topic through
+    /// ONE subscription, FIFO, and the route (called directly) awaited its
+    /// publishes before it returned.
+    async fn flush_events(harness: &mut TestHarness, user_id: &str) {
+        let marker = Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: marker.clone(),
+            user: user_id.to_string(),
+            message_id: marker.clone(),
+        }
+        .private(user_id.to_string())
+        .await;
+        harness
+            .wait_for_event(&format!("{user_id}!"), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+    }
+
+    /// Which pending list the announcement test fills
+    #[derive(Clone, Copy)]
+    enum Pending {
+        /// `pending_device_removals` (rule 3a)
+        Device,
+        /// `pending_removals`, the owner unseating the user (rule 3)
+        User,
+    }
+
+    #[test]
+    fn a_remove_clearing_a_pending_device_announces_the_text_group() {
+        crate::util::test::rt().block_on(a_remove_clearing_pending_announces_case(Pending::Device))
+    }
+
+    #[test]
+    fn a_remove_clearing_a_pending_user_announces_the_text_group() {
+        crate::util::test::rt().block_on(a_remove_clearing_pending_announces_case(Pending::User))
+    }
+
+    /// 7.5 (S2-D18, W2 audit MAJOR-1): a won Remove commit that clears a
+    /// pending entry publishes `ProtectedChannelChanged { scope:
+    /// ["text_group"] }` on the channel topic. The entry is written through
+    /// the database, which announces nothing, and nothing is announced
+    /// before the Remove. Control: the won commit's publish dropped.
+    async fn a_remove_clearing_pending_announces_case(pending: Pending) {
+        let mut setup = setup(2).await;
+        let channel_id = setup.channel_id().to_string();
+        let owner_id = setup.owner.user.id.clone();
+        let committer = &setup.members[0];
+        let target = &setup.members[1];
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![committer.device(), target.device()],
+                vec![],
+            )
+            .await,
+            "two Adds",
+        );
+
+        match pending {
+            Pending::Device => {
+                let touched = setup
+                    .harness
+                    .db
+                    .add_pending_device_removal(
+                        &target.user.id,
+                        &target.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                    .expect("the pending pass");
+                assert_eq!(touched, vec![channel_id.clone()]);
+            }
+            Pending::User => {
+                setup
+                    .harness
+                    .put_seats_with_db(
+                        &setup.protected.channel,
+                        &setup.protected.owner_device.seat_list(
+                            &channel_id,
+                            2,
+                            FIXTURE_DEVICE_CAP,
+                            &[&setup.owner.user.id, &committer.user.id],
+                        ),
+                    )
+                    .await;
+                assert!(setup
+                    .harness
+                    .db
+                    .fetch_mls_group(&setup.group_id)
+                    .await
+                    .expect("the group")
+                    .has_pending_removal(&target.user.id));
+            }
+        }
+
+        flush_events(&mut setup.harness, &owner_id).await;
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, text_group_changed(&channel_id));
+
+        assert_won(
+            commit_next(&setup, committer, vec![], vec![target.device()]).await,
+            "a Remove clearing the pending entry",
+        );
+        let group = setup
+            .harness
+            .db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert!(group.pending_removals.is_empty(), "{group:?}");
+        assert!(group.pending_device_removals.is_empty(), "{group:?}");
+        setup
+            .harness
+            .wait_for_event(&channel_id, text_group_changed(&channel_id))
+            .await;
+    }
+
+    #[test]
+    fn commits_that_clear_nothing_announce_nothing() {
+        crate::util::test::rt().block_on(commits_that_clear_nothing_announce_nothing_case())
+    }
+
+    /// 7.5: a won commit that clears no pending entry announces nothing: the
+    /// Adds (no entry yet), then, with a pending device entry the commits
+    /// leave in place, an Update and a Remove of the committer's own other
+    /// device (rule 2). Control: the publish made unconditional on every won
+    /// commit.
+    async fn commits_that_clear_nothing_announce_nothing_case() {
+        let mut setup = setup(2).await;
+        let channel_id = setup.channel_id().to_string();
+        let owner_id = setup.owner.user.id.clone();
+        let committer = &setup.members[0];
+        let target = &setup.members[1];
+        let own_other = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x60)
+            .await;
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![
+                    committer.device(),
+                    device_of(&committer.user, &own_other.device_id),
+                    target.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "three Adds",
+        );
+        setup
+            .harness
+            .db
+            .add_pending_device_removal(&target.user.id, &target.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+
+        assert_won(
+            commit_next(&setup, committer, vec![], vec![]).await,
+            "an Update",
+        );
+        assert_won(
+            commit_next(
+                &setup,
+                committer,
+                vec![],
+                vec![device_of(&committer.user, &own_other.device_id)],
+            )
+            .await,
+            "a Remove clearing nothing",
+        );
+        let group = setup
+            .harness
+            .db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert_eq!(
+            group.pending_device_removals.len(),
+            1,
+            "the pending entry stays: {group:?}"
+        );
+
+        flush_events(&mut setup.harness, &owner_id).await;
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, |event| {
+                matches!(event, EventV1::ProtectedChannelChanged { .. })
+            });
+    }
+
+    /// `seconds` before now
+    fn seconds_ago(seconds: i64) -> Timestamp {
+        Timestamp::now_utc()
+            .checked_sub(Duration::seconds(seconds))
+            .expect("a time")
+    }
+
+    /// `party`'s rejoin intent for the group, created at `created_at`
+    fn rejoin_intent(setup: &Setup, party: &Party, created_at: Timestamp) -> MlsJoinIntent {
+        MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(&setup.group_id, &party.user.id, &party.device_id),
+            group_id: setup.group_id.clone(),
+            user_id: party.user.id.clone(),
+            device_id: party.device_id.clone(),
+            key_package_ref: "rejoin-key-package".to_string(),
+            signature: "rejoin-signature".to_string(),
+            created_at,
+            generation: None,
+            issued_at: None,
+        }
+    }
+
+    /// Move a member device's latest Add (`member_added.at`) back to `at`,
+    /// so an intent can be older than the window and still newer than the
+    /// Add. No route reaches that state inside a test's runtime; written
+    /// directly
+    async fn backdate_member_added(db: &Database, group_id: &str, party: &Party, at: Timestamp) {
+        let mut member_added = db
+            .fetch_mls_group(group_id)
+            .await
+            .expect("the group")
+            .member_added;
+        member_added
+            .iter_mut()
+            .find(|entry| entry.user_id == party.user.id && entry.device_id == party.device_id)
+            .expect("the Add entry")
+            .at = at;
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .mls_groups
+                    .lock()
+                    .await
+                    .get_mut(group_id)
+                    .expect("the group")
+                    .member_added = member_added;
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, to_bson, Document};
+                let result = mongo
+                    .col::<Document>("mls_groups")
+                    .update_one(
+                        doc! { "_id": group_id },
+                        doc! { "$set": {
+                            "member_added": to_bson(&member_added).expect("bson")
+                        } },
+                    )
+                    .await
+                    .expect("write member_added");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+        let stored = db
+            .fetch_mls_group(group_id)
+            .await
+            .expect("the group")
+            .member_added
+            .into_iter()
+            .find(|entry| entry.user_id == party.user.id && entry.device_id == party.device_id)
+            .expect("the Add entry")
+            .at;
+        assert!(stored < seconds_ago(86400), "backdated to {:?}", stored);
+    }
+
+    /// Text rule 6 (S2-D28): `committer` evicts a device whose Add lies two
+    /// days back. An intent `stale` seconds old is refused by the route; one
+    /// `fresh` seconds old evicts, and the transaction stamps `rejoin`
+    async fn rejoin_window_case(stale: i64, fresh: i64) {
+        let setup = setup(2).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let rejoining = &setup.members[1];
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![committer.device(), rejoining.device()],
+                vec![],
+            )
+            .await,
+            "two Adds",
+        );
+        backdate_member_added(db, &setup.group_id, rejoining, seconds_ago(2 * 86400)).await;
+
+        db.upsert_mls_join_intent(&rejoin_intent(&setup, rejoining, seconds_ago(stale)))
+            .await
+            .expect("a stale intent");
+        let error = refusal(
+            commit_next(&setup, committer, vec![], vec![rejoining.device()]).await,
+            "an intent past the window",
+        );
+        assert_failed_validation(&error, "an intent past the window");
+        assert_route_refusal(&error, "an intent past the window");
+
+        db.upsert_mls_join_intent(&rejoin_intent(&setup, rejoining, seconds_ago(fresh)))
+            .await
+            .expect("a fresh intent");
+        assert_removal_stamped(
+            &setup,
+            committer,
+            &setup.owner,
+            rejoining,
+            MlsRemovalReason::Rejoin,
+            "an intent inside the window",
+        )
+        .await;
+    }
+
+    /// S2-D28: by default the Text window is a day, route and transaction
+    /// alike: a 25 h intent is refused, a 23 h one evicts (the 30 s Call
+    /// window would refuse both)
+    #[test]
+    fn the_text_rejoin_window_is_a_day() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                revolt_config::config()
+                    .await
+                    .features
+                    .protected_channels
+                    .text_rejoin_window_secs,
+                86400
+            );
+            rejoin_window_case(25 * 3600, 23 * 3600).await
+        })
+    }
+
+    /// The route's window is the configured `text_rejoin_window_secs`, not a
+    /// constant: with 1 h a 2 h intent is refused by the route itself
+    #[test]
+    fn the_text_rejoin_window_follows_the_config() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.text_rejoin_window_secs = 3600;
+            })
+            .await;
+            rejoin_window_case(2 * 3600, 1800).await
+        })
+    }
+
+    /// The Call window stays 30 s (S2-D28). The Call commit path has no
+    /// Remove rule; the constant is the join-intent and close window
+    #[test]
+    fn the_call_rejoin_window_stays_thirty_seconds() {
+        assert_eq!(super::super::REJOIN_OUTSTANDING_WINDOW_SECONDS, 30);
+        assert_eq!(revolt_database::mls_text_rejoin_window_seconds(0), 30);
     }
 
     // ---------------------------------------------------------------------
@@ -3140,6 +4315,8 @@ mod tests {
             key_package_ref: "rejoin-key-package".to_string(),
             signature: "rejoin-signature".to_string(),
             created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
         })
         .await
         .expect("the rejoin intent");
@@ -3202,8 +4379,10 @@ mod tests {
     }
 
     /// B48: when several rules admit one device the strongest is stamped,
-    /// `pending_removal` > `off_list` > `revoked` > `own_user` > `rejoin`.
-    /// Admission is unchanged: every one of these commits wins
+    /// in the design §6.1 S2 order `pending_removal` > `rejoin` >
+    /// `own_user` > `pending_device` > `revoked` > `idle` > `off_list`
+    /// (stamped by the driver inside the commit transaction). Admission is
+    /// unchanged: every one of these commits wins
     #[test]
     fn the_strongest_admitting_rule_is_stamped() {
         crate::util::test::rt().block_on(the_strongest_admitting_rule_is_stamped_case())
@@ -3223,6 +4402,15 @@ mod tests {
             session: committer.session.clone(),
             device_id: own_other.device_id,
         };
+        let own_rejoining = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x63)
+            .await;
+        let own_rejoining = Party {
+            user: committer.user.clone(),
+            session: committer.session.clone(),
+            device_id: own_rejoining.device_id,
+        };
         let pending_revoked = &setup.members[1];
         let pending_off_list = &setup.members[2];
         let off_list_revoked = &setup.members[3];
@@ -3233,6 +4421,7 @@ mod tests {
                 vec![
                     committer.device(),
                     own_other.device(),
+                    own_rejoining.device(),
                     pending_revoked.device(),
                     pending_off_list.device(),
                     off_list_revoked.device(),
@@ -3240,10 +4429,10 @@ mod tests {
                 vec![],
             )
             .await,
-            "five Adds",
+            "six Adds",
         );
 
-        // revoked + own_user: the committer's own revoked device
+        // own_user + revoked: the committer's own revoked device
         assert!(db
             .delete_e2ee_device(&committer.user.id, &own_other.device_id)
             .await
@@ -3253,8 +4442,37 @@ mod tests {
             committer,
             owner,
             &own_other,
-            MlsRemovalReason::Revoked,
-            "revoked over own_user",
+            MlsRemovalReason::OwnUser,
+            "own_user over revoked",
+        )
+        .await;
+
+        // rejoin + own_user: the committer's own live device on its fresh
+        // intent (the S2 order puts rejoin above own_user)
+        db.upsert_mls_join_intent(&MlsJoinIntent {
+            id: MlsJoinIntent::composite_id(
+                &setup.group_id,
+                &own_rejoining.user.id,
+                &own_rejoining.device_id,
+            ),
+            group_id: setup.group_id.clone(),
+            user_id: own_rejoining.user.id.clone(),
+            device_id: own_rejoining.device_id.clone(),
+            key_package_ref: "own-rejoin-key-package".to_string(),
+            signature: "own-rejoin-signature".to_string(),
+            created_at: Timestamp::now_utc(),
+            generation: None,
+            issued_at: None,
+        })
+        .await
+        .expect("the rejoin intent");
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            &own_rejoining,
+            MlsRemovalReason::Rejoin,
+            "rejoin over own_user",
         )
         .await;
 
@@ -3302,7 +4520,7 @@ mod tests {
         )
         .await;
 
-        // off_list + revoked, by the signer's device, no pending entry
+        // revoked + off_list, by the signer's device, no pending entry
         setup
             .harness
             .put_seats_with_db(
@@ -3325,8 +4543,111 @@ mod tests {
             owner,
             committer,
             off_list_revoked,
-            MlsRemovalReason::OffList,
-            "off_list over revoked",
+            MlsRemovalReason::Revoked,
+            "revoked over off_list",
+        )
+        .await;
+    }
+
+    /// B48 with rule 3a: the §6.1 S2 order around `pending_device`, stamped
+    /// by the transaction: `own_user` > `pending_device` > `revoked`, and
+    /// `pending_removal` > `pending_device`. The route sends no reasons
+    #[test]
+    fn pending_device_is_stamped_in_the_s2_order() {
+        crate::util::test::rt().block_on(pending_device_is_stamped_in_the_s2_order_case())
+    }
+
+    async fn pending_device_is_stamped_in_the_s2_order_case() {
+        let setup = setup(3).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let committer = &setup.members[0];
+        let own_other = setup
+            .harness
+            .new_e2ee_device(&committer.user, &Ulid::new().to_string(), 0x65)
+            .await;
+        let own_other = Party {
+            user: committer.user.clone(),
+            session: committer.session.clone(),
+            device_id: own_other.device_id,
+        };
+        let pending_revoked = &setup.members[1];
+        let pending_user = &setup.members[2];
+        assert_won(
+            commit_next(
+                &setup,
+                owner,
+                vec![
+                    committer.device(),
+                    own_other.device(),
+                    pending_revoked.device(),
+                    pending_user.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "four Adds",
+        );
+        for party in [&own_other, pending_revoked, pending_user] {
+            db.add_pending_device_removal(&party.user.id, &party.device_id, Timestamp::now_utc())
+                .await
+                .expect("the pending pass");
+        }
+        assert_eq!(
+            db.fetch_mls_group(&setup.group_id)
+                .await
+                .expect("the group")
+                .pending_device_removals
+                .len(),
+            3
+        );
+
+        // own_user + pending_device
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            &own_other,
+            MlsRemovalReason::OwnUser,
+            "own_user over pending_device",
+        )
+        .await;
+
+        // pending_device + revoked, by a non-signer
+        assert!(db
+            .delete_e2ee_device(&pending_revoked.user.id, &pending_revoked.device_id)
+            .await
+            .expect("revoke"));
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            pending_revoked,
+            MlsRemovalReason::PendingDevice,
+            "pending_device over revoked",
+        )
+        .await;
+
+        // pending_removal + pending_device: unseated by the owner
+        setup
+            .harness
+            .put_seats_with_db(
+                &setup.protected.channel,
+                &setup.protected.owner_device.seat_list(
+                    setup.channel_id(),
+                    2,
+                    FIXTURE_DEVICE_CAP,
+                    &[&owner.user.id, &committer.user.id, &pending_revoked.user.id],
+                ),
+            )
+            .await;
+        assert_removal_stamped(
+            &setup,
+            committer,
+            owner,
+            pending_user,
+            MlsRemovalReason::PendingRemoval,
+            "pending_removal over pending_device",
         )
         .await;
     }
@@ -3372,6 +4693,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -3538,6 +4862,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -3574,5 +4901,99 @@ mod tests {
         assert!(envelopes[0].added.is_empty());
         assert!(envelopes[0].removed.is_empty());
         assert!(envelopes[0].rejoin_intents.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // The stored Welcome (S2-D29)
+    // ---------------------------------------------------------------------
+
+    /// A Text commit with Adds stores the request's Welcome on its row, and
+    /// the Welcome route's read finds it; an Update stores none. The commit
+    /// fetch and the 409 body of an identical resubmit never carry it
+    #[test]
+    fn the_welcome_is_stored_on_the_row_and_never_served() {
+        crate::util::test::rt().block_on(the_welcome_is_stored_on_the_row_and_never_served_case())
+    }
+
+    async fn the_welcome_is_stored_on_the_row_and_never_served_case() {
+        let setup = setup(1).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let member = &setup.members[0];
+        let welcome = STANDARD_NO_PAD.encode(b"the one stored welcome of this test");
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let add = || v0::DataSubmitMlsCommit {
+            welcome: Some(welcome.clone()),
+            ..request(
+                &owner.device_id,
+                &setup.group_id,
+                1,
+                &ad,
+                vec![member.device()],
+                vec![],
+            )
+        };
+
+        assert_won(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                add(),
+            )
+            .await,
+            "an Add",
+        );
+        assert_eq!(
+            stored_commit(&setup, 1).await.welcome.as_deref(),
+            Some(welcome.as_str())
+        );
+        let found = db
+            .fetch_mls_text_welcome(&setup.group_id, &member.user.id, &member.device_id)
+            .await
+            .expect("the Welcome read")
+            .expect("the Welcome row");
+        assert_eq!(found.epoch, 1);
+        assert_eq!(found.welcome.as_deref(), Some(welcome.as_str()));
+
+        assert_won(
+            commit_next(&setup, owner, vec![], vec![]).await,
+            "an Update",
+        );
+        assert_eq!(stored_commit(&setup, 2).await.welcome, None);
+
+        let fetched = super::super::commits_fetch::fetch_commits(
+            State::from(db),
+            owner.user.clone(),
+            owner.session.clone(),
+            setup.group_id.clone(),
+            0,
+        )
+        .await
+        .expect("the owner is served")
+        .into_inner();
+        let wire = serde_json::to_value(&fetched).expect("JSON");
+        let commits = wire["commits"].as_array().expect("the commits");
+        assert_eq!(commits.len(), 2, "{}", wire);
+        for commit in commits {
+            assert!(commit.get("welcome").is_none(), "{}", wire);
+        }
+        assert!(!wire.to_string().contains(&welcome), "{}", wire);
+
+        let winning = assert_lost(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                add(),
+            )
+            .await,
+            "an identical resubmit",
+        );
+        let wire = serde_json::to_value(&winning).expect("JSON");
+        assert!(wire.get("welcome").is_none(), "{}", wire);
+        assert!(!wire.to_string().contains(&welcome), "{}", wire);
     }
 }

@@ -105,6 +105,12 @@ const EXEMPT: &[(&str, &str)] = &[
         "server channels only: needs a protected server channel, carries no plaintext",
     ),
     (
+        "servers/member_remove.rs",
+        "server channels only: the protected check decides whether a kick or ban needs a \
+         reason; the server-written system row goes to the server's system channel, the \
+         reason to the audit log",
+    ),
+    (
         "servers/server_edit.rs",
         "server channels only: server settings, writes no message",
     ),

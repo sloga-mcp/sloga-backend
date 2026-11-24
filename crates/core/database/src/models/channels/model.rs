@@ -2335,12 +2335,14 @@ mod tests {
                 signer_user_id: owner.to_string(),
                 signer_device_id: PC_DEVICE.to_string(),
                 seats: vec![owner.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: format!("B{}", "A".repeat(85)),
             signer_device_id: PC_DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 
@@ -2611,6 +2613,9 @@ mod tests {
                 seat_list_ad_sha256: None,
                 pending_removals: vec![],
                 member_added: vec![],
+                pending_device_removals: vec![],
+                signer_lost: None,
+                rejoin_readd: vec![],
             };
             db.create_text_mls_group(&group, None).await.unwrap();
             let list = db
@@ -2630,6 +2635,7 @@ mod tests {
                 created_at: pc_now(),
                 rejoin_intents: vec![],
                 removed_reasons: vec![],
+                welcome: None,
             };
             let outcome = db
                 .insert_mls_text_commit(&commit, &list.commit_ad_sha256().unwrap(), 0)

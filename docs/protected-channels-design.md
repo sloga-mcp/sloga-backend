@@ -8,6 +8,22 @@ Roadmap + Slice 1"). This document pins every format, rule and surface that the 
 document and the plan disagree, the plan wins on scope and this document wins on formats;
 report the disagreement.
 
+**S2 additions (S2-W0, 2026-10-26, #187).** Slice 2 (membership hardening) is added to this
+contract against branch `feat/protected-s2` at `be915a8d`, from the approved plan
+`protected-s2-membership-plan.md` (decisions S2-D1 to S2-D44; S2a is what the beta needs,
+S2b the follow-ups). New text is marked **DECISION (S2-W0)**; S1 text that an S2 decision
+replaces is kept and marked "S2 replaces". S2b items are marked "[S2b]" and are specified as
+formats only unless stated. The S2 index entries are #187 to #239 (section 12; #212 to #223
+are the fix round of the S2-W0 wave audit, #224 to #232 its second round, #233 the S2-W1
+wave audit, #234 to #239 the S2-W3 native doc pass).
+
+**S2-W3 native doc pass (2026-11-12, #234 to #239).** Text marked "As built (S2-W3)" records
+what the native wave does at desktop `feat/protected-s2-native` `876c034`, read from the
+code; where it differs from earlier text here, the earlier text is kept and the difference
+is stated. It covers the S3-N0 envelope v2 decoder (3.6.1), the native command and storage
+changes (8.2 to 8.4), the 4.4.1 rules as built, the #223 supersession, and a release note
+(rolling back past S2 is unsafe, 8.2).
+
 How to read it:
 
 - **MUST / MUST NOT / SHOULD** are normative.
@@ -70,11 +86,21 @@ Every signed text payload in this document follows the house pattern of
 | `sloga-text-group-v1` | text group id derivation | 3.1 |
 | `sloga-seat-list-v1` | seat list body | 4.1 |
 | `sloga-owner-handover-v1` | owner handover statement | 4.6 |
+| `sloga-seat-list-v2` | seat list body v2 (S2) | 4.1.1 |
+| `sloga-text-group-v2` | text group id derivation v2 (S2) | 3.1.1 |
+| `sloga-channel-authority-v1` | channel authority (S2) | 4.10 |
+| `sloga-text-commit-ad-v2` | commit `authenticated_data` v2 (S2) | 3.12.1 |
+| `sloga-text-join-v1` | Text join intent payload (S2) | 3.13 |
+| `sloga-owner-succession-v1` | owner succession statement ([S2b], format only) | 4.11 |
 
 The first three are fixed by the plan. The last three are **DECISION (W0)**. Like the
 existing `acutest:e2ee:*` literals, each is a protocol constant: changing one is a protocol
 migration with a compatibility matrix, never a find-and-replace. Native and server each
 carry their own copy and the section 5 vectors pin them byte-for-byte.
+
+**DECISION (S2-W0), #188.** The last six rows are S2's (plan S2-D1 to S2-D6). No S1 literal
+is renamed: every v1 builder and parser stays, for flag-off and dev data (7.1 `formats_v2`).
+Section 5.8 pins the six new literals byte for byte.
 
 ---
 
@@ -99,6 +125,12 @@ access" and must unseat by hand.
 
 **HOLD (W2 audit A2, #178):** no flag-on of `[features.protected_channels]` at all, beta
 included, before residual R24 (the Call-create oracle, 1.3) is fixed in S2.
+
+**S2 (S2-W0, #190, #201).** Both HOLDs stay until S2a has landed, its live leg has passed
+and the owner says go (plan; a production flag-on is a separate go). S2a replaces 6.4 with
+the reconciler and closes R24 with the viewer-bound group id (3.1.1); the R24 fix applies to
+channels on a v2 list, and a channel enters v2 only while `formats_v2` is on (7.1, #218), so
+flipping that flag is part of lifting the HOLD.
 
 ### 1.2 Trust model
 
@@ -146,6 +178,16 @@ A hostile or compromised server (or an operator with database access):
 - **R5. Welcome stranded by the queue budget until S2.** A Welcome dropped by the per-device
   E2EE queue depth cap leaves the joiner without group state. The joiner's join-intent retry
   (3 retries, media plan 1.4 step 5) then ends in the loud failure state; catch-up is S2.
+  **S2 (S2-W0, #203): closed in S2a.** Text commits store their Welcome
+  (`MlsCommit.welcome`, 2.5); `deliver()` exempts `mls_welcome` envelopes from the queue
+  DEPTH limit (the bytes limit stays) and logs a skip at `warn`; and a device that
+  `member_added` lists but that saw no Welcome within 20 s fetches it from
+  `GET /mls/groups/:id/welcome` (7.2). Text join intents stay outstanding for 24 h and the
+  joiner re-broadcasts with backoff (6.3 "Async Text join"), so silence is never a red state
+  (9.1). What remains: a Welcome whose commit row was pruned (R9) is gone (the route gives
+  the unknown-group answer and the device sends a rejoin intent), and the route needs
+  OpenMLS to keep the KeyPackage private key long enough for a Welcome processed up to 24 h
+  late (plan O-12: a spike precedes S2-W1).
 - **R6. Length and timing metadata.** Ciphertext length tracks plaintext length (no padding in
   S1, **DECISION (W0)**); send times, sender ids and reactions are visible to the server
   (reply targets are not: they are inside the ciphertext).
@@ -156,6 +198,14 @@ A hostile or compromised server (or an operator with database access):
 - **R8. Server-forced removal is availability-trust.** Kick, ban, leave and account deletion
   remove the user from the group only if the server reports them (6.3). The security-bearing
   removal is the owner's signed unseat, itself subject to R11.
+  **S2 (S2-W0, #195, #199, #222).** The Text commit transaction labels each removed device
+  (`removed_reasons`, 6.1). Native derives `rejoin` and `own_user` itself and uses the
+  server's label only where it cannot check (`pending_removal`, `pending_device`, `revoked`,
+  `idle`); it records forced-removal memory whenever the label is `pending_removal`, missing
+  or unknown (6.2). Residual cost: the label is unsigned and per-recipient, so a hostile
+  server can send members different labels (divergent memory) or label a kick as something
+  else (no memory). That is no stronger than its existing power never to report the kick at
+  all.
 - **R9. Commit retention.** Text commits older than `commit_retention_days` (default 30) are
   pruned. A device offline longer than that cannot catch up and must rejoin (history for the
   gap is lost until S2/S4). **DECISION (W1.5):** `commit_retention_days = 0` means pruning is
@@ -167,6 +217,13 @@ A hostile or compromised server (or an operator with database access):
   first commit whose `epoch` is greater than `e`, or as an empty `commits` list while
   `current_epoch >= e`. The bridge classifies either as desync (catch-up failed: wipe and
   rejoin, state `left`, 2.5); it never skips ahead.
+  **S2 (S2-W0, #203).** The bridge's catch-up pager (6.3 "Catch-up pager") refuses any page
+  that is not contiguous, so a pruned gap always ends in `catch_up_failed`, then `left`,
+  then the join path, and async join with stored Welcomes (R5) makes that rejoin work
+  without a member being online at the same moment. A leaf failure on a commit behind the
+  server tip whose only cause is an unpinned or revoked identity is
+  `CatchUpLeafUnresolvable` (left, then rejoin), never poisoned (8.4). History for a pruned
+  gap stays lost until S4.
 - **R10. Send-time check races.** The server's epoch and membership checks on send (7.3) are
   not atomic with commit arbitration; a send can land at epoch `e` while a commit to `e+1`
   wins. Receivers handle this (3.9 step 9).
@@ -187,6 +244,7 @@ A hostile or compromised server (or an operator with database access):
   detects it: its own commits never win, and its own `_encrypt` refuses (the unseated user
   is off its list), so its shield goes `unverified`. Members detect nothing until an owner
   commit is sequenced. Closing this fully (owner-signed epoch attestations, S2) is deferred.
+  **S2 (S2-W0):** deferred again, out of S2 (plan section G, O-14: post-beta).
 - **R12. Owner device loss freezes seat changes.** If the owner's pinned device is lost
   (logout, wipe, dead hardware), nothing can sign a new seat list, create a successor group
   or sign a handover. **DECISION (W0-fix):** in S1, seat changes FREEZE. Existing members keep
@@ -204,10 +262,26 @@ A hostile or compromised server (or an operator with database access):
   owner-signed list, keeps being accepted and members keep chatting. Removing the owner's
   device would instead have made every later commit unverifiable and killed the channel. A
   device that merely WIPED its state (not lost) recovers through the rejoin case (6.3).
+  **S2 replaces (S2-W0, #197, #198): R12 is closed in S2a for an owner who still has any
+  device.** The channel authority's `owner_devices` (4.10) lets any listed owner device sign
+  the next list without a handover, and a single-device owner recovers with
+  `_seat_list_sign(recovery: true)` from a new device of the owner user, behind a native
+  "Take over signing" dialog; members confirm it with the S1 same-user dialog (4.7). While
+  the signing device is revoked (logout, `DELETE /e2ee/keys/:id`, suspension), the channel's
+  open Text group carries `signer_lost` and sends pause (6.3 "Owner signing device lost").
+  The "lost device's leaf is never removed" rule above holds only until a list signed by
+  another device, carrying a higher authority that omits the lost device, lands: that write
+  turns the lost device into an ordinary pending device (`pending_device_removals`), which
+  any member removes (6.1 rule 3a). What remains: an owner whose account is deleted loses
+  the server (S2a keeps account deletion deleting owned servers, with a warning, S2-D43;
+  cross-user succession is S2b); a suspended owner is R28.
 - **R13. Inactive devices keep their compromise.** The Update cadence (3.11) is per device
   and triggered on open or send. A device that is never opened and never sends never issues
   an Update, so a past compromise of that device's leaf stays exploitable until it updates
   or is removed. Accepted for S1; S2 may add owner-driven Removes of long-idle devices.
+  **S2 (S2-W0):** unchanged in S2a. S2b (S2-D34, O-11) evaluates `update_due` on every
+  drain, exposes `member_refreshed`, and may evict devices idle past `idle_device_days`
+  (Remove rule 7, reason `idle`).
 - **R14. Denial of service (restated in W0-fix3).**
   - *Hostile server:* it can always deny service. It can refuse every commit or send, or
     sequence a commit whose embedded list fails verification so receivers take the
@@ -279,10 +353,20 @@ A hostile or compromised server (or an operator with database access):
     error), which is final in S1, and seat changes freeze as in R12.
 
   It fails closed and loud: nobody is seated or unseated silently. Succession is S2.
+  **S2 (S2-W0):** unchanged in S2a. S2b's `POST /servers/:id/ownership_transfer` (S2-D25)
+  closes it with one owner-filtered transaction.
 - **R17. Suspension and disabling keep seats (DECISION (W2), #147).** Only kick, ban, leave
   and account deletion release seats (6.3). Suspending or disabling an account releases
   nothing and adds no pending removal; that user's seats and leaves stay until the owner
   unseats them by list. Handled in S2.
+  **S2 replaces (S2-W0, #202; plan S2-D13 as amended).** Suspension, self-disable and
+  scheduled deletion still release no seat, but each funnels into `Account::disable`, which
+  deletes every session and so revokes every device; with S2-D17a (while `formats_v2` is on,
+  #219) every revocation queues a pending device removal in each Text group holding that
+  device (6.3 "Device revocation"), so the user's leaves are removed while the seat stays.
+  Unsuspending restores nothing by itself: the user's new devices join under the existing
+  seat through the normal join path. When the suspended user signs a channel's current list,
+  R28 applies.
 - **R18. Seat rows of deleted accounts are kept (DECISION (W2), #147).** `User::delete`
   releases the user's seats (6.3) but deletes no `channel_seats` row: each stays as a
   released seat, counted against `slot_cap` while cooling (2.3) and kept afterwards. The
@@ -323,6 +407,10 @@ A hostile or compromised server (or an operator with database access):
   name, and Text group ids are derived from the channel id (3.1) while Call ids are random.
   A per-plane context string (a `...:mls-join-text:v1` literal, a protocol migration, 0.4)
   is deferred to S2.
+  **CLOSED by S2-D6 (S2-W0, #194, #218)** on every channel whose list is v2: a Text join
+  intent there signs `sloga-text-join-v1` (3.13), which names the channel and the
+  generation, and Text routes refuse the shared payload for it. A channel whose list is
+  still v1 keeps the S1 payload.
 - **R22. Orphan Call commits at an evicted Text id (W2c, #168).** A Text create evicts a
   Call group squatting on its derived id, with that group's commits and join intents, in
   the same atomic unit as its insert (3.1). The Call commit path is not one transaction
@@ -358,6 +446,15 @@ A hostile or compromised server (or an operator with database access):
   who revoked a device and set up a new one can be refused `DeviceCapReached` until that
   leaf leaves through one of those cases. S2 makes revocation add a pending removal (beta
   blocker).
+  **CLOSED in S2a once `formats_v2` is flipped (S2-W0, #196, #200, #202, #212, #219).**
+  While the flag is on, a revocation queues a pending device removal (two passes around the
+  identity delete, 6.3); the join-intent route's cap count excludes devices that are pending
+  removal (the Add that follows must remove them in the same commit, Add-clears-pending); an
+  Add needs the added device's identity to exist inside the commit transaction; and native
+  may stage a Remove of a device the server lists in `pending_device_removals` (6.2).
+  **Until the flag flips, R23 stays open:** the revocation hook writes nothing while it is
+  off, because S1 natives never stage those Removes (W3 D26) and a pending entry would
+  freeze every send.
 - **R24. A Call create is an oracle on hidden protected channels (W2 audit A2, #178; S2;
   HOLD, 1.1).** Text group ids are public functions of the channel id (3.1), and
   `POST /mls/groups` with a CALL kind takes any client-chosen id. A caller who cannot view
@@ -371,6 +468,17 @@ A hostile or compromised server (or an operator with database access):
   genesis seat list), which also removes the squat (B47) and R22 at the root. It changes
   the native derivation and the 5.5 vectors, so it is not in S1. **No flag-on, beta
   included, before R24 is fixed.**
+  **CLOSED by S2-D1b (S2-W0, #190, #218)** on every channel whose list is v2: a Text group
+  id is `text_group_id_v2(channel, g, salt)` (3.1.1), where the salt is a line of the signed
+  seat list that only viewers (`GET .../seats`) and members (commit AD) see, so a non-viewer
+  cannot compute any generation's id and a Call create at a guessed id learns nothing. What
+  remains (#222): a viewer of the channel, seated or not, can compute the ids (a viewer
+  already sees `protected`) and so learns the generation count (`as_of_generation` and the
+  text-group state count every successor); the server knows everything; a channel whose list
+  is still v1 (protected before the flag flip; dev data only) keeps public ids.
+  `GET .../text_group` serves `pending_device_removals` (whose `created_at` dates a logout),
+  `signer_lost` (which also reveals an owner's suspension) and `join_requests` to SEATED
+  callers only (7.2), so an unseated viewer learns none of those.
 - **R25. The `Active` entitlement predicate is checked in the route only (W2 audit A4,
   #178; S5).** Text group create, a new device's join intent and every commit with `added`
   require an `Active` entitlement (6.1), but the route reads it outside the driver
@@ -379,6 +487,68 @@ A hostile or compromised server (or an operator with database access):
   S1 writes no state but `Active` (2.2), so in S1 the window is small; S5, which adds
   `Grace`, `Frozen` and `Deleted`, replaces these predicates and must move the check into
   the transactions.
+- **R26. Role-edit releases need no reason, and the reason rule reveals protection (S2-W0,
+  #205; plan S2-R1).** Kicks, bans and seat PUTs that release someone need a reason in a
+  server with a protected channel (`RemovalReasonRequired`, 6.3), but a permission or role
+  edit that makes the reconciler release a seat needs none (the edit is not a removal; the
+  release is recorded as `ProtectedSeatRelease` with cause `access_lost`). The refusal
+  itself tells a moderator who can see no protected channel that the server has one.
+  Accepted: a seat-keyed rule would be worse (it would tell whether the target holds a
+  seat).
+  **Kick-vs-protect race (S2-W2; W2 wave audit ruling 7, ACCEPTED).** The reason check
+  reads the server's protected channels before the kick writes anything, outside any
+  transaction, so a protect landing between that read and the removal lets ONE kick through
+  without a reason (like R16's stale read). The kick still releases the seat and queues the
+  pending removal (6.3); only the reason is missing from its `MemberKick` entry. A ban
+  checks the same way, right before `ServerBan::create`.
+- **R27. A stolen owner device can act as the owner (S2-W0, #191; plan S2-R3; rewritten in
+  the fix round, #216).** Any device in the newest authority's `owner_devices` may sign the
+  next list, and members accept it with no dialog. A thief holding such a device with a live
+  session can (1) seat attackers: its next list adds them and members admit them, and the
+  only native dialog is the thief's own; and (2) sign authority v+1 that drops the owner's
+  other devices, after which the owner's recovery list (4.9) reaches members as a same-user
+  confirmation that looks exactly like a thief's would, so members cannot tell which side is
+  honest. Revoking a listed device that is NOT the current signer sets no `signer_lost`, and
+  the device stays eligible in members' natives until the owner signs an authority without
+  it. An honest server stops a revoked device at the directory (its identity and session are
+  gone, so it cannot PUT); a hostile server can keep relaying its lists. **S2a detection:**
+  the server reports to the owner every `owner_devices` member of the stored authority that
+  has no registered identity or whose listed key differs from the directory key
+  (`revoked_owner_devices`, 7.2, #231), and the owner UI prompts "Re-sign your signing
+  devices" (an authority without them, 9.2); every owner-user device raises an alert when a
+  held authority drops THIS device, and a notice when another device of the owner changes
+  the authority, and on every list another owner device signs that seats someone ("Your
+  other device X seated Y", 4.4.1 rule 9, #227). It is the S1 exposure of a stolen single
+  owner device, multiplied by the number of listed devices; the detection shortens the
+  window, it does not close it.
+  **As built (S2-W3, #236).** The "drops THIS device" alert is a stored per-channel flag
+  (`mls_text_owner_alerts`, 8.2), set in the same transaction as the adoption that drops
+  the device, so a commit whose decryption half is then refused cannot lose it; it fires
+  only for a device that WAS signing (the pinned owner device, or listed in the held
+  authority), so a never-listed owner-user device is never alerted. What stays open by
+  design: a member that skipped list versions cannot check the authority's `prev` or the
+  #225 signer-device rule (both need the held version + 1, 4.4.1 "As built"), so it accepts
+  any authority whose named signer is an entry of the authority it holds. A thief with a
+  listed owner device signs such authorities, and a hostile server chooses which lists each
+  member sees. Detection, not prevention.
+  **Step 3b verification race (S2-W2; W2 wave audit ruling 1, ACCEPTED).** The route
+  verifies a CHANGED authority against the signer device's directory key BEFORE the write
+  transaction (4.3 step 3b), comparing with the stored authority it read outside the
+  transaction, and skips verification only for an authority EQUAL to the one it read. For
+  the driver to then see that same authority as a change, the stored authority would have
+  to move backward between the two reads. The planner forbids that: a change is the stored
+  version + 1 with `prev` = the stored body's hash, and an authority is never dropped (step
+  4c). The channel-delete cascade makes re-protecting the same channel id impossible, so the
+  stored authority never starts over. An unverified authority therefore never lands as a
+  change. Optional hardening, not built: pass the signer's directory key into
+  `SeatListWriteInput` and compare it inside the transaction.
+- **R28. A suspended or banned owner pauses their channels (S2-W0, #197; plan S2-R4).**
+  Suspension revokes every device of the owner (R17), including the one that signed the
+  current list, so every protected channel they own carries `signer_lost` and refuses sends
+  (the copy "The owner's account is unavailable", 9.2, derived at read time from the owner's
+  account flags, #222) until the owner is reinstated and recovers from a device, or the
+  server is deleted. In S2a a staff ban of an owner goes through server deletion. S2b
+  succession resolves it.
 
 ---
 
@@ -445,6 +615,31 @@ Type name `ChannelSeat`.
   NON-privileged account as the server owner; the privileged account is only the one that
   grants the entitlement.
 
+**S2 additions (S2-W0, #201, #205; plan S2-D10, S2-D21).** `ChannelSeat` gains two optional
+fields (serde default, omitted when `None`; no data migration):
+
+| Field | Type | Notes |
+|---|---|---|
+| `release_cause` | `Option<SeatReleaseCause>` | `OwnerUnseat`, `ServerRemoval`, `AccessLost`, `DeviceNeverJoined` (snake_case on the wire); written by every release: the S1 server-forced paths write `ServerRemoval`, the owner's list unseat `OwnerUnseat`, the reconciler `AccessLost`. The enum lives in `protected_channels/model.rs` |
+| `keys_received_at` | `Option<Timestamp>` | set by the Text commit transaction when the user's FIRST device is added (it already writes added users' seat rows); a re-seat while the seat is still cooling keeps it, or sets it to `released_at` when it was `None` (#233) |
+
+- **An unused seat frees at once (S2-D21, O-3).** A release while `keys_received_at` is
+  `None` writes `release_cause = DeviceNeverJoined` and NO cooldown (`cooldown_until` stays
+  `None`; the slot is free immediately). Spec: "a slot is used the moment a member's device
+  first receives the keys". A pre-S2 seat has `None`: the release treats it as received when
+  the user has, or per `member_added` ever had, a device in the channel's Text group, so old
+  seats keep their cooldown.
+- **Access-loss releases cool 14 days** like the others (O-4); otherwise a role removal
+  would bypass slot cooldowns.
+- `channel_seats._id = {channel}:{user}`, so a re-seat overwrites `release_cause` (and
+  `keys_received_at`, except while cooling, #233); the `ProtectedSeatsUpdate` and
+  `ProtectedSeatRelease` audit entries (7.5) are the history (S9 needs seat-at-time).
+  Re-seating a seat that is still cooling keeps `keys_received_at` (the slot was already
+  used; a cooling seat with no stamp gets its release time), so its next release cools
+  again; only a re-seat after a no-cooldown release or after the cooldown expired clears it
+  (#233).
+- Suspension never releases a seat (`Suspended` is not a cause; R17).
+
 ### 2.4 `channel_seat_lists` (new collection, both drivers)
 
 Type name `SeatList`. Newest only: `_id = channel_id`.
@@ -461,6 +656,13 @@ Type name `SeatList`. Newest only: `_id = channel_id`.
 | `updated_at` | Timestamp | |
 
 `SignedHandover { body: String, signature: String }`.
+
+**S2 additions (S2-W0, #189, #191).** `SeatList` gains `authority: Option<SignedAuthority>`
+(serde default, omitted when `None`), with
+`SignedAuthority { body: String, signature: String }`: the channel authority (4.10) whose
+SHA-256 the stored body's `authority:` line names (v2 lists only; a v1 row never has one).
+`body` stays the exact signed bytes of either format (4.1 or 4.1.1), and `version` is still
+the body's. [S2b] `pending_succession` is reserved for S2-D23 and not specified here.
 
 ### 2.5 `MlsGroup` changes
 
@@ -527,6 +729,10 @@ a hash check there either wedges the repair loop or silently reverts concurrent 
      own types, `DeviceCapReached { max }` and `MlsCallFull { max: 100 }` (W2 audit A5,
      #177; they were `FailedValidation`), so a race only this re-check catches looks the
      same to the client;
+     **S2 replaces** "Adds refused while non-empty" in this step: an Add is allowed when the
+     same commit removes every device that `pending_removals` or `pending_device_removals`
+     names (Add-clears-pending), and the per-user cap counts every post-commit leaf (6.1 "S2
+     additions", #212, #223);
   3. delete an UNMARKED row at `{group}:{epoch}` if there is one (#177; logged once the
      transaction commits as `AUDIT mls_text_stray_replaced group=<id> epoch=<n>`, ids only),
      then `insert_one` the commit row and mark it (its unique `_id` still arbitrates a racing
@@ -800,6 +1006,44 @@ commit at that epoch.
   error, and the task wrapper retries it (the delete is idempotent).
 - Close paths (`room_finished`, reconcile, `join_intent.rs` closes) touch Call groups only.
 
+**S2 additions to `MlsGroup`, `MlsCommit` and `MlsJoinIntent` (S2-W0, #196, #197, #203; plan
+section 5).** All additive, `#[serde(default, skip_serializing_if = ...)]`, Text-only, no
+data migration. A Call commit applied to a group document carrying them leaves them
+byte-identical (the field-level rule of (b) above):
+
+| Field | Type | Notes |
+|---|---|---|
+| `MlsGroup.pending_device_removals` | `Vec<MlsPendingDeviceRemoval { user_id, device_id, created_at }>` | a SEPARATE field from `pending_removals`, so an older binary ignores it instead of reading it as user-wide (S2-D17a) |
+| `MlsGroup.signer_lost` | `Option<MlsSignerLost { user_id, device_id, cause, at }>` | the device that signed the current list was revoked (S2-D17d, 6.3). The stored `cause` is only `device_revoked` ([S2b] `user_removed`); `account_unavailable` is never stored: `GET .../text_group` derives it at read time from the signer user's account flags (`UserFlags` `SuspendedUntil`, `Deleted`, `Banned`) (#222). COPIED into every successor created while it is set; only the 4.3 step-7 seat-list write clears it (#213) |
+| `MlsGroup.rejoin_readd` | `Vec<{ user_id, device_id, at }>` | written by a rule-6 eviction, consumed by that device's re-Add; marks the re-Add as recovery (S2-D32). Never pruned today; pruning is owed before the `formats_v2` flip (6.3 "`rejoin_readd` lifetime") |
+| `MlsGroup.member_refreshed` | [S2b] | S2-D34 |
+| `MlsCommit.removed_reasons` | exists (B48, #169) | gains `pending_device` and [S2b] `idle` (6.1) |
+| `MlsCommit.welcome` | `Option<String>` | the commit's Welcome (b64), stored on Text commits with `added`, pruned with the row, NEVER serialized into `MlsCommitInfo` or `GET .../commits` (only the Welcome route serves it, 7.2; S2-D29) |
+| `MlsJoinIntent.generation`, `MlsJoinIntent.issued_at` | `Option<u32>`, `Option<i64>` | the signed fields of the Text join payload (3.13); required on Text intents of a channel whose list is v2 (#218) |
+
+- **Generation cap (S2 replaces the `63` of 3.1; S2-D33).** `MAX_TEXT_GROUP_GENERATION`
+  becomes `65535` on the server and natively (the native `generation` CHECK widens, 8.2).
+- **Release primitives never queue the signer (S2-D15).** No release path (reconciler, kick,
+  ban, leave, account deletion, device revocation) adds a `pending_removals` or
+  `pending_device_removals` entry for the user or device that signed the current list: that
+  would wedge every send and Add for good, because rule 1 (3.12.2) lets the signer device go
+  only in the rejoin case. The primitive sets `signer_lost` instead, and logs and reports it
+  to Sentry (ids only). The revocation pass reads that signer (the newest stored list's
+  signer device) INSIDE its own claimed transaction, so a concurrent seat PUT cannot move
+  the signer between the read and the write (#222); the revocation hook runs only while
+  `formats_v2` is on (#219).
+- **Clearing (redefined in the second fix round, #224).** One rule, both drivers: drop every
+  `pending_device_removals` entry whose device is not a member of the open Text group. It
+  runs in EVERY seat-list write transaction (protect, the seat PUT, a handover append, Text
+  group create) and after EVERY won commit (Mongo: a second `$pull` on the pairs in step 4
+  of the commit transaction; Reference: under the same locks), so an entry always names a
+  device that holds a leaf and can be removed; a successor create empties both pending lists
+  but COPIES `signer_lost` (#213).
+- **Lock and claim order.** The new fields live on documents the paths already hold; the
+  added-identity claim (6.1, S2-D17c) reads `e2ee_identities`, already in the Text commit
+  path's Reference set. Pinning the identity documents' place in the Mongo claim order when
+  S2-D17c lands is a recorded plan nit.
+
 ### 2.6 `Message.encrypted`
 
 `encrypted: Option<EncryptedPayload>` on the database `Message` and the v0 `Message`
@@ -887,6 +1131,26 @@ registers the three new collections and keys its open-group check by `(channel_i
 Update the revision asserts in `scripts.rs` (the `LATEST_REVISION` assert and the
 "last migration" asserts) in the same lane.
 
+**S2 migration block (S2-W0, #206; plan section 5).** Indexes only (every S2 field is an
+additive serde default). Index names are **DECISION (S2-W0)**:
+
+1. `channel_seats`:
+   `{ key: { released_at: 1, channel_id: 1 }, name: "active_seats_by_channel" }` (the
+   reconciler sweep pages channels with active seats, 6.3).
+2. `mls_commits`:
+   `{ key: { group_id: 1, "added.device_id": 1 }, name: "text_welcome_lookup" }` (the
+   Welcome route's "newest commit that added this device", 7.2).
+
+Numbering (the merge steward's chain of 2026-11-02): S1 `<= 75` / `LATEST_REVISION` 76
+(above, as landed at `be915a8d`), S5a `<= 76` / 77, add-device `<= 77` / 78, then **S2
+`<= 78` / 79**, S5b `<= 79` / 80, S4 `<= 80` / 81, S6 `<= 81` / 82. This branch carries the
+S2 block as `if revision <= 78` with `LATEST_REVISION = 79`; add-device's `<= 77` block is
+not on it yet, so the gap at 77 is expected, and a `scripts.rs` test pins that no block is
+guarded by 77 until that block merges in. Any later renumber is the steward's call at land
+time. `init.rs` creates both indexes from the same specs as the block (the test database is
+not migrated). A dev database that ran an earlier numbering of this block must be reset
+(the revision-74 trap above).
+
 ---
 
 ## 3. Crypto formats (W3 implements; server mirrors 3.1 and 2.6 validation)
@@ -944,6 +1208,85 @@ id being public also makes a Call create an ORACLE on a hidden channel's protect
 
 Only the device that signed the channel's CURRENT seat list (the owner's pinned device) may
 create a text group or a successor (**DECISION (W0-fix)**, 6.1).
+
+**S2 replaces (S2-W0, #190, #204; S2-D33, S2-D17d):** the cap `63` above becomes `65535`
+(`g = 64` is no longer a failure; S1 clients refuse it loudly with `ChannelMismatch`), and
+the creator rule gains the S2-D17d recovery exception (6.1 "S2 additions").
+
+#### 3.1.1 Text group id v2 (S2-D1b, viewer-bound; closes R24)
+
+**DECISION (S2-W0), #190.** When the channel's seat list is a v2 list (4.1.1; a channel
+enters v2 only while `formats_v2` is on, 7.1, #218), a Text group id is:
+
+```
+text_group_id_v2(channel_id, g, salt) = lowercase_hex( SHA-256(
+      field( ASCII "sloga-text-group-v2" )     19 bytes
+   || field( ASCII channel_id )                26 bytes
+   || u64_be( g )                               8 bytes
+   || field( salt )                            32 bytes ) )
+```
+
+- `field(x) = u16_be(len(x)) || x` (the 3.5 encoding), so the hash input is always 91 bytes.
+  `salt` is the 32 raw bytes that the `group_salt:` line of the channel's signed v2 list
+  encodes (64 lowercase hex). `g` is `0 ..= 65535`.
+- **Where the salt comes from.** The owner's native draws 32 random bytes from the OS CSPRNG
+  at genesis (`_seat_list_sign` of version 1, or of the first v2 list over a v1 list) and
+  copies the held value into every later list; it is signed and immutable (4.3 step 4c,
+  4.4.1). Only callers of `GET .../seats` (ViewChannel) and members (commit AD) ever see it,
+  so a non-viewer cannot compute any generation's id. Why not "the genesis seat-list hash"
+  (the R24 example): the server keeps the NEWEST list only (2.4), so a late joiner never
+  sees the genesis; a line carried by every list survives.
+- **Server.** `groups_create` (Text) checks
+  `group_id == text_group_id_v2(channel, g, stored salt)`, and the B47 eviction (above)
+  tests "the target id is the derived Text id for the create's `(channel, generation)`" with
+  the same derivation. **Salt source (fix round, #217):** today's
+  `is_derived_text_group_id(group)` (`protected_channels/ops/reference.rs`, also used by the
+  Mongo create for its first claim and its eviction check) derives from the group's fields
+  only, and a v2 id cannot be derived from them. For a v2 channel the create reads the
+  `group_salt` of the channel's stored seat-list row INSIDE its transaction (it already
+  reads that row to bind the AD hash) and derives with it; the salt is never taken from the
+  request. Every check names ONE `(channel, generation)` pair and no path loops over
+  generations, so the plan's bound "g <= current_generation + 2" has nothing to bound in the
+  landed B47 shape (#210 OPEN item (g)). The Text commit marker (#177) stays as defense in
+  depth: a viewer in a voice call can still compute ids.
+- **Native.** `formats.rs` gains the v2 derivation. A joiner checks exactly the stated
+  generation (`as_of_generation`, 7.2, and the text-group state) by RECOMPUTING its id from
+  the held list's salt (the W3 D14 lookup; never a scan), with `g <= 65535`, BEFORE deriving
+  any key; a mismatch is `ChannelMismatch`, as in S1.
+- **Which derivation a group uses (DECISION (S2-W0)).** The format of the list the channel
+  holds when the group is CREATED decides: a v2 list gives a v2 id, a v1 list (a channel
+  protected before the flag flip; dev data) a v1 id (3.1). A joiner holding a v2 list
+  accepts only v2 ids. So on a channel whose first v2 list replaces a v1 list while a v1-id
+  group is open, the owner device creates a successor (generation `g + 1`, v2 id) right
+  after that list lands. **Ruling (fix round, #223):** members that adopt that first v2 list
+  treat their v1-id group as SUPERSEDED (as when a successor exists: kept for history, no
+  sends, join the successor), never poisoned, and a joiner holding the v2 list does not join
+  it. Production holds no Text group (the HOLD, 1.1), so this costs one successor per DEV
+  channel; accepting both derivations for one generation was rejected because it would keep
+  a public id in use with no end date.
+- **As built (S2-W3, #237).** (a) **Predicate.** Native has ONE superseded test, shared by
+  `_encrypt` and `_state`: a group is superseded when its row records a successor
+  (`superseded_by`) OR its id is not `group_id_for(channel, generation, held salt)` (the
+  held list's derivation). So a v1-id group under a held v2 list counts even with nothing
+  recorded. `_encrypt` refuses it (`MlsGroupNotFound`), `_state` reports its stored state
+  with verdict `no_group` (8.3), and `_decrypt` follows 3.9 "S2". (b) **AD path.** Adopting
+  the first v2 list from a commit AD records `superseded_by` = the generation + 1 id under
+  the adopted salt, in the same transaction as the adoption. (c) **GET path (#223 upgrade,
+  planner ruling 2026-11-11).** A v1 holder with an active v1-id group, shown a v2 list
+  whose snapshot names a group that is not the v1 derivation, defers the 4.4 step 0
+  recompute to the CANDIDATE list's salt, run only after anti-rollback, the signature, 4.4.1
+  rules 1 to 6 and signer acceptance passed and before anything is written: the candidate
+  salt must derive `as_of_group_id` at `as_of_generation` (else `ChannelMismatch`), and that
+  generation must be newer than the held group's (older: `SeatListBehind`). It then adopts
+  as a joiner would: the v1 group is NOT caught up, no signer-leaf check runs against it
+  (the signer's leaf is checked at the successor's Welcome), and no `superseded_by` is
+  written (the predicate in (a) already covers it). A v2 holder always uses its held salt.
+  (d) Commits later drained in the v1-id group are judged with the v1 rules (3.12.3 "As
+  built"). (e) **Known exceptions to "never poisoned"** (3.12.3 "As built"): the v1-id group
+  can still be poisoned on an upgraded member in two cases.
+- `sloga-text-group-v1` and the v1 derivation are untouched. Vectors: 5.8 (`g` = 0, 1, 64
+  and 65535, and the 91-byte hash input for `g = 0`). A control that reuses the v1
+  derivation for a v2 channel must fail on both sides.
 
 ### 3.2 MLS configuration
 
@@ -1027,6 +1370,70 @@ Compact JSON object, UTF-8:
   Mentions are not parsed server-side, so in S1 a mention inside protected text never pings
   (documented UX limitation).
 
+#### 3.6.1 Envelope v2 (S3-N0; decode only in S2)
+
+**DECISION (S2-W3), #234.** S2 native decodes the inner envelope v2 that S3 defines (S3 plan
+`protected-s3-attachments-plan.md` section 2.3 and its N0 row), so a file message from an S3
+sender is never red on an S2 client. S2 has NO v2 send path: `_encrypt` builds v1 only, so a
+text-only message stays a v1 envelope byte for byte (S3 rule M-7; S9 overrules M-7 for
+franked messages, below). Compact JSON, keys in this order, unknown, duplicate or missing
+keys refused:
+
+| Key | Type | Rule |
+|---|---|---|
+| `v` | number | exactly `2` |
+| `cid`, `ts`, `replies` | | as v1 (3.6) |
+| `text` | string | may be empty only when `files` is non-empty |
+| `files` | array of file ref | required; at most 5; `[]` only with a non-empty `text` |
+| `fk` | string | S9's franking key. MUST be ABSENT under an outer v1 payload: any present value, `null` included, refuses the envelope |
+
+A file ref is `{ blob_id, key, digest, sha256, size, name, mime }` in that order, unknown
+keys refused: `blob_id` 1 to 32 ASCII alphanumerics (the DM ref rule); `key` canonical b64
+of exactly 32 bytes; `digest` the ciphertext SHA-256 and `sha256` the plaintext SHA-256
+(reserved for S9 franking), each 64 lowercase hex; `size` the plaintext size,
+`1 ..= 2^53 - 1` (no per-scope cap here: caps belong to S3's download path); `name` at most
+120 UTF-8 bytes (a channel cap, tighter than the DM cap of 200 characters); `name` and
+`mime` are sanitized for display only.
+
+- **Decode order** (native `decode_envelope`, after the AEAD open of 3.9 step 6): (1) more
+  than 16368 bytes is `too_large`, so the cap counts the refs; (2) the first non-whitespace
+  byte must be `{`, then `v` alone is PEEKED (not an object, or no `v`: `envelope`); (3) by
+  `v`: `1` the 3.6 rules, `2` the rules above (every failure `envelope`), an integer `3` to
+  `255` `UnsupportedEnvelopeVersion { v }` (8.4, the grey "update" marker, never red),
+  anything else `envelope`. Peeking first is what lets a newer version reach the grey
+  marker; its strict decode would fail as `envelope`.
+- **Outer payload.** Before the 2.6 structure check, `_decrypt` peeks `encrypted.v`: an
+  integer `2` to `255` is `UnsupportedEnvelopeVersion { v }` and nothing is decrypted (S9's
+  ask 1); any other value goes on to 2.6 (`structure`). The server still accepts only
+  `v: 1` and refuses `franking` (2.6) until S9 changes it.
+- **Signature and AAD unchanged.** The 3.7 payload is the same for both versions: the refs
+  sit inside the signed ciphertext (S3 plan 2.3). An explicit `files` line is left to S9's
+  signature v2.
+- **Result.** `TextDecrypted.files` (8.3) carries one `FileMeta { idx, name, mime, size,
+  state, fail_reason }` per ref (`[]` for v1). S2 has no download path, so every file is
+  `state: "failed"`, `fail_reason: "unsupported"` (snake_case; the frontend maps it), with
+  `name` and `mime` through the DM sanitizers. The key, the blob id and both digests never
+  leave native. The `files[*].blob_id` subset check against `Message.blob_ids`, and the
+  `blob_ids` decrypt argument it needs, are S3's (not in S2).
+- **Version table.** S9 pins outer `encrypted.v` against envelope `v` in its finding F1
+  (`protected-s9a-safety-plan.md` section 2; S9 handoff `protected-s9-HANDOFF.md`). What S2
+  native does with each row:
+
+| outer `v` | envelope `v` | S9 meaning | S2 native |
+|---|---|---|---|
+| 1 | 1 | not franked | decoded (3.6) |
+| 1 | 2 | S3 files, not franked; `fk` absent | decoded (above); a present `fk` is `envelope` |
+| 2 | 2 | franked; `fk` required | `UnsupportedEnvelopeVersion { v: 2 }`, nothing decrypted |
+| 2 | 1 | refused | the same: the outer peek runs first |
+
+- **Residual (accepted).** The outer `v` is not authenticated, so a hostile server can turn a
+  message into the grey "update" marker by editing it (a red `structure` included). That is
+  equivalent to withholding the message; no plaintext is shown.
+- **Vectors are native-only** (`vectors_test.rs`, the `n0_*` tests: a one-file v2 envelope
+  reusing the 5.1 `cid`, `ts`, `text` and `replies`, its corruption table, v3 and later
+  grey, the ref budget against 16368 bytes, text-only encrypt still v1, outer v2 grey, `fk`
+  under outer v1 refused). This document carries no `tv2:` block for envelope v2.
+
 ### 3.7 Signature
 
 Ed25519 by the sender device's **vodozemac identity key** (`account.sign`, the same key that
@@ -1099,6 +1506,17 @@ Each failure is a typed, loud result (section 8.4); nothing is silently dropped.
 10. **Replay** (3.10): `Replay` if this `cid` is already bound to a different message id.
 11. Success returns the plaintext plus `ts_skew = |ts - ulid_time(Message.id)| > 10 minutes`
     (**DECISION (W0)**; rendered as an informational marker, not red).
+
+**S2 (As built, S2-W3; #234, #237).** Step 2 first peeks the outer `encrypted.v` (an integer
+`2` to `255` is `UnsupportedEnvelopeVersion`, nothing decrypted) and step 7 decodes either
+envelope version, peeking `v` first (3.6.1); step 11 adds `files`. **Superseded groups
+(#223).** Decrypt names no refusal for a superseded group, so it is unchanged there: while
+the superseded group is still the channel's newest, its messages decrypt, live ones
+included (members that have not adopted the v2 list still send in it; refusing them early
+would show them as removed). Once the successor is held, the superseded group is no longer
+the channel's current group, so a live message in it is `RemovedSender` (step 9; the L6
+rule for any older generation), and history still decrypts from held keys. Only `_encrypt`
+refuses a superseded group (3.1.1 "As built").
 
 ### 3.10 Replay dedupe
 
@@ -1200,6 +1618,50 @@ commit_ad = field( ASCII "sloga-text-commit-ad-v1" )                  23 bytes
   stores the chain with the list (8.2).
 - Vector: 5.7.
 
+**AD v2 (S2-D3; DECISION (S2-W0), #193).** When the newest list is a v2 list (4.1.1), the AD
+is:
+
+```
+commit_ad_v2 = field( ASCII "sloga-text-commit-ad-v2" )               23 bytes
+            || field( seat-list v2 body, exact signed bytes, 4.1.1 )   <= 4096 bytes
+            || field( seat-list signature, RAW 64 bytes )               64 bytes
+            || u16_be( chain_count )                                     0..=16
+            || chain_count x ( field( chain entry body, exact bytes )    <= 1024 bytes
+                             || field( its signature, RAW 64 bytes ) )
+            || field( authority body, exact signed bytes, 4.10 )       0 or <= 3072 bytes
+            || field( authority signature, RAW 64 bytes )              0 or 64 bytes
+```
+
+- The first five elements are the v1 layout with the v2 context. A chain entry is a handover
+  (4.6) or [S2b] a succession statement (4.11), told apart by its first line; an S2a server
+  never appends a succession statement, and an S2a native chain walk stops at one (4.6).
+- The two authority fields are both EMPTY (length 0) when the list's `authority:` line is
+  empty, and otherwise carry the stored authority whose SHA-256 that line names. A parser
+  refuses one empty and one non-empty field, an authority whose hash differs from the line,
+  a signature that is not 64 bytes, and any byte after the last field.
+- A v1 list is always embedded in the v1 AD and a v2 list in the v2 AD; the context field
+  says which. The server builds the AD from its stored row (3.12.2 compares byte for byte,
+  unchanged), so `seat_list_ad_sha256` hashes the v2 bytes for a v2 row.
+- **Worst case (exact, recomputed in S2-W0 and again in the fix round for the authority's
+  `signer_device_id` line, #215): 14112 bytes.** It is built from the largest valid inputs:
+  a v2 body of 3161 bytes (100 seats; `version` and `issued_at` at `2^53 - 1`; `device_cap`
+  at `2^32 - 1`; an `authority` hash; `history:visible`; a boundary; `pre_history:wiped`; a
+  salt); 16 chain entries at the largest valid entry, a 429-byte succession statement (a
+  handover is 386), so 497 bytes each with framing; and a 2836-byte authority (5 owner
+  devices with distinct keys, 10 delegates, 10 successors, maximal integers, a `prev` hash).
+  So 25 + 3163 + 66 + 2 + 16 x 497 + 2838 + 66 = 14112, which is 21.5% of
+  `MAX_MLS_COMMIT_RAW_SIZE` (65536) and fits a 2-byte varint. The plan's "<= ~14350" put the
+  authority at its 3072-byte parse limit (14348); no valid authority reaches that limit
+  (4.10). 5.8 pins the worst case by its length and SHA-256 together with the construction
+  that produces it (`worst_commit_ad_v2_*`).
+- **Every write that changes an AD input refuses a result over 16383 bytes** with
+  `FailedValidation`, writing nothing: protect, a seat PUT, an authority change, a handover
+  append, and [S2b] a succession append or a transfer. With today's limits no valid input
+  reaches it (14112 above); the check is a backstop that keeps the 2-byte varint rule of
+  3.12.2 true if a limit grows. Test: an AD of exactly 16383 bytes passes the length check
+  and one of 16384 is refused.
+- The 5.8 vector (3 seats, one handover, a two-device authority) is 1744 bytes.
+
 #### 3.12.2 Server enforcement (W2, `routes/mls/commits_submit.rs`)
 
 For a Text group the delivery service accepts a commit only if its AD is **byte-identical**
@@ -1261,6 +1723,11 @@ Text commit's declared `removed` list inside the commit transaction:
    remove itself.
 
 Anything else is `FailedValidation` (removal not permitted).
+
+**S2 (S2-W0, #196):** rule 3a (any committer may remove a device in
+`pending_device_removals`) and [S2b] rule 7 (idle devices) join this list (6.1 "S2
+additions"). Rule 1 is unchanged, and the release primitives never queue the signer's device
+(S2-D15, 2.5).
 
 **This rule is enforceable only together with the receiver binding (DECISION (W0-fix4)).**
 The DS sees only the committer-DECLARED `added` / `removed` lists (availability-trust,
@@ -1482,6 +1949,50 @@ The compare is now inside the Text commit transaction, see above and 2.5.)
      `v`.
 7. Merge.
 
+**S2 (S2-W0, #193, #198).** Step 2 parses the v1 or the v2 AD by its context field. Step 3
+also runs the S2 rules of 4.4.1 (format downgrade, immutable lines, the authority); a
+failure there is the poisoned path like any other step-3 failure, and a format downgrade or
+an authority rollback is `SeatListRollback` (S2 adds it to the AD path and to 9.1 step 3).
+**S2 replaces** "the owner's pinned signing device" in step 6 (rule g) with "the signer
+device of the newest list held AFTER step 3" (S2-D22, RR#S2-2a): when step 3 adopts a list
+signed by another owner device, the pin moves to that device (4.5) and step 6 protects the
+new signer. The server's rule 1 uses the same definition (the newest STORED list's signer
+device), so server and native never protect different devices. The Adds check counts EVERY
+leaf of the user in the post-commit roster against the cap, with no exclusion: receivers
+cannot see `signer_lost` or the server's pending lists, and W3 `checks.rs` step 6 (h) at
+`da03abc` counts every post-commit leaf (#212). A `rejoin_intents` entry is verified over
+the Text join payload (3.13) when it carries `generation` and `issued_at`, else over the S1
+payload, which native accepts only while it holds a v1 list for the channel. **No
+`issued_at` check runs here (fix round, #214):** the plan's rule that a rejoin intent older
+than this device's record of that device's latest Add is refused is STAGING-only (6.2
+`_remove` and `_admit`), because a receiver refusal would be the poisoned path and clock
+skew could then poison a group under an honest server.
+
+**As built (S2-W3, #237): a commit in a v1-id group under a held v2 list (W3 audit finding
+2).** A commit in a group whose id is the v1 derivation of its generation, processed while
+the held list is v2 (a group the first v2 list superseded, on either path, 3.1.1), is judged
+with the v1 rules, as the members that had not upgraded judged it when they merged it:
+rejoin intents are verified with no held salt (an S1 payload verifies), and rule g names the
+signer device of the list the commit's AD carries, not the held v2 list's signer. That AD
+list is the held one (adopted, or byte-identical) or an OLDER one that step 3 settled
+without any check. An older one names a device only when it is signed by the held list's
+signer USER, verifies under that device's usable slice-5 key, and that device (device and
+key) is still an owner device here: the owner pin, or an `owner_devices` entry of the held
+authority of that user. Otherwise rule g names nobody and the commit is `NotOwner`
+(poisoned). `_commit_won` applies the same predicate to the committer's own commit, so the
+committer and the receivers decide alike. The predicate is the id derivation alone: a group
+with a v2 id superseded by a recovery successor keeps the v2 rules.
+**Known exceptions to "#223 never poisons" (W3 re-review, accepted).** Both stay inside the
+superseded group, which takes no sends. (1) Under the v1 rules, rule h, the caps and
+forced-removal memory still read the HELD v2 list's seats, so a pending v1 Add of a user the
+v2 list unseated poisons the superseded group on a member that already upgraded (follow-up
+owed). (2) An older AD list whose signer device was since revoked or re-keyed (or is not
+pinned on this device), or is no longer an owner device, names nobody for rule g, so a
+commit that members who never upgraded merged poisons the superseded group on upgraded
+members. A hostile server can produce the same split on purpose by replaying a genuine old
+list signed by a FORMER owner device as a commit's AD: a member that never upgraded merges,
+an upgraded one poisons.
+
 There is no fetch, no post-decrypt deferral and no "named but not held" state. A Welcome
 carries no commit AD; a joiner verifies the list via `GET .../seats` before it signs its join
 intent (6.3), as before.
@@ -1495,6 +2006,66 @@ leaf in a Welcome does NOT refuse the Welcome. The joiner keeps the group state,
 is `roster_mismatch` (`_encrypt` refuses), and the shield shows `resecuring` for the first
 60 s, then `unverified` (9.1 step 6). That is not a hostile red at first sight. Meanwhile the
 pending Remove (by the owner, or by any member for a pending-removal user) clears it.
+**S2 replaces** "refuses every Add commit while `pending_removals` is non-empty" here: an
+Add that also removes every pending device and user in the same commit is allowed
+(Add-clears-pending, 6.1, #223), so a Welcome's roster never keeps a pending user either
+way.
+
+### 3.13 Text join payload (S2-D6, `sloga-text-join-v1`; closes R21)
+
+**DECISION (S2-W0), #194.** On a channel whose list is v2 (4.1.1; #218), a TEXT join or
+rejoin intent signs this payload instead of `acutest:e2ee:mls-join:v1` (Call intents are
+unchanged):
+
+```
+sloga-text-join-v1
+v:1
+user_id:{user id}
+device_id:{device id}
+channel_id:{channel id}
+generation:{decimal, 0 ..= 65535}
+group_id:{64 lowercase hex}
+key_package_ref:{1 to 64 chars of [A-Za-z0-9+/]}
+issued_at:{decimal ms, 0 ..= 2^53 - 1}
+```
+
+- Exactly 9 labeled lines (0.3), no trailing LF; Ed25519 by the joining device's identity
+  key, signature b64. `key_package_ref` keeps the existing charset
+  (`is_valid_key_package_ref`). Vector: 5.8 (`text_join_*`).
+- `group_id` must equal the Text group id of `(channel_id, generation)` (3.1.1) and the
+  route's group, and `generation` the stored group's generation. The plane is in the context
+  string, so a Call intent can never be replayed as a Text intent or the reverse (R21).
+- **Carriers.** Every carrier of the signed fields gains `generation` and `issued_at`
+  (`#[serde(default)]`) so a receiver can rebuild the payload: the request body
+  `DataMlsJoinIntent` (the plan's "v0 `MlsJoinRequest`"; no v0 type has that name), the
+  stored `MlsJoinIntent` (2.5), the join-request event `EventV1::MlsJoinRequested`, the
+  commit fetch's `MlsRejoinIntentInfo`, the envelope's `MlsEnvelopeRejoinIntent`, the
+  `join_requests` rows of `GET .../text_group` (7.2), and the native wire structs
+  (`wire::MlsJoinRequest`, `MlsJoinIntentPayload`). For a Text intent `channel_id` is now
+  inside the signature (before, it was filled in by the server and only cross-checked, 8.1).
+- **Server (join-intent route).** On a channel whose stored list is v2, a Text intent
+  without `generation` or `issued_at`, or whose signature does not verify over this payload,
+  is `FailedValidation`, whatever `formats_v2` says (#218); on a v1 channel the S1 payload
+  is used and the two fields are ignored. `issued_at` is only bounds-checked; the
+  outstanding window runs on the server's `created_at` (24 h for Text, 6.3).
+- **Native.** `_join` builds this payload when it holds a v2 list for the channel (a v2 list
+  implies the flag is on). Rule g's rejoin-intent check and `_admit` choose the payload by
+  the carrier: with `generation` and `issued_at` present, this payload; without them, the S1
+  payload, accepted only while the held list is v1. `_join` mints a fresh KeyPackage per
+  intent (S1-5), so two intents never carry the same deterministic signature.
+- **Rollout (corrected in the fix round, #219).** The v2 formats appear only on channels
+  that entered v2 while `formats_v2` was on, so an S1 desktop never meets them before the
+  flag flips. That is not true of everything S2 changes on the server, and two rules make it
+  so: (a) the revocation hook writes `pending_device_removals` and `signer_lost` ONLY while
+  `formats_v2` is on, because S1 natives never stage a pending-device Remove (W3 D26) and an
+  entry would freeze every send; R23 therefore stays open until the flip (1.3). (b)
+  `removed_reasons` gains values an S1 native does not know, so `MlsRemovalReason` gets a
+  `#[serde(other)] Unknown` catch-all on the server (database model and v0) and in the
+  native wire type, and native treats an unknown value as `pending_removal` for memory (fail
+  closed, 6.2). **Landing constraint:** the native catch-all ships on every protected
+  desktop before `formats_v2` is flipped (the planner stamps `pending_device` only for rule
+  3a, whose entries exist only while the flag is on), and the server catch-all lands with
+  S2-W1.
 
 ---
 
@@ -1519,6 +2090,7 @@ seats:{user ids, sorted ascending by byte value, unique, joined by ","}
   `v:2` body (and whatever it adds) is OWNED BY S2: S1 never emits, accepts or reserves its
   contents, and S2 defines it together with its compatibility rules (0.4: a protocol
   change, never a find-and-replace).
+  **S2 (S2-W0, #189):** S2 defines the v2 body in 4.1.1, with its own context line.
 - **Bounds (DECISION (W0-fix3)):** `version` is `1 ..= 2^53 - 1` (9007199254740991, JSON-safe,
   like epochs, 0.2) and `issued_at` is `0 ..= 2^53 - 1`. Builders refuse to produce anything
   outside that, and the server (4.3) and native (4.4) parsers refuse it as
@@ -1539,6 +2111,59 @@ seats:{user ids, sorted ascending by byte value, unique, joined by ","}
   signed value; the server enforces `min(signed, entitlement)` (2.5). Why: with "MUST
   equal", raising the entitlement cap made every PUT fail until the owner somehow learned the
   new value.
+
+#### 4.1.1 Seat list body v2 (S2-D1, `sloga-seat-list-v2`)
+
+**DECISION (S2-W0), #189.** The v2 body is the nine v1 lines with a new context line and
+`v:2`, then five more lines:
+
+```
+sloga-seat-list-v2
+v:2
+channel_id:{channel_id}
+version:{decimal, 1 ..= 2^53 - 1}
+device_cap:{decimal u32; 0 = unlimited}
+issued_at:{decimal ms, 0 ..= 2^53 - 1}
+signer_user_id:{user id}
+signer_device_id:{device id}
+seats:{user ids, sorted ascending by byte value, unique, joined by ","}
+authority:{64 lowercase hex = SHA-256 of the channel authority body (4.10), or empty}
+history:{visible | hidden}
+history_boundary:{message id (ULID), or empty}
+pre_history:{kept | wiped}
+group_salt:{64 lowercase hex = 32 random bytes}
+```
+
+- Exactly 14 lines, in this order, no trailing LF. Lines 3 to 9 keep every 4.1 rule (bounds,
+  sorting, signer seated, at most 100 seats, `device_cap` at most the entitlement cap).
+  `sloga-seat-list-v2` with `v:1`, or `sloga-seat-list-v1` with `v:2`, is malformed. The
+  signature (4.2) covers the whole body. The largest valid body is 3161 bytes (3.12.1 "AD
+  v2"); the 4096-byte body limit is unchanged.
+- **`group_salt`** (S2-D1b, 3.1.1): set by genesis, never changed afterwards.
+- **`authority`**: the SHA-256 (lowercase hex) of the exact authority body carried with the
+  list (`SeatList.authority`, 2.4, and the AD's authority field, 3.12.1); empty when the
+  list carries none. In S2a the authority takes effect only through `owner_devices` (4.10).
+- **`history`, `history_boundary`, `pre_history`**: S4's lines. S2 only parses and builds
+  them and enforces their anti-rollback (4.3 step 4c, 4.4.1); they have no other effect
+  until S4. Genesis defaults: `history:visible`, `history_boundary:` empty,
+  `pre_history:kept`. Until S4 ships a non-empty `history_boundary` is refused on every
+  path, protect included, and `pre_history:wiped` is refused until S4's `history_setting`
+  flag is on (a signed "wiped" with no wipe behind it would be false); `wiped` is also
+  refused whenever the boundary is empty (the parser treats that body as malformed,
+  `FailedValidation`).
+- **Entered only while `formats_v2` is on** (7.1, #218). An S1 build parses a v2 body as
+  malformed (`v:1` only, #172), which is why the flag exists. The flag governs only a NEW v2
+  genesis and a v1-to-v2 upgrade: a channel already on v2 keeps v2 (every later list, its
+  commits and successors) whatever the flag says. The v1 builder and parser stay for
+  channels still on v1.
+- **v1 to v2 (S2-D1, plan audit PA-18).** A held (server: stored) v1 list counts as the v2
+  predecessor
+  `{ authority: empty, history: hidden, history_boundary: empty, pre_history: kept }`, so
+  the first v2 list may set any `history` (hidden to visible is growth, 4.9) and picks the
+  `group_salt`, but may NOT set a boundary. **Builders emit `history:hidden` on the first v2
+  list over a v1 list** (never the genesis default), so an upgrade never turns sharing on
+  without the dialog. A v1 list after a v2 list is refused (4.3 step 4c, 4.4.1).
+- Vector: 5.8 (`seat_list_v2_*`).
 
 ### 4.2 Seat list signature
 
@@ -1637,6 +2262,72 @@ The server is not the trust anchor, but it validates so garbage never reaches cl
    It is appended (chain length `<= 16`, else `FailedValidation`). The successor device then
    signs the NEXT list itself. The server does NOT decide trust; clients do (4.5, 4.6).
 
+**S2 additions (S2-W0, #189, #191, #193, #196, #197, #201, #205).** In the step order above:
+
+- **Step 1 (format; corrected in the fix round, #218).** Over a stored v2 list only a v2
+  body is accepted, whatever `formats_v2` says (removal-only and every other PUT keep
+  working on a v2 channel with the flag off). Over a stored v1 list, a v2 body (the upgrade)
+  needs `formats_v2` on, else `FailedValidation`. Protect accepts a v2 genesis only while
+  the flag is on (every new channel is salted, 3.1.1) and a v1 genesis only while it is off.
+- **Step 3b (authority; v2 bodies).** If the PUT carries an authority
+  (`DataSeatList.authority`, 7.2), its body parses (4.10), its SHA-256 equals the body's
+  `authority:` line, its `channel_id` is the route channel, and its `owner_user_id` is the
+  list's `signer_user_id`. An authority that DIFFERS from the stored one is a change: its
+  `signer_device_id` is the PUT's signer device (#215; moved into this branch in the second
+  fix round, #225), its `version` is the stored authority's plus 1 (1 when none is stored),
+  its `prev` is the SHA-256 of the stored authority body (empty when none), the PUT's signer
+  device is listed in its `owner_devices` with that device's directory key, and its
+  signature verifies under that key. A byte-identical authority is no change and is not
+  re-verified: a list from another listed owner device may carry the stored authority
+  unchanged, signed by its original signer (4.4.1 rule 6, 6.3; #225). A non-empty
+  `authority:` line without an authority, an authority without a matching line, and an empty
+  line over a stored non-empty one are `FailedValidation`. Signer ELIGIBILITY (the pin or a
+  held `owner_devices` entry) is the members' decision (4.4.1), as every trust decision is
+  (step 8); see #210 OPEN item (e).
+- **Step 4 (byte-identical re-PUT) is unchanged and still answers first:** before the reason
+  check, the AD size check and every S2 rule below, so a retry of a list that landed always
+  succeeds.
+- **Step 4c (immutable and one-way lines, v2).** Against the stored list (a stored v1 list
+  counts as the 4.1.1 predecessor): `group_salt` equal (any salt is accepted when the stored
+  list is v1, which has none, #222); `history_boundary` equal (and empty until S4);
+  `pre_history` never `wiped` to `kept`, and `kept` to `wiped` refused on this route (only
+  S4's wipe route and a protect genesis may set it, and not before S4's flag); the authority
+  `version` never lower and never empty after non-empty; a v1 body over a stored v2 list
+  refused. Each is `FailedValidation`.
+- **Step 4d (removal reason, S2-D20).** A PUT whose planner releases anyone needs a
+  non-empty `X-Audit-Log-Reason` header (it is not part of the signed body; a reason of
+  only whitespace is empty), else `RemovalReasonRequired` (400) and nothing is written. It
+  is checked against the planner's released set inside the write transaction, after step
+  4, so a retry without the header of a list that already landed still succeeds.
+- **Step 4b** (no silent re-seat) is unchanged. S2-D16 adds the client half: the owner's
+  list builder drops users with a non-owner `release_cause` by default, and native counts
+  re-seating a forced-removed user as growth (4.9).
+- **Step 5 (eligibility)** reads the shared predicate `seat_holder_lacks_access` (6.4) for
+  newly claimed users.
+- **Step 5b exception (S2-D17d).** In the recovery flow the signer-user device first creates
+  the successor generation, where it holds the only leaf (6.1 "S2 additions"), so 5b is
+  evaluated against that successor and passes.
+- **Step 7 additions.** When the open Text group carries `signer_lost` and the list is
+  signed by ANOTHER device AND carries an authority of a higher version whose
+  `owner_devices` omits the lost device, the same transaction clears `signer_lost` and, ONLY
+  IF the lost device is a current member (holds a leaf) of the open group, adds it to
+  `pending_device_removals` (otherwise it only clears `signer_lost`: a recovery successor
+  never contains the lost device, and an entry nobody can remove would freeze every send,
+  #224) ([S2b] for a user-level cause, the user to `pending_removals`, which S2-D16 then
+  treats as a forced removal). While `signer_lost` is set, a list signed by ANOTHER device
+  that does NOT carry such an authority is refused with
+  `ProtectedChannelResecuring { reason: "owner_device_lost" }` (409) and nothing is written
+  (#222): landing it would leave `signer_lost` set under a live signer, and sends would stay
+  frozen. A list signed by the lost device itself is refused the same way (the revoked
+  device cannot sign through the route; refusing it here fails closed if one gets through).
+  Seats this list releases get `release_cause = OwnerUnseat` (or `DeviceNeverJoined`, 2.3).
+- **AD size.** The planner refuses a new row whose commit AD (3.12.1) would exceed 16383
+  bytes, `FailedValidation`, before any write.
+- **After the claim commits (S2-D12).** The route runs `reconcile_channel` with fresh reads
+  (6.3 "Reconciler"), then, if the list changed, emits
+  `ProtectedChannelChanged { scope: ["seats"] }` and writes the `ProtectedSeatsUpdate` audit
+  entry (7.5). Protect does the same after its transaction.
+
 ### 4.4 Client verification and anti-rollback (`e2ee_text_seat_list_verify`)
 
 **Order rewritten in W0-fix3** (anti-rollback FIRST, signer acceptance and the signer-leaf
@@ -1701,6 +2392,124 @@ decrypted, and a failure there is a poisoned epoch instead of a refused fetch. A
 stored together with the handover chain it arrived with (from `GET` or from the AD), because
 the device's own commits must embed exactly that chain (3.12.1).
 
+**Step 0 as built (S2-W3, #237; S2-D33).** With an active group, `as_of_epoch` and
+`as_of_group_id` are required. The held group itself: a stated `as_of_generation` that
+differs is `ChannelMismatch`, and a held epoch below `as_of_epoch` is `MlsEpochGap` (catch up
+first). Another group: its id is RECOMPUTED for exactly `as_of_generation` with the held
+list's salt; no `as_of_generation`, one above 65535 (no id derives from it: the server's
+snapshot is wrong, W3 audit finding 4) or an id that is not that derivation is
+`ChannelMismatch`; then a NEWER generation is `MlsGroupNotFound` (take the join path), an
+OLDER one `SeatListBehind { have, need }` and the same one `ChannelMismatch`. The single
+exception is the #223 upgrade over `GET` (3.1.1 "As built" (c)). Without an active group the
+list is adopted directly, as a joiner's.
+**Member recovery order (S2-D22).** A recovery successor's snapshot names a newer
+generation, so a member whose old group is still active gets `MlsGroupNotFound` from
+`_seat_list_verify` until it starts the join: `_join` of the successor writes a `joining`
+row, which makes the successor the channel's current group, so the next verify adopts
+directly. The order is therefore: join the successor; verify the recovery list (signed by
+a device that is neither the pin nor in the held authority: `OwnerChanged { same_user:
+true }`, step 4, or 4.4.1 rule 5 for the new authority on a v2 channel); confirm
+(4.7, the pin moves, source `confirmed`); verify again (adopted); then process the
+Welcome, whose signer-leaf check (step 5) now names the recovery device. A Welcome
+processed before the confirmation is `SignerLeafMissing` and is retried.
+
+#### 4.4.1 S2 rules for v2 lists and authorities (S2-D1, S2-D2, S2-D22)
+
+**DECISION (S2-W0), #189, #191, #198.** Within step 2 (anti-rollback, which still runs
+FIRST) and steps 3 to 6:
+
+1. **Format.** A v1 list newer than a held v2 list is `SeatListRollback` (on the AD path
+   too, poisoned). A v2 list over a held v1 list compares against the 4.1.1 predecessor.
+2. **Immutable lines** (newer lists): `group_salt` and `history_boundary` equal the held
+   ones (for a first v2 list over v1, any salt is accepted and the boundary is empty, #222),
+   else `SeatListInvalid { reason: immutable_changed }`.
+3. **One-way lines** (newer lists): `pre_history` from `wiped` to `kept` is
+   `SeatListRollback`; `wiped` with an empty boundary is
+   `SeatListInvalid { reason: malformed }`; `kept` to `wiped` has no native effect in S2
+   (S4). `history` may change either way: hidden to visible is growth for the SIGNER (4.9),
+   not a member check.
+4. **Authority, structure** (a newer list that carries one): the body parses (4.10), its
+   SHA-256 is the list's `authority:` line, `channel_id` matches, `owner_user_id` is the
+   list's `signer_user_id`, its `signer_device_id` names one of its own `owner_devices`
+   entries, and the signature verifies under THAT entry's key (no other entry's key is
+   tried, #215); else `SeatListInvalid { reason: authority_invalid }`. An empty `authority:`
+   line after a held non-empty one, or a lower authority `version`, is `SeatListRollback`;
+   the same authority version with a different body is `SeatListEquivocation`.
+5. **Authority, acceptance (S2a, RR#S2-2b).** A NEW authority (a higher version than held,
+   or the first) is accepted only if its named signer entry (`signer_device_id` with that
+   entry's key) is the pinned owner device with the pinned key, an entry (device and key) of
+   the newest HELD authority's `owner_devices`, or the same-user signer the user confirmed
+   for this list (4.7). `prev` must equal the SHA-256 of the held authority body when the
+   version is exactly held + 1; a member that skipped versions cannot check it and does not
+   (no history is fetched). Otherwise the list raises `OwnerChanged { same_user }` as an
+   unaccepted signer does (step 4), nothing is persisted, and the S1 dialog rules apply.
+   Eligibility is judged on the named signer entry ONLY (#215): listing the pinned device
+   elsewhere in the authority grants nothing, so an authority listing {pinned D1, X} but
+   signed by X is refused (`OwnerChanged` for X), never a silent re-pin. So a member that
+   missed an authority which added a device sees the confirmable same-user dialog when that
+   device signs, never a silent acceptance.
+6. **Signer acceptance gains a case (step 4, S2-D22).** The list signer is also accepted
+   when `(signer_device_id, key)` is an `owner_devices` entry of the authority accepted for
+   THIS list (or of the held authority, when the list carries it unchanged), `key` being the
+   key its signature verified under. There is no dialog. **Adopting such a list MOVES the
+   pin to the signer device** (`source = owner_device`, 4.5); from then on rule g (3.12.3
+   step 6) protects that device. The signing key is still resolved through the device's
+   slice-5 pin (step 3): an entry whose key differs from it is not eligible.
+7. **`delegates`, `delegate_scope`, `delegate_max_device_cap` and `successors`** are parsed
+   and validated (4.10) and carried, with NO effect in S2a: a list signed by a delegate
+   device is an unaccepted signer (`OwnerChanged`), exactly as in S1. S2b gives them effect
+   behind their own flags.
+8. **First sight** is unchanged in S2a: the first verified list's signer is pinned and must
+   be the server-reported owner; an authority it carries must name the same owner user.
+9. **Owner-device alerts (S2a detection for R27; fix round, #216).** On a device of
+   `owner_user_id`, adopting a newer authority raises a loud native alert when it drops THIS
+   device from `owner_devices`, and a notice when it was signed by ANOTHER device of the
+   owner ("Your signing devices were changed from {device}", 9.2). **Extended in the second
+   fix round (#227):** adopting ANY list signed by ANOTHER owner device raises a notice on
+   the owner's devices, at the least whenever the seat set grows ("Your other device
+   {device} seated {names}"). Members see nothing new.
+
+Native stores the newest accepted authority per channel (`mls_text_authorities`, 8.2) with
+the list.
+
+**As built (S2-W3, #236; W3 audit finding 1, W3 re-review items 1 and 3).** The rules run in
+one function on BOTH paths (`GET` and AD), in this order: anti-rollback, rules 1 to 3, the
+chain bodies, rule 4, (AD only) the signer's leaf present, the list signature, rule 5,
+signer acceptance with rule 6, the signer-leaf check, adoption, rule 9. Native details the
+rules above leave open:
+
+- **Rule 4, the native mirror of #225.** A NEW authority (not byte-identical to the held
+  one) must also name the list's signer device as its `signer_device_id`, but ONLY when the
+  list is exactly the held version + 1 (the server compared it with the authority it
+  stored, 4.3 step 3b, which a member holding the previous version also holds). A member
+  that skipped versions, or sees its first list, may get an authority an earlier list
+  introduced, carried unchanged by another owner device, and cannot tell the two apart;
+  checking it there would poison a skipper and make the channel unjoinable at first sight.
+  For those, signer acceptance (below) holds the signer to the carried authority instead.
+  A failure is `SeatListInvalid { reason: authority_invalid }`. The rule 4 owner-user check
+  also applies to a NEW authority only: a list by anyone else that carries the held
+  authority unchanged reaches signer acceptance and is `OwnerChanged` (rule 7).
+- **Rule 5, `prev`.** At exactly the held authority version + 1, a `prev` that is not the
+  held body's SHA-256 is `authority_invalid`, not `OwnerChanged`: no confirmation could make
+  that authority acceptable.
+- **Rule 6, signer acceptance under a carried authority.** When the list carries an
+  authority (new or held), the handover-chain walk from the pin may keep or hand over the
+  pin only to a signer that is an `owner_devices` entry (device and key) of THAT authority.
+  Otherwise the rule-6 case decides, and failing it the list is `OwnerChanged`. So a pinned
+  device that an authority dropped is answered with `OwnerChanged` by a member that skipped
+  the dropping list, exactly as by members that adopted it.
+- **Rule 9, one notice, the loudest.** Only on a device of the list's signer user, and never
+  at first sight (no held list): (1) `dropped_this_device` for a NEW authority signed by
+  another device that no longer lists this device (device and key) while this device was
+  signing (the pinned owner device, or listed in the held authority); (2) else
+  `changed_by_other` for a NEW authority signed by another device; (3) else
+  `seated_by_other`, naming the users, for a list signed by another device that seats users
+  the held list does not. It is returned as `owner_notice` (8.3). The `dropped_this_device`
+  case is ALSO stored in `mls_text_owner_alerts` in the adoption's transaction (on the AD
+  path, before decryption, so a refused decryption cannot lose it) and read back as
+  `TextChannelState.owner_alert`; an adoption that leaves this device the pinned owner
+  device, or an entry of the authority now held, clears it.
+
 ### 4.5 Owner pinning
 
 Native stores per channel `mls_text_owner_pins (channel_id, owner_user_id, owner_device_id,
@@ -1728,6 +2537,11 @@ pending signer's `user_id`, `device_id` and **identity key** (not just user/devi
 - The pin's trust level is the slice-5 verification state of that device; an unverified
   (TOFU) owner pin still allows the green shield (**DECISION (W0)**, consistent with DMs and
   calls; the roster panel shows per-member verification).
+- **S2 (S2-W0, #198; S2-D22, S2-D27).** The pin also moves when a list signed by an
+  `owner_devices` member is adopted (4.4.1 rule 6), with `source = owner_device`. The native
+  `source` CHECK therefore gains `owner_device` (S2a) and [S2b] `transfer`, `succession` and
+  `confirmed_other` (8.2). The pin still never moves backward and is never taken from
+  `server.owner`.
 
 ### 4.6 Handover statement
 
@@ -1752,6 +2566,8 @@ S1 uses it for the owner moving to a new device (`to_user_id == from_user_id`). 
 `to_user_id` is format-valid, but **in S1 such a link is refused** (the chain walk stops
 there, and `_owner_handover_sign` refuses to create one). Server ownership transfer is
 refused in S1 (7.4), and cross-user succession is S2 (**DECISION (W0-fix2)**).
+**S2 (S2-W0):** unchanged in S2a (S2-D4: S2a only parses a cross-user link; S2b accepts it
+behind a native dialog).
 
 Chain walk (client): starting from the pinned key `K`, repeatedly find a stored statement
 with `from_identity_key == K` whose signature verifies under `K` and whose `channel_id`
@@ -1789,6 +2605,12 @@ cannot accept on the user's behalf) naming the channel and the new signer.
 
 No other path changes the pin.
 
+**S2 (S2-W0, #198).** Two more paths move the pin: adopting a list signed by an
+`owner_devices` member (4.4.1 rule 6, no dialog), and the recovery list (S2-D22), which
+members confirm with the same-user dialog above (the new device is in no held authority).
+The different-user case stays refused in S2a; [S2b] makes it confirmable for succession and
+transfer only (S2-D23, S2-D25, S2-D41).
+
 ### 4.8 Signer rules (summary)
 
 A seat list is ADOPTED only if all hold, checked in this order (W0-fix3):
@@ -1800,6 +2622,10 @@ A seat list is ADOPTED only if all hold, checked in this order (W0-fix3):
    newer list;
 4. the signer is on its own list;
 5. the signer holds a verified leaf (newer lists only; genesis exception, 4.4 step 5).
+
+**S2 (S2-W0):** step 3 also accepts an `owner_devices` member of the authority accepted for
+the list (4.4.1 rules 5 and 6), and the 4.4.1 format, immutable-line and authority rules run
+with step 1.
 
 ### 4.9 Signing and publishing a seat list (no wedge, no equivocation)
 
@@ -1873,6 +2699,122 @@ A seat list is ADOPTED only if all hold, checked in this order (W0-fix3):
   than dropping them unannounced. Adding one of them back is a later, separate list, an
   ordinary growth add with the native dialog of this section. The frontend needs the usual
   `ErrorType` cast for the new variant (7.6).
+- **S2 additions (S2-W0, #189, #198, #205).**
+  - Growth (the dialog above) also covers `history` hidden to visible, and re-seating a user
+    who is in forced-removal memory for the channel since the held version (S2-D16; "added"
+    no longer means only "absent from the previous list").
+  - `_seat_list_sign` builds v2 whenever the held list is v2, and for a genesis or a
+    v1-to-v2 upgrade only while `formats_v2` is on (the bridge passes the format from the
+    root advert, 7.2; #218): a genesis draws the `group_salt` and uses the defaults (4.1.1);
+    a first v2 list over v1 emits `history:hidden` and draws a salt; later lists copy the
+    held salt and boundary. It embeds the held authority unchanged unless the bridge passes
+    a new one signed by `e2ee_text_authority_sign` (8.3).
+  - **Recovery (S2-D22; reordered in the fix round, #213).**
+    `_seat_list_sign(recovery: true)` from a NEW device of the owner user signs a list
+    carrying a new authority (`owner_devices` and `signer_device_id` = this device, version
+    held + 1, `prev` = the held authority's hash). Its native dialog "Take over signing
+    #channel on this device" runs FIRST, before anything is created or sent: the bridge
+    calls it BEFORE the recovery successor create (6.3). It is therefore exempt from the
+    `SignerLeafMissing` refusal, like genesis (the server's 4.3 step 5b checks the leaf
+    against the successor). It persists nothing: if the device dies between the successor
+    create and the PUT, the signed bytes are lost and recovery starts again from this or
+    another owner-user device (6.3). Members confirm the list with the same-user dialog
+    (4.7).
+  - `_seat_list_sign` refuses `format: 1` while this device holds a v2 list for the channel
+    (`SeatListRollback`; #222).
+  - **Signer qualification as built (S2-W3, #236; W3 re-review item 1).** The sign side
+    refuses what members would answer with `OwnerChanged` (4.4.1 "As built"). Under a held
+    authority, `_seat_list_sign` needs the pinned owner user and this device to be an
+    `owner_devices` entry (device and key) of the held authority, or the pinned owner device
+    (device and key) passing a NEW authority that names it; the held handover chain
+    qualifies no one there, so an unlisted handover target is `NotOwner`, a stricter rule
+    than 8.3's "pinned owner key OR a chain-verified successor", which still holds with no
+    held authority. `_authority_sign` needs the pinned owner user and this device to be the
+    pinned owner device or an entry of the held authority. A recovery list is exempt from
+    both (#232; its own dialog, members confirm it in 4.7). Accepted consequence: a
+    same-user device that the carried authority does not list gets a 4.7 confirmation that
+    can never settle, so W4 words that dialog accordingly.
+  - **A recovery list keeps the held list's format (second fix round, #232).** On a v1
+    channel it is a v1 list and the recovery successor gets a v1 id; the upgrade to v2 is a
+    later ordinary list (the #223 supersession then applies). Chosen over "a v2-id recovery
+    successor" because the server verifies a create's id against the STORED list, which on a
+    v1 channel has no salt, and over "g + 1 then g + 2" because one successor suffices.
+  - **`RemovalReasonRequired`** is a 4xx that does NOT use up the bytes: the reason is a
+    header, not part of the signed body, so the bridge asks the owner for a reason and
+    re-sends the SAME bytes with it.
+
+### 4.10 Channel authority (S2-D2, `sloga-channel-authority-v1`)
+
+**DECISION (S2-W0), #191.** An owner-signed statement of which devices may sign the
+channel's seat lists, carried with each v2 list (2.4, 3.12.1) and named by the list's
+`authority:` line:
+
+```
+sloga-channel-authority-v1
+v:1
+channel_id:{channel id}
+version:{decimal, 1 ..= 2^53 - 1}
+owner_user_id:{user id}
+signer_device_id:{device id}
+issued_at:{decimal ms, 0 ..= 2^53 - 1}
+owner_devices:{device_id "." b64 identity key; 1 to 5 entries; sorted; joined by ","}
+delegates:{user_id "." device_id "." b64 identity key; 0 to 10 entries; sorted; joined by ","}
+delegate_scope:seat
+delegate_max_device_cap:{decimal u32; 0 = unlimited}
+successors:{user_id "." device_id "." b64 identity key; 0 to 10 entries; RANK ORDER; joined by ","}
+prev:{64 lowercase hex = SHA-256 of the previous authority body, or empty}
+```
+
+- Exactly 13 lines (the `signer_device_id` line was added in the fix round, #215), no
+  trailing LF, at most 3072 bytes (the largest valid body is 2836 bytes, 3.12.1). `.` and
+  `,` cannot occur in ULIDs, hex or b64, so entries split unambiguously. Ed25519 signature
+  (b64) by the `owner_devices` entry that `signer_device_id` names (4.4.1 rule 4; on the
+  server, the PUT's signer device, 4.3 step 3b).
+- **Format rules, both sides** (natively `SeatListInvalid { reason: authority_invalid }`; on
+  the server `FailedValidation`): every id and key in its charset (0.1); "sorted" is
+  ascending by the byte value of the whole entry, with no duplicate entry and no device id
+  twice in one line; `owner_devices` non-empty, with no identity key twice and with an entry
+  for `signer_device_id` (#215); no `delegates` or `successors` entry for `owner_user_id`;
+  `delegate_scope` exactly `seat` (a closed set with one value in v1); `successors` names at
+  most 5 distinct users, each user's entries contiguous and sorted by device id within the
+  user, a user's RANK being its position among the distinct users (1 to 5); `prev` empty
+  exactly when `version` is 1.
+- **Effect in S2a: `owner_devices` only** (signing eligibility, 4.4.1 rules 5 and 6). The
+  device that rule 1 and rule g protect is still the newest list's signer device, never "any
+  owner device" (S2-D22). `delegates` (S2-D24) and `successors` (S2-D23) are parsed,
+  validated and carried with no effect until S2b and its flags, so one format bump covers
+  both slices.
+- An authority changes only on an owner-signed list (version + 1). The server stores the
+  newest only (`SeatList.authority`), like lists.
+- Vector: 5.8 (`authority_*`).
+
+### 4.11 Owner succession statement ([S2b], format only; S2-D5, `sloga-owner-succession-v1`)
+
+**DECISION (S2-W0), #192.** Signed by the SUCCESSOR's device; in S2b, a chain entry of the
+AD (3.12.1) and of `SeatList.handovers`:
+
+```
+sloga-owner-succession-v1
+v:1
+channel_id:{channel id}
+from_user_id:{user id}
+from_identity_key:{b64 Ed25519 public key}
+to_user_id:{user id}
+to_device_id:{device id}
+to_identity_key:{b64 Ed25519 public key}
+authority_sha256:{64 lowercase hex}
+rank:{decimal, 1 ..= 5}
+issued_at:{decimal ms, 0 ..= 2^53 - 1}
+```
+
+- Exactly 11 lines, no trailing LF, at most 1024 bytes (the largest valid one is 429 bytes).
+  Signature by `to_identity_key`. S2b semantics, summarized from the plan and not specified
+  here: a link from pinned key K is accepted when the receiver holds an authority with that
+  hash verified under K (or K's `owner_devices`), that authority is the NEWEST held one, and
+  `to_*` is listed in its `successors` at `rank`.
+- **In S2a** builders never emit it, the server never appends it, and a native chain walk
+  stops at it (the S1 behavior for a link it cannot follow).
+- Vector: 5.8 (`succession_*`).
 
 ---
 
@@ -2135,6 +3077,236 @@ above follow immediately, then the opaque `encrypted_sender_data<V>` and `cipher
 4340
 ```
 
+### 5.8 S2 vectors (S2-W0, #193; `tv2:` blocks)
+
+**Reading rule.** S2 vectors sit after an HTML comment `tv2:NAME` instead of `tv:NAME`: the
+S1 blocks are frozen byte for byte against the S1 baseline by the document checker, which
+refuses any unknown `tv:` name (13), and the S2 blocks are checked by their own recompute.
+Otherwise the 5.x rule applies: a text block's bytes are its lines joined by LF with no
+trailing LF; a `*_hex` block's bytes are its rows concatenated. Seeds, ids, `cid` and the
+5.4 handover come from `tv:inputs` and 5.4; the S2-only inputs are:
+
+<!-- tv2:inputs -->
+```text
+group_salt_hex = a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+seat_v2_version = 4
+seat_v2_device_cap = 5
+seat_v2_issued_at = 1790812860000
+seat_v2_history = visible
+seat_v2_pre_history = kept
+authority_version = 1
+authority_issued_at = 1790812860000
+authority_delegate_max_device_cap = 5
+join_generation = 0
+join_key_package_ref = S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789
+join_issued_at = 1790812870000
+succession_rank = 1
+succession_issued_at = 1790812880000
+extra1_seed_hex = c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf
+extra2_seed_hex = e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff
+```
+
+`seat_v2_*` and `authority_*` feed the list and the authority below, and `extra1_seed_hex`
+and `extra2_seed_hex` only the worst case; the list carries no boundary and the authority no
+`prev` (both lines empty). Every value in 5.8 was computed by two independent programs and
+agrees byte for byte (13).
+
+**Channel authority (4.10)**: version 1; `signer_device_id` = the owner device; owner
+devices = the owner device and the new owner device (5.1, with their 5.2 keys); one delegate
+and one successor, both the member's device; signed by the owner seed.
+
+<!-- tv2:authority_body -->
+```text
+sloga-channel-authority-v1
+v:1
+channel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3
+version:1
+owner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA
+signer_device_id:00112233445566778899aabbccddeeff
+issued_at:1790812860000
+owner_devices:00112233445566778899aabbccddeeff.A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg,0123456789abcdef0123456789abcdef.zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o
+delegates:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc
+delegate_scope:seat
+delegate_max_device_cap:5
+successors:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc
+prev:
+```
+
+<!-- tv2:authority_body_sha256 -->
+```text
+0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71
+```
+
+<!-- tv2:authority_signature -->
+```text
+xRMnLtvVVtb5tra2OK01NOd+gCbkWfTqnQSYJThQ1Wlc5Cv2XObDdLXviQH/kji2qjWDRj7PMWDTfqkQusupAA
+```
+
+**Seat list v2 (4.1.1)**: 5.3's seats, version 4, carrying that authority,
+`history:visible`, no boundary, `pre_history:kept`, the salt; signed by the owner seed.
+
+<!-- tv2:seat_list_v2_body -->
+```text
+sloga-seat-list-v2
+v:2
+channel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3
+version:4
+device_cap:5
+issued_at:1790812860000
+signer_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA
+signer_device_id:00112233445566778899aabbccddeeff
+seats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC
+authority:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71
+history:visible
+history_boundary:
+pre_history:kept
+group_salt:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+```
+
+<!-- tv2:seat_list_v2_body_sha256 -->
+```text
+6822d2c987006383581ee0cf0c5fd758dd3785bb2c214d514332dd7eed336806
+```
+
+<!-- tv2:seat_list_v2_signature -->
+```text
+2fpKyQ7i80lUPxe8a4K8CjJAeoRR1xH4s3owXpN4L92AeR2ot0pcaRD/qLR8bbH97vLzYNNQ/5jP+M6GXybwAg
+```
+
+**Text group ids v2 (3.1.1)** with the salt. The 91-byte hash input for `g = 0`, one row per
+element (context field, channel field, `u64_be(g)`, salt field):
+
+<!-- tv2:group_id_v2_input_g0_hex -->
+```text
+0013736c6f67612d746578742d67726f75702d7632
+001a30314a395a334b344d354e365037513852395330543156325733
+0000000000000000
+0020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf
+```
+
+<!-- tv2:group_id_v2_g0 -->
+```text
+6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+```
+
+<!-- tv2:group_id_v2_g1 -->
+```text
+f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f
+```
+
+<!-- tv2:group_id_v2_g64 -->
+```text
+787025fd12b11b64a85630a1fa261c420d919691633a6ab349a51173c671eb95
+```
+
+<!-- tv2:group_id_v2_g65535 -->
+```text
+c6e859ede61183b2d91d57c50484667f004a96e931dc5cbc38d614674ae5e4c3
+```
+
+**Commit AD v2 (3.12.1)** embedding the v2 list, a one-entry chain (the 5.4 handover and its
+5.4 signature) and the authority: 1744 bytes. One row per element: context field, seat-list
+body field, seat-list signature field (raw 64 bytes), chain count (`u16_be`), handover body
+field, handover signature field, authority body field, authority signature field (raw 64
+bytes):
+
+<!-- tv2:commit_ad_v2_hex -->
+```text
+0017736c6f67612d746578742d636f6d6d69742d61642d7632
+01e8736c6f67612d736561742d6c6973742d76320a763a320a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a340a6465766963655f6361703a350a6973737565645f61743a313739303831323836303030300a7369676e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a73656174733a3031485a584141414141414141414141414141414141414141412c3031485a584242424242424242424242424242424242424242422c3031485a584343434343434343434343434343434343434343430a617574686f726974793a303237376238643530653633323235363833383065316665646530656531613761303361653730343434343230343435653836643130653939646337636437310a686973746f72793a76697369626c650a686973746f72795f626f756e646172793a0a7072655f686973746f72793a6b6570740a67726f75705f73616c743a61306131613261336134613561366137613861396161616261636164616561666230623162326233623462356236623762386239626162626263626462656266
+0040d9fa4ac90ee2f349543f17bc6b82bc0a32407a8451d711f8b37a305e93782fdd80791da8b74a5c6910ffa8b47c6db1fdeef2f360d350ff98cff8ce865f26f002
+0001
+017f736c6f67612d6f776e65722d68616e646f7665722d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a66726f6d5f757365725f69643a3031485a584141414141414141414141414141414141414141410a66726f6d5f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a66726f6d5f6964656e746974795f6b65793a41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62670a746f5f757365725f69643a3031485a584141414141414141414141414141414141414141410a746f5f6465766963655f69643a30313233343536373839616263646566303132333435363738396162636465660a746f5f6964656e746974795f6b65793a7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a6973737565645f61743a31373930383132383030303030
+004024a9d8b5a88afe2ded612c55ef55e85f2cfd9745da0ec588873a02bbcb3d22e4dd9859965f904db68121a6dfaff604af844fa7a92dbf919100d025fa82247a04
+0282736c6f67612d6368616e6e656c2d617574686f726974792d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a310a6f776e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a6973737565645f61743a313739303831323836303030300a6f776e65725f646576696365733a30303131323233333434353536363737383839396161626263636464656566662e41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62672c30313233343536373839616263646566303132333435363738396162636465662e7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a64656c6567617465733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a64656c65676174655f73636f70653a736561740a64656c65676174655f6d61785f6465766963655f6361703a350a737563636573736f72733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a707265763a
+0040c513272edbd556d6f9b6b6b638ad3534e77e8026e459f4ea9d0498253850d5695ce42bf65ce6c374b5ef8901ff9238b6aa3583463ecf3160d37ea910bacba900
+```
+
+<!-- tv2:commit_ad_v2_sha256 -->
+```text
+38495363a9d10a817ed464523a1d17852f6c634008124118d6ff814397299d46
+```
+
+**Text join payload (3.13)**: the member's device joining the generation-0 v2 group, signed
+by the member seed.
+
+<!-- tv2:text_join_body -->
+```text
+sloga-text-join-v1
+v:1
+user_id:01HZXBBBBBBBBBBBBBBBBBBBBB
+device_id:ffeeddccbbaa99887766554433221100
+channel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3
+generation:0
+group_id:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3
+key_package_ref:S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789
+issued_at:1790812870000
+```
+
+<!-- tv2:text_join_signature -->
+```text
+l6DoK5goYia40tveyilADPFzJ46y8uVz/IUGtdn3DuybteG/t0xU1Hfur8G0siBGCbEVQNxzNiGKayHnCjKABw
+```
+
+**Succession statement (4.11, [S2b] format only)**: from the owner to the member's device at
+rank 1, naming the authority above, signed by the member seed (the successor's device).
+
+<!-- tv2:succession_body -->
+```text
+sloga-owner-succession-v1
+v:1
+channel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3
+from_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA
+from_identity_key:A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg
+to_user_id:01HZXBBBBBBBBBBBBBBBBBBBBB
+to_device_id:ffeeddccbbaa99887766554433221100
+to_identity_key:Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc
+authority_sha256:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71
+rank:1
+issued_at:1790812880000
+```
+
+<!-- tv2:succession_signature -->
+```text
+FTQqMwVpolS3sn+iveaRPZwuthYIbGn1P99OBmLp1OpCrcOYSG8C3o90XFn1LsqMt3yxRBiJqtHkW+6mOEZhCw
+```
+
+**AD v2 worst case (3.12.1).** Too large to print, so pinned by its length and SHA-256.
+Construction (every "i as 20 digits" is zero-padded decimal; every "n as 32 hex" is
+zero-padded lowercase hex; `MAX` = 9007199254740991; `MAXU32` = 4294967295; the channel, the
+owner and the keys are those of 5.1 and 5.2):
+
+- authority A: `version` and `issued_at` `MAX`; `signer_device_id` = the owner device;
+  `owner_devices` = the owner device with the owner key, the new owner device with the new
+  owner key, device 1 as 32 hex with the member key, and devices 2 and 3 as 32 hex with the
+  keys of `extra1_seed_hex` and `extra2_seed_hex` (no identity key twice, 4.10); `delegates`
+  = for i in 0..9, user `01HZXD` + i as 20 digits, device 16 + i as 32 hex, the member key;
+  `delegate_max_device_cap` `MAXU32`; `successors` = for u in 0..4 in that order, user
+  `01HZXW` + u as 20 digits with devices 32 + 2u and 33 + 2u as 32 hex (in that order), the
+  member key; `prev` = `authority_body_sha256` above; signed by the owner seed. It is 2836
+  bytes.
+- list L: `version` and `issued_at` `MAX`, `device_cap` `MAXU32`, signer = the owner user
+  and device, seats = the owner user plus `01HZXS` + i as 20 digits for i in 0..98,
+  `authority` = SHA-256 of A, `history:visible`, `history_boundary` = `cid` of 5.1,
+  `pre_history:wiped`, the salt; signed by the owner seed. It is 3161 bytes. (The boundary
+  and `wiped` are format-valid but refused by S2's semantic rules until S4; they only set
+  the length bound.)
+- chain: for i in 0..15, a succession statement from the owner user and owner key to user
+  `01HZXT` + i as 20 digits, device i as 32 hex, the member key, `authority_sha256` =
+  SHA-256 of A, `rank:5`, `issued_at` `MAX`; each signed by the member seed. Each is 429
+  bytes.
+- AD = `commit_ad_v2(L, chain, A)`: 14112 bytes.
+
+<!-- tv2:worst_commit_ad_v2_len -->
+```text
+14112
+```
+
+<!-- tv2:worst_commit_ad_v2_sha256 -->
+```text
+745d6adff648976eb588bab96cb005001819f66858b6556bba5f59bf3dcd68c1
+```
+
 ---
 
 ## 6. Admission and removal rules
@@ -2245,7 +3417,7 @@ any caller class, learns nothing (the invariant above; 7.4 "Refusal placement").
 | KeyPackage claim (group is Text) | Claimer is a current member device AND seated (else `NotSeated`); growth gate. Each target must be seated and hold ViewChannel, else that target's status is `NotFound` |
 | Every Text commit: existing-row check (W0-fix7; position pinned W0-fix8) | In BOTH the route and the driver: AFTER the access checks (not a bot; `assert_bound_session` for the submitting device; seated AND ViewChannel, the commit-fetch authorization) and BEFORE every validity check (membership, AD, Remove/Add rules, growth gate, `pending_removal`), a commit row already at `{group}:{epoch}` returns `Lost { winning: <that row> }` (409). This makes an identical-bytes resubmit idempotent without letting an unauthorized caller read commit rows (2.5 step 0). **(#177)** Only a Text-marked row counts; an unmarked (Call-plane) row at the id is replaced by the commit transaction (2.5 "Text commit marker") |
 | Every Text commit (W0-fix2, W0-fix3) | The MLS framing prefix parses (3.12.2, else `FailedValidation`), and its `authenticated_data` is byte-identical to the `commit_ad` of the newest stored seat list (else `ProtectedChannelResecuring { reason: "stale_seat_list" }`). The route pre-checks; the binding check is **inside the Text commit transaction** (Mongo multi-document transaction; Reference lock order), via `seat_list_ad_sha256` (2.5, 3.12.2; W0-fix4). Applies to Add, Remove and Update commits alike, including with the flag off |
-| Commit with `added` | Committer is a current member device. **Refused while `pending_removals` is non-empty** (`ProtectedChannelResecuring { reason: "pending_removal" }`, **DECISION (W0-fix3)**, so a joiner never receives a roster with an unseated user). Every added device: **not already a member, and not also listed in `removed`** (no same-commit Remove + re-Add of one device in S1, **DECISION (W0-fix7)**; matches today's `commits_submit.rs` refusal and the driver's "added device already a member"); registered E2EE device; its user **seated AND has ViewChannel** (the friend/DM-eligibility OR is dropped for Text); per-user device count within the **enforced device cap = min(signed-list cap, effective entitlement cap)** (inside the commit transaction, 2.5); total leaves `<= 100`. Growth gate |
+| Commit with `added` | Committer is a current member device. **Refused while `pending_removals` is non-empty** (`ProtectedChannelResecuring { reason: "pending_removal" }`, **DECISION (W0-fix3)**, so a joiner never receives a roster with an unseated user). Every added device: **not already a member, and not also listed in `removed`** (no same-commit Remove + re-Add of one device in S1, **DECISION (W0-fix7)**; matches today's `commits_submit.rs` refusal and the driver's "added device already a member"); registered E2EE device; its user **seated AND has ViewChannel** (the friend/DM-eligibility OR is dropped for Text); per-user device count within the **enforced device cap = min(signed-list cap, effective entitlement cap)** (inside the commit transaction, 2.5); total leaves `<= 100`. Growth gate. **S2 replaces the pending refusal and the cap count:** Add-clears-pending and the post-commit count (6.1 "S2 additions", #212, #223) |
 | Commit `removed` list (any Text commit; W0-fix3 main-session decision, amended W0-fix4) | The exact rule is 3.12.2 "Remove rule". **The current list signer's device can be removed ONLY in the rejoin case** (a stored, verified, outstanding rejoin intent from that device, copied into the commit's `rejoin_intents`), regardless of every other case. Every other removed device must be one of: a device of the committer's own user other than the committing device; a device of a `pending_removals` user; a device whose E2EE identity was revoked (looked up inside the transaction); ONLY when the committer is the current list signer's device, a device of a user absent from the newest signed list; or a device with an outstanding rejoin intent. Anything else is `FailedValidation`. Checked in the route and inside the commit transaction. **Enforceable only together with the receiver declaration binding (3.12.3 step 6)** |
 | Commit with only `removed` or an Update | Committer is a current member device. No seat-list signature is needed for a removal, but the Remove rule above applies. Allowed with the flag off |
 | `pending_removals` clearing | After a won commit, every pending entry whose user has no remaining member device is removed from the list |
@@ -2328,6 +3500,104 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
   saw. Admission is unaffected (the transaction re-checks the Remove rule itself); only the
   advisory label can be stale, which is one more reason no client may act on it in S1.
 
+**S2 additions to the Delivery Service rules (S2-W0, #195, #196, #197, #203, #204).**
+
+- **Remove rule 3a (S2-D17a; the plan's "3-prime").** Any committer may remove a device
+  listed in the group's `pending_device_removals`, whether or not its user is on the list.
+  Like rules 2 to 5 it never applies to the current list signer's device (rule 1), which a
+  release primitive never queues (S2-D15, 2.5). [S2b] rule 7: the signer device may remove a
+  device idle past `idle_device_days` (reason `idle`, S2-D34).
+- **Add-clears-pending (S2-D17b). S2 replaces** "Adds refused while `pending_removals` is
+  non-empty": an Add is allowed when the SAME commit removes every device that either
+  pending list names (MLS applies removes before adds, RFC 9420), so a reinstalled device is
+  admitted in one commit. A partial clear is still refused (`pending_removal`). Every
+  pending device entry names a current member, because the clearing rule (2.5, #224) drops
+  the others on every seat-list write and every won commit. The DS accepts the removes and
+  the Add in one commit or in two; S2a natives use two (6.2, #230).
+- **Added-identity claim (S2-D17c).** Inside the Text commit transaction each ADDED device's
+  E2EE identity is looked up (absent: `FailedValidation`), and on Mongo it is claimed with
+  `$inc txn_serial` (the #143 pattern), so a concurrent revocation write-conflicts with the
+  Add. Together with the revocation's second pending pass (6.3) every ordering ends with no
+  member or with a pending entry.
+- **Device cap counts (S2-D17b; corrected in the fix round, #212).** The join-intent route's
+  count (today every member device of the user, `join_intent.rs`) excludes devices listed in
+  `pending_device_removals`: the Add that follows must remove them in the same commit
+  (Add-clears-pending), so they never coexist with the new device. That is the ONLY
+  exclusion. The commit transaction counts EVERY leaf of the user in the POST-commit roster
+  against the enforced cap, exactly as native `_admit` and every receiver do (receivers
+  cannot see `signer_lost` or the server's pending lists; W3 `checks.rs` step 6 (h) at
+  `da03abc` counts every post-commit leaf); an exclusion there would let the DS sequence an
+  Add that members must refuse, poisoning the group. So while `signer_lost` is set, a
+  replacement Add that would exceed the cap (the lost device still holds its leaf) is
+  refused, and recovery goes through the signer-user successor `g + 1` (6.3).
+- **`signer_lost` (S2-D17d).** While it is set: an encrypted send is refused with
+  `ProtectedChannelResecuring { reason: "owner_device_lost" }` (confidentiality first: a
+  logged-out or stolen signing device must not keep receiving traffic unnoticed); Adds of
+  the signer USER's devices stay allowed (recovery-gated, S2-D32); other Adds are refused
+  with the same reason (**DECISION (S2-W0)**: the plan names only the signer user's Adds as
+  allowed, and refusing the rest keeps growth frozen while a lost device still holds a leaf
+  and receives every new epoch's secrets); Removes and Updates are allowed. It is COPIED
+  into every successor created while it is set, and clears only in the seat-list write of
+  4.3 step 7 (#213).
+- **Sends and pending devices.** S2 extends 7.3 step 5: a non-empty `pending_removals` OR
+  `pending_device_removals` refuses a send with `pending_removal`. After the clearing rule
+  (2.5, #224) every remaining entry names a member, so a send is never blocked by an entry
+  no commit can clear.
+- **`removed_reasons` in S2 (S2-D7, RR#S2-4; amends B48, #169).** The planner stamps
+  `pending_device` for rule 3a and [S2b] `idle` for rule 7. The code enum is
+  `MlsRemovalReason` (`mls/model.rs`; the plan's name `RemovedReason` predates the B48
+  code); it gains `PendingDevice` and `Idle`. **S2 replaces the B48 priority**
+  `pending_removal > off_list > revoked > own_user > rejoin` **with
+  `pending_removal > rejoin > own_user > pending_device > revoked > idle > off_list`.** Why
+  (RR#S2-4): native now records forced-removal memory whenever the label is
+  `pending_removal` (6.2), so `pending_removal` must win over every other admitting case;
+  the locally derivable cases (`rejoin`, `own_user`) come next, so a label native cannot
+  check never hides one it can; `off_list` goes last because an off-list user needs no
+  memory (the list already refuses them). **S2 replaces the route-time view of #178 (fix
+  round, #222):** the labels are stamped INSIDE the Text commit transaction from its own
+  reads, so no stale route-time label decides memory. No client may let a label WIDEN what
+  it accepts; a label can only ADD memory (`pending_removal`, missing or unknown). The enum
+  gains a `#[serde(other)] Unknown` catch-all (#219).
+- **Text create (S2-D1b, S2-D17d, S2-D32, S2-D33).** `generation <= 65535` (S2 replaces 63)
+  and the id check with the 3.1.1 derivation. **Recovery exception (widened in the fix
+  round, #213):** while the open group carries `signer_lost`, OR the newest stored list's
+  signer device has no registered E2EE identity (a fact the server derives from its own
+  directory, so recovery never depends on `signer_lost` having been written), a
+  session-bound, registered device of the signer USER may create generation `g + 1` (with
+  `supersedes`; the seated check as before) and then publishes its recovery list against
+  that successor (4.9). A successor create when the channel already has a Text group is
+  recovery-gated (S2-D32), so it works with the growth flag off and in Grace; a first create
+  needs the growth flag and `allows_text_traffic()` (#220). **Rate limit:** at most
+  `successor_rate_per_day` (default 10; `0` is no limit) successors per channel per 24 h,
+  else `InSlowmode`; the owner is told which committer's commit forced each successor (9.2;
+  the S2a backend does not report it yet, S2-W2). A successor create empties both pending
+  lists and COPIES `signer_lost` (#213).
+- **Join intent (S2-D6, S2-D28, S2-D32).** A Text intent signs the Text join payload (3.13)
+  on a channel whose list is v2 (#218), and stays outstanding for
+  `TEXT_REJOIN_OUTSTANDING_WINDOW_SECONDS` = `text_rejoin_window_secs` (86400; the driver's
+  rule-6 window too; the Call window stays 30 s). A rejoin intent (the device is already a
+  member) is recovery-gated; a new device of a seated member needs the growth flag and
+  `allows_text_traffic()` (#220). The signer user's replacement device's intent is
+  recovery-gated under the widened recovery condition above (#213).
+- **KeyPackage claim (S2-D32).** A claim for the re-Add of a device in `rejoin_readd`, or
+  for the signer user's replacement device while `signer_lost` is set or the stored list's
+  signer device has no registered identity (#213), is recovery-gated; other claims need the
+  growth flag and `allows_text_traffic()` (#220). The gate is checked after the seated
+  check, so an unseated claimer gets `NotSeated` with the growth flag off too and cannot
+  probe `signer_lost`.
+- **Commit with `added` (S2-D29, S2-D32).** The commit row stores the Welcome
+  (`MlsCommit.welcome`) and `removed_reasons`. The re-Add of a device in `rejoin_readd` is
+  recovery-gated and consumes the entry; the Add of a new device of a seated member needs
+  the growth flag and `allows_text_traffic()`; claiming a NEW seat is the seat PUT's and
+  protect's, which need the growth flag and `allows_new_seats()` (#220).
+- **Pending clearing (S2-D17a; redefined in the second fix round, #224).** Drop every
+  `pending_device_removals` entry whose device is not a member of the open group, after
+  every won commit and in every seat-list write, both drivers (2.5 "Clearing"), together
+  with the existing user-level clearing.
+- **Commit fetch (S2-D30).** `ResponseFetchMlsCommits` gains an optional `oldest_epoch` (the
+  oldest stored Text commit); the stored Welcome is never part of it.
+- **Welcome fetch (S2-D29).** A new route (7.2).
+
 ### 6.2 Client side (native; W3). The real trust decisions.
 
 | Operation | Rule |
@@ -2341,6 +3611,39 @@ would change the Call path's answers (decision 1 keeps it byte-identical).
 | Encrypt | 3.8: refused on any roster member off the newest list or locally removed (`RosterMismatch`), owner pin changed, not seated, Update ceiling |
 | Decrypt | 3.9 |
 | Call commands | `mls_call_*` / `e2ee_call_*` refuse text group ids (`WrongGroupKind`); text commands refuse call ids |
+
+**S2 changes to the native rules (S2-W0, #198, #199, #200).**
+
+| Operation | S2 rule |
+|---|---|
+| Admit (`_admit`) | The join intent verifies over the Text join payload when it carries `generation` and `issued_at` (3.13). When pending devices must go first, the bridge commits them with `_remove` and then calls `_admit`: two commits, no new argument (#230). The per-user cap counts EVERY leaf of the user in the post-commit roster (after the commit's removes), with no exclusion, as the commit transaction and every receiver do (#212). **Staging only (#214):** this device does not stage a re-Add citing a join intent whose `issued_at` is older than the `issued_at` of the join intent that device's latest Add consumed (the same remote clock, never a local time; native records it from the intent it saw, the join-request event or `join_requests`, and the rule does not apply when it never saw that intent; #229). A user in forced-removal memory is admitted only under a higher list version that includes them (unchanged) |
+| Remove (`_remove`) | **S2 replaces S1's "no revoked-only Remove" (W3 D26) for pending devices:** any member device may stage a Remove of a device the bridge reports in `pending_device_removals` (new argument `pending_device_targets`, from `GET .../text_group`), mirroring the DS's rule 3a. What native verifies before acting on that server claim: the target is a current leaf of this group, is not this device, and is not the device rule g protects (the newest adopted list's signer, 3.12.3 "S2"). That is all it CAN verify: S2a has no signed revocation. The claim can only make native REMOVE a leaf, never admit one, so the worst a hostile DS gets is the eviction of a live device, which then rejoins (availability, not confidentiality). A revoked-only Remove of a device NOT in `pending_device_removals` stays unstaged, as in S1. **Staging only (#214):** this device does not stage an eviction (a rule-6 Remove) citing a rejoin intent whose `issued_at` is older than the `issued_at` of the join intent that device's latest Add consumed (the same remote clock, never a local time; native records it from the intent it saw, the join-request event or `join_requests`, and the rule does not apply when it never saw that intent; #229); this narrows R14 for staging only and is never a receiver check (3.12.3) |
+| Forced-removal memory | **S2 rewrite of W3 D26 (S2-D7, RR#S2-4).** Native still records `(channel, user, list_version)` only when (1) the user is on the newest held list and (2) the commit removes that user's last leaf. Within that, the label now decides: memory is recorded when the server label of any of that user's removed devices in the commit is `pending_removal`, missing, or unknown (a value native does not know, including the `Unknown` catch-all of #219, or a checkable label it finds false, such as `own_user` from another user's committer or `rejoin` without a verified intent), EVEN IF a rejoin intent from that device also verifies. That closes the kicked-user escape (sign a rejoin intent, get removed under `rejoin`, avoid the memory). No memory for a `rejoin` or `own_user` that native verified itself, nor for `pending_device`, `revoked` or `idle`; an `off_list` user already fails (1). Missing or unknown never narrows. Native derives `rejoin` and `own_user` itself and verifies EVERY rejoin intent's signature, not only the owner device's |
+| Rule g (protected device) | The signer device of the newest list adopted after 3.12.3 step 3, not the pin's device (S2-D22; the two coincide once the pin moves, 4.4.1 rule 6) |
+| Seat-list sign | 4.9 "S2 additions" |
+
+**Why memory now follows the label (DECISION (S2-W0), #199).** D26's local rule would record
+memory for a revoked single-device user removed under `pending_device` (on the list, last
+leaf, not a rejoin, not own-user), so honest members would refuse that user's next device
+until the owner signs a higher list: the plan's finding 3 again, now reachable by any
+logout. The plan (S2-D7) therefore records memory ONLY for `pending_removal` (missing and
+unknown included). The S2-W0 contract's wording "local rules (1) to (4) otherwise unchanged"
+would keep D26's rules (3) and (4) as a second recording path and re-create that case; this
+document follows the plan and lists the difference as #210 OPEN item (b). The cost of acting
+on a label is R8's (1.3): a hostile server can mislabel a kick to avoid memory, which is no
+stronger than never reporting the kick.
+
+**Staging-only `issued_at`, as built (S2-W3, #238).** The record is
+`mls_text_admitted_intents` (8.2): `_admit` writes the `issued_at` of the intent its Add
+consumes, keyed `(group, user, device)`, in the SAME transaction as the OpenMLS stage (at
+stage time, not when the commit wins; the latest Add replaces it). Only this device's own
+Adds write it: a join-request event, `join_requests` or another member's Add write nothing,
+so "the intent it saw" in the rows above means, natively, the intent this device itself
+admitted. An S1 intent (no `issued_at`) writes no record, and with no record the rule does
+not apply. The comparison is strict: an `issued_at` EQUAL to the record is allowed, only an
+older one is refused. `_admit` and `_remove` refuse it as `ReplayedRejoinIntent`, nothing
+staged (for `_remove`, before any target is looked at). A group wipe deletes the group's
+records.
 
 ### 6.3 Flows
 
@@ -2389,6 +3692,14 @@ below). Member clients learn of it
 from `ProtectedChannelResecuring { reason: "pending_removal" }` on send or from the text-group
 state refresh, and any member device commits the Remove (leaf-index stagger, 2 s; permitted
 because the user is in `pending_removals`, 6.1 Remove rule).
+**S2 (W2 wave audit MAJOR-1).** Every server-forced release (`Member::create`, both
+releases of `Member::remove_with_outcome`, both of `User::delete`, and the ban's own
+release) sends `ProtectedChannelChanged { scope: ["seats", "text_group"] }` on the channel
+topic of each channel it returned, right after that release succeeds and never after a
+failed one (7.5). Both scopes, because the release returns one list for its seat releases
+and its Text group writes (pending removals, `signer_lost`). These paths record no
+`ProtectedSeatRelease` entry: a kick or a ban records only its `MemberKick` or
+`MemberBanAdd` entry, and a leave or an account deletion records none.
 
 **Removal order, fail closed (DECISION (W2), #141).** The release
 (`release_channel_seats_for_user(user, Some(server), now)`) runs BEFORE the membership
@@ -2528,6 +3839,8 @@ from their own server, and `User::delete` deletes every server the user owns BEF
 SERVER deletion: every protected channel of that server is deleted with its entitlement,
 seats, seat list, Text group and commits (7.5 "Delete cascades"). No pending removal of the
 owner is ever created.
+**S2 (S2-W0):** unchanged in S2a (S2-D43 adds a warning before the deletion, 9.2);
+succession is S2b.
 
 **Update.** 3.11.
 
@@ -2535,6 +3848,7 @@ owner is ever created.
 `g + 1` (3.1), created only by the current seat-list signer's device (6.1). Members that detect
 the poisoned epoch stay `resecuring` until the owner's device creates the successor; with the
 owner's device lost, the channel stays there (R12).
+**S2:** the recovery exception (6.1) replaces that freeze for an owner who has any device.
 
 **Every member wiped its state (DECISION (W0-fix5)).** If the group's only member, or every
 member, has wiped its local group state, no leaf-holder remains to serve a rejoin (no one can
@@ -2551,6 +3865,8 @@ A bridge detects this case when its join intent goes unanswered past the join-re
 while `GET .../text_group` shows only stale members. It surfaces `resecuring`, and on the
 owner's device it offers "Re-create the protected group". Under R12 (the owner's device lost
 and no successor qualified) this is a **freeze**: no successor can be created in S1.
+**S2:** the S2-D17d recovery successor (6.3 "Owner signing device lost") ends that freeze
+for an owner who has any device.
 
 **Owner moves to a new device (handover; DECISION (W0-fix3)).** Old owner device `K0` (pinned
 everywhere), new device `K1` of the SAME user:
@@ -2614,10 +3930,291 @@ owner device unless the old device ran steps 2 to 3 of the handover above before
 lost. The lost device's leaf is never removed: the DS refuses every Remove of the current
 list signer's device except the rejoin case (6.1), and a lost device never sends a rejoin
 intent.
+**S2 replaces this paragraph in S2a** (6.3 "Owner signing device lost", below).
 
 **Server ownership transfer.** Refused while the server has any protected channel (7.4), so
 `server.owner` and the pinned owner cannot drift apart in S1, except through the R16 race
 (a transfer landing on a stale read right after protect), which fails closed and loud.
+
+**S2 flows (S2-W0).** S2a unless marked.
+
+**Reconciler (S2-D9 to S2-D16; #201).** One predicate,
+`protected_access::seat_holder_lacks_access(user, member, channel, server)` (NEW
+`crates/core/database/src/util/protected_access.rs`): true for a non-member, a missing user,
+a bot, a privileged (staff) account, or no ViewChannel. Suspended or disabled accounts are
+NOT in it (R17). `GET .../seats` computes `seated_without_access` from it, so the owner UI
+and the reconciler agree on every holder except the list signer user, whom the reconciler
+keeps (below, #222). Because the predicate counts bots and staff, a bot or staff holder is
+flagged too, which S1's ViewChannel-only flag never did (6.4).
+- `reconcile_channel(channel)` releases every active seat whose holder lacks access through
+  the per-channel CAS release
+  `release_channel_seat(channel_id, user_id, expected_seated_at, cause, now) -> Result<bool>`
+  (both drivers; cause `AccessLost`). Mongo claims the open Text group first, then updates
+  the seat filtered on `{ _id, released_at: null, seated_at: expected }` (setting
+  `released_at`, `release_cause` and `cooldown_until = now + 14 d` unless 2.3's no-cooldown
+  rule applies) and `$push`es a pending removal when the user has a member device and none
+  is pending (never for the list signer: `signer_lost` instead, S2-D15). Reference takes
+  `channel_seats` then `mls_groups`, a suffix of the 2.5 (d) order. The `seated_at` CAS
+  stops a stale reconcile from undoing an owner re-seat. `reconcile_server` and
+  `reconcile_member_in_server` iterate it.
+- **Hooks (S2-D11)** run unconditionally (so retrying the same edit repairs a failed
+  reconcile), after the write and its audit entry and BEFORE the existing voice sync. The
+  reconcile result is KEPT (a failure is logged at once) and the voice sync always runs;
+  then the route answers the reconcile's error, unchanged, after the voice sync (in practice
+  500). A failing voice sync answers first, and the reconcile error stays in the log. A
+  channel or server row the reconcile cannot find (deleted under the pass, or a legacy row)
+  is nothing to reconcile, logged at `warn`, so a successful permission edit never answers
+  404 for it (W2 wave audit MINOR-1). The permission write is never undone: the
+  `Member::remove` kept-second-release shape. Routes:
+  `servers/member_edit.rs` (roles change; that member); `servers/permissions_set.rs`,
+  `servers/permissions_set_default.rs`, `roles_delete.rs`, `roles_edit_positions.rs` (the
+  server); `channels/permissions_set.rs`, `channels/permissions_set_default.rs`, and
+  `channel_edit.rs` with `remove: DefaultPermissions` (that channel). The upstream
+  source-text pins in `roles_edit_positions.rs`, `permissions_set_default.rs` and
+  `permissions_set.rs` are edited with stated reasons, each with a mutation proving it still
+  bites. A timeout never loses ViewChannel (`ALLOW_IN_TIMEOUT` includes it), so there is no
+  timeout hook; a test pins that.
+- **Race closure (S2-D12).** `seats_put.rs` and `channel_protect.rs` run `reconcile_channel`
+  with fresh reads AFTER their claim commits (write W then hook H; claim C then recheck R;
+  every order ends reconciled). Permissions are not evaluated inside the transaction, which
+  would contend with every send and role edit inside the 10 s retry budget.
+- **Sweep (S2-D14).** NEW crond task `tasks/protected_access_sweep.rs` (registered like
+  `afk_sweep.rs`, with the `include_str!("../main.rs")` pin) pages
+  `fetch_channels_with_active_seats(after: Option<String>, limit: i64) -> Result<Vec<String>>`
+  and runs `reconcile_channel` every `reconcile_sweep_secs` (300; `0` disables the sweep,
+  the hooks still run). It runs regardless of both feature flags and of the entitlement
+  state (removal always works; S5's growth predicates never gate it) and is idempotent
+  across replicas (the CAS, and "already pending"). While `formats_v2` is on (#219), it
+  also queues a pending device removal for every Text member device whose identity row is
+  absent, whose bound session no longer exists, or which a newer identity on the same
+  session superseded: the repair path of "Device revocation" below (RR#S2-9). The repair
+  reaches the open Text group of each channel the sweep pages, i.e. each channel with an
+  active seat. That covers every live channel: the list signer is always seated and the
+  reconciler never releases them (#222; W2 wave audit ruling 5).
+- **The reconciler never releases the current list signer user (fix round, #222).** A
+  privileged owner (the staff flag set after protect) would match the predicate, and
+  releasing the signer would wedge the channel; the reconciler skips that seat and logs and
+  reports it (ids only, on every pass that finds it, the sweep included). `GET .../seats`
+  still shows that seat to the owner as `seated_without_access` (owner only); the owner UI
+  must not offer to unseat the signer (W2 wave audit ruling 10).
+- **Regaining access never re-seats (S2-D16).** The user stays released; re-seating is an
+  owner growth add (4.9).
+- Every release with a non-empty result emits `ProtectedChannelChanged` (7.5) and records
+  `ProtectedSeatRelease { channel, user, cause }`. Both live inside `reconcile_*`, so every
+  caller emits the same: one entry per release that landed, and ONE event per channel with
+  `scope: ["seats"]`, also when the release queued a pending removal on the open Text group
+  (as the seat PUT's event does, 4.3). The entry's `cause` is the reason the seat was
+  released for, `access_lost`, never `device_never_joined`, even when the row stored that
+  (2.3: the stored value only says the slot freed at once) (W2 wave audit ruling 12).
+- Role editors get copy only (the spec rule "a role that opens a protected channel uses a
+  slot" is superseded by explicit seating): "makes them eligible; the owner seats them", and
+  a generic warning before role or permission edits in a server with protected channels
+  (9.2).
+
+**Device revocation (S2-D17a, S2-D17c; #202).** While `formats_v2` is on (#219; with it off
+revocation stays as in S1 and R23 stays open), `E2EEIdentity::revoke_device` (also behind
+logout, session revocation, `DELETE /e2ee/keys/:id` and every path through
+`Account::disable`) becomes, in order: (1)
+`add_pending_device_removal(user_id, device_id, now) -> Result<Vec<String>>` (both drivers;
+it claims the Text groups holding the device first, adds a `pending_device_removals` entry
+in each, and for the device that signed a channel's current list sets that group's
+`signer_lost` instead, S2-D15, reading that signer inside the same claimed transaction,
+#222); (2) `delete_e2ee_device` and the KeyPackage delete, unchanged; (3) the pending pass
+AGAIN (idempotent; it catches a Text commit that added the device between the first pass and
+the delete); then the `E2EEDeviceDelete` broadcast and `ProtectedChannelChanged` for each
+returned channel. A failed pending pass fails the revocation closed for the route.
+`Session::delete` and `delete_all_sessions` delete the session BEFORE revoking, so a failure
+there leaves an identity bound to a dead session: the sweep above repairs it.
+**Disable and suspend order (W2 wave audit MAJOR-2).** `Account::disable` stores
+`disabled` FIRST, then `delete_all_sessions` deletes every session and revokes EVERY device
+(each one is attempted even after another fails, and each failure is logged), sends
+`DeleteAllSessions`, and returns the first error. A device whose pending pass failed stays
+intact (identity and leaf), bound to a dead session, and the sweep's repair queues it while
+`formats_v2` is on. `User::suspend` stores the suspension (`SuspendedUntil`) BEFORE it
+disables the account, so a failed revocation answers its error with the user already
+suspended and disabled, never logged out and free to sign straight back in.
+`Account::schedule_deletion` goes through `disable` too, so a failed revocation there answers
+its error with the deletion already scheduled. The commit
+transaction refuses an Add whose identity is absent and claims the identity of every added
+device (6.1), so every ordering of a revocation and an Add ends with no member or a pending
+entry. On `E2EEDeviceDelete` for one of its OWN devices, each of the user's other active
+devices removes it too (rule 2; no server label needed).
+
+**Owner signing device lost: `signer_lost` and recovery (S2-D17d, S2-D22; #197, #198).** S2
+replaces "Owner device loss" above for S2a.
+
+1. The owner logs out of, revokes, or loses through suspension the device that signed the
+   current list. The revocation's pending pass sets
+   `MlsGroup.signer_lost { user_id, device_id, cause: device_revoked, at }` on that
+   channel's open Text group instead of queuing the device (S2-D15), and logs and reports it
+   (ids only). Every successor created while it is set carries it over (#213).
+2. Sends pause (`owner_device_lost`, 6.1). Members see the amber "owner device lost" state
+   with copy (9.2), never silence; when the owner's ACCOUNT is suspended, deleted or banned
+   the copy is "The owner's account is unavailable" (R28), derived at read time from the
+   account flags (only `device_revoked` is stored, #222).
+3. The owner's replacement device joins if it can: Adds of the signer USER's devices stay
+   allowed and its join intent and KeyPackage claim pass the recovery gate (S2-D32), but the
+   lost device's leaf still counts toward the cap (#212). Recovery never depends on another
+   member being online (RR#S2-1): if nobody admits it (a solo owner, the normal state after
+   S4's owner-only genesis; every member offline), or the Add would exceed the cap (cap 1,
+   say), it recovers through successor generation `g + 1` in steps 4 and 5.
+4. That device FIRST signs the recovery list (`_seat_list_sign(recovery: true)`, 4.9): the
+   native dialog "Take over signing #channel on this device" runs before anything is created
+   (#213). The list carries an authority of a higher version whose `owner_devices` omits the
+   lost device. Then, if it holds no leaf, it creates successor `g + 1` (the 6.1 recovery
+   exception, keyed on `signer_lost` OR on the stored signer device having no registered
+   identity), where it holds the only leaf; the successor carries `signer_lost` over.
+5. It PUTs the list. 4.3 step 5b passes (it holds a leaf in the open group). The write
+   clears `signer_lost`. If the lost device still holds a leaf in the open group (no
+   successor was needed), it is added to `pending_device_removals` and rule 3a removes it;
+   in a recovery successor it holds no leaf, so nothing is queued (4.3 step 7, #224) and the
+   channel sends and admits members at once.
+6. Members adopt the list. When it is signed by an `owner_devices` member of an authority
+   they hold, there is no dialog (4.4.1); a new device (the single-device case) gets the S1
+   same-user owner-change confirmation (4.7). Members reach a recovery successor through
+   `as_of_group_id` and the normal join path.
+
+**A replacement device that dies between the successor create and the PUT strands nothing
+(#213):** the successor still carries `signer_lost` and the stored list's signer device
+still has no registered identity, so any device of the owner user (the same one after a
+restart, or another) repeats steps 4 and 5, creating `g + 2` if it cannot join `g + 1`. The
+lost device and the dead replacement hold no leaf in `g + 2`, so its recovery list queues
+neither, and the channel resumes (#224).
+
+Tests: a solo owner, cap = 1, and Grace each recover; a replacement device killed between
+the create and the PUT, after which another owner device recovers. An owner with several
+listed devices simply signs from another one (no successor needed while members are online).
+
+**Async Text join (S2-D28; #203).** `GET .../text_group` gains
+`join_requests: [{ user_id, device_id, generation, key_package_ref, signature, issued_at, created_at, rejoin }]`:
+the stored intents of seated users that are newer than that device's `member_added.at`,
+returned to SEATED callers only (absent for an unseated viewer, as it is when there are
+none; `generation` and `issued_at` are absent on a v1 intent). Members admit on channel
+open, on the 60 s refresh and on reconnect (leaf-index stagger), as well as on the live
+event. A Text intent stays outstanding 24 h (`text_rejoin_window_secs`, route and driver;
+Call stays 30 s); the native Text intent lifetime (W3 D22) goes from 1 h to 24 h. The joiner
+re-broadcasts with backoff (from 10 s, doubling, capped at 15 min) instead of 3 retries; its
+shield stays `resecuring` "Waiting for a member to come online" (9.1). Red (9.1 step 6d)
+only on a verified failure, never on silence.
+
+**Stored Welcome and refetch (S2-D29; #203).** Every Text commit with `added` stores its
+Welcome on the commit row (2.5). `deliver()` exempts `mls_welcome` envelopes from the queue
+DEPTH limit (the bytes limit stays) and logs every skipped envelope at `warn`. The bridge:
+once `member_added` lists this device at an epoch after its intent and no Welcome arrived
+within 20 s, it fetches `GET /mls/groups/:id/welcome?device_id=` (7.2); on the unknown-group
+answer it sends a rejoin intent. A spike comes first (O-12): OpenMLS must keep the
+KeyPackage private key long enough to process a Welcome up to 24 h late.
+
+**Catch-up pager (S2-D30; #203).** NEW node-testable `textCatchUpPolicy.ts` (bridge): page
+from `from_epoch = held + 1` up to `current_epoch`; every page must be contiguous (its first
+row is the requested epoch, with no holes), else `catch_up_failed`, then `_mark_left`, then
+the join path. An empty page while `current_epoch > held` is a gap too. `MlsEpochGap` runs
+the same pager. `IdentityPinRequired`: pin from the signed device listing, then retry once
+(W3 D5). A seat refresh catches up to `as_of_epoch` first (4.4 step 0, W3 D14). On a
+successor: catch up the old group to its last stored epoch, then join the new one.
+
+**`CatchUpLeafUnresolvable` (S2-D31; #203).** A leaf failure on a commit BEHIND the server
+tip whose only cause is an unpinned or revoked identity returns native
+`CatchUpLeafUnresolvable { group_id, epoch }` (8.4); the bridge calls
+`_mark_left(catch_up_failed)` and rejoins, never poisoned (W3 D12 refuses `_mark_left` on a
+poisoned group, so poisoning over a harmless history would brick the device). A key that
+exists but mismatches stays poisoned. The rejoin Welcome re-verifies every current leaf.
+**As built (S2-W3, #238).** Native cannot know the server tip by itself, so `_process`
+takes `catch_up_tip: Option<i64>` (8.3): the server's current epoch while the bridge pages
+through history, `None` for a live envelope (the S1 poisoned path). A commit is behind the
+tip only when its epoch is below `catch_up_tip`. A bridge that lies there can only turn a
+poisoned epoch into left plus rejoin, whose Welcome re-verifies every leaf. "Unresolvable"
+means the added leaf's device is revoked, or still unpinned after its one pin retry (W3
+D5). The rule covers LEAVES only: the signer of a newer list embedded in the commit's AD
+(3.12.3 step 3) keeps the S1 handling even behind the tip, so an unpinned signer is retried
+once and then poisoned as `BadSig`, and a revoked or re-keyed signer device is `BadSig`
+and poisoned at once (W3 wave audit item (b), accepted).
+**Late Welcome, as built (S2-D28, #238).** The Text join intent window is native's own
+24 h constant (the boundary is inclusive; one millisecond past it a Welcome is
+`MlsUnsolicitedWelcome` with nothing written); the call plane keeps its 1 h. A test
+processes a Welcome 23 h 59 m after `_join` and joins. Those tests pass the clock in, so
+they prove native's window; that OpenMLS keeps the KeyPackage private key for a real 24 h
+(the O-12 spike above) is not proven by them.
+
+**Recovery gates (S2-D32; #203).** Recovery operations pass under the available gate
+(`e2ee_enabled`) plus the entitlement's `allows_text_traffic()` (S5's predicate: `Active` or
+`Grace`; before S5 lands, `Active`), with NO growth flag: a rejoin intent (the device is
+already a member); the re-Add of a device whose rule-6 eviction is recorded in
+`rejoin_readd` (written by the eviction, consumed by the re-Add) and its KeyPackage claim; a
+successor create when the channel already has a Text group; following a successor (second
+fix round, #226): the join intent, the KeyPackage claim and the Add of a device that held a
+leaf in the PREDECESSOR generation (the server finds it as the channel's closed Text group
+at the open group's generation - 1, which the create's `supersedes` named, and checks its
+member list), for recovery successors, poisoned-epoch successors and the v1-to-v2
+supersession of #223 alike (OWED: not built in S2a; such a device is treated as a new one,
+so it fails closed with the growth flag off; W2 wave audit MINOR-3); and, while
+`signer_lost` is set or the stored list's signer device has no registered identity (#213),
+the signer user's replacement device's join intent and KeyPackage claim (RR#S2-1).
+**Gating tiers (aligned with S5 plan section 7; fix round, #220):** a NEW SEAT (the seat
+claims of a seat PUT and of protect) needs the growth flag and `allows_new_seats()` (Active
+only); a NEW DEVICE of a seated member (its join intent, its
+KeyPackage claim and its Add) and a first Text group create need the growth flag and
+`allows_text_traffic()` (Active or Grace); RECOVERY needs the available gate and
+`allows_text_traffic()` and no growth flag. Before S5 lands both predicates are `Active`.
+**S2 replaces** 7.1's consequence that "with the flag off, every Add is refused, including
+the re-admission of a member device that desynced": recovery Adds pass with the growth flag
+off (O-16). The predicate names are coordinated with S5. A MISSING entitlement row refuses
+every KeyPackage claim and every Add, recovery included; at the S5b merge S5b's
+pass-on-missing in `key_packages_claim` is dropped and its test rewritten (W2 wave audit
+ruling 11).
+**`rejoin_readd` lifetime (W2 wave audit MINOR-2).** Entries are never pruned today. The
+list is bounded (one entry per device, and a successor create empties it), but an evicted
+device that stays seated, viewing and registered keeps its recovery re-Add, a bypass of the
+growth flag, indefinitely (the commit transaction still re-checks everything else). Pruning
+on identity revocation or seat release, with a TTL of the Text rejoin window, is owed before
+the `formats_v2` flip.
+
+**Generations (S2-D33; #204).** The cap is 65535 on both sides (3.1, 3.1.1); `GET .../seats`
+gains `as_of_generation`, and W3 D14 checks a stated generation by recomputing its id, never
+by scanning. Successor creates are rate-limited (6.1). S1 clients refuse `g >= 64` loudly
+(`ChannelMismatch`).
+
+**Removal events and duty (S2-D18, S2-D19; #205).** `ProtectedChannelChanged { id, scope }`
+(7.5) reaches viewers after every change of seats or pending entries. Any device holding an
+active leaf runs the removal duty on the event even if the channel is not open (stagger: the
+signer device at 0 s, the others at `leaf_index x 2 s`): it fetches `GET .../text_group` and
+commits the Removes that rules 3 and 3a allow. The server NEVER clears a pending entry on a
+timer. After 10 minutes the owner UI shows "Removal waiting" with "Finish now"; on a
+poisoned group it points to "Re-create the protected group" (9.2).
+
+**Removal reasons (S2-D20; #205).** New error `RemovalReasonRequired` (400) from the seam
+`refuse_removal_without_reason(db, server_id, reason)` (`member_remove.rs`, shared with
+`ban_create.rs`). The S2 rule: EVERY kick and ban in a server with at least one protected
+channel (a channel of the server's entitlements that carries the `protected` flag), and
+every seat PUT that releases someone (4.3 step 4d). A reason that is empty after
+sanitizing, or only whitespace, counts as none. The seam takes no target: keying it on
+"the target holds a seat" would tell a KickMembers moderator who cannot view the channel
+whether the target is seated (O-2). Kick: after the rank check, before `remove`; the reason
+is the `X-Audit-Log-Reason` header. Ban: after the rank check, BEFORE `ServerBan::create`
+(coordinated with B42's source-text tests), and only for a ban this request creates (an
+"already banned" retry writes nothing and needs no reason); the reason checked is the
+request BODY reason, sanitized as a header reason is, which is the reason the
+`MemberBanAdd` entry records (plan audit M4: a ban reason may run to 1024 characters, past
+the header's 512). New audit actions
+`ProtectedSeatsUpdate { channel, released, seated, reason }` and
+`ProtectedSeatRelease { channel, user, cause }` (`#[serde(other)] Unknown` keeps a rollback
+safe). **Audit visibility (fix round, #221):** both actions name a protected channel and its
+seat holders, so `servers/audit_log_fetch.rs` returns a `ProtectedSeatsUpdate` or
+`ProtectedSeatRelease` entry only to a reader who has ViewChannel on that entry's channel;
+a reader with ViewAuditLog but without ViewChannel never sees it. **(S2-W2)** The route
+filters inside its fetch loop, BEFORE it collects the page's `users`, so a hidden entry
+contributes neither its actor nor its target. An entry with no channel, a channel that no
+longer exists or a channel of another server is hidden from every reader, the owner
+included (fail closed). Hidden entries are replaced from older ones: the route reads up to
+10 further batches of 100 entries to fill the page. Accepted residuals: a run of more than
+about 1000 hidden entries ends the page early; the response time leaks a rough count of
+hidden entries; an `Unknown` entry (written by a newer build) is not filtered. Copy never
+reveals contribution data. Role-edit releases bypass the rule (R26).
+
+**Account deletion and leave (S2-D43).** Server behavior is unchanged in S2a: deleting the
+owner's account deletes their servers (above), and the client warns first (9.2). [S2b]
+succession and "Leave and hand over" (S2-D23), cross-user handover (S2-D4) and ownership
+transfer (S2-D25) are specified by the plan, not here.
 
 ### 6.4 Permission loss (not handled in S1)
 
@@ -2625,6 +4222,14 @@ A seated member who loses ViewChannel keeps their seat and their leaves and stil
 new epochs. S1 mitigation only: `GET /channels/:id/seats` returns `seated_without_access: true`
 for them (owner caller) and the owner's seat UI highlights them for unseating. The reconciler
 is S2. This is why the HOLD in 1.1 exists.
+
+**S2 replaces 6.4 (S2-W0, #201).** The reconciler (6.3 "Reconciler") releases the seat of a
+seated member who loses ViewChannel (or who is a non-member, a missing user, a bot or a
+staff account) within the request on every hook route, or within `reconcile_sweep_secs`
+through the sweep, and queues a pending removal for their devices; any member then removes
+their leaves. `seated_without_access` stays in `GET .../seats` (owner only) and reads the
+same predicate; in S2 it is a transient state between a permission change and its reconcile,
+not a standing one.
 
 ---
 
@@ -2713,6 +4318,11 @@ Gates (**kind-aware**; the media gate body is unchanged and stays pinned by `fla
 | Encrypted send, history, receive | Allowed (**DECISION (W0)**: existing protected channels keep working) |
 | Plaintext send, attachments, every 7.4 refusal | Still refused: the channel is still protected |
 | Pruning of Text commits (crond, R9; **DECISION (W2)**, #147) | Unaffected by BOTH flags: pruning runs with `e2ee_enabled` or `protected_channels.enabled` off. Only `commit_retention_days = 0` stops it (0 = never prune, 2.5). The daily crond task `prune_mls_text_commits` (W2 lane B43, #174) reads no flag |
+| (S2, #218) `formats_v2` off, a channel already on a v2 list | Unaffected: v2 seat PUTs (removal-only included), commits, successors, the Text join payload and v2 ids keep working |
+| (S2, #218) `formats_v2` off, a new v2 genesis or a v1-to-v2 upgrade list | Refused (`FailedValidation`); protect takes a v1 genesis |
+| (S2, #219) `formats_v2` off, a device revocation | The S2 revocation hook writes nothing (no pending device entry, no `signer_lost`; R23 open) |
+| (S2, #220) growth flag off, a recovery operation (rejoin, `rejoin_readd` re-Add, successor of an existing group, `signer_lost` replacement) | Allowed (available gate and `allows_text_traffic()`) |
+| (S2, #226) growth flag off, a device that held a leaf in the predecessor generation joins the successor (intent, KeyPackage claim, Add) | OWED, not built in S2a (W2 wave audit MINOR-3): refused like a new device (fails closed). Specified: allowed as recovery; a device new to the channel is still refused |
 
 **Flag off (DECISION (W2), #135).** The flag stops growth only. It refuses seat claims,
 Adds, Text group create, join intents and KeyPackage claims (and the grant and protect,
@@ -2728,6 +4338,43 @@ Consequence, stated so nobody mistakes it for a bug: with the flag off, every Ad
 including the re-admission of a member device that desynced and must rejoin. Such a device
 stays in `resecuring` until the flag is back on. Growth is frozen; nothing is unprotected and
 nothing falls back to plaintext.
+
+**S2 replaces that consequence for recovery Adds** (6.3 "Recovery gates", O-16): a desynced
+member device's rejoin and re-Add pass with the growth flag off.
+
+**S2 configuration and gates (S2-W0, #204, #206).**
+
+```toml
+[features.protected_channels]
+formats_v2 = false              # entry into v2 (genesis, upgrade) and the revocation hook; flip once every protected device runs S2
+reconcile_sweep_secs = 300      # S2-D14 sweep period; 0 disables the sweep (the hooks still run)
+text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver); never below 30 (the Call window)
+successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h; 0 is no limit
+# idle_device_days              # [S2b] S2-D34; default commit_retention_days
+```
+
+- **Rollout gate (`formats_v2`; scope corrected in the fix round, #218).** An S1 build that
+  receives a v2 list in a commit AD parses it as malformed and takes the poisoned path, so a
+  channel ENTERS v2 (a v2 genesis, or a v1-to-v2 upgrade list) only while the flag is on.
+  The flag governs nothing else about formats: a channel already on v2 keeps v2 bodies, v2
+  ids, the AD v2, the Text join payload, removal-only and other seat PUTs, commits and
+  successors whatever the flag says, so turning it off never strands a v2 channel. With it
+  on protect accepts a v2 genesis only, with it off a v1 genesis only. It also gates the
+  revocation hook (6.3 "Device revocation", #219). It is flipped once every protected device
+  runs S2 (trivially true under the HOLD: dev and staging only until then). The root advert
+  carries it (7.2).
+- `successor_rate_per_day` is S2a: S2-D33 moved to S2a (plan audit PA-7) after plan section
+  6 had tagged this key [b] (#204).
+- **Recovery gate (S2-D32, 6.3).** A third Text gate beside Available and Growth
+  (`TextGate::Recovery`, `require_text_gate_for` in `routes/mls/mod.rs`; no route calls it
+  yet: the S2-W2 routes check the available gate and the entitlement inline, `Active` only
+  until S5 lands): available AND the entitlement's `allows_text_traffic()` (the three gating
+  tiers are in 6.3 "Recovery gates", #220). The route chooses Recovery or Growth from the
+  operation (a rejoin, a `rejoin_readd` re-Add and its claim, the successor of an existing
+  group, a `signer_lost` replacement), never from a client flag.
+- Flag-off table, S2 rows: recovery operations are allowed with the growth flag off; the
+  reconciler, its sweep, the revocation passes and every removal run with any flag in any
+  state, like pruning.
 
 ### 7.2 Routes
 
@@ -2862,8 +4509,9 @@ sufficient. `device_cap` here is the enforced cap (2.5); `entitlement_device_cap
 ceiling a newly signed list may use (4.1, W0-fix4).
 
 `list` is `null` only for a channel that is not protected. `seated_without_access` is computed
-(ViewChannel for that user) and present **only when the caller is the server owner**; omitted
-otherwise (**DECISION (W0)**: other members' permission state is not disclosed).
+(ViewChannel for that user; S2: the 6.3 predicate) and present **only when the caller is the
+server owner**; omitted otherwise (**DECISION (W0)**: other members' permission state is not
+disclosed).
 **Nullable caps (DECISION (W2), #152).** `entitlement_device_cap` and `slot_cap` serialize
 as `null` when the channel has no entitlement, and `device_cap` as `null` when it has no
 seat list. A client MUST treat `null` as "unknown", never as `0` (which means unlimited).
@@ -2910,6 +4558,7 @@ Welcomes. A Welcome reaches its device only as a queued `mls_welcome` envelope (
 one dropped by the queue budget or never drained is lost (R5). A re-Added device that never
 processes its Welcome ends in the loud `welcomeRetriesExhausted` state (9.1 step 6d); a
 Welcome store and refetch route is S2.
+**S2 replaces this (S2-W0, #203):** the Welcome route below.
 **Access (W2 lane B8, #160).** The read needs ViewChannel and the MLS caller checks only, NO
 seat: a seated member's device reads it BEFORE it joins (6.3 "Seat a member"), and so can an
 UNSEATED viewer. The roster it returns (`members` user and device ids, `pending_removals`,
@@ -2926,6 +4575,56 @@ has one). A stored Text group without a `generation` is corrupt and answers
 
 **Existing MLS routes**, behavior by the stored group's kind: join intent, KeyPackage claim,
 commit submit and commit fetch per 6.1; the ctl pipe refuses Text.
+
+**S2 route changes (S2-W0, #203, #205, #206; plan section 6).** S2a unless marked. Every
+field S2 adds to a response is OMITTED when it is `None` or empty, never sent as `null` or
+`[]` (the S2-W1 wire choice); a client reads an absent S2 field as `null` or empty. The S1
+fields keep their S1 shapes (`list`, `as_of_epoch`, `as_of_group_id` and the caps above
+still serialize `null`).
+
+| Surface | Change |
+|---|---|
+| `PUT /channels/:id/seats` | v2 bodies (4.1.1); `DataSeatList.authority: Option<SignedAuthority>` (2.4, 4.3 step 3b); `X-Audit-Log-Reason` (4.3 step 4d); post-claim reconcile, `ProtectedChannelChanged`, `ProtectedSeatsUpdate` (4.3 "S2 additions") |
+| `GET /channels/:id/seats` | `list.authority` (`{ body, signature }`, absent when none); `revoked_owner_devices` (owner caller only, absent when empty: the device ids of the stored authority's `owner_devices` that have no registered identity, or whose listed key differs from the directory key, computed at read time; R27, #216, #231); `as_of_generation` (the open group's generation, absent without one, read in the same snapshot; S2-D33); `cooling[].cause` (`release_cause`, owner caller only, like `seated_without_access`); `seated_without_access` from the shared predicate (6.3, 6.4) |
+| `PUT /channels/:id/protect` | a v2 genesis while `formats_v2` is on, a v1 genesis while it is off (#218); post-claim reconcile |
+| server audit log (`servers/audit_log_fetch.rs`) | `ProtectedSeatsUpdate` and `ProtectedSeatRelease` entries only for readers with ViewChannel on their channel (#221), filtered inside the fetch loop before user collection, with up to 10 refill batches (6.3 "Removal reasons") |
+| reconciler hooks: `servers/{member_edit, permissions_set, permissions_set_default, roles_delete, roles_edit_positions}.rs`, `channels/{permissions_set, permissions_set_default, channel_edit}.rs` (`channel_edit` on `remove: DefaultPermissions` only) | `reconcile_*` after the write and its audit entry, before the voice sync; a failed reconcile's error is answered after the sync (6.3 "Hooks") |
+| `GET /mls/channels/:id/text_group` | `join_requests` (6.3), `pending_device_removals: [{ user_id, device_id, created_at }]` and `signer_lost: { user_id, device_id, cause, at }`, absent when none (`cause` is `account_unavailable` when the signer user's account is suspended, deleted or banned, derived at read time, else the stored `device_revoked`; #222; for a caller who is the signer USER it is also reported, derived at read time, when the newest list's signer device has no registered identity even though no flag is stored, which covers the authority-less solo owner and a revocation with `formats_v2` off, #228), all three to SEATED callers only: for an unseated viewer all three are absent (R24, #222); [S2b] `member_refreshed` |
+| `GET /mls/groups/:id/welcome?device_id=` | NEW (below) |
+| commit fetch (`commits_fetch.rs`) | `removed_reasons` with the S2 values; optional `oldest_epoch`; never the stored Welcome |
+| commit submit (`commits_submit.rs`) | rule 3a, Add-clears-pending, the added-identity claim, `signer_lost`, stores the Welcome and the reasons (6.1); [S2b] rule 7 |
+| join intent (`join_intent.rs`) | `DataMlsJoinIntent` gains `generation` and `issued_at` (3.13); the 24 h Text window; the recovery gate |
+| Text group create (`groups_create.rs`) | the signer-or-recovery creator rule, the recovery gate, `generation <= 65535`, the successor rate limit (6.1) |
+| KeyPackage claim (`key_packages_claim.rs`) | the recovery gate for a `rejoin_readd` re-Add and a `signer_lost` replacement |
+| kick (`member_remove.rs`), ban (`ban_create.rs`) | `RemovalReasonRequired` (6.3; the kick reads the `X-Audit-Log-Reason` header, the ban its body reason) |
+| `DELETE /servers/:id` | [S2b] the owner's "Leave and hand over" (S2-D23) |
+| `POST /servers/:id/ownership_transfer` | [S2b] NEW (S2-D25) |
+| own E2EE device listing (`routes/e2ee/fetch_devices.rs`) | for the caller's OWN devices only, each entry gains `session_id` and `session_name` (S2-D38); both absent on any other user's devices and on a device bound to no session |
+| protected send (`channels/message_send.rs`) | `pending_removal` while `pending_device_removals` is non-empty, `owner_device_lost` while `signer_lost` is set (7.3) |
+| root advert (`routes/root.rs`) | `protected_channels.formats_v2` (below) |
+| crond (`tasks/protected_access_sweep.rs`) | NEW: the sweep and its revocation repair (6.3 "Sweep") |
+| events | `ProtectedChannelChanged` (7.5) |
+
+**Welcome fetch (S2-D29; DECISION (S2-W0) for the response shape).**
+`GET /mls/groups/:group_id/welcome?device_id=` (NEW `routes/mls/welcome_fetch.rs`,
+registered in `routes/mls/mod.rs`). The 6.1 order and its unknown-group invariant apply: an
+unknown id, a Call group (this route has no Call path), a missing channel and a channel the
+caller cannot view all get the byte-identical unknown-group answer; then the caller checks,
+the available gate, seated, and the session bound to `device_id`. It answers
+`{ group_id, epoch, welcome }` (the stored b64 Welcome) from the newest Text commit whose
+`added` holds `(caller, device_id)`, and only while that device is still a member whose
+`member_added.epoch` equals that commit's epoch; otherwise (no such commit, pruned, evicted
+or re-added since) the unknown-group answer. Driver:
+`fetch_mls_text_welcome(group_id, user_id, device_id) -> Result<Option<MlsCommit>>`, both
+drivers, Text-marked rows only.
+
+**Root advert (DECISION (S2-W0), #206).** `protected_channels` gains `formats_v2`: the
+configured value the server enforces (protect and the seat PUT read the same key),
+advertised as is; unlike `enabled`, it is not combined with `e2ee_enabled` (W2 wave audit
+ruling 8). Native cannot read the server's
+configuration, so the bridge passes the format to `_seat_list_sign` for a genesis or an
+upgrade list (8.3). This is not in the plan; S2-D1's "builders emit v2 while the flag is on"
+needs it (#210 OPEN item (h)).
 
 ### 7.3 Protected-channel send (`POST /channels/:id/messages`)
 
@@ -2993,6 +4692,10 @@ Server checks, in this one order (the same order 7.1 states):
 7. `(caller, sender_device_id)` is a current member, else
    `ProtectedChannelResecuring { reason: "not_member" }`.
 8. (W2) The existing slowmode check, then `create_from_api`.
+
+**S2 (S2-W0, #196, #197):** step 5 also refuses while `pending_device_removals` is non-empty
+(`pending_removal`), and while the group carries `signer_lost` the send is refused at step 5
+with `owner_device_lost` (6.1).
 
 **Placement in `message_send.rs` (DECISION (W2), #138; the doc's order wins).**
 
@@ -3197,6 +4900,42 @@ unknown-group answer (6.1 invariant).
   `GET .../seats` and `GET .../text_group` on channel open, on every processed commit, on every
   `ProtectedChannelResecuring` error and every 60 s while the channel is open. S2 adds push
   events.
+- **S2 replaces "no new events" (S2-W0, #205; S2-D18).**
+  `EventV1::ProtectedChannelChanged { id: String, scope: Vec<String> }`, `scope` items
+  `seats` or `text_group`, published on the CHANNEL topic `.p(channel_id)` (viewers only; no
+  user ids in the event). Emitters, with their scopes (as built in S2-W2 and the W2 wave
+  audit fixes, MAJOR-1):
+  - a seat PUT or protect that changed the list (this also covers `signer_lost` being
+    cleared, 4.3 step 7): `seats`;
+  - the reconciler: ONE `seats` event per channel that released someone (6.3), even when
+    the release also queued a pending removal on the open Text group;
+  - every server-forced release (`Member::create`, both releases of
+    `Member::remove_with_outcome`, both of `User::delete`, the ban's own release):
+    `["seats", "text_group"]` for each channel the release returned, right after each
+    release that succeeded and never after a failed one (6.3 "Server-forced removal");
+  - a device revocation (including `signer_lost` being set) and the sweep's repair:
+    `text_group`;
+  - a won Text commit whose pending lists shrank: `text_group`. The route decides from its
+    own group read; a read that raced another commit counts any commit with Removes as
+    clearing, so the event may be needless. It can be missing in one narrow race: a pending
+    entry added after the route's read and cleared by this commit is not seen, and the
+    members keep a stale "pending" view until their polling refresh (fails closed; a
+    followup returns the cleared lists from the transaction).
+
+  Clients refetch (debounced) and run the removal duty (6.3) on the event, whatever its
+  scope. No
+  push notification in S2. stoat.js types it in `events/v1.ts` and routes it to
+  `client.e2ee.onEvent` (S2-D44). The polling above stays as the backstop.
+- **Audit (S2-W0, #205, #221).**
+  `ProtectedSeatsUpdate { channel, released, seated, reason }` and
+  `ProtectedSeatRelease { channel, user, cause }` (6.3), served by the audit-log fetch only
+  to readers with ViewChannel on the entry's channel, filtered inside the fetch loop before
+  the page's users are collected (6.3 "Removal reasons" names the refill and its residuals).
+  Entries of a deleted channel are hidden from every reader, the owner included (W2 wave
+  audit ruling 9). Only the reconciler records `ProtectedSeatRelease`; its `cause` is the
+  reason released for (`access_lost`), never `device_never_joined` (ruling 12). Kick, ban,
+  leave and account deletion record no `ProtectedSeatRelease`; a kick or a ban records only
+  its `MemberKick` or `MemberBanAdd` entry.
 - **Reveal carries `protected` (DECISION (W2), #149).** bonfire caches hidden server
   channels, and on a hidden-to-visible `ChannelUpdate` it emits the CACHED copy as a
   `ChannelCreate`. A socket that missed the protect `ChannelUpdate` (an N3 landed-but-5xx
@@ -3223,10 +4962,18 @@ unknown-group answer (6.1 invariant).
 | `ProtectedFieldRefused` | `field: String` | 400 |
 | `DeviceCapReached` (W2, #137) | `max: usize` | 400 |
 | `SeatListNamesRemovedUsers` (W2 audit C1, #179) | `users: Vec<String>` (sorted user ids) | 400 |
+| `RemovalReasonRequired` (S2, #205) | none | 400 |
+| `ProtectedHandoverRequired` ([S2b], S2-D25) | `channel_ids: Vec<String>` | 400 |
 
 `DuplicateNonce` (409, existing, `util/idempotency.rs`) is reused for a protected `cid`
 replay (3.10, #153). `MlsCallFull { max }` (existing) is reused for the Text 100-leaf cap
 (6.1, #137).
+
+**S2 (S2-W0, #197, #204).** `ProtectedChannelResecuring.reason` gains `owner_device_lost` (a
+send, or an Add other than the signer user's, while `signer_lost` is set, 6.1), and its
+`pending_removal` now also covers `pending_device_removals`. A successor create over the
+rate limit reuses `InSlowmode` (seconds in `retry_after`, 4.9). Native gains
+`CatchUpLeafUnresolvable` (8.4). stoat.js adds the new error types to its lists (S2-D44).
 
 **DECISION (W0):** the `reason` and `field` / `max` fields. The frontend needs the usual cast
 for new `ErrorType`s (the `stoat-api` types are upstream).
@@ -3300,6 +5047,49 @@ for new `ErrorType`s (the `stoat-api` types are upstream).
 Table names other than `mls_text_epoch_keys` (plan-pinned) are **DECISION (W0)** and may be
 renamed by W3 with a note in its report.
 
+**S2 (S2-W0, #198, #207; S2-D27, S2-D33).**
+- NEW `mls_text_authorities` (`channel_id` PK, `version`, `body`, `body_sha256`,
+  `signature`, `adopted_at`): the newest accepted authority per channel (4.4.1). It is
+  channel-scoped and kept on wipe-and-rejoin like `mls_text_seat_lists`, and excluded from
+  key backup like every text table (the `store.rs` classification test gains it).
+- `mls_text_seat_lists.body` holds either format; no column changes.
+- **CHECK widening.** At W3a (`da03abc`) the `mls_text_owner_pins.source` CHECK is
+  `('protect','first_sight','handover','confirmed')` and the `mls_text_groups.generation`
+  CHECK is `BETWEEN 0 AND 63`. S2 needs `owner_device` (S2a) and [S2b] `transfer`,
+  `succession` and `confirmed_other` in the first, and `BETWEEN 0 AND 65535` in the second.
+  W3 D26 asked W3 to add the three S2b sources early; `owner_device` was not in that list.
+  S2-W3 rebuilds whichever CHECK is still narrow behind a text-schema version marker (these
+  CHECKs are created outside the schema ladder).
+- `mls_text_join_intents`: a Text intent lives 24 h (S2-D28).
+
+**As built (S2-W3, #235, #239).**
+- **CHECK widening, no marker.** S2-W3 uses no version marker: on every open, the stored
+  DDL text of `mls_text_groups` and `mls_text_owner_pins` is compared with the current DDL,
+  and a table that differs is rebuilt (renamed aside, recreated under its own name, rows
+  copied, old table dropped) in the same transaction that creates any missing table. The
+  CHECKs only widen, so every S1 row fits. A `has_text_tables` fast path skips all of it
+  once every text table exists, and the S2 tables are created in the rebuild's
+  transaction, so "all present" also means "wide".
+- NEW `mls_text_admitted_intents` (`(group_id, user_id, device_id)` PK, `issued_at`): the
+  staging-only `issued_at` record (6.2 "As built"). Group-scoped: a group wipe deletes it.
+- NEW `mls_text_owner_alerts` (`channel_id` PK, `device_id`, `at`): the 4.4.1 rule 9
+  `dropped_this_device` flag (4.4.1 "As built"). Channel-scoped: kept on wipe-and-rejoin
+  like the authority, since a wipe that cleared it would silence the alert.
+- **Add-device split** (the "make this a separate device" step of the multi-device plan):
+  it deletes `mls_text_owner_alerts` with the other per-device rows (a flag names the OLD
+  device, which the twin keeps and alerts on in its own store; the new device was never a
+  signing device), and keeps `mls_text_authorities`, `mls_text_admitted_intents` and the
+  seat lists and pins. Both new tables are excluded from key backup like every text table.
+- Native holds 15 text tables in all; the table above omits `mls_text_own_device_pins` and
+  `mls_text_pin_attempts`, which S1 W3 added.
+- **Release note: rolling back past S2 is unsafe (#239).** An S1 build of the core
+  reopening an S2 store treats its S2 data as corruption: S1 parses an owner pin with
+  source `owner_device` as `StoreCorrupt`, and a held v2 seat list fails S1's v1-only
+  parser, also `StoreCorrupt`. A group at generation 64 or above still loads, but S1
+  cannot derive its id (`InvalidArgument { field: "generation" }`), and S1 never reads the
+  S2 tables. So no shell (desktop, Android, Electron) may ship an S1 core over a store an
+  S2 core has opened; a rollback past S2 is not a plain binary downgrade.
+
 ### 8.3 Commands
 
 Each command needs its autogenerated permission TOML and a `capabilities/default.json` allow;
@@ -3363,6 +5153,61 @@ Result shapes:
   (W0-fix7) yields verdict `no_group`, so the shield shows `resecuring` while the device
   rejoins.
 
+**S2 command changes (S2-W0, #198, #200, #207; plan section 7).** S2a unless marked:
+
+| Command | Change |
+|---|---|
+| `e2ee_text_seat_list_sign` | new `format: Option<u8>` (the bridge passes 2 from the root advert, 7.2; otherwise the held list's format), new `authority: Option<{ body, signature }>` (from `_authority_sign`; else the held authority is embedded unchanged) and new `recovery: bool` (S2-D22: from a NEW owner-user device, a list carrying a new authority whose `owner_devices` is this device, whose native dialog "Take over signing #channel on this device" runs before any successor create; exempt from `SignerLeafMissing`, #213). Refuses `format: 1` while holding a v2 list (#222). Signer qualification adds "an `owner_devices` member of the held authority" (4.4.1). Growth also covers `history` hidden to visible and re-seating a forced-removed user (4.9) |
+| `e2ee_text_authority_sign` | NEW. Signs the next authority (version held + 1, `prev` = the held hash, `signer_device_id` = this device, #215) with this device's key; always a native dialog listing the owner devices (and [S2b] delegates and successors) it grants; refuses `NotOwner` unless this device may sign the next list; persists nothing, like `_seat_list_sign` |
+| `e2ee_text_seat_list_verify` | the 4.4.1 rules; new `as_of_generation: Option<u32>` (S2-D33; recompute, never scan); stores the accepted authority |
+| `e2ee_text_owner_confirm_change` | unchanged for the same-user case, which also confirms a recovery list (4.7); the cross-user case stays refused until [S2b] |
+| `e2ee_text_join` | builds the Text join payload (3.13) when the held list is v2; `generation <= 65535`; a Text intent lives 24 h |
+| `e2ee_text_admit` | verifies the Text join payload; the cap counts every post-commit leaf, with no exclusion (#212); the staging-only `issued_at` rule (#214) (6.2) |
+| `e2ee_text_remove` | new `pending_device_targets: Vec<MlsMemberDevice>`; the staging-only `issued_at` rule (#214) (6.2) |
+| `e2ee_text_process` | `removed_reasons` decide forced-removal memory, an unknown value counting as `pending_removal` (6.2, #219); on adopting the first v2 list over v1, a v1-id group becomes superseded, never poisoned (#223); `CatchUpLeafUnresolvable` (S2-D31); rule g from the newest adopted list's signer |
+| `e2ee_text_group_create` | the recovery exception (a signer-USER device while the bridge reports `signer_lost` or a stored signer device without a registered identity, #213), `generation <= 65535`, v2 ids |
+| `e2ee_text_succession_sign`; cross-user and batch `_owner_handover_sign` | [S2b] |
+
+**W3 `Step6Input.owner_device` contract change (S2-D22, RR#S2-2a).** At `da03abc`
+(`checks.rs`) the field is "The channel owner's pinned signing device". S2 replaces that
+with "the signer device of the newest list adopted after 3.12.3 step 3", and the caller
+builds it after the adoption. A parity test pins server rule 1 and native rule g to the same
+device, with a control that protects `owner_devices` on one side only.
+
+**As built (S2-W3, #235; W3 addendum rulings OR-5 to OR-20).** Native at `876c034`. The
+dialog commands also take display arguments (`channel_name`, `display_names`) that only feed
+the native dialog.
+
+| Command | As built |
+|---|---|
+| `e2ee_text_seat_list_sign` | `format` other than absent, 1 or 2 is `InvalidArgument { field: "format" }`; an `authority` for a v1 list, or with `recovery`, is `InvalidArgument { field: "authority" }`; `recovery` without a held list, or from the pinned device or a device the held authority lists, is `InvalidArgument { field: "recovery" }`, and from another user's device `NotOwner`. Signer qualification: 4.9 "As built". `SignedSeatList` gains `authority: Option<SignedAuthority>` (omitted when absent) |
+| `e2ee_text_authority_sign` | `channel_id, user_id, owner_devices: Vec<String>`: 1 to 5 device ids, no repeat, this device included (else `InvalidArgument { field: "owner_devices" }`); each key comes from this device's pin of that own device (unpinned `IdentityPinRequired`, changed or revoked `BadSig`); the held `delegates`, `delegate_max_device_cap` and `successors` are carried unchanged. Returns `SignedAuthority { body, signature }`. Refuses `NotOwner` unless this device is the pinned owner device or an entry of the held authority, under the pinned owner user (4.9 "As built"; narrower than "may sign the next list" above) |
+| `e2ee_text_seat_list_verify` | `as_of_generation` sits beside `as_of_epoch` and `as_of_group_id`; the list input carries `authority`; step 0 as 4.4 "Step 0 as built". `SeatListVerdict` gains `owner_notice: Option<OwnerDeviceNotice>` (omitted when absent) |
+| `e2ee_text_process` | NEW `catch_up_tip: Option<i64>` (OR-9; 6.3 "As built"). `TextProcessOutcome` gains `owner_notice` (omitted when absent) |
+| `e2ee_text_commit_won` | `group_id, won_epoch, stored_commit_b64, rejoin_intents: Vec<MlsJoinRequest>, removed_reasons: Vec<MlsRemovedReason>`. The bridge copies both lists from the commit's `MlsCommitInfo` (`rejoin_intents` since S1 W3 D11). `removed_reasons` is NEW and REQUIRED (`[]` when none, OR-8): the committer's own forced-removal memory follows the labels exactly as receivers' does (6.2); a v1-id group under a held v2 list uses the v1 rules (3.12.3 "As built") |
+| `e2ee_text_group_create` | NEW `recovery: bool, supersedes_generation: Option<u32>` (OR-17). `recovery` only from a device of the held list's signer user that is not the signer device (from the signer device `InvalidArgument { field: "recovery" }`, from another user's device `NotOwner`), and only with `supersedes` (else `InvalidArgument { field: "supersedes" }`); the DS enforces `signer_lost` (#213), which native cannot see. A `supersedes` this store holds gives the generation (a disagreeing `supersedes_generation` is `InvalidArgument`); one it does not hold (a recovery device that never joined) needs `supersedes_generation`, never trusted: it must derive `supersedes` under the held format (else `ChannelMismatch`; absent: `MlsGroupNotFound`). The successor keeps the held format (#232); past 65535 is `InvalidArgument { field: "generation" }` |
+| `e2ee_text_encrypt` | refuses a superseded group with `MlsGroupNotFound` (3.1.1 "As built"). With no group at all the error names the channel's v1 generation-0 id even on a v2 channel: a public label, never used for trust (OR-20) |
+| `e2ee_text_decrypt` | `TextDecrypted` gains `files: Vec<FileMeta>` (3.6.1; always serialized); `UnsupportedEnvelopeVersion`; superseded groups per 3.9 "S2" |
+| `e2ee_text_state` | `TextChannelState` gains `owner_alert: Option<OwnerDeviceNotice>` (omitted when absent), read ONLY from the stored flag (4.4.1 "As built"; `device_id` names this device). A superseded group is reported in its stored state with verdict `no_group`, so **`verdict == "ok"` iff the group is active AND not superseded** (#223) and the other conditions above hold; the order of the verdicts is unchanged |
+
+- `OwnerDeviceNotice { kind: "dropped_this_device" | "changed_by_other" | "seated_by_other",
+  device_id, seated: Vec<String> }`: `device_id` is the other owner device that signed
+  (this device for `owner_alert`), `seated` the users seated (`seated_by_other` only). A
+  passive command never prompts (W3 plan D18): the frontend renders the 9.2 copy (OR-12).
+- **Text protocol (OR-13, S8 ask 1).** Core `TEXT_PROTOCOL = 2` (S1 shells answered 1; S9
+  takes 3): `ShellEngine::text_protocol()`, Android `text_capability` (`{"protocol":2}`),
+  Electron an internal napi `textProtocol()`. It is not a Tauri command. **Protocol floor:**
+  the server half is S4's (its plan's 2026-11-11 appendix): on a channel whose stored list is
+  v2, Text join intents and Text group creates carry `protocol`, and `join_intent`, Text
+  `groups_create`, an Add in `commits_submit` and `welcome_fetch` refuse an absent or lower
+  one with `ProtectedClientOutdated { min: 2 }`, so an S1-only device is refused cleanly
+  instead of being poisoned by v2 commits. The client half (the bridge sends `protocol`,
+  the frontend maps the error to "Update Sloga") is S2-W4. S2-W3 native and S2-W4 land as
+  a PAIR: an S1 frontend leaves protocol-2 shells dark.
+- **`issued_at` across napi (OR-15).** The native wire types accept `issued_at` as a JSON
+  integer or an integral float (napi passes millisecond times as `f64`); a string is
+  refused. Electron's napi path is not exercised by a built `.node` yet (a landing blocker).
+
 ### 8.4 Typed errors (added to `e2ee-core` `Error`, serde tag `type`, snake_case)
 
 No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `BadSig`,
@@ -3395,11 +5240,27 @@ No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `Bad
 | `TextGroupFull` | `max: usize` | admit; processing an Add that exceeds 100 leaves (poisoned path) |
 | `MalformedTextPayload` | `reason` (closed: `structure`, `envelope`, `cid_mismatch`, `too_large`) | encrypt and decrypt |
 | `WrongGroupKind` | `group_id` | call commands given a text id and vice versa |
+| `CatchUpLeafUnresolvable` (S2, #203) | `group_id, epoch: i64` | a leaf failure on a commit BEHIND the server tip whose only cause is an unpinned or revoked identity (S2-D31); the bridge marks the group `left` (`catch_up_failed`) and rejoins; never poisoned. As built (#238): only when `_process` got a `catch_up_tip` above the commit's epoch, and for added leaves only, never for the signer of an embedded list (6.3 "As built") |
+| `UnsupportedEnvelopeVersion` (S3-N0 in S2, #234) | `v: u8` | decrypt: an outer `encrypted.v` of `2` to `255`, or an envelope `v` of `3` to `255` (3.6.1); nothing is shown. The grey "update" marker (9.2), never red |
 
 Existing `MlsGroupNotFound`, `MlsUnsolicitedWelcome`, `MlsLeafRejected`, `MlsEpochGap`,
 `MlsPoisonedEpoch` and `Declined` (a cancelled native dialog) apply to text groups with their
 current meaning. None of the text errors
 is ever a quiet drop (unlike `MlsStaleCtl`).
+
+**S2 (S2-W0, #207).** `SeatListRejection` gains `immutable_changed` (a changed `group_salt`
+or `history_boundary`) and `authority_invalid` (4.4.1, 4.10). `SeatListRollback` is also
+raised on the commit-AD path, for a format downgrade or an authority rollback (poisoned
+path, 3.12.3 "S2"). `OwnerChanged` can come from an authority whose named signer entry is
+ineligible (4.4.1 rule 5). The native wire `MlsRemovalReason` gains a
+`#[serde(other)] Unknown` catch-all (#219).
+**As built (S2-W3, #234, #235).** `CatchUpLeafUnresolvable` and `UnsupportedEnvelopeVersion`
+are appended after the S1 variants; the webview pins the variant order, and later slices
+append in slice order (S2, then S3, S4, S9). `authority_invalid` also covers, natively, a
+NEW authority whose `signer_device_id` is not the list's signer device at the held list
+version + 1, and a wrong `prev` at the held authority version + 1 (4.4.1 "As built").
+`ReplayedRejoinIntent` is also the staging-only `issued_at` refusal of `_admit` and
+`_remove` (6.2 "As built").
 
 ---
 
@@ -3488,6 +5349,31 @@ The composer exists only in `protected`. `resecuring` shows a disabled composer 
 re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_available` shows
 "Not available on this device"; `unverified` shows the loud banner and no composer.
 
+**S2 shield changes (S2-W0, #208; S2-D35 to S2-D37).**
+- **New state `capacity`** (`reason: "device_cap" | "group_full"`): read-only, not alarming,
+  no pulse. Precedence: after step 5 (`not_seated`), before step 6. It is produced ONLY from
+  the bridge's own recorded join refusal (`DeviceCapReached` from the join-intent route, or
+  `TextGroupFull` / `MlsCallFull` on its Add), never from a server field alone. A
+  `DeviceCapReached` on a retry never counts toward `welcomeRetriesExhausted`. Every
+  consumer of the enum adds an exhaustive `never` check.
+- **S2 replaces step 6d.** With async join (6.3) a missing Welcome is not a failure: the
+  joiner keeps re-broadcasting and refetching, and the shield is `resecuring` "Waiting for a
+  member to come online" (static after 2 minutes). `unverified` comes only from a VERIFIED
+  failure (the step-3 inputs, `SignerLeafMissing` past its budget, a refetched Welcome that
+  fails verification), never from silence.
+- **Re-securing causes and escalation** (NEW node-testable `protectedResecurePolicy.ts`,
+  S2-D36): cause to copy, automatic action, escalation timer and actions. Pending removal: 2
+  min, then "Retry removal". Stale epoch or group: 2 min, then "Rejoin". Poisoned group on
+  the owner's device: 1 min, then "Re-create the protected group". Poisoned group on a
+  member device: 5 min, then "Waiting for {owner}". Owner device lost (`signer_lost`):
+  "Recover ownership on this device" on an owner-user device, else the 9.2 copy. Waiting for
+  a member to come online: static after 2 min. Escalated means static amber; **red only for
+  verification failures**.
+- **Composer (S2-D37).** S2a keeps S1's disabled composer while `resecuring`; [S2b] adds a
+  single in-memory pending send.
+- `seat_list_rollback` joins the step-3 `groupError` set (it can now come from the commit-AD
+  pre-check, 3.12.3 "S2").
+
 ### 9.2 Error to UI mapping
 
 | Source | Error | Shield / state | User-facing (suggested copy, final strings via lingui) |
@@ -3543,6 +5429,38 @@ re-securing notice; `not_seated` shows "Ask the owner for a seat"; `not_availabl
 | Client | no `encrypted` on a protected or pinned channel | message marker (red) | "Unencrypted message in a protected channel. It did not come from a member's protected app." |
 | Client | `ts_skew` | message marker (informational) | "Sent time doesn't match." |
 | Client | `new_devices` / forced removal | timeline marker | "{name} added a new device." / "{name} was removed by the server and can't rejoin until the owner re-seats them." |
+| Server | `ProtectedChannelResecuring { reason: "owner_device_lost" }` (S2) | `resecuring` (amber) | "The owner's signing device was signed out. Messages are paused until the owner signs in on another device." On an owner-user device: "Recover ownership on this device". When the owner's account is disabled or suspended: "The owner's account is unavailable. Messages are paused." |
+| Server | `RemovalReasonRequired` (S2) | the kick, ban or unseat dialog | "This member is protected from removal without a reason. Add a reason to continue." A seat PUT is re-sent with the SAME bytes and the reason header (4.9) |
+| Server | `DeviceCapReached { max }` on the join path (S2) | `capacity` (`device_cap`) | full pane "This device can't open #channel yet", listing the user's devices in the channel (session name, last active), each with "Sign out that device" (the signing device shown as not removable); "Try again", plus an automatic retry on `ProtectedChannelChanged`; the owner also gets "Raise the device limit" (disabled when `entitlement_device_cap` is `null`; `0` is unlimited) (S2-D38) |
+| Server | `InSlowmode` on a successor create (S2) | owner UI | "This channel was re-secured too many times today. Try again later." The owner is told which member's commit forced each successor |
+| Native | `CatchUpLeafUnresolvable` (S2) | `resecuring` | "Re-securing this channel..." The bridge marks the group `left` and rejoins |
+| Client | a removal pending for 10 minutes (S2-D19) | owner seat UI | "Removal waiting" with "Finish now"; on a poisoned group, "Re-create the protected group" |
+| Client | deleting an account that owns servers with protected channels (S2-D43) | `Account.tsx` | "You own N servers with protected channels. Deleting your account deletes them, including their protected channels." |
+| Server | `revoked_owner_devices` non-empty in `GET .../seats` (owner caller, #216) | owner seat UI | "A device that could sign this channel's member list was signed out or changed its key. Re-sign your signing devices." (#231) One native dialog signs an authority without those devices (`e2ee_text_authority_sign`) |
+| Native | an adopted authority drops this device, another device of the owner changed it, or another owner device's list seated someone (4.4.1 rule 9, #216, #227) | owner-user device: alert / notice; "Your other device {device} seated {names}." for the last | "This device can no longer sign #channel's member list. If you didn't do this, secure your account." / "Your signing devices were changed from {device}." |
+| Native | `TextChannelState.owner_alert` (`dropped_this_device`, the stored flag; S2-W3, #236) | owner-user device: the same alert, shown on every state read until an adoption pins or lists this device again (the `owner_notice` of an adoption is shown once) | "This device can no longer sign #channel's member list. If you didn't do this, secure your account." |
+| Native | `UnsupportedEnvelopeVersion { v }` (S3-N0 in S2, #234) | message marker (gray), never red | "Update Sloga to see this message." |
+| Native | `TextDecrypted.files[]` entry with `state: "failed"`, `fail_reason: "unsupported"` (envelope v2, 3.6.1) | the message renders; each file shows as unavailable (name, type, size), never as another file | "Update Sloga to open this file." |
+| Server | `ProtectedClientOutdated { min }` (S4 server half of the protocol floor, 8.3 "As built") | unchanged; notice, never a generic failure | "Update Sloga to use this protected channel." |
+| Client | a role or permission edit in a server with protected channels (S2-D16) | role editor | "Roles make members eligible; the owner seats them." plus a generic warning before the edit |
+
+**S2 client surfaces (S2-W0, #208; S2-D38 to S2-D44).** Owner seat UI (S2-D39): a "Released"
+section from `cooling[]` with the cause; a banner "N people on your signed list no longer
+have seats. Update the list." (removal only, no dialog); "Removal waiting / Finish now"; a
+per-seat device column; the cap editor clamped to the entitlement cap. Removal reason prompt
+(S2-D40): kick, ban and unseat require a reason whenever the server has a protected channel
+(`channel.protected` is already visible, so this leaks nothing), and it never queries
+contribution data. Owner-change review (S2-D41): the banner "This channel's owner changed.
+Review" opens the native `e2ee_text_owner_confirm_change` (native is the gate; the webview
+shows copy only); after Declined: "Still locked. Review again / Leave channel". Server
+settings "Protected channels" page (S2-D42, owner only): the channels with seat and slot
+counts, "Move ownership key to this device" (the 6.3 handover: the webview drives, native
+confirms) and "Recover ownership on this device" (S2-D22); [S2b] a backup-owner picker and
+"Who can manage seats". Device-cap screens (S2-D38): above; [S2b] a member-device panel.
+stoat.js (S2-D44): `ProtectedChannelChanged` in `events/v1.ts`, routed to
+`client.e2ee.onEvent`; `RemovalReasonRequired`, `ProtectedHandoverRequired` and
+`DeviceCapReached` in the error lists; any new `Server` field needs hydration `keyMapping`
+and `functions`. Every string goes through lingui.
 
 ### 9.3 Message markers
 
@@ -3594,6 +5512,23 @@ string goes through lingui.
   the transactions (R25, with S5); followups: a backfill that marks Text commit rows
   written before the marker (R22 (a)), and a retention sweep of expired and released seat
   rows (7.5).
+- **S2 after S2-W0 (#209).** Specified for S2a in this document: the permission-loss
+  reconciler; every removal path (device revocation, removal reasons, events, the removal
+  duty); the device-cap UI; owner device-loss recovery (R12) through `owner_devices` and the
+  recovery list; catch-up and rejoin (R5, R9: async join, stored Welcomes, the pager); the
+  full re-securing UX; events for seat and removal changes; more than 64 successor
+  generations; device revocation adding a pending removal (R23); the Welcome store and
+  refetch route; the per-plane join payload (R21); the use of `removed_reasons`; the v2
+  seat-list body; the viewer-bound Text group id (R24). **Still S2b:** signing delegated to
+  admins (S2-D24); owner succession and "leave and hand over" (S2-D23, O-17) and their UX;
+  cross-user handover (S2-D4); lifting the S1 refusal of server ownership transfer (S2-D25,
+  7.4); chain compaction (S2-D26); Removes of long-idle devices (R13, S2-D34); the in-memory
+  pending send (S2-D37); the member-device panel (S2-D38). **Out of S2 (plan section G):**
+  stronger member-side detection of a suppressed unseat (R11, O-14, post-beta); the
+  commit-outcome recovery on the CALL path (its own media lane, O-13); R14 per-device
+  barring; the platform ban and a server-side identity-key log (S9); dry-run "who would lose
+  access". Moving the `Active` predicate into the transactions stays with S5 (R25); the R22
+  (a) backfill and the seat-row retention sweep stay followups.
 - **S3:** attachments (persistent ciphertext blobs, storage allowance, large files).
 - **S4:** history sharing (owner setting), the "protected from here" divider, opt-in wipe,
   protecting an existing channel, text tables in key backup.
@@ -3861,6 +5796,130 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
   (`InvalidOperation`, `NotAuthenticated`) resolves to "landed" only when the read-back shows this device's genesis bytes at version 1 on a protected channel, and to
   "refused" (no self-pin) otherwise (4.9); a row without `encrypted` in a protected or pinned
   channel, from a history fetch, renders the red marker (9.4).
+
+- **S2-W0 obligations, from plan section 8 (S2a items only).** Backend tests run on
+  REFERENCE and MONGODB with `TEST_DB` set (never production), through `cargo-serial`; every
+  control is pinned to a literal SHA.
+  - **Formats (S2-W1 L1a; native S2-W3):** every 5.8 vector through the builders and parsers
+    on both sides (the v2 list, the authority, AD v2 including the worst case by length and
+    SHA-256, the Text join payload, group ids v2 at g = 0, 1, 64 and 65535, the succession
+    statement by parse only); a control that renames any S2 context string, or reuses the v1
+    group-id derivation for a v2 channel, fails on both sides; v2 refused while `formats_v2`
+    is off; the boundary, `pre_history` and `history` rules of 4.3 step 4c and 4.4.1; a v1
+    list after a v2 list refused; the first v2 list over v1 emits `history:hidden`;
+    `seats_put` refuses `kept` to `wiped`; a changed salt refused; an AD of 16383 bytes
+    passes the length check and one of 16384 is refused.
+  - **Reconciler:** each hook route releases a seated user who lost View (control: delete
+    that hook); regaining access keeps the cooldown (control: a reactivating reconciler);
+    the signer is never queued (control: no skip, so a wedge); a CAS no-op after an owner
+    re-seat (control: drop the `seated_at` filter); an unpaced MONGODB seat PUT racing a
+    role removal never ends with an active seat lacking access (control: no post-claim
+    recheck, deterministic seam); the sweep releases an injected row, two concurrent sweeps
+    converge, and it runs with both flags off (control: an unregistered task, via the
+    `include_str!("../main.rs")` pin); a timeout keeps the seat; a suspension gives every
+    device of the user a pending device entry and the seat stays; a predicate parity matrix
+    (GET vs the reconciler); an injected release failure answers 500 after the write while
+    the voice sync still ran (control: `?` before the sync); every edited upstream pin keeps
+    a biting mutation.
+  - **The owner signing state machine (the S2-W0 audit's first lens):** the signer device is
+    protected identically on the server and natively (parity test; control: protect
+    `owner_devices` on one side); the owner logs out of the signing device, giving
+    `signer_lost`, refused sends, an accepted Add of the owner's new device, and its newer
+    list (a higher authority omitting the lost device) clearing `signer_lost` and queuing
+    the old device (control: skip instead of `signer_lost`, and the "silent leaf" test
+    fails); a solo owner, cap = 1 and Grace each recover through the recovery successor; an
+    authority from a key outside the pin and the held `owner_devices` raises `OwnerChanged`;
+    adopting an `owner_devices` member's list moves the pin (`owner_device`); the
+    replacement device is killed between the successor create and the PUT and another owner
+    device still recovers (`signer_lost` copied into the successor; the recovery exception
+    keyed on the missing identity; #213); an authority listing {pinned D1, X} but signed by
+    X is refused, never a silent re-pin (control: try every listed key; #215); a list from
+    another device without a qualifying authority while `signer_lost` is set gets
+    `owner_device_lost` (#222); the reconciler skips the signer user (#222).
+  - **Removal:** a revocation gives a pending device entry and 409 on send; a member Remove
+    clears it; logout, suspension and scheduled deletion each produce entries; a revocation
+    racing an Add never leaves a member without a pending entry (MONGODB race, deterministic
+    seam between the two passes; control: no second pass); the sweep repairs an identity
+    bound to a dead session and a superseded same-session identity; an over-cap Add is
+    refused while `signer_lost` is set, and a cap-1 owner recovers through `g + 1` (control:
+    exclude the lost device from the transaction's count, and receivers poison the group;
+    #212); the join-intent count ignores pending devices only; a cap-1 owner recovers via
+    `g + 1`, then sends and admits a member (control: queue the lost device D1
+    unconditionally, and the channel stays frozen; #224); D3 dies between the create and the
+    PUT and D4 recovers via `g + 2`, then sends (#224); D2 signs a routine list carrying the
+    D1-signed authority unchanged and the server accepts it (control: require
+    `signer_device_id` = the PUT signer for an unchanged authority, #225); with the growth
+    flag off, a member of the predecessor generation joins a recovery, a poisoned-epoch and
+    a v1-to-v2 successor while a device new to the channel is refused (#226; owed with the
+    feature, W2 wave audit MINOR-3); an owner
+    device sees a notice when another owner device's list seats someone (#227); a
+    signer-user caller gets a derived `signer_lost` when the stored signer device has no
+    identity and no flag is stored (#228); the staging-only `issued_at` rule compares two
+    intent `issued_at` values, with a skewed local clock changing nothing (#229);
+    `revoked_owner_devices` lists a key mismatch (#231); a recovery on a v1 channel needs
+    one successor, with a v1 id (#232); one Remove+Add commit admits a reinstalled device
+    and a partial clear is refused; Call commits leave the new fields byte-identical; old
+    documents decode; the event reaches viewers only (control: the server topic, and the
+    non-viewer test fails); a kick in a server with a protected channel needs a reason even
+    when the target holds no seat (control: a seat-keyed rule, and the oracle test fails); a
+    kick, ban or seat PUT without a reason is refused with nothing persisted (control: the
+    reason check after `ServerBan::create`); an unused seat's release has no cooldown
+    (control: always cool); `removed_reasons` matches the rule for every reason, in the S2
+    priority order (control: the B48 order).
+  - **Catch-up:** a Welcome survives a full queue and the post-win error paths; the Welcome
+    route refuses a bot, an unbound session, a device not added, an evicted device and a
+    non-viewer with the byte-identical unknown answer, and the Welcome never appears in
+    `GET .../commits`; a 23 h rejoin intent evicts, a 25 h one does not, and one older than
+    `member_added` never does; with the growth flag off and in Grace, a rejoin, a re-Add and
+    a successor pass while a new device is refused; a pruned middle row is a documented gap.
+    Controls: drop the Welcome exemption; a 30 s window for Text; drop the `rejoin` reason.
+  - **Fix-round obligations (#212 to #223):** a viewer's Call squat at a v2 Text id is
+    evicted by the Text create (control: the v1 derivation in the database layer, #217);
+    with `formats_v2` off, a channel already on v2 keeps working (a removal-only seat PUT, a
+    commit, a successor) while a new v2 genesis and a v1-to-v2 upgrade are refused, and the
+    revocation hook writes nothing (#218, #219); an unknown `removed_reasons` value
+    deserializes as `Unknown` on the server and natively, and records memory (#219); a
+    ViewAuditLog holder without ViewChannel never receives `ProtectedSeatsUpdate` or
+    `ProtectedSeatRelease` entries for that channel (control: no filter, #221); an unseated
+    viewer gets no `join_requests`, `pending_device_removals` or `signer_lost` (all three
+    absent) from `GET .../text_group` (#222); `removed_reasons` are stamped inside the
+    commit transaction (a pending removal cleared between the route's read and the
+    transaction gives the transaction's label, #222); a first v2 list over v1 accepts any
+    salt (#222); native refuses `format: 1` while holding a v2 list (#222).
+  - **Join payload:** the v2 fields round-trip through every carrier (3.13); a Call intent
+    replayed as a Text rejoin is refused.
+  - **Native (S2-W3):** a single-device rule-6 rejoin is merged by every member (older and
+    newer) with no memory row; a `pending_removal` label still records memory, even with a
+    verified rejoin intent; a single-device `pending_device` Remove records none; catch-up
+    through an Add of a revoked or unpinned device gives `CatchUpLeafUnresolvable`, then
+    left, then rejoin (a mismatched key gives poisoned); re-seating a forced-removed user
+    shows the growth dialog (control: "added = not on the previous list"); first sight pins
+    the signer and checks the authority's owner; a rejoin intent with an `issued_at` older
+    than this device's record of the latest Add is not staged by `_remove` or `_admit`,
+    while a commit citing one is still merged (staging-only, #214); after the first v2 list
+    over v1, the v1-id group is superseded, not poisoned (#223).
+  - **Native as built (S2-W3, `876c034`; #234 to #238):** the envelope v2 decoder (the
+    `n0_*` tests, 3.6.1); a Welcome 23 h 59 m late joins and one past 24 h is unsolicited
+    (simulated clock); a skipper and a first sight adopt an authority another owner device
+    carries unchanged, and a pinned device the authority dropped is `OwnerChanged` for a
+    skipper too (4.4.1 "As built"); `prev` is checked only at the next version, on both
+    paths; the rule 9 flag survives a refused decryption half and is never set for a
+    never-listed device; draining a v1-id group after a `GET` upgrade uses the v1 rules
+    (3.12.3 "As built"); a superseded group decrypts live until its successor is held; a
+    member confirms a recovery list through the same-user dialog. **Owed before landing**
+    (pair-landing with S2-W4): a built Electron `.node`, the napi argument-path and OR-15
+    tests on it, and a live leg. A follow-up, not a landing blocker: the first exception of
+    3.12.3 "As built".
+  - **Frontend (S2-W4, `node --test` on pure modules with the production options bag):**
+    shield precedence including `capacity` and the `never` check; a `DeviceCapReached` retry
+    never reaches 6d; capacity never from a server field alone; the re-securing policy is
+    exhaustive and red only from verification inputs; the catch-up pager (several pages, a
+    hole mid-page, an empty page with current > held, the pin retry once, silence never
+    red); the device-cap model (`null` is unknown, `0` unlimited, the signer device not
+    removable); the reason policy; the i18n dist floor.
+  - **Live leg (dev stack only):** as plan section 8 (role removal, a member's logout, the
+    owner's logout and recovery, offline catch-up, a dropped Welcome refetched, the capacity
+    screen, a Grace rejoin).
 
 ---
 
@@ -4742,6 +6801,431 @@ the code was taken as the truth.
      #175 annotated in place; 1.1 gains the R24 HOLD; 1.3 gains R24 and R25, R20 is
      narrowed and R22 marked fixed; 10 gains the fix-round S2 items.
 
+Added in S2-W0 (the S2 document and vectors lane; contract `protected-s2-W0-addendum.md`,
+base `be915a8d`, plan `protected-s2-membership-plan.md`, approved 2026-10-25). The contract
+said the index ran to 180; it runs to 186 (the W2 fix round), so S2 starts at #187. Points
+where the plan, the contract and the code disagree are #210.
+
+187. DECISION (S2-W0): S2 is added to this contract as marked text ("DECISION (S2-W0)", "S2
+     replaces", "[S2b]"); the S2 vectors use their own `tv2:` marker, because the S1 checker
+     freezes every `tv:` block against the S1 baseline and refuses unknown `tv:` names
+     (header, 5.8, 13).
+188. DECISION (S2-W0), S2-D1 to S2-D6: six new context literals, `sloga-seat-list-v2`,
+     `sloga-text-group-v2`, `sloga-channel-authority-v1`, `sloga-text-commit-ad-v2`,
+     `sloga-text-join-v1` and `sloga-owner-succession-v1`; no S1 literal renamed; the v1
+     builders and parsers stay for flag-off and dev data (0.4).
+189. DECISION (S2-W0), S2-D1 (plan audit PA-18; S4-PA-7, S4-PA-8): the v2 seat-list body is
+     the nine v1 lines under a new context line and `v:2`, plus `authority`, `history`,
+     `history_boundary`, `pre_history` and `group_salt` (14 lines; at most 3161 bytes).
+     Anti-rollback for every new line on both sides: salt and boundary immutable;
+     `pre_history` one-way, with `kept` to `wiped` only on S4's wipe route or a protect
+     genesis (so never in S2, where the boundary stays empty), and `wiped` refused with an
+     empty boundary and before S4's flag; `history` free, hidden to visible being growth;
+     the v1 predecessor rule and `history:hidden` on the first v2 list; v1 after v2 refused
+     (`SeatListRollback`). Emitted and accepted only while `formats_v2` is on; with it on,
+     protect takes a v2 genesis only (2.4, 4.1, 4.1.1, 4.3, 4.4.1, 4.9). Amended by #218
+     (the flag governs only entry into v2) and #222 (any salt over v1).
+190. DECISION (S2-W0), S2-D1b (O-20; closes R24):
+     `text_group_id_v2 = hex(SHA-256(field("sloga-text-group-v2") || field(channel_id) || u64_be(g) || field(salt)))`
+     over 91 bytes, the salt being the signed list's `group_salt`. A group's derivation is
+     fixed by the list format the channel holds when it is created; a channel moving from v1
+     to v2 with an open v1-id group needs a successor (dev data only). The B47 eviction
+     tests the v2 id of its own (channel, generation). Generation cap 65535 (1.1, 1.3, 3.1,
+     3.1.1, 5.8). Amended by #217 (salt source of the eviction), #218 and #223 (the v1-id
+     group is superseded).
+191. DECISION (S2-W0), S2-D2 (RR#S2-2b): the channel authority (12 lines, at most 3072
+     bytes, largest valid 2786; 13 lines and 2836 since #215) and its rules. Format rules on
+     both sides; the server checks structure, version + 1, `prev` and a signature by the
+     PUT's signer device listed in `owner_devices`; native accepts a new authority only from
+     the pin, a held `owner_devices` entry or a same-user-confirmed signer, at a higher
+     version (`prev` checked only for a contiguous version). S2a gives effect to
+     `owner_devices` only; `delegates` and `successors` are parsed, validated and carried
+     with no effect. New residual R27 (1.3, 2.4, 4.3, 4.4.1, 4.10). Amended by #215
+     (`signer_device_id`, distinct keys, named-entry eligibility), #216 (R27 rewritten,
+     detection), #225 and #227.
+192. DECISION (S2-W0), S2-D5 [S2b]: the succession statement, format only (11 lines, at most
+     1024 bytes, largest valid 429, signed by the successor's device); S2a never emits,
+     appends or walks it (3.12.1, 4.11).
+193. DECISION (S2-W0), S2-D3, S2-D8: AD v2 is the v1 layout under the v2 context, then
+     `field(authority) || field(authority signature)` (both empty when the list names none).
+     The exact worst case is 14062 bytes (14112 since #215) (the plan's "<= ~14350" put the
+     authority at its parse limit). Every write that changes an AD input refuses a result
+     over 16383 bytes (`FailedValidation`), a backstop no valid input reaches. The S2
+     vectors (5.8) were computed by two independent programs and agree byte for byte
+     (3.12.1, 3.12.3, 5.8, 13). Amended by #215 (every S2 vector recomputed by both
+     programs).
+194. DECISION (S2-W0), S2-D6 (plan audit PA-12; closes R21): the Text join payload
+     `sloga-text-join-v1` (9 lines, including `channel_id`, `generation` and `issued_at`),
+     required on Text intents while `formats_v2` is on. Carriers: `DataMlsJoinIntent`,
+     `MlsJoinIntent`, `EventV1::MlsJoinRequested`, `MlsRejoinIntentInfo`,
+     `MlsEnvelopeRejoinIntent`, `join_requests` and the native wire structs. Native picks
+     the payload by the carrier and accepts the S1 payload only while it holds a v1 list;
+     the `issued_at` rule is staging-only (#214) (1.3, 3.12.3, 3.13). Amended by #218 (keyed
+     on the channel's list format) and #219 (rollout).
+195. DECISION (S2-W0), S2-D7 (RR#S2-4): `removed_reasons` gains `pending_device` and [S2b]
+     `idle` (code enum `MlsRemovalReason`). The planner priority CHANGES from B48's
+     `pending_removal > off_list > revoked > own_user > rejoin` to
+     `pending_removal > rejoin > own_user > pending_device > revoked > idle > off_list`:
+     memory now follows a `pending_removal` label, and a label native can check must not be
+     hidden by one it cannot. The route-time-view caveat (#178) stays (REPLACED by #222: the
+     labels are stamped inside the transaction); a label can only add memory, never widen
+     what a client accepts (1.3 R8, 6.1). Amended by #219 (`Unknown` catch-all) and #222.
+196. DECISION (S2-W0), S2-D17a to S2-D17c (plan audit PA-4, PA-13): Remove rule 3a (any
+     committer removes a pending device, never the signer's); Add-clears-pending (one commit
+     removes every pending device and user and then adds; a partial clear stays refused);
+     the added-identity lookup and Mongo claim inside the commit transaction; the cap counts
+     (route, transaction and native `_admit`) exclude pending and identity-less devices
+     (CORRECTED by #212: only the join-intent route excludes, and only pending devices); a
+     pending device entry clears when the device leaves (1.3 R23, 2.5, 3.12.2, 6.1, 6.2,
+     7.3).
+197. DECISION (S2-W0), S2-D15, S2-D17d (plan audit PA-3, PA-5; RR#S2-1, RR#S2-3): the
+     release primitives never queue the list signer's user or device and set
+     `MlsGroup.signer_lost` instead. While it is set, sends (and Adds other than the signer
+     user's) answer `owner_device_lost`, the lost device leaves the cap count (CORRECTED by
+     #212: it still counts), the replacement device is recovery-gated, and a signer-USER
+     device may create the recovery successor. It clears in the seat-list write when another
+     device signs a list carrying a higher authority that omits the lost device, which then
+     becomes a pending device. New residual R28 (1.3, 2.5, 4.3, 6.1, 6.3, 7.3, 7.6, 9.2).
+     Amended by #212, #213 (copied into successors; widened recovery condition; dialog
+     first), #222 (only `device_revoked` stored; typed refusal; signer read inside the
+     transaction) and #224 (the lost device is queued only if it is a member).
+198. DECISION (S2-W0), S2-D22, S2-D27 (plan audit PA-2; RR#S2-2, RR#S2-2a, RR#S2-8): ONE
+     protected-device definition on both sides, the newest stored (server) or adopted
+     (native) list's signer device; `owner_devices` grants signing eligibility only;
+     adopting such a list moves the pin (new source `owner_device`); W3's
+     `Step6Input.owner_device` contract becomes "the newest adopted list's signer device";
+     recovery through `_seat_list_sign(recovery: true)` behind "Take over signing #channel
+     on this device", which members confirm with the S1 same-user dialog. R12 updated (1.3,
+     3.12.3, 4.4.1, 4.5, 4.7, 4.8, 4.9, 6.3, 8.2, 8.3). Amended by #213 and #215.
+199. DECISION (S2-W0), S2-D7 (RR#S2-4), rewriting W3 D26: forced-removal memory is recorded
+     when (1) the user is on the newest list, (2) its last leaf is removed, and a removed
+     device of that user carries a `pending_removal`, missing or unknown label (a checkable
+     label native finds false counts as unknown), even when a rejoin intent verifies; there
+     is no memory for a `rejoin` or `own_user` native verified itself, nor for
+     `pending_device`, `revoked` or `idle`. This follows the plan over the contract's "(1)
+     to (4) otherwise unchanged" (#210 (b)) (1.3 R8, 6.2). Amended by #219 (an `Unknown`
+     label counts as unknown).
+200. DECISION (S2-W0), S2-D17a (closes R23 with #196): native may stage a Remove of a device
+     the bridge reports in `pending_device_removals` (a new `_remove` argument). Native
+     verifies only that the target is a current leaf, not this device and not the rule-g
+     device; the claim only ever removes (the worst case is a hostile DS evicting a live
+     device, which rejoins). Revoked-only Removes outside the pending list stay unstaged
+     (6.2, 8.3).
+201. DECISION (S2-W0), S2-D9 to S2-D14, S2-D16 (O-4): the reconciler. One access predicate
+     shared with `GET .../seats`; the per-channel `seated_at` CAS release with cause
+     `AccessLost` and the 14-day cooldown; the eight hook routes with the kept-result shape;
+     the post-claim recheck on the seat PUT and protect; the crond sweep, independent of
+     both flags and of the entitlement state, which is also the revocation repair path;
+     regaining access never re-seats. 6.4 replaced (1.1, 2.3, 6.3, 6.4). Amended by #222
+     (the signer user is skipped).
+202. DECISION (S2-W0), S2-D13 (as amended, plan audit PA-3), S2-D17a, S2-D17c (RR#S2-9): a
+     device revocation runs the pending pass, the identity delete, then the pending pass
+     again; a failure fails the route closed; the sweep repairs identities bound to a dead
+     or superseded session; suspension, disable and scheduled deletion keep the seat while
+     every leaf goes. R17 replaced (1.3, 6.3). Amended by #219 (the hook runs only while
+     `formats_v2` is on) and #222.
+203. DECISION (S2-W0), S2-D28 to S2-D32 (O-12, O-16): async Text join (`join_requests`, 24 h
+     windows, re-broadcast backoff, never red on silence); stored Welcomes
+     (`MlsCommit.welcome`, never in a commit fetch; the DEPTH exemption) and
+     `GET /mls/groups/:id/welcome` with unknown-group parity; the catch-up pager; native
+     `CatchUpLeafUnresolvable`; the recovery gate (available plus `allows_text_traffic`) for
+     a rejoin, a `rejoin_readd` re-Add and its claim, the successor of an existing group and
+     the `signer_lost` replacement. R5 closed, R9 updated, 7.2's "no Welcome refetch"
+     replaced (1.3, 2.5, 6.1, 6.3, 7.1, 7.2, 8.4, 9.1). Amended by #213, #214 and #220.
+204. DECISION (S2-W0), S2-D33 (plan audit PA-7): generation cap 65535 on both sides;
+     `as_of_generation` in `GET .../seats`; the successor rate limit
+     `successor_rate_per_day` (10 per 24 h, `InSlowmode`), with the forcing committer
+     reported to the owner. Plan sections 6 and 7 tag `as_of_generation`, the generation
+     cap, `successor_rate_per_day` and `_seat_list_verify(as_of_generation)` [b], but S2-D33
+     moved to [a] (PA-7), so they are S2a here (#210 (f)) (2.5, 3.1, 6.1, 6.3, 7.1, 7.2,
+     8.3).
+205. DECISION (S2-W0), S2-D18 to S2-D21 (O-2, O-3; plan audit PA-10, PA-21, PA-22; RR#S2-7):
+     `ProtectedChannelChanged { id, scope }` on the channel topic; the removal duty and its
+     10-minute escalation, with no clearing on a timer; `RemovalReasonRequired` for every
+     kick and ban in a server with a protected channel and every seat PUT that releases
+     someone (a header, checked after the byte-identical return); the audit actions
+     `ProtectedSeatsUpdate` and `ProtectedSeatRelease`; an unused seat frees at once
+     (`keys_received_at`, `DeviceNeverJoined`, the pre-S2 fallback through `member_added`).
+     New residual R26 (1.3, 2.3, 4.3, 6.3, 7.5, 7.6, 9.2). Amended by #221 (audit
+     visibility).
+206. DECISION (S2-W0), plan sections 5 and 6: the S2 data model (`ChannelSeat.release_cause`
+     and `keys_received_at`, `SeatList.authority`, `MlsGroup.pending_device_removals`,
+     `signer_lost` and `rejoin_readd`, `MlsCommit.welcome`, `MlsJoinIntent.generation` and
+     `issued_at`); the indexes-only migration block (`<= 78` / 79 in the steward's chain of
+     2026-11-02, 2.7; index names chosen here); the config keys `formats_v2`,
+     `reconcile_sweep_secs`, `text_rejoin_window_secs` and `successor_rate_per_day`; the
+     route table; `formats_v2` in the root advert (not in the plan, #210 (h)); the Welcome
+     route's response shape; the errors `RemovalReasonRequired` and [S2b]
+     `ProtectedHandoverRequired`, and the `owner_device_lost` reason (2.3, 2.4, 2.5, 2.7,
+     7.1, 7.2, 7.6). Amended by #216, #218, #221 and #222.
+207. DECISION (S2-W0), plan section 7: the native surface. `mls_text_authorities`; widening
+     the pin-source and generation CHECKs (still narrow at W3a `da03abc`; `owner_device` was
+     not in W3 D26's list); the command changes (`_seat_list_sign` format, authority and
+     recovery; NEW `e2ee_text_authority_sign`; `_seat_list_verify(as_of_generation)`; the
+     Text join payload in `_join` and `_admit`; `_remove(pending_device_targets)`; reasons
+     and `CatchUpLeafUnresolvable` in `_process`; the recovery create); `SeatListRejection`
+     gains `immutable_changed` and `authority_invalid`; `SeatListRollback` on the AD path
+     (8.2, 8.3, 8.4).
+208. DECISION (S2-W0), S2-D35 to S2-D44: the `capacity` shield state (after `not_seated`,
+     before step 6, only from the bridge's recorded join refusal); step 6d replaced (silence
+     is never red); the re-securing policy with escalation, red only for verification
+     failures; S2a keeps the disabled composer; the new copy (owner device lost, account
+     unavailable, reason required, the capacity screen, the successor rate limit, removal
+     waiting, the account-deletion warning, role-editor copy); the owner seat UI, the reason
+     prompt, the owner-change review, the server settings page and stoat.js typing (9.1,
+     9.2).
+209. S2-W0 residual maintenance: R5, R8, R9, R11, R12, R13, R16, R17, R21, R23 and R24
+     annotated; R21, R23 and R24 closed while `formats_v2` is on (R5 closed in S2a); new
+     R26, R27 and R28 (the plan's S2-R1, S2-R3 and S2-R4; S2-R2 belongs to S2b and is
+     written when S2b lands); section 10 rewritten: S2a specified, the S2b list kept, the
+     deferrals named (1.3, 10). Amended by #216 (R27 rewritten), #219 (R23 open until the
+     flag flip) and #222 (R24's remains).
+210. OPEN for the S2-W0 audit (each also written where it applies). (a) Numbering: the
+     contract said the index ran to 180; it ran to 186, so S2 starts at #187 (resolved;
+     recorded). (b) Forced-removal memory: plan S2-D7 ("ONLY `pending_removal`") against the
+     contract's "local rules (1) to (4) otherwise unchanged". This document follows the plan
+     (6.2), because D26's rules (3) and (4) would record memory for a revoked single-device
+     user removed under `pending_device`. (c) `signer_lost.cause = account_unavailable`: the
+     pinned `add_pending_device_removal(user_id, device_id, now)` has no cause, and the plan
+     leaves `accounts/model.rs` untouched, so the primitive cannot tell a suspension from a
+     logout. Recommended: `GET .../text_group` derives `account_unavailable` at read time
+     from the signer user's account flags, and only `device_revoked` is stored; the
+     alternative is a cause parameter (a change to the pinned signature). The S2-W1 addendum
+     decides. (d) A channel whose first v2 list replaces a v1 list while a v1-id group is
+     open needs an owner-created successor (3.1.1); accepting both derivations was rejected
+     (dev data only). (e) Server-side authority eligibility: RR#S2-2b says "the server
+     likewise". The server here checks structure, version + 1, `prev` and the signer
+     device's listing and signature, and leaves eligibility (the pin or a held
+     `owner_devices` entry) to members, because it must accept the same-user recovery list
+     from a device no held authority lists. A tighter rule (an unlisted signer only while
+     `signer_lost` is set, say) would block an owner whose old device is dead but not
+     revoked. (f) Plan sections 6 and 7 tag `as_of_generation`, the generation cap,
+     `successor_rate_per_day` and `_seat_list_verify(as_of_generation)` [b] while S2-D33 is
+     [a]; treated as S2a. (g) The plan's "B47's Call-branch refusal recomputes v2 ids for g
+     <= current_generation + 2": the landed B47 (`4206add3`) is a Text-side eviction that
+     tests one (channel, generation), with no Call-side refusal and no loop; 3.1.1 applies
+     the v2 derivation to that one test. Confirm nothing else was meant. (h) `formats_v2` in
+     the root advert and a format argument to `_seat_list_sign` are not in the plan; native
+     needs them because it cannot read the server's configuration. (i) "Native refuses a
+     rejoin intent whose `issued_at` is older than the Add it observed" compares the
+     joiner's clock with this device's local record of the Add. On the commit path a refusal
+     is the POISONED path, so clock skew could poison a group under an honest server. S2-W3
+     must define the comparison and its tolerance, or the audit should confine the rule to
+     `_remove` (staging) rather than step 6. **Fix round:** (c) CLOSED by #222 (only
+     `device_revoked` is stored; `account_unavailable` is derived at read time); (i)
+     RESOLVED by #214 (staging-only). **Planner rulings agreed by the wave audit:** (b)
+     RESOLVED: follow the plan; forced-removal memory only for `pending_removal` labels
+     (missing and unknown included), 6.2. (d) RESOLVED: on the switch to v2 the v1-id group
+     is superseded by an owner-created successor (superseded, not poisoned, #223); no dual
+     derivation. (e) RESOLVED: the server accepts a recovery list from a registered,
+     session-bound device of the server-owner user without authority eligibility, and
+     members decide through the same-user dialog (the S1 4.7 exposure, noted). (f) RESOLVED:
+     `as_of_generation`, the 65535 cap and `successor_rate_per_day` are S2a. (g) RESOLVED:
+     no "g <= current_generation + 2" bound; B47 as landed is a Text-side eviction, and with
+     v2 ids a non-viewer cannot compute ids. (h) RESOLVED: `formats_v2` in the root advert
+     and a `format` argument to `_seat_list_sign` are accepted. (a) stays as recorded.
+211. S2-W0 index maintenance: S1 entries that S2 extends or replaces are left as written and
+     are superseded by: #14 and #41 (the generation cap) by #204; #33 (no new events) by
+     #205; #43 (owner device loss freezes) by #197 and #198; #147 (R17) by #202; #168 (R21)
+     by #194; #169 (B48 reasons and the D26 memory rule) by #195 and #199; #170 (no Welcome
+     refetch) by #203; #171 (R23) by #196 and #200; #172 (`v:2` owned by S2) by #189; #178
+     (R24) by #190.
+
+Added in the S2-W0 fix round (wave audit PASS WITH FIXES, 2026-10-26; items HIGH 1 to 3,
+MEDIUM 4 to 10, LOW L1 to L7 and the NITs).
+
+212. DECISION (S2-W0 fix), HIGH 1: the device cap. The commit transaction, native `_admit`
+     and every receiver count EVERY post-commit leaf of the user, with no exclusion
+     (receivers cannot see `signer_lost` or the server's pending lists; W3 `checks.rs` step
+     6 (h) at `da03abc`); an exclusion there would let the DS sequence an Add that members
+     refuse. The join-intent route alone excludes devices in `pending_device_removals`
+     (Add-clears-pending removes them in the same commit). While `signer_lost` is set and
+     the replacement Add would exceed the cap, recovery goes through the signer-user
+     successor `g + 1`. Corrects #196 and #197 (1.3 R23, 3.12.3, 6.1, 6.2, 6.3, 8.3, 11).
+213. DECISION (S2-W0 fix), HIGH 2: `signer_lost` cannot wedge. (a) It is copied into every
+     successor created while it is set; only the 4.3 step-7 seat-list write clears it. (b)
+     The recovery exception (Text create, join intent, KeyPackage claim) also holds when the
+     newest stored list's signer device has no registered identity, a fact the server
+     derives itself. (c) The native "Take over signing" dialog runs in
+     `_seat_list_sign(recovery: true)` BEFORE the successor create (exempt from
+     `SignerLeafMissing`, like genesis). A replacement device that dies between the create
+     and the PUT strands nothing (2.5, 4.9, 6.1, 6.3, 8.3, 11).
+214. DECISION (S2-W0 fix), HIGH 3: the rejoin-intent `issued_at` rule is deleted from the
+     receiver commit path (3.12.3), where a refusal is the poisoned path and clock skew
+     could poison a group under an honest server; it is STAGING-only: this device does not
+     stage an eviction or a re-Add citing an intent older than its local record of that
+     device's latest Add (6.2 `_remove` and `_admit`). It narrows R14 for staging only.
+     Resolves #210 (i) (3.12.3, 6.2, 8.3, 11).
+215. DECISION (S2-W0 fix), MEDIUM 4: the authority gains a `signer_device_id:` line (13
+     lines; still a free format bump) and refuses a duplicate identity key in
+     `owner_devices`; eligibility is judged on the named signer entry only, whose key must
+     verify (no other key is tried), so an authority listing {pinned D1, X} signed by X is
+     refused. Every S2 vector was recomputed by both programs: the authority, the seat list
+     v2 (its `authority:` hash), AD v2 (1744 bytes) and the worst case (authority 2836
+     bytes, AD 14112 bytes; the construction now uses two extra seeds for distinct keys).
+     The group ids and the Text join vector are unchanged (3.12.1, 4.3, 4.4.1, 4.10, 5.8,
+     11).
+216. DECISION (S2-W0 fix), MEDIUM 5: R27 is rewritten (a thief with a listed owner device
+     and a live session can seat attackers with no member dialog, and can sign an authority
+     dropping the owner's other devices so the owner's recovery list looks like the thief's
+     to members; a revoked listed non-signer device stays eligible in members' natives until
+     the owner re-signs; an honest server blocks it at the directory, a hostile one does
+     not). S2a detection: `GET .../seats` reports `revoked_owner_devices` to the owner,
+     whose UI prompts "Re-sign your signing devices"; owner-user devices alert when a held
+     authority drops this device and note when another owner device changes it (1.3, 4.4.1
+     rule 9, 7.2, 9.2).
+217. DECISION (S2-W0 fix), MEDIUM 6: the B47 squat eviction's v2 derivation takes the salt
+     from the channel's stored seat-list row, read inside the create transaction;
+     `is_derived_text_group_id(group)` derives from group fields only today and cannot
+     compute a v2 id. Test: a viewer's Call squat at a v2 id is evicted (control: the v1
+     derivation in the database layer) (3.1.1, 11).
+218. DECISION (S2-W0 fix), MEDIUM 7: `formats_v2` governs only ENTRY into v2 (a new v2
+     genesis, a v1-to-v2 upgrade); a channel already on v2 keeps working whatever the flag
+     says (seat PUTs including removal-only ones, commits, successors, the Text join
+     payload, v2 ids). The format-dependent rules are keyed on the channel's list format,
+     not the flag. Flag-off rows added to the 7.1 table (1.1, 1.3 R21 R24, 2.5, 3.1.1, 3.13,
+     4.1.1, 4.3 step 1, 7.1, 7.2, 11).
+219. DECISION (S2-W0 fix), MEDIUM 8: "S1 desktops keep working until the flag flips" was
+     false and is corrected: (a) the revocation hook (both pending passes and `signer_lost`)
+     and the sweep's revocation repair run only while `formats_v2` is on, so R23 stays open
+     until the flip; (b) `MlsRemovalReason` gains `#[serde(other)] Unknown` on the server
+     (database model and v0) and in the native wire type, and native treats an unknown value
+     as `pending_removal` for memory. Landing constraint: the native catch-all ships on
+     every protected desktop before the flip; the server catch-all lands with S2-W1 (1.3 R17
+     R23, 2.5, 3.13, 6.1, 6.2, 6.3, 7.1, 8.4, 11).
+220. DECISION (S2-W0 fix), MEDIUM 9: gating tiers aligned with S5 plan section 7. A new
+     seat: the growth flag and `allows_new_seats()`. A new device of a seated member (join
+     intent, KeyPackage claim, Add) and a first Text group create: the growth flag and
+     `allows_text_traffic()`. Recovery: the available gate and `allows_text_traffic()`, no
+     growth flag (6.1, 6.3 "Recovery gates", 7.1).
+221. DECISION (S2-W0 fix), MEDIUM 10: `servers/audit_log_fetch.rs` returns
+     `ProtectedSeatsUpdate` and `ProtectedSeatRelease` entries only to readers with
+     ViewChannel on the entry's channel, so a hidden channel and its seat holders never leak
+     through the audit log. Test with a ViewAuditLog holder who cannot view the channel.
+     (This route is not in the plan's file-overlap table: an S2-W2 lane must own it.) (6.3,
+     7.2, 7.5, 11).
+222. DECISION (S2-W0 fix), LOW L1 to L7: (L1) R24's remains are listed (a viewer learns the
+     generation count), and `GET .../text_group` serves `pending_device_removals`,
+     `signer_lost` and `join_requests` to SEATED callers only; (L2) only
+     `signer_lost.cause = device_revoked` is stored ([S2b] `user_removed`),
+     `account_unavailable` is derived at read time from the account flags, closing #210 (c);
+     (L3) any salt is accepted when the stored or held list is v1; (L4) `removed_reasons`
+     are stamped inside the commit transaction, replacing #178's route-time view for them;
+     (L5) the reconciler never releases the current list signer user; (L6) the revocation
+     pass reads the signer inside its claimed transaction, and while `signer_lost` is set a
+     list from another device without a qualifying authority is refused
+     `ProtectedChannelResecuring { reason: "owner_device_lost" }`; (L7) native
+     `_seat_list_sign` refuses `format: 1` while it holds a v2 list (1.3, 2.5, 4.3, 4.4.1,
+     4.9, 6.1, 6.3, 7.2, 11).
+223. S2-W0 fix-round maintenance and rulings: the S1 text at 2.5 commit-transaction step 2
+     ("Adds refused while non-empty"), 3.12.3 "Welcome during a pending unseat" and the 6.1
+     "Commit with `added`" row is marked "S2 replaces" (Add-clears-pending); ruling on #210
+     (d): members that adopt the first v2 list over v1 treat the v1-id group as SUPERSEDED,
+     never poisoned; R24's "(flag off, dev data)" reworded; amendment notes added to #189 to
+     #191, #193 to #199, #201 to #203, #205, #206, #209 and #210 (2.5, 3.1.1, 3.12.3, 6.1).
+
+Added in the S2-W0 second fix round (targeted re-review NEEDS CHANGE, 2026-10-26).
+
+224. DECISION (S2-W0 fix 2), HIGH: a recovery successor must not freeze. The 4.3 step-7
+     write queues the lost device into `pending_device_removals` ONLY IF it is a current
+     member of the open group, otherwise it only clears `signer_lost`. One clearing rule,
+     both drivers: drop every pending device entry whose device is not a member, in every
+     seat-list write and after every won commit; so every entry names a removable leaf and
+     no entry blocks sends for good. Covers the cap-1 owner (`g + 1`) and the D3-dies,
+     D4-creates-`g + 2` path (2.5, 4.3, 6.1, 6.3, 11). Amends #197 and #213.
+225. DECISION (S2-W0 fix 2), MEDIUM: 4.3 step 3b checks `signer_device_id` = the PUT's
+     signer device only for an authority that DIFFERS from the stored one; an unchanged
+     authority carried by another listed owner device's list is accepted (matches 4.4.1 rule
+     6 and 6.3). Amends #215 (4.3, 11).
+226. DECISION (S2-W0 fix 2), MEDIUM: following a successor is recovery. The join intent,
+     KeyPackage claim and Add of a device that held a leaf in the predecessor generation
+     (found through the channel's closed Text group at generation - 1, which the create's
+     `supersedes` named) pass the available gate and `allows_text_traffic()` with no growth
+     flag, for recovery, poisoned-epoch and v1-to-v2 successors. A 7.1 flag-off row is
+     added. Amends #203 and #220 (6.3, 7.1, 11).
+227. DECISION (S2-W0 fix 2), MEDIUM: R27 detection extended: adopting ANY list signed by
+     ANOTHER owner device raises a notice on the owner's devices, at least when the seat set
+     grows ("Your other device X seated Y"). Amends #216 (1.3 R27, 4.4.1 rule 9, 9.2).
+228. DECISION (S2-W0 fix 2), LOW: `GET .../text_group` also reports `signer_lost` to a
+     signer-USER caller when the newest list's signer device has no registered identity and
+     no flag is stored (derived at read time; the authority-less solo owner and a flag-off
+     revocation), so its UI can offer recovery. Server send gating still reads the stored
+     flag only (7.2).
+229. DECISION (S2-W0 fix 2), LOW: the staging-only `issued_at` rule compares against the
+     `issued_at` of the join intent the device's latest Add consumed (the same remote
+     clock), never a local time; when this device never saw that intent the rule does not
+     apply. Amends #214 (6.2).
+230. DECISION (S2-W0 fix 2), LOW: remove-then-admit is two commits in S2a natives
+     (`_remove`, then `_admit`; no new argument); the DS accepts one commit or two (6.1,
+     6.2).
+231. DECISION (S2-W0 fix 2), LOW: `revoked_owner_devices` also reports an `owner_devices`
+     entry whose listed key differs from the directory key. Amends #216 (1.3 R27, 7.2, 9.2).
+232. DECISION (S2-W0 fix 2), NIT: a recovery list keeps the held list's format; on a v1
+     channel the recovery successor has a v1 id and the v2 upgrade is a later ordinary list
+     (one successor). Chosen over a v2-id recovery successor (the server verifies a create's
+     id against the stored list, which on a v1 channel has no salt) and over "g + 1 then g +
+     2" (4.9).
+233. DECISION (S2-W1 wave audit F-1): re-seating a seat that is still cooling keeps it
+     keys-received (`keys_received_at` kept, or set to the release time when the release
+     cooled on the `member_added` fallback alone), so its next release cools 14 days.
+     Clearing the stamp let one slot rotate among any number of key-receiving users, each
+     second unseat freeing it at once as `DeviceNeverJoined`. A re-seat after a no-cooldown
+     release or after the cooldown expired is a new slot use and clears the stamp. Amends
+     #205, #206 (2.3).
+
+Added in the S2-W3 native doc pass (desktop `feat/protected-s2-native` `876c034`,
+2026-11-12). Each records what the native code does; the code was read, not the notes.
+
+234. DECISION (S2-W3, S3-N0): native decodes envelope v2 (S3 plan 2.3) with no v2 send
+     path; `v` is peeked before the strict decode, so outer `encrypted.v` 2 to 255 and
+     envelope `v` 3 to 255 are `UnsupportedEnvelopeVersion { v }` (grey, never red); `fk`
+     present under outer v1 refuses; every v2 file is reported `failed` / `unsupported`
+     with no key, blob id or digest leaving native; the 3.7 signature is unchanged;
+     pointer to S9's F1 version table; vectors native-only. Residual: a hostile server can
+     grey a message by editing the unauthenticated outer `v` (withholding-equivalent)
+     (3.6.1, 3.9, 8.3, 8.4, 9.2, 11).
+235. DECISION (S2-W3): the native command and storage surface as built:
+     `_process(catch_up_tip)`, `_commit_won(rejoin_intents, removed_reasons)`,
+     `_group_create(recovery, supersedes_generation)`, `_seat_list_verify` with
+     `as_of_generation` and `authority`, `_authority_sign(owner_devices)`, `owner_notice`
+     on verdicts and outcomes, `owner_alert` on the state, `TextDecrypted.files`; verdict
+     `ok` needs a group that is active AND not superseded; `TEXT_PROTOCOL = 2` with the
+     protocol floor's server half in S4 and client half in S2-W4 (pair landing);
+     `issued_at` accepted as an integral float across napi; NEW
+     `mls_text_admitted_intents` and `mls_text_owner_alerts`; the CHECK widening detected
+     by the stored DDL text, no marker; the add-device split wipes the owner alerts; error
+     append order S2, S3, S4, S9 (8.2, 8.3, 8.4).
+236. DECISION (S2-W3; W3 wave audit finding 1, re-review items 1 and 3): 4.4.1 as
+     built. The native mirror of #225 checks a NEW authority's `signer_device_id` against
+     the list signer only at the held list version + 1 (a skipper or a first sight is held
+     to the carried authority by signer acceptance instead); a wrong `prev` at the next
+     authority version is `authority_invalid`; under a carried authority the chain walk
+     keeps or hands over the pin only to its `owner_devices` entries; rule 9 is one notice
+     (dropped > changed > seated) and `dropped_this_device` is a stored flag, set in the
+     adoption's transaction and cleared when this device is pinned or listed again; the
+     sign side refuses what members would refuse (4.9). R27 gains its as-built detection
+     and the version-skipping residual (1.3 R27, 4.4.1, 4.9, 8.2, 9.2, 11).
+237. DECISION (S2-W3; W3 wave audit findings 2 and 4, re-review item 2; planner ruling
+     2026-11-11): #223 as built. One superseded predicate (a recorded successor, or an id
+     that is not the held list's derivation) for `_encrypt` and `_state`; decrypt
+     unchanged, live in the newest group until the successor is held; the `GET`-path
+     upgrade recomputes with the candidate salt after every check and does not catch up,
+     leaf-check or record the v1 group; commits drained in a v1-id group under a held v2
+     list are judged with the v1 rules, rule g on the AD list's signer only while that
+     device is still an owner device; two known exceptions to "never poisoned" are
+     recorded; the member recovery order is join, verify, confirm, Welcome (3.1.1, 3.9,
+     3.12.3, 4.4, 8.3).
+238. DECISION (S2-W3): 6.2 and 6.3 as built. The staging-only `issued_at` record is
+     written by `_admit` at stage time from the intent its own Add consumes (no record from
+     join-request events or others' Adds), and an equal `issued_at` is allowed;
+     `CatchUpLeafUnresolvable` needs a `catch_up_tip` above the commit's epoch and covers
+     added leaves only, while an embedded list's revoked or unpinned signer still poisons
+     (W3 wave audit item (b), accepted); the Text intent window is 24 h and a 23 h 59 m
+     Welcome joins under a simulated clock (O-12 not proven by it) (6.2, 6.3, 8.4, 11).
+239. DECISION (S2-W3): release note. An S1 core reopening a store an S2 core opened reads
+     an `owner_device` pin and a held v2 list as `StoreCorrupt` and cannot derive a group
+     id past generation 63, so rolling back past S2 is unsafe (8.2).
+
 ---
 
 ## 13. How the vectors in section 5 were checked
@@ -4753,3 +7237,16 @@ HChaCha20 + ChaCha20-Poly1305 (itself first validated against draft-irtf-cfrg-xc
 sections 2.2.1 and A.3.1), and Ed25519 sign and verify. The checker was shown to fail on a copy
 of this document with a single altered byte before it was run on the real file. W1 and W3
 must reproduce the vectors in Rust; they are the parity test, not this checker.
+
+**S2 vectors (5.8, S2-W0, #193).** The `tv2:` values were computed by two programs written
+independently for this purpose: a Python one (`hashlib`, the `cryptography` package's
+Ed25519, f-string line builders and `struct` packing) and a node one (`node:crypto`, a
+Buffer byte builder over label and value tables) that takes every input by PARSING this
+document (`tv:inputs`, the 5.4 handover and `tv2:inputs`) and also checks every `tv2:`
+block, and the stated AD byte counts, against its recompute. Their outputs were
+byte-identical; after the fix round's `signer_device_id` line (#215) both programs were
+updated and every vector recomputed, and the outputs were again byte-identical. The node
+checker was shown to fail on a copy of this document with one altered `tv2:` byte before it
+was run on the real file. The S1 document checker freezes every `tv:` block against the S1
+baseline and refuses unknown `tv:` names, which is why S2 uses its own marker; W1 and W3
+reproduce the S2 vectors in Rust, and those tests are the parity test.

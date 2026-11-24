@@ -22,6 +22,10 @@ screen_leg = true
 # An explicit header: a bare key under [features] is silently ignored.
 [features.protected_channels]
 enabled = true
+# Off, as in production: with it on, protect accepts a v2 genesis only, and
+# the existing route tests protect with a v1 genesis. A v2 test turns it on
+# for itself with overwrite_config.
+formats_v2 = false
 
 [api.smtp]
 host = "localhost"

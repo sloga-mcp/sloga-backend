@@ -236,6 +236,9 @@ pub struct ProtectedChannelsFeature {
     pub enabled: bool,
     /// Device cap used when a channel's entitlement sets none (0 = unlimited)
     pub default_device_cap: u32,
+    /// Whether channels may enter the S2 (v2) formats (design 7.2 "Root
+    /// advert"); the bridge passes it to native when signing a list
+    pub formats_v2: bool,
 }
 
 /// # E2EE Capabilities
@@ -627,6 +630,8 @@ pub fn root_config(config: Settings, passkeys_usable: bool) -> RevoltConfig {
             protected_channels: ProtectedChannelsFeature {
                 enabled: config.features.e2ee_enabled && config.features.protected_channels.enabled,
                 default_device_cap: config.features.protected_channels.default_device_cap,
+                // As configured: protect and the seat PUT read the same key
+                formats_v2: config.features.protected_channels.formats_v2,
             },
             e2ee: E2EEFeature {
                 // A capability of this build, not a setting
@@ -915,14 +920,21 @@ mod test {
     /// the test proves the configured value is the one advertised
     const ADVERT_DEVICE_CAP: u32 = 7;
 
-    /// Sets both flags (and the device cap) explicitly, then fetches the root
-    /// and checks the protected channels advert. Every case is its own
-    /// `#[test]`: `overwrite_config` runs once per process (nextest)
-    async fn protected_channels_advert_case(e2ee: bool, enabled: bool, advertised: bool) {
+    /// Sets both flags, `formats_v2` (and the device cap) explicitly, then
+    /// fetches the root and checks the protected channels advert. Every case
+    /// is its own `#[test]`: `overwrite_config` runs once per process
+    /// (nextest)
+    async fn protected_channels_advert_case(
+        e2ee: bool,
+        enabled: bool,
+        advertised: bool,
+        formats_v2: bool,
+    ) {
         revolt_config::overwrite_config(|settings| {
             settings.features.e2ee_enabled = e2ee;
             settings.features.protected_channels.enabled = enabled;
             settings.features.protected_channels.default_device_cap = ADVERT_DEVICE_CAP;
+            settings.features.protected_channels.formats_v2 = formats_v2;
         })
         .await;
 
@@ -937,7 +949,13 @@ mod test {
             .as_object()
             .expect("protected_channels object");
 
-        assert_eq!(advert.len(), 2, "advert fields: {advert:?}");
+        assert_eq!(advert.len(), 3, "advert fields: {advert:?}");
+        assert_eq!(
+            advert["formats_v2"].as_bool(),
+            Some(formats_v2),
+            "advert: {:?}",
+            advert
+        );
         assert_eq!(advert["enabled"].as_bool(), Some(advertised));
         assert_eq!(
             advert["default_device_cap"].as_u64(),
@@ -947,22 +965,35 @@ mod test {
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, false))
+    }
+
+    /// 7.2 "Root advert" (#206): `formats_v2` is the configured flag
+    #[test]
+    fn protected_channels_advert_carries_formats_v2() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, true))
+    }
+
+    /// `formats_v2` is advertised as configured even with growth off: it
+    /// also governs the revocation hook, which runs with growth off (#219)
+    #[test]
+    fn protected_channels_advert_carries_formats_v2_with_growth_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, true))
     }
 
     /// The node's own config with every Prot switch on and a valid sale
