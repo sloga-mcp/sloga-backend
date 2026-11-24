@@ -151,6 +151,7 @@ mod tests {
                 nsfw: false,
                 spoiler: false,
                 voice: None,
+                e2ee_only: false,
             })
             .await
             .unwrap();
@@ -416,6 +417,7 @@ mod tests {
                 nsfw: false,
                 spoiler: false,
                 voice: None,
+                e2ee_only: false,
             })
             .await
             .unwrap();

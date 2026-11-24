@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod bulk_permissions;
 pub mod captcha;
 pub mod chunked;
+pub mod e2ee_only;
 pub mod email;
 pub mod event_visibility;
 mod funcs;

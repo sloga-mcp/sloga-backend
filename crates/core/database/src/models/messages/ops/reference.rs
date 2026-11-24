@@ -26,6 +26,9 @@ impl AbstractMessages for ReferenceDb {
     /// `encrypted` already has is refused with `DuplicateNonce`. Plaintext
     /// messages are outside the index and never conflict. A duplicate id is
     /// checked first and stays a `DatabaseError`.
+    ///
+    /// The same channel read refuses a row that is not a system message in a
+    /// group marked encrypted-only (`Message::validate_e2ee_only_insert`).
     async fn insert_message(&self, message: &Message) -> Result<()> {
         let channels = self.channels.lock().await;
         let read = |id: &str| {
@@ -35,6 +38,7 @@ impl AbstractMessages for ReferenceDb {
                 .ok_or_else(|| create_error!(NotFound))
         };
         let channel = read(&message.channel);
+        message.validate_e2ee_only_insert(&channel).await?;
         // A thread is judged by its parent (W2 audit B1), read under the
         // same `channels` lock
         let parent = match &channel {
@@ -905,5 +909,86 @@ mod nonce_tests {
                 .await,
         );
         assert_eq!(db.fetch_message(&stored.id).await.expect("kept"), stored);
+    }
+}
+
+/// The encrypted-only half of `insert_message` on this driver, the same
+/// cases as the MongoDB tests in `messages/ops/mongodb.rs`
+#[cfg(test)]
+mod e2ee_only_insert_tests {
+    use revolt_result::ErrorType;
+
+    use super::AbstractMessages;
+    use crate::{AbstractChannels, Channel, Message, ReferenceDb, SystemMessage};
+
+    const MARKED: &str = "01JB0000000000000000000G01";
+    const UNMARKED: &str = "01JB0000000000000000000G02";
+    const AUTHOR: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+
+    fn group(id: &str, marked: bool) -> Channel {
+        Channel::Group {
+            id: id.to_string(),
+            name: "group".to_string(),
+            owner: AUTHOR.to_string(),
+            description: None,
+            recipients: vec![AUTHOR.to_string()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: marked,
+        }
+    }
+
+    fn plaintext(id: &str, channel: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: AUTHOR.to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A plain row in a marked group is refused and not stored; a system row
+    /// there, and a plain row in an unmarked group, are stored
+    #[tokio::test]
+    async fn insert_message_refuses_plain_rows_in_a_marked_group() {
+        let db = ReferenceDb::default();
+        db.insert_channel(&group(MARKED, true)).await.expect("marked");
+        db.insert_channel(&group(UNMARKED, false))
+            .await
+            .expect("unmarked");
+
+        let refused = plaintext("01JB0000000000000000000M01", MARKED);
+        let error = db
+            .insert_message(&refused)
+            .await
+            .expect_err("a plain row in a marked group");
+        match error.error_type {
+            ErrorType::EncryptionRequired { side } => assert_eq!(side, "group"),
+            other => panic!("expected EncryptionRequired, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                db.fetch_message(&refused.id).await.map_err(|e| e.error_type),
+                Err(ErrorType::NotFound)
+            ),
+            "the refused row must not be stored"
+        );
+
+        let system = SystemMessage::ChannelRenamed {
+            name: "renamed".to_string(),
+            by: AUTHOR.to_string(),
+        }
+        .into_message(MARKED.to_string());
+        db.insert_message(&system).await.expect("a system row");
+        assert_eq!(db.fetch_message(&system.id).await.expect("stored"), system);
+
+        let open = plaintext("01JB0000000000000000000M02", UNMARKED);
+        db.insert_message(&open).await.expect("an unmarked group");
+        assert_eq!(db.fetch_message(&open.id).await.expect("stored"), open);
     }
 }

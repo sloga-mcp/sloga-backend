@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use bson::{to_document, Document};
 use iso8601_timestamp::Timestamp;
 use mongodb::options::FindOptions;
@@ -41,6 +43,31 @@ impl AbstractE2EE for MongoDb {
                 "user_id": user_id
             }
         )
+    }
+
+    async fn fetch_e2ee_user_ids_with_identity(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashSet<String>> {
+        if user_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        self.col::<Document>(COL_IDENTITY)
+            .distinct(
+                "user_id",
+                doc! {
+                    "user_id": { "$in": user_ids }
+                },
+            )
+            .await
+            .map(|values| {
+                values
+                    .into_iter()
+                    .filter_map(|value| value.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .map_err(|_| create_database_error!("distinct", COL_IDENTITY))
     }
 
     async fn insert_e2ee_identity(&self, identity: &E2EEIdentity) -> Result<()> {

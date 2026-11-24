@@ -10,7 +10,8 @@ use redis_kiss::redis;
 use revolt_database::util::email::normalise_email;
 use revolt_database::util::password::hash_password;
 use revolt_database::{
-    events::client::EventV1, Channel, Database, Member, Message, PartialRole, Server, User, AMQP,
+    events::client::EventV1, Channel, Database, Member, Message, PartialRole, PartialUser, Server,
+    User, AMQP,
 };
 use revolt_database::{
     seat_list_channel_server, ChannelEntitlement, ChannelEntitlementSource,
@@ -986,6 +987,17 @@ pub struct ProtectedChannel {
     pub seat_list: v0::DataSeatList,
 }
 
+/// What [`TestHarness::new_encrypted_user`] built
+pub struct EncryptedUser {
+    pub account: Account,
+    /// The session its device is bound to
+    pub session: Session,
+    /// Re-read after its flags were set
+    pub user: User,
+    /// Its published device, bound to `session`
+    pub device: TestE2EEDevice,
+}
+
 impl TestHarness {
     /// A server owned by `owner`, the owner's membership (as `server_create`
     /// leaves it) and a fresh unprotected TextChannel; the server is re-read,
@@ -1054,6 +1066,38 @@ impl TestHarness {
             .await
             .expect("`E2EEIdentity`");
         device
+    }
+
+    /// A new account with encryption turned on (`e2ee_enabled`) and one
+    /// published device bound to its session, through the database
+    /// primitives. With `e2ee_only` the account is Encrypted-only as well,
+    /// set directly on the user (no ticket, no route), for the tests of the
+    /// routes that must refuse it
+    pub async fn new_encrypted_user(&self, e2ee_only: bool) -> EncryptedUser {
+        let (account, session, mut user) = self.new_user().await;
+        let device = self
+            .new_e2ee_device(&user, &session.id, rand::thread_rng().gen())
+            .await;
+
+        user.update(
+            &self.db,
+            PartialUser {
+                e2ee_enabled: Some(true),
+                e2ee_only: e2ee_only.then_some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the encryption flags");
+        let user = self.db.fetch_user(&user.id).await.expect("`User`");
+
+        EncryptedUser {
+            account,
+            session,
+            user,
+            device,
+        }
     }
 
     /// Protect `channel` with `data`'s genesis list through the database

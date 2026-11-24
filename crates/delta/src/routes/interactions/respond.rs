@@ -149,7 +149,15 @@ pub async fn interaction_respond(
     // and before the edit fetch and the slot claim, so it covers every path
     // below, including the ephemeral reply that never reaches
     // `insert_message`. A thread is judged by its parent too (W2 audit B1).
-    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+    // An encrypted-only group takes no bot reply either, refused at the same
+    // point.
+    crate::util::interactions::ensure_interactions_allowed_in(
+        db,
+        &user,
+        &channel,
+        &permission_channel,
+    )
+    .await?;
 
     // Edit path: fetch and verify the component's host message BEFORE
     // claiming the single-use slot, so a deleted message doesn't burn it.
@@ -1535,5 +1543,211 @@ mod test {
         for (_, body) in &answers[0] {
             assert!(!body.contains("ChannelProtected"), "{}", body);
         }
+    }
+
+    /// A group of `owner` and a new bot, stored directly and unmarked
+    async fn group_with_bot(
+        harness: &TestHarness,
+        owner: &User,
+    ) -> (revolt_database::Channel, Bot) {
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), owner, None)
+            .await
+            .expect("`Bot`");
+        let group = revolt_database::Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone(), bot.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        (group, bot)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &revolt_database::Database, channel_id: &str, marked: bool) {
+        match db {
+            revolt_database::Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(revolt_database::Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            revolt_database::Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// How many messages are stored in `channel_id`
+    async fn stored_messages(harness: &TestHarness, channel_id: &str) -> usize {
+        harness
+            .db
+            .fetch_messages(revolt_database::MessageQuery {
+                limit: Some(10),
+                filter: revolt_database::MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    ..Default::default()
+                },
+                time_period: revolt_database::MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .expect("the channel's messages")
+            .len()
+    }
+
+    /// POST a response to `interaction_id` as `bot`; the status and raw body
+    async fn respond_as(
+        harness: &TestHarness,
+        bot: &Bot,
+        interaction_id: &str,
+        body: &serde_json::Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/interactions/{interaction_id}/respond"))
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(ContentType::JSON)
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// Encrypted-only: a bot reply into a marked group is refused (`group`)
+    /// on both reply paths, before the slot claim, with no message row. With
+    /// the mark lifted the identical reply goes through (the control), so
+    /// the refusal consumed nothing. The acting account is the bot, which
+    /// can never be encrypted-only itself, so `sender` does not arise here.
+    ///
+    /// Control: the helper's `plain_write_allowed` call removed → the first
+    /// reply is accepted.
+    #[test]
+    fn respond_in_an_encrypted_only_group_is_refused_before_claim() {
+        crate::util::test::rt()
+            .block_on(respond_in_an_encrypted_only_group_is_refused_before_claim_case())
+    }
+
+    async fn respond_in_an_encrypted_only_group_is_refused_before_claim_case() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+
+        for ephemeral in [false, true] {
+            let interaction = interaction_row(
+                ulid::Ulid::new().to_string(),
+                "tok-group",
+                &bot.id,
+                &user.id,
+                group.id(),
+            );
+            harness
+                .db
+                .insert_interaction(&interaction)
+                .await
+                .expect("interaction");
+            let body = json!({
+                "token": "tok-group",
+                "content": "plaintext into an encrypted-only group",
+                "ephemeral": ephemeral
+            });
+
+            // The previous round's accepted reply is already stored
+            let messages_before = stored_messages(&harness, group.id()).await;
+            mark_group_raw(&harness.db, group.id(), true).await;
+            let refused = respond_as(&harness, &bot, &interaction.id, &body).await;
+            mark_group_raw(&harness.db, group.id(), false).await;
+
+            assert_eq!(refused.0, Status::Forbidden, "ephemeral {ephemeral}: {:?}", refused);
+            let error: serde_json::Value = serde_json::from_str(&refused.1).expect("JSON");
+            assert_eq!(error["type"], "EncryptionRequired", "{error}");
+            assert_eq!(error["side"], "group", "{error}");
+            let stored = harness
+                .db
+                .fetch_interaction(&interaction.id)
+                .await
+                .expect("interaction");
+            assert!(
+                !stored.responded,
+                "ephemeral {ephemeral}: the slot was claimed"
+            );
+            assert_eq!(
+                stored_messages(&harness, group.id()).await,
+                messages_before,
+                "ephemeral {ephemeral}: the refusal stored a message"
+            );
+
+            let allowed = respond_as(&harness, &bot, &interaction.id, &body).await;
+            assert_eq!(allowed.0, Status::Ok, "ephemeral {ephemeral}: {:?}", allowed);
+        }
+
+        // Only the persisted reply left a row
+        assert_eq!(stored_messages(&harness, group.id()).await, 1);
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn respond_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt()
+            .block_on(respond_in_an_encrypted_only_group_is_allowed_when_not_enforced_case())
+    }
+
+    async fn respond_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+        let interaction = interaction_row(
+            ulid::Ulid::new().to_string(),
+            "tok-group",
+            &bot.id,
+            &user.id,
+            group.id(),
+        );
+        harness
+            .db
+            .insert_interaction(&interaction)
+            .await
+            .expect("interaction");
+        mark_group_raw(&harness.db, group.id(), true).await;
+
+        let allowed = respond_as(
+            &harness,
+            &bot,
+            &interaction.id,
+            &json!({ "token": "tok-group", "content": "Pong!" }),
+        )
+        .await;
+        assert_eq!(allowed.0, Status::Ok, "{:?}", allowed);
+        assert_eq!(stored_messages(&harness, group.id()).await, 1);
     }
 }

@@ -1287,6 +1287,124 @@ async fn backup_put_requires_a_device_bound_session_case() {
     );
 }
 
+/// PUT a backup whose ciphertext is `encoded_len` base64 characters.
+async fn put_backup_of_size(
+    harness: &TestHarness,
+    session_token: &str,
+    device_id: &str,
+    header: String,
+    generation: i64,
+    encoded_len: usize,
+) -> Status {
+    let body = v0::DataPutE2EEBackup {
+        device_id: device_id.to_string(),
+        header,
+        ciphertext: "A".repeat(encoded_len),
+        generation,
+    };
+    harness
+        .client
+        .put("/e2ee/backup")
+        .header(ContentType::JSON)
+        .header(Header::new("x-session-token", session_token.to_string()))
+        .body(serde_json::to_string(&body).unwrap())
+        .dispatch()
+        .await
+        .status()
+}
+
+/// A backup between Rocket's 1 MiB JSON default and the 8 MiB cap is stored
+/// (it used to be refused 413 before the route ran); one just over the cap
+/// reaches the route and is refused by it; a body over the route's own
+/// 12 MiB limit is refused 413 before it is parsed.
+#[test]
+fn backup_put_body_limit_is_the_route_cap_not_the_json_default() {
+    crate::util::test::rt()
+        .block_on(backup_put_body_limit_is_the_route_cap_not_the_json_default_case())
+}
+
+async fn backup_put_body_limit_is_the_route_cap_not_the_json_default_case() {
+    let harness = TestHarness::new().await;
+    let (account, session, user) = harness.new_user().await;
+    let device = publish_device(&harness, &account.id, &session.token, 1).await;
+    const MIB: usize = 1024 * 1024;
+
+    // 2 MiB decoded: over the 1 MiB JSON default, well under the cap
+    let two_mib = 2 * MIB / 3 * 4;
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 1),
+            1,
+            two_mib,
+        )
+        .await,
+        Status::Ok
+    );
+    let stored = harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .expect("2 MiB backup stored");
+    assert_eq!(stored.ciphertext.len(), two_mib);
+
+    // Exactly at the cap: stored
+    let at_cap = revolt_database::E2EE_MAX_BACKUP_SIZE / 3 * 4;
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 2),
+            2,
+            at_cap,
+        )
+        .await,
+        Status::Ok
+    );
+
+    // Just over the cap but inside the body limit: the route's own check
+    // refuses it (400 FailedValidation), and nothing is stored
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 3),
+            3,
+            at_cap + 8,
+        )
+        .await,
+        Status::BadRequest
+    );
+
+    // Over the route's 12 MiB body limit: 413 before parsing
+    assert_eq!(
+        put_backup_of_size(
+            &harness,
+            &session.token,
+            &device.device_id,
+            backup_header(&user.id, &device.device_id, 3),
+            3,
+            13 * MIB,
+        )
+        .await,
+        Status::PayloadTooLarge
+    );
+
+    let stored = harness
+        .db
+        .fetch_e2ee_backup(&user.id, &device.device_id)
+        .await
+        .unwrap()
+        .expect("backup still stored");
+    assert_eq!(stored.generation, 2);
+    assert_eq!(stored.ciphertext.len(), at_cap);
+}
+
 #[test]
 fn backup_survives_device_revocation_but_dies_with_account() {
     crate::util::test::rt().block_on(backup_survives_device_revocation_but_dies_with_account_case())
@@ -1822,8 +1940,16 @@ async fn e2ee_pause_not_enforced_while_detector_off_case() {
 }
 
 /// The E2EE invariant for the pause: the gate is decided from the
-/// recipient id alone (no envelope field, ciphertext or device id), sits
-/// before anything is queued, and the route never feeds the detector.
+/// recipient id alone (no envelope field, ciphertext or device id) and sits
+/// before anything is queued. The copy-paste detector never sees an E2EE
+/// send; the fan-out signal is called once, after the queue insert, with
+/// the sender and the recipient-id set only.
+///
+/// Rewritten for the fan-out signal (Slim M3 S7). This pin used to assert
+/// that the route never feeds any anti-spam observer ("E2EE is never
+/// observed"). The route now calls `observe_e2ee_fanout` by design, so that
+/// half is a positive pin on exactly what the observer is given. The pause
+/// gate assertions below are unchanged.
 #[test]
 fn e2ee_pause_gate_reads_no_envelope_content() {
     use crate::util::test::{statement_at, without_comments, without_whitespace};
@@ -1832,7 +1958,7 @@ fn e2ee_pause_gate_reads_no_envelope_content() {
 
     assert!(
         !code.contains("observe_dm_message"),
-        "E2EE is never observed"
+        "the copy-paste detector never sees an E2EE send"
     );
     assert!(!code.contains("dm_send_allowed"), "no message-history gate");
     assert_eq!(code.matches("DirectMessagesPaused").count(), 1, "{code}");
@@ -1872,6 +1998,336 @@ fn e2ee_pause_gate_reads_no_envelope_content() {
     assert!(enforced < recipients_loop, "computed once, before the loop");
     assert!(recipients_loop < gate_start, "per recipient id");
     assert!(gate_start < insert, "refused before anything is queued");
+
+    // The fan-out signal: called exactly once, after the queue insert, for a
+    // send that reached another user, with the route's own `user` and the
+    // ids of the other users that got a queued envelope, and nothing else
+    assert_eq!(code.matches("antispam::observe_").count(), 1, "{code}");
+    assert_eq!(code.matches("observe_e2ee_fanout").count(), 1, "{code}");
+    let delivered_set = statement_at(
+        &code,
+        "letdelivered_recipient_ids:HashSet<String>=accepted.iter().map(|envelope|envelope.recipient_user_id.clone()).filter(|id|id!=&user.id).collect();",
+    );
+    let fanout_block = code
+        .find("ifreached_other_user{")
+        .expect("the fan-out block");
+    let user_clone = statement_at(&code, "letuser=user.clone();");
+    let observe = statement_at(
+        &code,
+        "antispam::observe_e2ee_fanout(&db,&antispam_config,&user,&delivered_recipient_ids,).await;",
+    );
+    let config = statement_at(
+        &code,
+        "letantispam_config=revolt_config::config().await.features.antispam;",
+    );
+    // Nothing is cloned or spawned while the signal is off
+    let active = code
+        .find("ifantispam_config.e2ee_fanout_active(){")
+        .expect("the switch check");
+    statement_at(&code, "letdb=db.inner().clone();");
+    assert!(insert < delivered_set, "built from the stored envelopes");
+    assert!(delivered_set < fanout_block, "{code}");
+    assert!(insert < fanout_block, "after the envelopes are stored");
+    assert!(fanout_block < config && config < active, "{code}");
+    assert!(active < user_clone && user_clone < observe, "{code}");
+
+    // No name can be rebound on the way: each is bound exactly once, never
+    // mutably, and the route has no tuple pattern that could shadow any of
+    // them. The set is bound and used once; the config is bound, checked and
+    // used once; so an `if let`, `match` or `for` rebinding adds a count.
+    assert_eq!(code.matches("letuser").count(), 1, "{code}");
+    assert_eq!(
+        code.matches("letdelivered_recipient_ids").count(),
+        1,
+        "{code}"
+    );
+    assert_eq!(code.matches("delivered_recipient_ids").count(), 2, "{code}");
+    assert_eq!(code.matches("antispam_config").count(), 3, "{code}");
+    for rebinding in [
+        "letmutuser",
+        "letmutdelivered_recipient_ids",
+        "letmutantispam_config",
+        "let(",
+        "letmut(",
+    ] {
+        assert!(!code.contains(rebinding), "`{rebinding}` in the route");
+    }
+    assert!(
+        code.contains("user:User,"),
+        "the route's `user` is the guard"
+    );
+
+    let spawned = &code[fanout_block..observe];
+    for forbidden in [
+        "envelope",
+        "ciphertext",
+        "accepted",
+        "receipts",
+        "sequence",
+        "device",
+        "data.",
+    ] {
+        assert!(
+            !spawned.contains(forbidden),
+            "the fan-out block reads `{}`: {}",
+            forbidden,
+            spawned
+        );
+    }
+
+    // Its signature takes recipient ids, never an envelope type
+    let antispam = without_whitespace(&without_comments(include_str!(
+        "../../../../core/database/src/util/antispam.rs"
+    )));
+    assert_eq!(
+        antispam
+            .matches("pubasyncfnobserve_e2ee_fanout(db:&Database,cfg:&AntispamFeatures,author:&User,recipient_ids:&HashSet<String>,){")
+            .count(),
+        1,
+        "the observer's signature changed"
+    );
+}
+
+/// Whether `key` exists in Redis
+async fn redis_key_exists(key: &str) -> bool {
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    redis_kiss::redis::cmd("EXISTS")
+        .arg(key)
+        .query_async(&mut *conn)
+        .await
+        .expect("EXISTS")
+}
+
+/// Whether any key of the fan-out signal exists for `user_id`
+async fn any_fanout_key(user_id: &str) -> bool {
+    let keys =
+        revolt_database::util::antispam::e2ee_fanout_keys(user_id, revolt_database::now_ms());
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    let existing: i64 = redis_kiss::redis::cmd("EXISTS")
+        .arg(&keys[..])
+        .query_async(&mut *conn)
+        .await
+        .expect("EXISTS");
+    existing > 0
+}
+
+/// Run one Redis command whose reply is not needed
+async fn redis_run(command: &str, args: &[&str]) {
+    let mut conn = redis_kiss::get_connection().await.expect("redis");
+    let _: () = redis_kiss::redis::cmd(command)
+        .arg(args)
+        .query_async(&mut *conn)
+        .await
+        .expect("redis command");
+}
+
+/// The system report filed against `user_id`, waited for (the observer runs
+/// in a spawned task)
+async fn wait_for_system_report(harness: &TestHarness, user_id: &str) -> revolt_database::Report {
+    for _ in 0..50 {
+        let reports = harness.db.fetch_reports(None).await.expect("reports");
+        if let Some(report) = reports.into_iter().find(|report| {
+            report.author_id == revolt_database::SYSTEM_USER_ID
+                && matches!(&report.content, v0::ReportedContent::User { id, .. } if id == user_id)
+        }) {
+            return report;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("no system report within 5 s");
+}
+
+/// Off in the shipped and the test config: an envelope to a stranger leaves
+/// no fan-out key behind, on either side. Requires Redis.
+#[test]
+fn e2ee_fanout_off_by_default_writes_no_keys() {
+    crate::util::test::rt().block_on(e2ee_fanout_off_by_default_writes_no_keys_case())
+}
+
+async fn e2ee_fanout_off_by_default_writes_no_keys_case() {
+    assert!(
+        !revolt_config::config()
+            .await
+            .features
+            .antispam
+            .e2ee_fanout_active(),
+        "run WITHOUT REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED"
+    );
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, user_a) = harness.new_user().await;
+    let (account_s, session_s, stranger) = harness.new_user().await;
+
+    share_server(&harness, &user_a, &stranger).await;
+
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+    let device_s = publish_device(&harness, &account_s.id, &session_s.token, 1).await;
+
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(&stranger, &device_s, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert_all_queued(&body, 1);
+
+    // Give the spawned observer time to (wrongly) write
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    assert!(!any_fanout_key(&user_a.id).await);
+    assert!(!any_fanout_key(&stranger.id).await);
+}
+
+/// Through the route: a new account that writes to the new-account threshold
+/// of strangers (one request each) is reported once, and the report holds
+/// counts only: no message, no recipient. With `e2ee_fanout_pause` it is also
+/// paused under fingerprint `e2ee-fanout`; without it no guard is taken.
+/// Requires Redis.
+///
+/// The two route tests that assert the signal is off
+/// (`e2ee_fanout_off_by_default_writes_no_keys`, and
+/// `e2ee_pause_not_enforced_while_detector_off` for the detector) fail by
+/// design in a run with both switches set; run this one on its own.
+#[test]
+#[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true and REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED=true"]
+fn antispam_route_e2ee_fanout_flags_a_new_account() {
+    crate::util::test::rt().block_on(antispam_route_e2ee_fanout_flags_a_new_account_case())
+}
+
+async fn antispam_route_e2ee_fanout_flags_a_new_account_case() {
+    let antispam = revolt_config::config().await.features.antispam.clone();
+    assert!(
+        antispam.e2ee_fanout_active(),
+        "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true and \
+         REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED=true"
+    );
+    let threshold = antispam.e2ee_fanout_threshold_for(true);
+    assert!(threshold <= 10, "keep the new-account threshold small here");
+
+    let harness = TestHarness::new().await;
+    let (account_a, session_a, sender) = harness.new_user().await;
+    let device_a = publish_device(&harness, &account_a.id, &session_a.token, 1).await;
+
+    let mut targets = Vec::new();
+    for _ in 0..threshold {
+        let (account, session, stranger) = harness.new_user().await;
+        share_server(&harness, &sender, &stranger).await;
+        let device = publish_device(&harness, &account.id, &session.token, 1).await;
+        targets.push((stranger, device));
+    }
+
+    for (stranger, device) in &targets[..threshold - 1] {
+        let (status, body) = post_envelopes(
+            &harness,
+            &session_a,
+            &device_a,
+            vec![envelope_to(stranger, device, 1)],
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{body}");
+    }
+
+    // Give the spawned observers time to (wrongly) flag
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let reports = harness.db.fetch_reports(None).await.expect("reports");
+    assert!(
+        !reports.iter().any(|report| matches!(
+            &report.content,
+            v0::ReportedContent::User { id, .. } if id == &sender.id
+        )),
+        "below the threshold"
+    );
+
+    let (stranger, device) = &targets[threshold - 1];
+    let (status, body) = post_envelopes(
+        &harness,
+        &session_a,
+        &device_a,
+        vec![envelope_to(stranger, device, 1)],
+    )
+    .await;
+    assert_eq!(status, Status::Ok, "{body}");
+
+    let report = wait_for_system_report(&harness, &sender.id).await;
+    match &report.content {
+        v0::ReportedContent::User { message_id, .. } => {
+            assert!(message_id.is_none(), "no message is attached")
+        }
+        content => panic!("expected a user report, got {:?}", content),
+    }
+    for (stranger, _) in &targets {
+        assert!(
+            !report.additional_context.contains(&stranger.id),
+            "no recipient is named: {}",
+            report.additional_context
+        );
+    }
+
+    let guard = harness.db.fetch_user(&sender.id).await.unwrap().dm_guard;
+    if antispam.e2ee_fanout_pause {
+        let guard = guard.expect("a pausing flag takes the guard");
+        assert_eq!(guard.report_id, report.id);
+        assert_eq!(
+            guard.fingerprint,
+            revolt_database::util::antispam::E2EE_FANOUT_FINGERPRINT
+        );
+        assert_eq!(guard.recipients as usize, threshold);
+        assert!(guard.paused);
+    } else {
+        assert!(guard.is_none(), "report only takes no guard");
+    }
+}
+
+/// The fan-out signal's keys for an account die with it (account deletion
+/// cascade), whatever the config says, and its id leaves the window of a
+/// stranger who wrote to it; another user's reply memory is left to its own
+/// expiry. Requires Redis.
+#[test]
+fn e2ee_fanout_keys_die_with_the_account() {
+    crate::util::test::rt().block_on(e2ee_fanout_keys_die_with_the_account_case())
+}
+
+async fn e2ee_fanout_keys_die_with_the_account_case() {
+    use revolt_database::util::antispam::{
+        e2ee_fanout_day, e2ee_fanout_hour, e2ee_fanout_in_key, e2ee_fanout_out_key,
+        e2ee_fanout_reported_key,
+    };
+
+    let harness = TestHarness::new().await;
+    let (_, _, mut user) = harness.new_user().await;
+    let (_, _, other) = harness.new_user().await;
+
+    let now = revolt_database::now_ms();
+    let (hour, day) = (e2ee_fanout_hour(now), e2ee_fanout_day(now));
+    let out_key = e2ee_fanout_out_key(&user.id, hour);
+    let in_key = e2ee_fanout_in_key(&user.id, day);
+    let reported_key = e2ee_fanout_reported_key(&user.id);
+    let other_in_key = e2ee_fanout_in_key(&other.id, day);
+    let other_out_key = e2ee_fanout_out_key(&other.id, hour);
+
+    // The account wrote to `other`, and `other` wrote to it and counted it
+    for (key, member) in [
+        (&out_key, &other.id),
+        (&in_key, &other.id),
+        (&other_in_key, &user.id),
+        (&other_out_key, &user.id),
+        (&reported_key, &user.id),
+    ] {
+        redis_run("SADD", &[key.as_str(), member.as_str()]).await;
+        redis_run("EXPIRE", &[key.as_str(), "600"]).await;
+    }
+    assert!(any_fanout_key(&user.id).await);
+
+    user.delete(&harness.db).await.expect("delete");
+
+    assert!(!any_fanout_key(&user.id).await, "every key of the account");
+    assert!(
+        !redis_key_exists(&other_out_key).await,
+        "its id left the window"
+    );
+    assert!(redis_key_exists(&other_in_key).await);
 }
 
 /// One send is minted at ONE server instant: every copy's id shares its
@@ -2826,10 +3282,8 @@ async fn root_advertises_split_support_case() {
     assert_eq!(response.status(), Status::Ok);
     let body: serde_json::Value =
         serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
-    assert_eq!(
-        body["features"]["e2ee"],
-        serde_json::json!({ "split_from": true })
-    );
+    // `features.e2ee.only` has its own test in `root.rs`
+    assert_eq!(body["features"]["e2ee"]["split_from"], serde_json::json!(true));
 }
 
 /// D4 + D5 (audit MAJOR-1): the split publication deletes the old device's
@@ -3440,5 +3894,517 @@ async fn removal_of_an_offline_device_bound_to_the_caller_or_dead_is_allowed_cas
         let allowed =
             delete_device(&harness, &account.id, &session.token, &device.device_id).await;
         assert_removal_allowed(&harness, &user.id, &device.device_id, allowed, case).await;
+    }
+}
+
+/// Encrypted-only chats, `PUT /e2ee/only`. A case that changes a config
+/// switch is its own `#[test]`: `overwrite_config` runs once per process
+/// (nextest)
+mod e2ee_only_tests {
+    use std::future::Future;
+    use std::path::Path;
+
+    use revolt_database::{
+        events::client::EventV1, Bot, E2EEIdentity, MFATicket, PartialUser, Session, User,
+    };
+    use revolt_models::v0;
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::{json, Value};
+
+    use super::mfa_ticket;
+    use crate::routes::e2ee_only_scan_tests::{is_test_only, without_test_modules};
+    use crate::util::test::{rt, without_comments, without_whitespace, EncryptedUser, TestHarness};
+
+    /// Run `case` with the setting available on this node
+    fn with_only_available(case: impl Future<Output = ()>) {
+        rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_available = true;
+            })
+            .await;
+            Box::pin(case).await
+        })
+    }
+
+    /// The test node's own switches: E2EE on, the setting not available
+    async fn assert_node_defaults() {
+        let config = revolt_config::config().await;
+        assert!(config.features.e2ee_enabled, "the test node has E2EE on");
+        assert!(
+            !config.features.e2ee.only_available,
+            "run without [features.e2ee] only_available = true"
+        );
+    }
+
+    /// `PUT /e2ee/only` from `session`, with `ticket` as the MFA ticket when
+    /// there is one. The status and the JSON body (`Null` when there is none)
+    async fn put_only(
+        harness: &TestHarness,
+        session: &Session,
+        ticket: Option<String>,
+        enabled: bool,
+    ) -> (Status, Value) {
+        let mut request = harness
+            .client
+            .put("/e2ee/only")
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.clone()))
+            .body(json!({ "enabled": enabled }).to_string());
+        if let Some(ticket) = ticket {
+            request = request.header(Header::new("X-MFA-Ticket", ticket));
+        }
+
+        let response = request.dispatch().await;
+        let status = response.status();
+        let body = response
+            .into_string()
+            .await
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    /// [`put_only`] with a fresh validated ticket of `account_id`
+    async fn put_only_ticketed(
+        harness: &TestHarness,
+        account_id: &str,
+        session: &Session,
+        enabled: bool,
+    ) -> (Status, Value) {
+        let ticket = mfa_ticket(harness, account_id).await;
+        put_only(harness, session, Some(ticket), enabled).await
+    }
+
+    async fn stored_flag(harness: &TestHarness, user_id: &str) -> bool {
+        harness
+            .db
+            .fetch_user(user_id)
+            .await
+            .expect("`User`")
+            .e2ee_only
+    }
+
+    /// Set the flag directly, the way a test of another route does
+    async fn mark_encrypted_only(harness: &TestHarness, user: &mut User) {
+        user.update(
+            &harness.db,
+            PartialUser {
+                e2ee_only: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the account is Encrypted-only");
+    }
+
+    #[track_caller]
+    fn assert_set(answer: &(Status, Value), enabled: bool, case: &str) {
+        assert_eq!(answer.0, Status::Ok, "{}: {}", case, answer.1);
+        assert_eq!(answer.1, json!({ "e2ee_only": enabled }), "{}", case);
+    }
+
+    #[track_caller]
+    fn assert_refused(answer: &(Status, Value), status: Status, error: &str, case: &str) {
+        assert_eq!(answer.0, status, "{}: {}", case, answer.1);
+        assert_eq!(answer.1["type"], error, "{}: {}", case, answer.1);
+    }
+
+    /// The UserUpdate about `user_id` that carries `e2ee_only: value`,
+    /// serialized as the account's contacts receive it
+    async fn only_update(harness: &mut TestHarness, user_id: &str, value: bool) -> Value {
+        let event = harness
+            .wait_for_event(user_id, |event| match event {
+                EventV1::UserUpdate { id, data, .. } => {
+                    id == user_id && data.e2ee_only == Some(value)
+                }
+                _ => false,
+            })
+            .await;
+        serde_json::to_value(&event).expect("the event serializes")
+    }
+
+    #[test]
+    fn encrypted_user_fixture_is_device_bound_and_flagged() {
+        rt().block_on(encrypted_user_fixture_is_device_bound_and_flagged_case())
+    }
+
+    /// The shared fixture: encryption on, one device bound to the session,
+    /// and the flag only when asked for
+    async fn encrypted_user_fixture_is_device_bound_and_flagged_case() {
+        let harness = TestHarness::new().await;
+        for e2ee_only in [false, true] {
+            let fixture = harness.new_encrypted_user(e2ee_only).await;
+            let stored = harness
+                .db
+                .fetch_user(&fixture.user.id)
+                .await
+                .expect("`User`");
+            assert!(stored.e2ee_enabled, "e2ee_only {}", e2ee_only);
+            assert_eq!(stored.e2ee_only, e2ee_only);
+            assert_eq!(fixture.user.e2ee_only, e2ee_only);
+            assert_eq!(fixture.account.id, fixture.user.id);
+            assert_eq!(fixture.device.user_id, fixture.user.id);
+
+            E2EEIdentity::require_device_bound_session(
+                &harness.db,
+                &fixture.user.id,
+                &fixture.session.id,
+            )
+            .await
+            .expect("a device-bound session");
+            let devices = harness
+                .db
+                .fetch_e2ee_identities(&fixture.user.id)
+                .await
+                .expect("the account's devices");
+            assert_eq!(devices.len(), 1, "e2ee_only {}", e2ee_only);
+        }
+    }
+
+    #[test]
+    fn only_turns_on_and_off_and_repeats_are_harmless() {
+        with_only_available(only_turns_on_and_off_and_repeats_are_harmless_case())
+    }
+
+    /// On from the device's session, on again, off, off again: each answers
+    /// and stores the asked value and consumes its ticket. Each change
+    /// reaches the account's topic with an explicit `true` or `false`
+    async fn only_turns_on_and_off_and_repeats_are_harmless_case() {
+        let mut harness = TestHarness::new().await;
+        let EncryptedUser {
+            account,
+            session,
+            user,
+            ..
+        } = harness.new_encrypted_user(false).await;
+        assert!(!user.e2ee_only);
+
+        for (enabled, case) in [
+            (true, "on"),
+            (true, "on again"),
+            (false, "off"),
+            (false, "off again"),
+        ] {
+            let ticket = mfa_ticket(&harness, &account.id).await;
+            let answer = put_only(&harness, &session, Some(ticket.clone()), enabled).await;
+            assert_set(&answer, enabled, case);
+            assert_eq!(stored_flag(&harness, &user.id).await, enabled, "{}", case);
+            assert!(
+                harness.db.fetch_ticket_by_token(&ticket).await.is_err(),
+                "{}: the ticket was not consumed",
+                case
+            );
+        }
+
+        let on = only_update(&mut harness, &user.id, true).await;
+        assert_eq!(on["type"], "UserUpdate", "{}", on);
+        assert_eq!(on["data"]["e2ee_only"], json!(true), "{}", on);
+        let off = only_update(&mut harness, &user.id, false).await;
+        assert_eq!(off["data"]["e2ee_only"], json!(false), "{}", off);
+    }
+
+    #[test]
+    fn only_on_is_refused_while_unavailable() {
+        rt().block_on(only_on_is_refused_while_unavailable_case())
+    }
+
+    /// The node default: an account that is otherwise ready cannot turn it
+    /// on. The guard consumed the ticket before the route ran
+    async fn only_on_is_refused_while_unavailable_case() {
+        assert_node_defaults().await;
+        let harness = TestHarness::new().await;
+        let fixture = harness.new_encrypted_user(false).await;
+
+        let ticket = mfa_ticket(&harness, &fixture.account.id).await;
+        let answer = put_only(&harness, &fixture.session, Some(ticket.clone()), true).await;
+        assert_refused(&answer, Status::BadRequest, "FeatureDisabled", "unavailable");
+        assert_eq!(answer.1["feature"], "e2ee_only", "{}", answer.1);
+        assert!(!stored_flag(&harness, &fixture.user.id).await);
+        assert!(harness.db.fetch_ticket_by_token(&ticket).await.is_err());
+    }
+
+    #[test]
+    fn only_with_e2ee_off_refuses_on_and_allows_off() {
+        rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee_enabled = false;
+                settings.features.e2ee.only_available = true;
+            })
+            .await;
+            Box::pin(only_with_e2ee_off_refuses_on_and_allows_off_case()).await
+        })
+    }
+
+    /// With E2EE off on the node, turning it on is refused even with the
+    /// setting available, and turning it off still works
+    async fn only_with_e2ee_off_refuses_on_and_allows_off_case() {
+        let harness = TestHarness::new().await;
+
+        let plain = harness.new_encrypted_user(false).await;
+        let answer = put_only_ticketed(&harness, &plain.account.id, &plain.session, true).await;
+        assert_refused(&answer, Status::BadRequest, "FeatureDisabled", "on");
+        assert_eq!(answer.1["feature"], "e2ee", "{}", answer.1);
+        assert!(!stored_flag(&harness, &plain.user.id).await);
+
+        let flagged = harness.new_encrypted_user(true).await;
+        let answer =
+            put_only_ticketed(&harness, &flagged.account.id, &flagged.session, false).await;
+        assert_set(&answer, false, "off");
+        assert!(!stored_flag(&harness, &flagged.user.id).await);
+    }
+
+    #[test]
+    fn only_on_needs_a_device_bound_session() {
+        with_only_available(only_on_needs_a_device_bound_session_case())
+    }
+
+    /// Turning it on is refused from a session no published device is bound
+    /// to (another session of the same account, or an account with no device
+    /// at all) with `EncryptionRequired` naming the sender, as group creation
+    /// does, never with a status a client reads as a dead session. Allowed
+    /// from the device's own session
+    async fn only_on_needs_a_device_bound_session_case() {
+        let harness = TestHarness::new().await;
+        let fixture = harness.new_encrypted_user(false).await;
+        let deviceless = fixture
+            .account
+            .create_session(&harness.db, String::new())
+            .await
+            .expect("a second `Session`");
+        let (bare_account, bare_session, bare_user) = harness.new_user().await;
+
+        for (account_id, session, user_id, case) in [
+            (
+                &fixture.account.id,
+                &deviceless,
+                &fixture.user.id,
+                "another session",
+            ),
+            (&bare_account.id, &bare_session, &bare_user.id, "no device"),
+        ] {
+            let answer = put_only_ticketed(&harness, account_id, session, true).await;
+            assert_refused(&answer, Status::Forbidden, "EncryptionRequired", case);
+            assert_eq!(answer.1["side"], "sender", "{}: {}", case, answer.1);
+            assert!(!stored_flag(&harness, user_id).await, "{}", case);
+
+            // The session itself still works
+            let (status, _) = put_only_ticketed(&harness, account_id, session, false).await;
+            assert_eq!(status, Status::Ok, "{}: turning off", case);
+        }
+
+        let answer =
+            put_only_ticketed(&harness, &fixture.account.id, &fixture.session, true).await;
+        assert_set(&answer, true, "the device's session");
+        assert!(stored_flag(&harness, &fixture.user.id).await);
+    }
+
+    #[test]
+    fn only_off_works_from_any_session_while_unavailable() {
+        rt().block_on(only_off_works_from_any_session_while_unavailable_case())
+    }
+
+    /// Turning it off needs the ticket only: from a session with no device,
+    /// and on an account with no device at all, while the setting is not
+    /// available. The account's topic gets an explicit `false`, which a
+    /// missing key could not stand for
+    async fn only_off_works_from_any_session_while_unavailable_case() {
+        assert_node_defaults().await;
+        let mut harness = TestHarness::new().await;
+
+        let fixture = harness.new_encrypted_user(true).await;
+        let deviceless = fixture
+            .account
+            .create_session(&harness.db, String::new())
+            .await
+            .expect("a second `Session`");
+        let answer = put_only_ticketed(&harness, &fixture.account.id, &deviceless, false).await;
+        assert_set(&answer, false, "another session");
+        assert!(!stored_flag(&harness, &fixture.user.id).await);
+
+        let event = only_update(&mut harness, &fixture.user.id, false).await;
+        assert_eq!(event["type"], "UserUpdate", "{}", event);
+        assert_eq!(event["data"]["e2ee_only"], json!(false), "{}", event);
+
+        let (account, session, mut user) = harness.new_user().await;
+        mark_encrypted_only(&harness, &mut user).await;
+        assert!(stored_flag(&harness, &user.id).await);
+        let answer = put_only_ticketed(&harness, &account.id, &session, false).await;
+        assert_set(&answer, false, "no device");
+        assert!(!stored_flag(&harness, &user.id).await);
+    }
+
+    #[test]
+    fn only_needs_a_validated_ticket() {
+        rt().block_on(only_needs_a_validated_ticket_case())
+    }
+
+    /// Turning it off needs nothing but the ticket, so it is the case that
+    /// shows the ticket is required: none, or a login (unvalidated) one, and
+    /// the setting stays on
+    async fn only_needs_a_validated_ticket_case() {
+        let harness = TestHarness::new().await;
+        let fixture = harness.new_encrypted_user(true).await;
+
+        let (status, _) = put_only(&harness, &fixture.session, None, false).await;
+        assert_eq!(status, Status::Unauthorized, "no ticket");
+
+        let login = MFATicket::new(fixture.account.id.clone(), false);
+        login.save(&harness.db).await.expect("`MFATicket`");
+        let (status, _) =
+            put_only(&harness, &fixture.session, Some(login.token.clone()), false).await;
+        assert_eq!(status, Status::Forbidden, "an unvalidated ticket");
+
+        assert!(stored_flag(&harness, &fixture.user.id).await);
+    }
+
+    #[test]
+    fn only_refuses_bots() {
+        with_only_available(only_refuses_bots_case())
+    }
+
+    /// A bot cannot set it: with its own token (no session for a ticket to
+    /// bind to), or with its token next to its owner's session and ticket
+    /// (the ticket guard refuses a bot token and keeps the ticket)
+    async fn only_refuses_bots_case() {
+        let harness = TestHarness::new().await;
+        let owner = harness.new_encrypted_user(false).await;
+        let (bot, bot_user) =
+            Bot::create(&harness.db, TestHarness::rand_string(), &owner.user, None)
+                .await
+                .expect("`Bot`");
+
+        let bot_ticket = mfa_ticket(&harness, &bot.id).await;
+        let status = harness
+            .client
+            .put("/e2ee/only")
+            .header(ContentType::JSON)
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(Header::new("X-MFA-Ticket", bot_ticket))
+            .body(json!({ "enabled": true }).to_string())
+            .dispatch()
+            .await
+            .status();
+        assert!((400..500).contains(&status.code), "the bot alone: {}", status);
+
+        let owner_ticket = mfa_ticket(&harness, &owner.account.id).await;
+        let status = harness
+            .client
+            .put("/e2ee/only")
+            .header(ContentType::JSON)
+            .header(Header::new("x-bot-token", bot.token.clone()))
+            .header(Header::new("x-session-token", owner.session.token.clone()))
+            .header(Header::new("X-MFA-Ticket", owner_ticket.clone()))
+            .body(json!({ "enabled": true }).to_string())
+            .dispatch()
+            .await
+            .status();
+        assert_eq!(status, Status::Forbidden, "the bot with its owner's session");
+        assert!(
+            harness.db.fetch_ticket_by_token(&owner_ticket).await.is_ok(),
+            "the owner's ticket was consumed by a refused request"
+        );
+
+        assert!(!stored_flag(&harness, &bot_user.id).await, "the bot");
+        assert!(!stored_flag(&harness, &owner.user.id).await, "the owner");
+    }
+
+    #[test]
+    fn user_edit_cannot_set_e2ee_only() {
+        rt().block_on(user_edit_cannot_set_e2ee_only_case())
+    }
+
+    /// `e2ee_only` is not a user edit field: a body carrying it, alone or next
+    /// to a real change, leaves the setting as it was, on or off
+    async fn user_edit_cannot_set_e2ee_only_case() {
+        let harness = TestHarness::new().await;
+        let (_, plain_session, plain) = harness.new_user().await;
+        let (_, flagged_session, mut flagged) = harness.new_user().await;
+        mark_encrypted_only(&harness, &mut flagged).await;
+
+        for (session, body, expected, case) in [
+            (
+                &plain_session,
+                json!({ "display_name": "No Badge", "e2ee_only": true }),
+                false,
+                "turn on",
+            ),
+            (
+                &flagged_session,
+                json!({ "e2ee_only": false }),
+                true,
+                "turn off",
+            ),
+        ] {
+            let response = TestHarness::with_session(
+                session.clone(),
+                harness
+                    .client
+                    .patch("/users/@me")
+                    .header(ContentType::JSON)
+                    .body(body.to_string()),
+            )
+            .await;
+
+            assert_eq!(response.status(), Status::Ok, "{}", case);
+            let edited = response.into_json::<v0::User>().await.expect("`User`");
+            assert_eq!(edited.e2ee_only, expected, "{}", case);
+        }
+
+        assert!(!stored_flag(&harness, &plain.id).await, "turn on: stored");
+        assert!(stored_flag(&harness, &flagged.id).await, "turn off: stored");
+        let renamed = harness.db.fetch_user(&plain.id).await.expect("`User`");
+        assert_eq!(renamed.display_name, Some("No Badge".to_string()));
+    }
+
+    /// No other code in this crate writes the account flag: a staff route,
+    /// a user edit or any other path would need `e2ee_only: Some(..)` on a
+    /// `PartialUser`. Test code is left out (tests set the flag directly)
+    #[test]
+    fn only_the_ticketed_route_writes_the_account_flag() {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut writers = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|error| panic!("read {}: {}", dir.display(), error));
+            for entry in entries {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                    continue;
+                }
+
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("under the source directory")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if is_test_only(&relative) {
+                    continue;
+                }
+
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {}", path.display(), error));
+                if !source.contains("e2ee_only") {
+                    continue;
+                }
+                let code = without_test_modules(&without_whitespace(&without_comments(&source)));
+                if code.contains("e2ee_only:Some(") {
+                    writers.push(relative);
+                }
+            }
+        }
+
+        writers.sort();
+        assert_eq!(
+            writers,
+            ["routes/e2ee/set_only.rs"],
+            "only `PUT /e2ee/only` may write the account's Encrypted-only flag"
+        );
     }
 }

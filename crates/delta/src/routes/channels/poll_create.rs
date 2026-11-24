@@ -1,5 +1,6 @@
 use revolt_config::config;
 use revolt_database::util::antispam;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -73,6 +74,12 @@ pub async fn poll_create(
     if channel.is_protected() || permission_channel.is_protected() {
         return Err(create_error!(ChannelProtected));
     }
+
+    // An encrypted-only account or group never takes a poll either: the
+    // question and the answers are plain text. Refused in the same place,
+    // before slowmode, the nonce, the poll row and the message.
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await?;
 
     // Archived or locked threads reject polls exactly like normal messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
@@ -221,9 +228,14 @@ mod test {
         MessageTimePeriod,
     };
     use revolt_models::v0::{self, MessageFlags};
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::json;
     use ulid::Ulid;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_marked_group, e2ee_messages_in,
+        e2ee_request, set_e2ee_only,
+    };
 
     #[test]
     fn create_poll_creates_flagged_message_with_definition() {
@@ -475,6 +487,160 @@ mod test {
 
         let response = create_dm_poll(&harness, &session.token, dm.id()).await;
         assert_eq!(response.status(), Status::Ok);
+    }
+
+    /// How many open poll rows `channel_id` holds
+    async fn open_polls_in(harness: &TestHarness, channel_id: &str) -> usize {
+        harness
+            .db
+            .fetch_expired_open_polls(i64::MAX)
+            .await
+            .expect("polls")
+            .iter()
+            .filter(|poll| poll.channel == channel_id)
+            .count()
+    }
+
+    /// A poll into a direct message or group with an encrypted-only side is
+    /// refused, and stores no poll row, no message and spends no nonce.
+    /// Control: with the flags lifted the same poll, nonce included, is
+    /// created.
+    #[test]
+    fn e2ee_only_poll_refused_without_side_effects() {
+        crate::util::test::rt()
+            .block_on(Box::pin(e2ee_only_poll_refused_without_side_effects_case()))
+    }
+
+    async fn e2ee_only_poll_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let dm_path = format!("/channels/{}/polls", dm.id());
+        let group_path = format!("/channels/{}/polls", group.id());
+        let poll = json!({
+            "question": "Lunch?",
+            "answers": [{ "text": "Yes" }, { "text": "No" }],
+            "nonce": Ulid::new().to_string()
+        });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&poll),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&poll),
+        )
+        .await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &peer_session,
+            Some(&json!({
+                "question": "Dinner?",
+                "answers": [{ "text": "Yes" }, { "text": "No" }]
+            })),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "the encrypted-only peer polling back");
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &group_path,
+            &author_session,
+            Some(&poll),
+        )
+        .await;
+        assert_encryption_required(&answer, "group", "a marked group");
+
+        for channel_id in [dm.id(), group.id()] {
+            assert_eq!(
+                e2ee_messages_in(&harness, channel_id).await,
+                0,
+                "{channel_id}"
+            );
+            assert_eq!(open_polls_in(&harness, channel_id).await, 0, "{channel_id}");
+        }
+
+        // Control: no flags, the same poll and nonce
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&poll),
+        )
+        .await;
+        assert_accepted(&answer, "no flags, the refused polls' nonce");
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 1);
+        assert_eq!(open_polls_in(&harness, dm.id()).await, 1);
+    }
+
+    /// With `only_enforced = false` the same polls are created
+    #[test]
+    fn e2ee_only_poll_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_poll_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_poll_allowed_when_not_enforced_case() {
+        assert!(
+            !config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (session, channel_id, case) in [
+            (
+                &author_session,
+                dm.id(),
+                "an encrypted-only author and peer",
+            ),
+            (&peer_session, dm.id(), "the peer polling back"),
+            (&author_session, group.id(), "a marked group"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &format!("/channels/{channel_id}/polls"),
+                session,
+                Some(&json!({
+                    "question": "Lunch?",
+                    "answers": [{ "text": "Yes" }, { "text": "No" }]
+                })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        assert_eq!(open_polls_in(&harness, dm.id()).await, 2);
+        assert_eq!(open_polls_in(&harness, group.id()).await, 1);
     }
 }
 

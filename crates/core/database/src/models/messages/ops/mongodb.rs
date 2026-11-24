@@ -170,8 +170,12 @@ impl AbstractMessages for MongoDb {
     /// `PROTECTED_NONCE_INDEX_NAME` and is refused with `DuplicateNonce`, the
     /// answer the in-memory nonce cache gives (W2 Decision 15). Any other
     /// insert error, a duplicate `_id` included, is a `DatabaseError`.
+    ///
+    /// The same channel read refuses a row that is not a system message in a
+    /// group marked encrypted-only (`Message::validate_e2ee_only_insert`).
     async fn insert_message(&self, message: &Message) -> Result<()> {
         let channel = self.fetch_channel(&message.channel).await;
+        message.validate_e2ee_only_insert(&channel).await?;
         // Only an unprotected server text channel can become protected (2.1)
         let guard = matches!(
             &channel,
@@ -1658,6 +1662,107 @@ mod nonce_index_tests {
                     .await,
             );
             assert_eq!(mongo.fetch_message(&stored.id).await.expect("kept"), stored);
+        });
+    }
+}
+
+/// The encrypted-only half of `insert_message` on this driver, the same
+/// cases as the Reference tests in `messages/ops/reference.rs`. Mongo only:
+/// under `TEST_DB=REFERENCE` this returns early.
+#[cfg(test)]
+mod e2ee_only_insert_tests {
+    use revolt_result::ErrorType;
+
+    use crate::{AbstractChannels, AbstractMessages, Channel, Database, Message, SystemMessage};
+
+    const MARKED: &str = "01JB0000000000000000000G01";
+    const UNMARKED: &str = "01JB0000000000000000000G02";
+    const AUTHOR: &str = "01HZXBBBBBBBBBBBBBBBBBBBBB";
+
+    fn group(id: &str, marked: bool) -> Channel {
+        Channel::Group {
+            id: id.to_string(),
+            name: "group".to_string(),
+            owner: AUTHOR.to_string(),
+            description: None,
+            recipients: vec![AUTHOR.to_string()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: marked,
+        }
+    }
+
+    fn plaintext(id: &str, channel: &str) -> Message {
+        Message {
+            id: id.to_string(),
+            channel: channel.to_string(),
+            author: AUTHOR.to_string(),
+            content: Some("hi".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// A plain row in a marked group is refused and not stored; a system row
+    /// there, and a plain row in an unmarked group, are stored
+    #[tokio::test]
+    async fn insert_message_refuses_plain_rows_in_a_marked_group() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: insert_message_refuses_plain_rows_in_a_marked_group runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            mongo
+                .insert_channel(&group(MARKED, true))
+                .await
+                .expect("marked");
+            mongo
+                .insert_channel(&group(UNMARKED, false))
+                .await
+                .expect("unmarked");
+
+            let refused = plaintext("01JB0000000000000000000M01", MARKED);
+            let error = mongo
+                .insert_message(&refused)
+                .await
+                .expect_err("a plain row in a marked group");
+            match error.error_type {
+                ErrorType::EncryptionRequired { side } => assert_eq!(side, "group"),
+                other => panic!("expected EncryptionRequired, got {other:?}"),
+            }
+            assert!(
+                matches!(
+                    mongo
+                        .fetch_message(&refused.id)
+                        .await
+                        .map_err(|e| e.error_type),
+                    Err(ErrorType::NotFound)
+                ),
+                "the refused row must not be stored"
+            );
+
+            let system = SystemMessage::ChannelRenamed {
+                name: "renamed".to_string(),
+                by: AUTHOR.to_string(),
+            }
+            .into_message(MARKED.to_string());
+            mongo.insert_message(&system).await.expect("a system row");
+            assert_eq!(
+                mongo.fetch_message(&system.id).await.expect("stored"),
+                system
+            );
+
+            let open = plaintext("01JB0000000000000000000M02", UNMARKED);
+            mongo
+                .insert_message(&open)
+                .await
+                .expect("an unmarked group");
+            assert_eq!(mongo.fetch_message(&open.id).await.expect("stored"), open);
         });
     }
 }

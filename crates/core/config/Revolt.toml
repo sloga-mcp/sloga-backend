@@ -533,6 +533,21 @@ dm_dupe_threshold = 3
 dm_dupe_window_hours = 24
 dm_dupe_min_chars = 30
 dm_dupe_rearm_days = 30
+# Fan-out signal for end-to-end encrypted DMs: counts distinct strangers an account writes to
+# with no reply (recipient ids and time only, never content). Needs dm_dupe_enabled too.
+# Turning it on needs the Privacy Policy update first (30-day memory of who wrote to whom).
+# Switch on with e2ee_fanout_pause = false (staff report only, no pause); set it to true only
+# after two weeks of reviewed reports.
+e2ee_fanout_enabled = false
+e2ee_fanout_pause = false
+# Distinct strangers in the window with no reply; clamped to 2..=50
+e2ee_fanout_threshold = 10
+# Accounts younger than 14 days (never above e2ee_fanout_threshold)
+e2ee_fanout_new_account_threshold = 5
+# Clamped to 1..=48
+e2ee_fanout_window_hours = 24
+# Clamped to 1..=90
+e2ee_fanout_reply_memory_days = 30
 daily_enabled = false
 daily_run_hour_utc = 14
 daily_account_age_days = 14
@@ -598,6 +613,17 @@ prot_shell_return_url = "https://sloga.gg/prot/thanks/"
 # and delta's device removal decides from the database alone; the lock's
 # protections between a user's own installs are gone while it is off.
 claim_lock = true
+# "Encrypted only" for accounts and groups. only_available lets people turn
+# the setting on; it ships OFF, and a config without the key keeps it off
+# (turning the setting off still works).
+# only_enforced makes existing marks refuse unencrypted writes; it is ON by
+# default, and a config without the key keeps it on. Emergency switch only:
+# false keeps every stored mark but refuses nothing. Set either one here under
+# an explicit [features.e2ee] header in Revolt.overrides.toml, or with
+# REVOLT__FEATURES__E2EE__ONLY_AVAILABLE / REVOLT__FEATURES__E2EE__ONLY_ENFORCED,
+# and RESTART delta AND crond.
+only_available = false
+only_enforced = true
 
 [features.takedown]
 # Take It Down Act requests. Ships OFF; prod sets it in Revolt.overrides.toml under an explicit

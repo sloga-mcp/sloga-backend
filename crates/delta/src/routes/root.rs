@@ -249,6 +249,19 @@ pub struct E2EEFeature {
     /// device). Clients offer the split only when this is true: an older
     /// server would revoke the shared device instead
     pub split_from: bool,
+    /// Encrypted-only chats. Always sent by a server that has the setting
+    pub only: E2EEOnlyFeature,
+}
+
+/// # Encrypted-only Chats
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct E2EEOnlyFeature {
+    /// Whether accounts can turn the setting on (needs E2EE on this node as
+    /// well). Turning it off works either way
+    pub available: bool,
+    /// Whether the server refuses unencrypted messages for accounts and
+    /// groups that have it
+    pub enforced: bool,
 }
 
 /// # Feature Configuration
@@ -565,8 +578,16 @@ pub fn root_config(config: Settings) -> RevoltConfig {
                 // As configured: protect and the seat PUT read the same key
                 formats_v2: config.features.protected_channels.formats_v2,
             },
-            // A capability of this build, not a setting
-            e2ee: E2EEFeature { split_from: true },
+            e2ee: E2EEFeature {
+                // A capability of this build, not a setting
+                split_from: true,
+                // The effective switch, like protected channels above: the
+                // route refuses turning it on while E2EE is off
+                only: E2EEOnlyFeature {
+                    available: config.features.e2ee_enabled && config.features.e2ee.only_available,
+                    enforced: config.features.e2ee.only_enforced,
+                },
+            },
             prot,
         },
         ws: config.hosts.events,
@@ -1246,5 +1267,74 @@ mod test {
             assert!(links.get("take_it_down").is_none(), "{links}");
             assert!(links.get("terms_of_service").is_some(), "{links}");
         })
+    }
+
+    fn e2ee_only_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["e2ee"]["only"]
+            .clone()
+    }
+
+    /// `features.e2ee.only` carries the effective availability (the setting
+    /// and E2EE both on) and the enforcement switch as configured
+    #[test]
+    fn root_advertises_e2ee_only() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+
+        // (e2ee_enabled, only_available, only_enforced, advertised available)
+        let table: [(bool, bool, bool, bool); 8] = [
+            (true, true, true, true),
+            (true, true, false, true),
+            (true, false, true, false),
+            (true, false, false, false),
+            (false, true, true, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+        ];
+        for (e2ee, available, enforced, advertised) in table {
+            let mut config = config.clone();
+            config.features.e2ee_enabled = e2ee;
+            config.features.e2ee.only_available = available;
+            config.features.e2ee.only_enforced = enforced;
+            assert_eq!(
+                e2ee_only_json(config),
+                serde_json::json!({ "available": advertised, "enforced": enforced }),
+                "e2ee {e2ee}, available {available}, enforced {enforced}"
+            );
+        }
+    }
+
+    /// `GET /` carries the advert for the node's own config, next to
+    /// `split_from`, and nothing else under `features.e2ee`
+    #[test]
+    fn root_serves_e2ee_only() {
+        crate::util::test::rt().block_on(root_serves_e2ee_only_case())
+    }
+
+    async fn root_serves_e2ee_only_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let e2ee = body["features"]["e2ee"].as_object().expect("e2ee object");
+        let mut keys: Vec<&str> = e2ee.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["only", "split_from"]);
+
+        let config = revolt_config::config().await;
+        assert_eq!(
+            body["features"]["e2ee"]["only"],
+            serde_json::json!({
+                "available": config.features.e2ee_enabled && config.features.e2ee.only_available,
+                "enforced": config.features.e2ee.only_enforced,
+            })
+        );
+
+        // The shipped defaults: nobody can turn it on, and marks are enforced
+        assert_eq!(body["features"]["e2ee"]["only"]["available"], false);
+        assert_eq!(body["features"]["e2ee"]["only"]["enforced"], true);
     }
 }
