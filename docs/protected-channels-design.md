@@ -36,8 +36,9 @@ replaces" or "S4 extends". S4b items are marked "[S4b]" (own-device history in h
 over Olm, O-4; the native confirmation before an honest new device of a seated user walks
 history, O-17); everything else is S4a. What the plan did not settle was put to the S4-W0
 crypto-lens audit; its rulings are recorded in #283 and its fixes in #285 to #299. The S4
-index entries are #240 to #316 (section 12; #300 is the planner's 40 KiB cap ruling,
-#301 to #309 the second fix round, #310 to #316 the S4-W2 doc pass).
+index entries are #240 to #325 (section 12; #300 is the planner's 40 KiB cap ruling,
+#301 to #309 the second fix round, #310 to #316 the S4-W2 doc pass, #317 to #325 the S4-W3
+doc pass).
 
 **S4-W2 backend doc pass (2026-11-21, #310 to #316).** Text marked "As built (S4-W2)" records
 what the S4 backend waves W1 and W2 built on `feat/protected-s4` (base `952b007b` plus the W2
@@ -46,6 +47,15 @@ and the difference is stated, except where a planner ruling replaces it (F1, F2 
 the W1 wave audit's fix round; R-REJOIN, R-WELCOME and R-WIPEJOB of W2): that text is
 rewritten in place and says so. It also carries the server half of the minimum text
 protocol (the S4 plan's 2026-11-11 appendix, 8.3 "Text protocol").
+
+**S4-W3 native doc pass (2026-11-23, #317 to #325).** Text marked "As built (S4-W3)" records
+what the S4 native wave W3 built on `feat/protected-s4-native` (base `94ba1c84`, read at
+`b688f121`) and the backend's `MlsCommitInfo.created_at` (lane W3-BE on `feat/protected-s4`),
+read from the code. Where it differs from earlier S4 text, the earlier text is kept and the
+difference is stated, except where the W3 wave audit and its fix lanes replaced a rule: 3.14.7
+"Merged roster", the step 9 bullet of 3.9 "S4" and the provenance claim of the 3.14.2 seal are
+rewritten in place and say so. Nothing of S4 is landed or enabled. R31 and #321 list what is
+still open before the `history_setting` flag may be turned on.
 
 How to read it:
 
@@ -284,6 +294,11 @@ the existing passphrase-sealed backup (8.5). Visible history WIDENS R1 and R3 (S
   verified", never red. The tradeoff, stated: a removed sender colluding with the server can
   backdate into history anyway (above), so a red verdict on imported timing protected little,
   while one lying writer could otherwise paint honest history red with a small `observed_at`.
+  **As built (S4-W3, #319, #323).** `history_link_disputed` rows are informational in the same
+  way, and a restore keeps a link-sourced epoch link-sourced (8.5), so a backup and restore
+  cannot turn a writer's claimed time into a red verdict. An imported epoch does not mask a
+  later local observation either: the red clause is still applied to the first `derived` or
+  `backup` epoch without the sender's leaf above it (3.9 "S4" step 9).
 - **R8. Server-forced removal is availability-trust.** Kick, ban, leave and account deletion
   remove the user from the group only if the server reports them (6.3). The security-bearing
   removal is the owner's signed unseat, itself subject to R11.
@@ -690,6 +705,27 @@ the existing passphrase-sealed backup (8.5). Visible history WIDENS R1 and R3 (S
   candidate stored for that holder), a hostile server together with that member can still show
   a joiner a false `roster(e)` within commit retention, or the member alone beyond it; the pins
   still bind every entry to a real device.
+  **Amended in S4-W3 (as built, #320, #321).** The merge no longer replaces the candidates'
+  rosters by their union: every roster they derive is kept, the level below is derived from
+  each on its own, and a disputed epoch is stored with its candidate rosters (3.14.7 "Merged
+  roster"). With ONE forger among honest writers of a holder, on a device that was not
+  restored, a forged `added` or `removed` neither stops the walk nor makes an honest sender of
+  that epoch unreadable; while the epoch is disputed its senders are unverified. "Cannot cut
+  history" holds only with that qualification. What remains:
+  - (a) **A restored disputed epoch.** Key backup does not carry the candidate rosters (8.5).
+    After a restore a disputed epoch has only its recorded roster: an honest sender whose leaf
+    was only in another candidate is `UnknownSender`, every epoch a later walk imports below it
+    stays disputed, and that walk derives from the recorded roster alone, so a forged entry in
+    it can again stop the walk. **Open, and a precondition for turning `history_setting` on:**
+    the backup text section must carry the candidates.
+  - (b) **A forged extra leaf.** A forged roster that only ADDS a leaf still fits the
+    honest links below and holds every honest sender, so no probe contradicts it. It keeps
+    those epochs disputed (senders unverified, messages readable) until a link below stops
+    deriving from it or the walk ends.
+  - (c) **Two colluders.** A writer together with a probe author, or the server together with
+    a member, can have the true roster pruned or outranked (the R32 and R34 class).
+  - (d) **A sole forged writer.** When the forger's candidate is the only one carrying those
+    keys the epoch is imported undisputed with the false roster (the residual stated above).
 - **R32. Five colluding seated users can fill every candidate slot (S4-W0 fix F14,
   #298).** Slots are one per writer user, five per holder epoch (3.14.6). Five colluding
   members of epoch e' that each write first can take every slot, so no honest candidate is
@@ -723,6 +759,14 @@ the existing passphrase-sealed backup (8.5). Visible history WIDENS R1 and R3 (S
   attributed to its real author by the pinned key; if an honest candidate also has evidence,
   the walk stops `conflict` (loud). The forged keys never decrypt the real messages of that
   epoch, which show as undecryptable to that joiner.
+  **As built (S4-W3, #320).** The same split also steers the ROSTER of a disputed epoch: a
+  probe prunes the candidate rosters that lack its sender, and it counts for a roster only
+  when its author wrote none of the links on the way to that roster (3.14.7 "Merged roster"),
+  so one forger's own message cannot have the true roster dropped, but a forging writer plus
+  a second user who plants the message can; when only the false roster is left, the epoch is
+  imported undisputed with it (R31 (c)).
+  A step takes at most 3 probes (8.3 "S4"), so the bridge must not spend them on authors who
+  cannot qualify (3.14.7 "Evidence").
 
 ---
 
@@ -1948,7 +1992,8 @@ the channel's current group, so a live message in it is `RemovedSender` (step 9;
 rule for any older generation), and history still decrypts from held keys. Only `_encrypt`
 refuses a superseded group (3.1.1 "As built").
 
-**S4 (S4-W0, S4-D4, S4-D5, #254).** Imported keys (3.14) touch three steps:
+**S4 (S4-W0, S4-D4, S4-D5, #254).** Imported keys (3.14) touch three steps (as built in
+S4-W3, also steps 5 and 8):
 
 - **Step 3.** A predecessor group reached through a bridge link gets a `mls_text_groups` row
   (`state = 'left'`) only after the 3.14.4 derivation check (3.14.8), so the lookup maps it to
@@ -1967,14 +2012,37 @@ refuses a superseded group (3.1.1 "As built").
   `left` group above the last epoch held there, to the history walk (3.14.8); `epoch > current`
   in an active group to catch-up and one retry (S1). A bare `left` state never sets
   `removed_self`.
-- **Step 9 (fix F4, #288).** The local observation time of the sender's removal stays the
-  `first_seen_at` of the first held epoch without the sender's leaf. For a `derived` or
-  `backup` row (the original device's stored value, 8.5) the verdict is `RemovedSender` as
-  before. When that row is a `history_link` row (its value is the MINIMUM signed
-  `observed_at`, 3.14.7), the time clause is INFORMATIONAL: `_decrypt` succeeds with
-  `timing_unverified: true` (8.3 "S4") instead of `RemovedSender`, and the bridge shows the grey
-  "Timing of this message can't be verified" marker (9.3 "S4"). The live-arrival half of step 9
-  is unchanged.
+  **As built (S4-W3, #319).** `current` is the group's `last_epoch`, else the newest epoch key
+  held from any source, else `-1`. `oldest_held` is `null` when the group has no membership row
+  and `current` is not a held derived epoch. An epoch imported WITHOUT a text key (a
+  history-key row with no epoch-key row, 3.14.7 "Text key") is `UnknownEpoch` like any other
+  epoch without a key. All five fields are always serialized (8.4 "S4").
+- **Steps 5 and 8 (As built (S4-W3), fix lane F5; #319).** For an epoch stored
+  `history_link_disputed`, the sender's leaf is looked up in the epoch's recorded roster and
+  then in each of its stored candidate rosters (3.14.2, 3.14.7 "Merged roster"), and step 8
+  accepts the signature under the identity key of any leaf found (a disputed epoch can name
+  one device under two keys). `UnknownSender` only when no stored roster of the epoch holds
+  the leaf. The candidates are never verified rosters: a message of such an epoch always
+  returns `sender_verified: false`, whichever roster held the leaf and this device's own
+  messages included. Every other epoch has exactly its one roster, as before. A disputed epoch
+  restored from a backup has no candidate rosters (8.5), so only its recorded roster is read
+  (R31 (a)).
+- **Step 9 (fix F4, #288; rewritten in S4-W3 as built, wave-audit m1, #319).** The local
+  observation time of the sender's removal stays the `first_seen_at` of the first held epoch
+  after the message's whose roster lacks the sender's leaf. For a `derived` or `backup` row
+  (the original device's stored value, 8.5) the verdict is `RemovedSender` as before. When
+  that row is LINK-SOURCED, `history_link` or `history_link_disputed` (its value is the
+  MINIMUM signed `observed_at`, 3.14.7: a writer's claim), it decides nothing red, and it must
+  not hide what this device saw itself. Native therefore scans on to the first epoch without
+  the leaf whose row is `derived` or `backup` and applies the hard clause to THAT row's
+  `first_seen_at`: `RemovedSender` when the signed `ts` is more than 5 minutes later. Only
+  when that clause does not fire (or no such row is held) and the link-sourced row's own time
+  clause would have fired does `_decrypt` succeed with `timing_unverified: true` (8.3 "S4"),
+  and the bridge shows the grey "Timing of this message can't be verified" marker (9.3 "S4").
+  The S4-W0 text read "the time clause is informational" for a `history_link` row without the
+  further scan, which let an imported epoch mask a later derived one. A restore keeps link
+  provenance (8.5), so the rule is the same after a restore. The live-arrival half of step 9
+  and the forced-removal clause are unchanged.
 
 ### 3.10 Replay dedupe
 
@@ -2569,8 +2637,31 @@ and races a second opener; `put_epoch_key`'s fork check compares only the key an
 
 `mls_text_history_keys (group_id, epoch, key_nonce, key_sealed, history_visible, source, PRIMARY KEY(group_id, epoch))`
 
+**As built (S4-W3, #317)** the table has three more nullable columns, all in its `CREATE`
+(the feature never shipped, so no `ALTER` exists; a development store made by an earlier W3
+build lacks them and is not migrated):
+
+`mls_text_history_keys (group_id, epoch, key_nonce, key_sealed, history_visible, source, list_version, roster, candidates, PRIMARY KEY(group_id, epoch))`
+
+- `list_version` (ruling R-W3-3): the version of the list the visibility record was written
+  under (the list embedded in the commit; the held list at a Welcome or a create). A writer
+  copies it into its link's `seat_list_version` (3.14.5), else the held list's version, else
+  `0`. Informational: not in the seal and not part of the identity a re-put is compared on
+  (R-W3-23).
+- `roster` (R-W3-24): the canonical roster JSON of a link import WITHOUT a text key (3.14.7
+  "Text key"), which has no epoch-key row to hold its roster. CHECK: only on a row with a
+  sealed key whose source is `history_link` or `history_link_disputed`.
+- `candidates` (fix lane F5): the candidate rosters of a disputed epoch (3.14.7 "Merged
+  roster"), a JSON array of 2 to 5 `{ roster, lineage, against }` in the walk's preference
+  order, no roster twice, `lineage` and `against` ascending lists of writer user ids. CHECK:
+  only on a row with a sealed key whose source is `history_link_disputed`. Such a row can also
+  have none (a restore, 8.5).
+- The key pair is all or nothing (CHECK: `key_nonce` and `key_sealed` both NULL or both set).
+
 - `history_visible`: `1`, `0` or NULL; the per-epoch visibility record of 3.14.3 for this
   epoch (the transition INTO it). NULL on every imported row and on every provenance-only row.
+  As built, only a `derived` row with a sealed key may carry one; on any other row it is
+  `StoreCorrupt` on open.
 - `source`: `derived`, `history_link`, `history_link_disputed` (fix round 2: imported from a
   merged roster, 3.14.7) or `backup` (S4-D5; a CHECK on the four values). It is
   the provenance of the epoch's TEXT key as well: an import writes the epoch-key row and the
@@ -2579,6 +2670,14 @@ and races a second opener; `put_epoch_key`'s fork check compares only the key an
   (Ruled in the S4-W0 fix round, #283 (a): `source` lives here, not on
   `mls_text_epoch_keys`, as the plan's S4-PA-20 fold moved the history key here to avoid an
   `ALTER` there.)
+  **As built (S4-W3, #317).** Each kind of write has ONE writer that puts both rows:
+  `record_derived_epoch` (every derivation point of 3.14.1), `record_imported_epoch` (a link
+  import, a restore) and `record_disputed_epoch` (a link import with candidate rosters). Each
+  refuses to run outside the caller's SQLite transaction and writes under a savepoint, so a
+  refusal half way leaves neither row. No production path writes an epoch key without its
+  provenance row. `held_epoch_range` still reads `mls_text_epoch_keys` alone (the lowest and
+  highest epoch key held, any source); the readers of `source` are the membership-run fallback
+  and step 9 of 3.9 "S4", the link builder (3.14.6) and `sender_verified` (3.9 step 11).
 - **Provenance-only rows (S4-W0 fix F10, #294).** `key_nonce` and `key_sealed` are NULL on a
   provenance-only row. S4's `ensure` step BACKFILLS one (`source = 'derived'`, key NULL,
   `history_visible` NULL) for every existing `mls_text_epoch_keys` row that has none, inside its
@@ -2586,6 +2685,11 @@ and races a second opener; `put_epoch_key`'s fork check compares only the key an
   nothing); a restore writes a `backup` provenance row for an epoch the backup carries without
   a history key (8.5). After the backfill an epoch-key row with NO history-key row is
   `StoreCorrupt` (fail closed), never "derived by default".
+  **As built (S4-W3, wave-audit M1; #323).** A restore writes the provenance-only row under the
+  source the epoch RESTORES as (8.5 "Restore"): `backup`, or the link source it was held under.
+  So a provenance-only row can be `history_link` or `history_link_disputed` too, when a backup
+  entry names a link source and carries no history key (an S4 writer stores every link import
+  with its history key, so an honest backup has none).
 - **Seal (DECISION (S4-W0)).** The store's existing secret sealing, under its own AAD:
 
   ```
@@ -2593,16 +2697,43 @@ and races a second opener; `put_epoch_key`'s fork check compares only the key an
   ```
 
   where `group_id` is the 64-char hex as ASCII, `source` its ASCII value, and `v` one byte:
-  `0x01` visible, `0x00` hidden, `0x02` absent (NULL). The AAD binds the key to its row AND to
-  its visibility and provenance, so a store edit that flips `history_visible` (to make the
-  device build links for a hidden transition) or relabels an imported row `derived` makes the
-  row fail to open (`StoreCorrupt`, fail closed), as 3.3's seal binds the roster. A
-  provenance-only row seals nothing and is never used to build or open a link. Vector: 5.9
-  (`history_key_seal_aad_hex`, 106 bytes for a 64-char id).
+  `0x01` visible, `0x00` hidden, `0x02` absent (NULL). The AAD binds a SEALED key to its row
+  AND to its visibility and provenance, so a store edit that flips `history_visible` (to make
+  the device build links for a hidden transition) or relabels an imported row that holds a
+  sealed key `derived` makes the row fail to open (`StoreCorrupt`, fail closed), as 3.3's seal
+  binds the roster. A provenance-only row seals nothing and is never used to build or open a
+  link. Vector: 5.9 (`history_key_seal_aad_hex`, 106 bytes for a 64-char id).
+  **As built (S4-W3, #317).** Two suffixes follow the vector's bytes, each only when its
+  column is set: `0x00 || sha256(roster JSON)` for a row that carries `roster`, then
+  `0x01 || sha256(candidates JSON)` for a row that carries `candidates`. The vector's row has
+  neither and is unchanged; the four shapes cannot collide. An edited, swapped or dropped
+  roster or candidate list makes the row fail to open.
+  **Corrected in S4-W3 (wave-audit m2).** The S4-W0 sentence read "relabels an imported row
+  `derived` makes the row fail to open" without the limit to sealed rows. That was false for
+  PROVENANCE-ONLY rows: they have no seal, so their `source` is bound to nothing, and someone
+  who can write the store file can relabel one (`backup` or a link source to `derived`, or
+  back) with no open failing. Such a row still holds no history key, so whatever its label it
+  builds and opens no link. What the label changes: step 9 of 3.9 "S4" then treats that row's
+  time as this device's own observation (a hard `RemovedSender` instead of the grey marker),
+  a `history_link_disputed` label taken off lets step 11 verify senders again, and the
+  membership-run fallback of step 4 counts the row as derived. The epoch-key row's own seal
+  still binds its key and roster (3.3). Follow-up, before the `history_setting` flag: a sealed
+  marker for provenance-only rows.
 - **Writes.** A plain INSERT, as `put_epoch_key`: on a primary-key conflict the stored row is
   opened and compared; the identical key, visibility and source are a no-op, anything else is
   a fork, refused with `StoreCorrupt`, nothing written. An import never overwrites a held row
   (3.14.7 "Anchor").
+  **As built (S4-W3, #317).** The compared identity also covers `roster` and `candidates`; a
+  `list_version` that alone differs is a no-op (R-W3-23). So re-recording a derived epoch with
+  another visibility is a fork. An import is refused when EITHER row of the epoch exists and
+  writes nothing. **One exception (wave-audit m4):** when `record_derived_epoch` meets an
+  epoch held as a link import (`history_link` or `history_link_disputed`) whose stored history
+  key, and text key when one is held, are IDENTICAL to the derived ones, it deletes the
+  import's rows and writes the derived record in their place (the derived roster, visibility
+  and `list_version`, `first_seen_at` = now; stored candidates go with the row): the device's
+  own derivation is the stronger evidence, and without this a device that derived an epoch it
+  had imported would be refused as forked. A different key, or a link row with no sealed key,
+  stays `StoreCorrupt`. A `backup` row is never replaced.
 
 #### 3.14.3 Per-epoch visibility record (S4-D1, S4-D2; S4-PA-4, S4-RR-6)
 
@@ -2617,6 +2748,18 @@ The `history_visible` of epoch e + 1 is written ONCE, when the device derives ep
 - the creator's epoch 0 (`_group_create`, a first group or a successor): from the list the
   create binds, which is the device's newest verified list (the server's
   `history_visible_at_create`, 2.5 "S4", comes from the same list; S4-RR-6).
+
+**As built (S4-W3, #318).** The record is written with the epoch's keys by
+`record_derived_epoch` (3.14.2), together with `list_version`: the embedded list's version
+for a commit, the held list's for a Welcome or a create. It fails closed to HIDDEN:
+
+- `_process`: an embedded list that does not parse at this point, or no held list, records
+  hidden (and no `list_version` in the first case);
+- `_commit_won`: the embedded list is read from this device's own PERSISTED pending commit
+  (2.5 "Commit outcome recovery"), not from a server value; one that cannot be read records
+  hidden, with a loud log;
+- written once: recording the same epoch again with the other value is a fork
+  (`StoreCorrupt`, 3.14.2 "Writes").
 
 **Both ends visible (S4-W0 fix F3, #287).** A link `W(G, e)` (held at e + 1) is built ONLY
 when the records of BOTH e AND e + 1 are `1`; a bridge (held at (G', 0)) only when the
@@ -2778,6 +2921,36 @@ and cannot launder a forged candidate under its own signature.)
    only adds noise; five colluding seated users can fill every slot, and two colluders can
    forge evidence (residuals R32, R34).
 
+**As built (S4-W3, #318).**
+
+- **Own leaf (wave-audit m3).** Besides the three derived keys, the builder needs THIS
+  device's leaf (its user and device id) in `roster(G', e')`. A joiner vouches a link under
+  its writer's leaf in the holder roster (3.14.7 step 2), so a device with no leaf there has
+  no link to give; it is refused `not_derived`.
+- **Refusals, in this order.** `not_derived`: any of `text_key(G, e)`, `hist_key(G, e)` and
+  `hist_key(G', e')` is not held from a derived row with a sealed key, or the own leaf is
+  missing. That includes a holder epoch this device has not entered yet, or does not hold at
+  all (8.3 "S4" read `hidden` for an absent record: the answer is `not_derived`), a bridge
+  whose predecessor holds no derived epoch, and a bridge asked of a generation-0 group. Then
+  `hidden`: both rows are derived and either record is not visible. Then `too_large`. An
+  unknown group is `MlsGroupNotFound`, not a refusal.
+- **The committer's link (step 1; rulings R-W3-17, R-W3-31).** `_commit_won` builds it inside
+  the transaction of the won commit. It is ALSO built when `_commit_won` answers `duplicate`
+  (a retry after a lost response, or after the pipeline already merged the own commit's
+  echo), so a link lost with a dropped response is recovered; each build draws a fresh nonce,
+  and the server's first write wins (2.8), so a repeat is harmless. A build ERROR never fails
+  the won commit: `history_link` is `None`, logged loud, and the other members' duty run
+  (step 2) covers the holder.
+- **The contest comparison (step 2) is stricter than "it opens".** A stored candidate
+  discharges the duty only if a joiner would accept it too: the wire shape and position of
+  3.14.7 step 1, a signature that verifies under its writer's leaf in `roster(G', e')`, the
+  same keys and entries, and an `observed_at` within the 5 minutes. A candidate that is not
+  for this position or not signed by a member is ignored: it neither discharges the duty nor
+  is named. A member-signed candidate that does not open under this device's key, or carries
+  other keys or entries, is a mismatch: its writer is listed in `mismatched_writers`, once.
+  An identical candidate that is too late is ignored, and the own link is returned. A call
+  takes at most 200 candidates (`InvalidArgument { field: "candidates" }`).
+
 #### 3.14.7 Joiner verification: a level-by-level search over states (S4-PA-2, S4-RR-2; fix rounds 1 and 2)
 
 **Rewritten in S4-W0 fix round 2 (#301, #302)**, replacing both the first-in-stored-order
@@ -2796,13 +2969,71 @@ against that state (steps 1 to 4); every candidate that passes carries a pair of
 (G, e) and derives a roster for it. The passing candidates, over all states of (G', e'), are
 grouped by the HISTORY KEY they carry: each group is one state at the next holder down, (G, e).
 
-- **Merged roster (fix round 2, HIGH 2).** A state's roster is the MERGE of the rosters derived
-  by the candidates in its group. When they disagree, the state vouches the next level with the
-  UNION of those rosters, its epoch is imported with source `history_link_disputed` (3.14.2), so
-  `_decrypt` reports every sender of that epoch `sender_verified: false` and the bridge shows
-  "Sender couldn't be verified (history)", never green, and the disagreement is logged loud.
-  One writer's forged `added`/`removed` therefore cannot cut history: it only widens vouching
-  below and greys that epoch's senders (residual R31, amended).
+- **Merged roster (fix round 2, HIGH 2; rewritten in S4-W3 as built, fix lanes F2 and F5,
+  #320).** The S4-W0 rule made the state's roster the UNION of the rosters its candidates
+  derived and derived the level below from that union. As built, native keeps EVERY distinct
+  roster the candidates derive (step 4) as a VARIANT of the state and never replaces them by
+  their union:
+  - **Disputed.** A state with one variant is undisputed and its epoch is imported
+    `history_link`. A state with more than one is DISPUTED: its epoch is imported
+    `history_link_disputed` with its variants stored as the row's `candidates` (3.14.2),
+    `_decrypt` takes a sender's leaf from any of them and reports every sender of that epoch
+    `sender_verified: false` (3.9 "S4" steps 5 and 8), the bridge shows "Sender couldn't be
+    verified (history)", never green, and the disagreement is logged loud.
+  - **Vouch with the union, derive from each variant.** Step 2 vouches the next level with
+    the union of the variants (every leaf any of them holds; a writer whose device appears
+    under two keys is tried under each). Step 4 derives the next level from EACH variant on
+    its own, never from the union: a candidate passes when its difference applies exactly to
+    at least one variant, and every (variant, difference) pair gives one roster of the state
+    below. A forged entry in one candidate's roster (a pre-placed `removed` entry, an occupied
+    leaf index) therefore cannot make the honest link below fail its derivation.
+  - **Recorded roster.** The roster stored for the epoch is the one variant; for a dispute,
+    the union when it is itself a roster (unique `leaf_index` and unique `(user_id,
+    device_id)`), else the first variant in the ranking below.
+  - **Memory.** Each variant carries `lineage`, the writer users of every link on the way to
+    it since the dispute opened, and `against`, the writer users whose links passed for the
+    same state and derived something else from the same base. Devices of one user count as
+    one writer. Both are stored with the candidates.
+  - **Prune by probe.** At the holder's own step, before the state is decided or expanded, a
+    qualifying probe (below) that opens under the state's decided text key and carries a
+    strictly parsed envelope bound to its nonce names a sender leaf and the key that signed
+    it, which is what `_decrypt` checks (3.9 steps 5 and 8). It SUPPORTS a variant that holds
+    that leaf under that key, unless the probe's author is in that variant's `lineage`
+    (whoever shaped a roster could also have planted the message that fits it). A variant is
+    CONTRADICTED when a probe that supports some variant does not find its sender in it.
+    Contradicted variants are dropped, loud, unless that would drop them all. This picks among
+    the rosters of a state; it is never evidence for the state.
+  - **Collapse.** A state left with one variant is undisputed again and forgets its memory
+    (unless it is sticky, below).
+  - **Ranking.** Which variants are kept past a cap, and which is recorded when the union is
+    no roster: (1) the fewest users `against` it; (2) the most writer users at this level;
+    (3) a SHA-256 over a random per-session salt and the roster, a content order nobody
+    outside the process can predict (never the order of arrival, which a writer could aim).
+    The ranking is not evidence and accepts nothing.
+  - **Both caps.** A state keeps at most FIVE variants once its own step has settled it
+    (what a row stores); the rest are dropped in ranking order, loud. A new state builds at
+    most 25 (variant, difference) pairs before that step, cut in ranking order before any
+    roster is built (a page can carry 200 candidates).
+  - **Sticky after a restore.** A walk session that starts at a held disputed epoch loads its
+    stored candidates as its variants, with their memory. A disputed epoch stored WITHOUT
+    candidates (a restore: 8.5 does not carry them) starts from its recorded roster alone and
+    is STICKY: no probe prunes it and nothing imported below it is ever undisputed.
+
+  **What holds, and what does not (residual R31, amended).** With ONE forger among honest
+  writers of a holder, on a device that was not restored: disagreeing rosters never stop the
+  walk; an honest sender of the disputed epoch stays readable, unverified; and the true
+  roster has at most that one user against it while every other roster has an honest writer
+  against it, so the true roster survives both caps. The S4-W0 sentence "one writer's forged
+  `added`/`removed` cannot cut history" is true only inside those limits. Outside them:
+  (a) a disputed epoch that was RESTORED has no candidates, so an honest sender outside its
+  recorded roster is `UnknownSender`, the dispute is sticky, and a forged entry in the
+  recorded roster can again stop the walk below (`roster_diff_mismatch` on every candidate);
+  (b) a forged roster with an EXTRA leaf still fits the honest links and holds every honest
+  sender, so no probe contradicts it: the epochs below stay disputed until a link stops
+  deriving from it or the walk ends; (c) TWO colluders (a writer and a probe author, or the
+  server and a member) can have the true roster pruned or outranked; (d) a SOLE forged writer is
+  imported undisputed. **(a) is a precondition for turning the `history_setting` flag on:**
+  the backup text section must carry the candidate rosters first (8.5).
 - **Text key.** Candidates of one state normally carry one text key. When they carry more than
   one, the state's text key is the one that opens a qualifying probe (below); if none or more
   than one does, the epoch is imported WITHOUT a text key (its messages show "Sent before this
@@ -2815,6 +3046,11 @@ grouped by the HISTORY KEY they carry: each group is one state at the next holde
 - **Work bound.** Each holder costs at most 5 states x 5 candidates = 25 AEAD opens and 25
   signature checks, plus at most 3 probe opens per state; the search is LINEAR in the depth of
   the walk (no backtracking over earlier levels).
+  **As built (S4-W3, #320).** A step that carries more than 3 probes is refused outright
+  (8.3 "S4"), so the probe work of a state is bounded by 3 probes for each text key it
+  carries, plus the pruning pass above. Step 4 runs once per variant of the state (at most
+  5), and a new state builds at most 25 rosters. The stored commit a bridge step supplies is
+  parsed once per distinct `prev_epoch`, not once per candidate and state.
 
 **Checks.** Every check below refuses ONE CANDIDATE for that state, never the holder (#286):
 each refusal is logged loud (console error and Sentry breadcrumb, ids and the reason only).
@@ -2835,6 +3071,13 @@ A candidate PASSES for a state S = (holder (G', e'), k) with roster R when:
    is `roster_identity_mismatch`. A device missing from the directory does NOT refuse the
    candidate: its messages at (G, e) get the "Sender couldn't be verified (history)" marker,
    never green (9.3 "S4").
+   **As built (S4-W3; rulings R-W3-8, R-W3-28).** A usable pin must carry the same key, else
+   `roster_identity_mismatch`; a pin marked identity-changed refuses the candidate the same
+   way. A REVOKED device is accepted, unverifiable. The FIRST unpinned device of a session
+   fails the whole call with `IdentityPinRequired`: nothing of that call is written and the
+   session is as it was, so the bridge pins from the signed listing and re-sends the SAME
+   page. A device still unpinned on that retry is accepted as unverifiable, never refused and
+   never green (its messages read the live pins).
 4. **Exact roster derivation (S4-RR-2; fix F11, F12).** Every `added` entry is a full entry of
    R; no `removed` entry equals a full entry of R; no entry repeats; `(R - added) + removed`
    has unique `leaf_index` and unique `(user_id, device_id)`; survivors are identical FULL
@@ -2845,6 +3088,10 @@ A candidate PASSES for a state S = (holder (G', e'), k) with roster R when:
    too) must be seated on the list embedded in THAT commit's AD (`roster_diff_mismatch`).
    Checking `roster(e)` against the list embedded in e -> e + 1 instead would refuse every
    honest link at an unseat. The declarations are unsigned server data (residual R31).
+   **As built (S4-W3).** For a disputed state, R is each of its variants in turn ("Merged
+   roster"): the candidate passes when the derivation is exact from at least one. At an epoch
+   this device already holds, the anchor rule ("Anchor" below) is applied to each derivation,
+   and a candidate with none left is `anchor_mismatch`.
 
 **Evidence (fix round 2, HIGH 1; LOW 6).** A state X at holder (G, e) has EVIDENCE when:
 
@@ -2854,9 +3101,24 @@ A candidate PASSES for a state S = (holder (G', e'), k) with roster R when:
   DISTINCT authors whenever its paged history holds them (3.14.8). A probe that fails to open is
   "no evidence", NEVER a refusal of anything (an honest probe can fail to open for reasons
   unrelated to the link, and a planted one must not be able to veto the truth).
+  **As built (S4-W3, wave-audit m5; a W4 bridge duty).** A step's `probes` are stored messages
+  of THAT step's holder (their `encrypted.group_id` and `encrypted.epoch` must name it; any
+  other is no evidence) and are judged against the states staged at that holder, whose keys
+  the candidates of the step ABOVE carried. More than 3 probes in one step is an argument
+  error that refuses the whole call (`InvalidArgument { field: "probes" }`, 8.3 "S4"):
+  refused, not truncated, so which probes count never depends on the order of a list. Within
+  the 3, native skips without error a probe whose author is a writer user of a candidate
+  carrying the state's keys and a second probe by an author already counted. A skipped probe
+  is a lost slot, so the bridge MUST choose the probes of an epoch from DISTINCT authors, none
+  of whom wrote a candidate that carried that epoch's keys (the candidates it sent in the
+  step above). A probe whose envelope this build cannot read still counts as evidence when it
+  opens; it only says nothing about a roster.
 - **Anchor.** (G, e) is an epoch this device already holds and both carried keys equal the
   held ones; for a held provenance-only row (its history key is NULL, 3.14.2), the held text key
   equals X's and the held roster equals X's.
+  **As built (S4-W3).** For an epoch held WITHOUT a text key (a keyless import), the carried
+  history key equals the held one and, when the row stores a roster, the derived roster
+  equals it or one of the row's stored candidate rosters.
 - **Descent.** Some state at the next holder down, reached by opening (G, e)'s candidates with
   X's history key, has evidence.
 
@@ -2883,15 +3145,38 @@ bridge supplies embeds a list saying `history:hidden` (for e = 0, the group's bo
 walk stops there (`stopped: hidden`) and imports nothing for that holder, whatever the server
 stored. It is a stop, not evidence.
 
+**As built (S4-W3; rulings R-W3-28, R-W3-30).** The importer checks the two supplied COMMITS.
+It does NOT check the bound list of a group's epoch 0 ("for e = 0, the group's bound list"
+above): that list is not part of an import step. The writer's builder still needs both
+records visible (3.14.3) and the server's PUT checks `history_visible_at_create` (6.1 "S4"),
+so an honest writer never links a hidden epoch 0; the importer's check there was defense in
+depth and is not built. A commit whose embedded list does not parse, or is a v1 list, counts
+as hidden; a supplied commit that names another group or epoch than the one expected is
+ignored, loud, as if it had not been supplied. At a bridge holder, a held list without a
+salt (a v1 list) stops `hidden`; a holder id that does not derive from the held salt
+(3.14.4) refuses every candidate of the step `malformed` and stops `invalid`; bridge
+candidates that pass and name two different `prev_epoch` values stop `conflict`. Within one
+step the order is: the session caps, a hidden
+commit into the holder, the probes and the decision for the states at the holder, a hidden
+commit into the linked epoch, `genesis`, the bridge derivation, `missing`, then the expansion,
+with an anchor deciding at once.
+
 - **`seat_list_version`.** When the bridge supplied the commit that created (G, e), native
   requires the field to equal the version of the list in that commit's AD (`malformed`);
   otherwise it is ignored. It never takes part in the contest (3.14.6).
+  **As built (S4-W3; ruling R-W3-3).** The comparison is LOG-ONLY: a link whose
+  `seat_list_version` differs from the commit's list is logged and still passes. The field is
+  informational (#283 (f)), and a writer whose record holds no version fills it from its held
+  list or with `0` (3.14.2 `list_version`), so a refusal would cut honest history.
 - **`observed_at` (S4-PA-16; fix F4, #288; fix round 2, LOW 5).** Each candidate's
   `observed_at` is first CAPPED at the `created_at` of the stored commit e' (the commit
   e -> e + 1) when the bridge supplied it (an epoch cannot be first seen after it ended; the cap
   is safe because the value only ever feeds the grey check). The imported epoch-key row's
   `first_seen_at` is the MINIMUM capped `observed_at` over the accepted state's candidates. It
   feeds ONLY the informational timing check of 3.9 "S4", never a red verdict.
+  **As built (S4-W3; ruling R-W3-4).** The cap applies only when the supplied commit carries
+  `created_at` (6.1 "S4"; a body from an older server has none, and then the value is not
+  capped); the result is never below `0`.
 - **Anchor mismatch.** At an epoch this device already holds, a candidate whose carried keys
   differ from the held ones is refused (`anchor_mismatch`, loud, per candidate as every reason).
   A held row is never overwritten.
@@ -2934,6 +3219,24 @@ transition before S4, or a link over the cap), `invalid`, `anchor_mismatch`, `co
 `unanchored` and `genesis` (epoch 0 of the channel's first group). After a bridge the walk
 continues in G from the bridge's `prev_epoch` downward.
 
+**As built (S4-W3, #320; rulings R-W3-11, R-W3-28).**
+
+- A session is memory only, at most 4 at once (the oldest created is evicted), with a random
+  128-bit hex id. `group_id` names the walk's STARTING group for the whole session; a bridge
+  moves the holders into the predecessor, not the session. An unknown id, or one opened for
+  another group, starts a fresh session, whose first step must name a held epoch with a
+  sealed history key (`InvalidArgument { field: "holder_epoch" }` otherwise).
+- The steps of a call are consecutive holders, highest first; a step for any other holder
+  than the expected one is `InvalidArgument { field: "steps" }`. The 200-row cap counts the
+  candidates of ALL steps of one call.
+- A call is all or nothing: its accepted paths are written only after every step of it was
+  processed, and an error (`IdentityPinRequired` included) leaves the store and the session
+  as they were before the call.
+- **The session continues below a commit.** Evidence commits the evidenced path, the accepted
+  state becomes the session's new base, and the walk goes on from it: `need_more` is `true`
+  until a stop or an anchor ends the session, not only "while no level has evidence". An
+  anchored end answers `stopped: null`.
+
 - **Staged import (fix F1; DECISION (S4-W0)).** States are STAGED in memory while the levels
   below are searched. Only a path from the top down to an evidenced state is COMMITTED, in ONE
   SQLite transaction per committed level range: for each (G, e) on it, the epoch-key row
@@ -2943,6 +3246,14 @@ continues in G from the bridge's `prev_epoch` downward.
   `mls_text_groups` row (a predecessor reached by a bridge) gets one with `state = 'left'`,
   `generation = g - 1`, `superseded_by = G'` and `last_epoch` NULL, after the 3.14.4
   derivation check. An import never touches OpenMLS state.
+  **As built (S4-W3, #320).** Each epoch is written by one of the two import writers of
+  3.14.2, which refuse an epoch that already has either row. A disputed epoch is written
+  with its CANDIDATE ROSTERS (the row's `candidates`, sealed with it; 3.14.7 "Merged
+  roster"), which is what lets `_decrypt` read a sender from any of them and a later session
+  start from all of them. An epoch imported without a text key gets no epoch-key row; its
+  roster is stored on the history-key row instead (`roster`, R-W3-24). A predecessor id that
+  is already held for another channel or generation, or a generation of the channel already
+  taken by another group, is `StoreCorrupt`.
 - **Floor.** `TextChannelState.history_floor` (8.3 "S4") reports the lowest epoch held for
   the channel from any source and why the walk stopped there.
 - [S4b] O-17: an honest client on a NEW device of an already-seated user walks only after a
@@ -3538,6 +3849,13 @@ rules above leave open:
 4. **hidden -> visible** stays a SIGNER check (the growth dialog, 4.9); members adopt either
    direction without a dialog, and the change acts through the per-epoch record (3.14.3).
 
+**As built (S4-W3, #322).** Rule 3 is written in the adoption's own transaction, on the GET
+path and on the AD path, and only ever lowers the stored value. Nothing backfills it for a
+list adopted before S4: the first adoption under an S4 build sets it. The signer-side rule
+that a `kept -> wiped` list changes nothing else (4.9 "S4") is NOT a member check: a member
+adopts such a list under rule 2 and S2's rules, and the wipe write's own comparison is the
+server's (4.3 "S4").
+
 ### 4.5 Owner pinning
 
 Native stores per channel `mls_text_owner_pins (channel_id, owner_user_id, owner_device_id,
@@ -3782,6 +4100,34 @@ with step 1.
   `issued_at := max(local_now, ulid_time(B), held.issued_at)` (fix F5, 4.1.1 "S4"). With a
   boundary the
   genesis seats ONLY the signer (4.3 "S4"), so it has no growth dialog.
+  **As built (S4-W3, #322; rulings R-W3-1, R-W3-2, R-W3-13).** "Accepted for a genesis only"
+  was a doc bug for `pre_history`, and a third input exists:
+  - `history: Option<"visible" | "hidden">` sets the `history:` line of any v2 list (a
+    genesis, the first v2 list over v1, a later list); absent, the S2 defaults above apply (a
+    later list copies the held line). On a list that is not v2, or with `recovery`, it is
+    `InvalidArgument { field: "history" }`. hidden -> visible is growth.
+  - `history_boundary` is accepted for a v2 GENESIS only, as an id that passes `ulid_time`
+    (4.1.1 "S4"); anything else is `InvalidArgument { field: "history_boundary" }`. A genesis
+    with a boundary that seats anyone but the signer is refused by native too
+    (`InvalidArgument { field: "seats" }`), not only by the server.
+  - `pre_history` is NOT genesis-only. It is accepted on any v2 list (else `InvalidArgument {
+    field: "pre_history" }`). `kept` over a held `wiped` is `SeatListRollback`. `wiped` needs
+    a boundary: the genesis's own, or the held one on a later list (else the same error). A
+    LATER list that moves `kept -> wiped` is the wipe list: it must equal the held list in
+    everything but `version`, `issued_at`, the two signer lines and `pre_history` (the seats,
+    `device_cap`, `history`, the boundary, the salt AND the `authority` line: no new authority
+    rides a wipe), and it is never a recovery list; else `InvalidArgument { field:
+    "pre_history" }`. This is the server's wipe-write rule (4.3 "S4"), enforced before
+    anything is signed.
+  - **`issued_at`.** With a boundary input: `max(local_now, ulid_time(B))`. On a later list
+    under a HELD boundary: `max(local_now, ulid_time(B), held.issued_at)`. On every other
+    list: `local_now`, as before S4. The rule is idempotent, so the commit half reproduces
+    the previewed value.
+  - **Order.** These argument checks run right after the `SeatListBehind`, version and
+    format checks and BEFORE the signer rules, so a caller that would be `NotOwner` or
+    `SignerLeafMissing` gets the `InvalidArgument` (or `future_boundary`, or
+    `SeatListRollback`) first. The one exception is the wipe list's "nothing else changed"
+    comparison, which needs the built body and so runs after the signer rules.
 - **`ProtectHistoryMoved` retry (S4-D13, O-10).** On `ProtectHistoryMoved` (409, returned only
   after the N3 check inside the transaction; nothing landed) the bridge reads back as this
   section says (channel not protected, no list), fetches the newest message id again
@@ -3807,6 +4153,40 @@ with step 1.
   channel (fix F15), which the `ProtectHistoryMoved` retries use; a later `kept -> wiped` list
   always shows its own dialog, and there is never a webview-supplied "skip the dialog" flag. A
   `kept` genesis needs no consent.
+  **As built (S4-W3, #322; rulings R-W3-12, R-W3-20, R-W3-32).**
+  - **Copy.** The dialog's title is "Delete earlier messages", its buttons "Delete" and
+    "Cancel" (the default), and its text depends on the bridge's display-only `wipe_count`
+    (8.3 "S4"):
+    - a count of 2 or more: "Delete {N} earlier unencrypted messages from Sloga's servers?
+      This can't be undone.";
+    - a count of 1: "Delete 1 earlier unencrypted message from Sloga's servers? This can't be
+      undone.";
+    - no count, or a count of 0 (never rendered as a number): "Delete the earlier unencrypted
+      messages from Sloga's servers? This can't be undone.".
+
+    Every variant is followed by the scope paragraph "This deletes every message sent in
+    {channel} before it is protected, and the files sent with them. Copies on people's
+    devices, forwards, crossposts and reports may remain." ("was protected" on a later wipe
+    list, "is protected" at a genesis), so what is deleted is stated without the number. When
+    a number is shown, a last line says "The number comes from the app and is not verified by
+    this device.". The count decides nothing.
+  - **Growth, then wipe.** A wipe list may change nothing else and a boundary genesis seats
+    only its signer, so the two dialogs rarely meet; they can when an otherwise unchanged wipe
+    list keeps a user who is in forced-removal memory (re-seating is growth, S2 above). Then
+    the growth dialog is shown FIRST, the wipe dialog second, and the list is signed only when
+    both were confirmed. Each dialog has its own decline lockout (`text:sign:{channel}`,
+    `text:wipe:{channel}`): declining one does not lock the other.
+  - **Consent.** At most 5 signatures in all, the confirmed one included, within 60 s of it,
+    held in memory only (none after a restart), per channel. It covers version-1 WIPED
+    geneses of that channel and nothing else; a later `kept -> wiped` list neither reads nor
+    writes it. It is GRANTED by the commit half of `_seat_list_sign` that follows the
+    confirmed dialog, not by the dialog itself, so the shell calls that commit for a wipe
+    only after the dialog was confirmed; each later signature that needs no dialog spends
+    one. A consent that ran out between a preview and its commit refuses that commit
+    (`SeatListBehind`, as a preview that moved does), and the next attempt shows the dialog.
+    No input skips a dialog. Follow-ups before the flag: an explicit confirmation token from
+    the shell to the commit instead of the "dialog was required" bit, and a monotonic clock
+    for the 60 s.
 - **hidden -> visible** is growth (S2 above); the copy is in 9.5.
 
 ### 4.10 Channel authority (S2-D2, `sloga-channel-authority-v1`)
@@ -4920,6 +5300,23 @@ depends on the list's format (the 6.1 invariant).
 | Commit submit, an Add | The LAST validity check before the write, so every earlier answer is unchanged. Each added device's protocol is its stored join intent's, else the group's `rejoin_readd` entry's (R-REJOIN), else `None`; an intent without `protocol` is never topped up from the entry. On a refusal the route re-reads the row at the epoch: a commit that took the epoch meanwhile consumed the intents it added, so the answer is that row's `Lost { winning }`, not `ProtectedClientOutdated`. Not re-checked inside the commit transaction: an intent changes only through the device's own (floored) join intent, an entry only on re-membership, and a v1 -> v2 list change fails the AD hash (3.12.2) |
 | Welcome fetch | The last step before serving, after `last_added_at` (the device is still a member whose `member_added.epoch` is that commit's epoch). The commit's `added_protocols` must hold an entry for (caller, `device_id`), and EVERY entry for that pair must be `>= 2` (none, or one without `protocol`, refuses). A missing stored list answers the unknown-group answer (no Welcome; fails closed). Rows written before S4 record nothing and are refused on a v2 channel (v2 was dark before S4, so no live rows exist). The route writes nothing |
 
+**`MlsCommitInfo.created_at` (As built, S4-W3 lane W3-BE; ruling R-W3-4, #324).** The v0
+`MlsCommitInfo` (the commit fetch and the `Lost { winning }` body; "Errors" above) gains
+`created_at: Option<i64>` as its LAST field: the server's store time of the commit row in
+whole milliseconds since the Unix epoch, always a JSON INTEGER in `0 ..= 2^53 - 1`
+(truncated from the stored `MlsCommit.created_at`: Mongo keeps milliseconds, the Reference
+driver nanoseconds; clamped to the range). Every commit the server serves carries it, Call
+commits included (one construction site, `MlsCommit::into_commit_info`); the field is
+`Option` with a serde default and omitted when `None` only so a body written before the
+field existed still deserializes. No migration: the stored row always had `created_at`.
+Its one use is the history walk's cap on a link's
+`observed_at` (3.14.7), which is applied only when the field is present. The native reader
+(`wire::MlsCommitInfo`, the field last as well) takes an integer or an integral float (a
+napi bridge hands a number above `2^32` over as a float, the `issued_at` rule of 8.3) and
+REFUSES a negative value, a fraction, a value above `2^53 - 1` and a string; `null` and an
+absent field read as none. It is server data, unsigned: a server that lies about it can only
+move a value that feeds the grey timing marker (3.9 "S4" step 9), never a red verdict.
+
 ### 6.2 Client side (native; W3). The real trust decisions.
 
 | Operation | Rule |
@@ -4972,8 +5369,10 @@ records.
 | Operation | S4 rule |
 |---|---|
 | Derive (Welcome, `_process`, `_commit_won`, `_group_create`) | also derive and store the history key and the visibility record, in the same SQLite transaction as the epoch key (3.14.1 to 3.14.3) |
-| Build a link (`_commit_won`, `_history_link_build`) | DERIVED rows with sealed keys only, the records of BOTH epochs visible (fix F3), never the currently held list; a link over the cap is refused `too_large` (3.14.3, 3.14.5, 3.14.6) |
-| Import (`_history_import`) | 3.14.7 and 3.14.8: the level-by-level search over states with probe, anchor and descent evidence, staged then committed, a refusal per candidate (fix rounds 1 and 2); never overwrites a held row |
+| Build a link (`_commit_won`, `_history_link_build`) | DERIVED rows with sealed keys only, the records of BOTH epochs visible (fix F3), never the currently held list; a link over the cap is refused `too_large` (3.14.3, 3.14.5, 3.14.6). As built (S4-W3): also this device's own leaf in the holder roster, else `not_derived`; the committer's link is also built on a `duplicate` `_commit_won` (3.14.6 "As built") |
+| Import (`_history_import`) | 3.14.7 and 3.14.8: the level-by-level search over states with probe, anchor and descent evidence, staged then committed, a refusal per candidate (fix rounds 1 and 2); never overwrites a held row. As built (S4-W3): disagreeing rosters are kept as variants and stored as the disputed row's candidates, never merged to their union; at most 3 probes per step (3.14.7 "Merged roster", "Evidence") |
+| Derive over an identical link import (As built, S4-W3) | `record_derived_epoch` replaces a `history_link` or `history_link_disputed` row whose keys equal the derived ones by the derived record; any other difference is a fork (3.14.2 "Writes") |
+| Decrypt a disputed epoch (As built, S4-W3) | the sender leaf from the recorded roster or any stored candidate roster, never verified; the hard time clause from the first `derived` or `backup` epoch without the leaf (3.9 "S4" steps 5, 8, 9) |
 | Membership run and removed self (fix F6, F7) | a Welcome join and a create record `joined_epoch` and CLEAR `removed_self_epoch` in `mls_text_membership` (8.2 "S4"); `_process` of a commit that removes this device records `removed_self_epoch` in the transaction that moves the group to `left`; 3.9 step 4 reads both (S4-D4, S4-PA-21). Never inferred from `left` alone |
 | Keys are never deleted | removal, `left`, wipe-and-rejoin and successor creation keep `mls_text_epoch_keys` AND `mls_text_history_keys` (S4-D4; 2.5 "Wipe-and-rejoin" already keeps epoch keys) |
 | Seat-list sign / verify | 4.9 "S4" / 4.4.1 "S4" |
@@ -6777,6 +7176,12 @@ existing variants (7.2 "S4", 6.1 "S4").
   envelope. `_process` on a Text commit uses them for the 3.12.3 step 6 declaration binding.
   Call processing ignores them (unchanged behavior). Commit gap-refetch uses `MlsCommitInfo`,
   which carries the same fields (`rejoin_intents` added).
+  **`created_at` (As built (S4-W3), #324).** `wire::MlsCommitInfo` gains `created_at:
+  Option<i64>`, last, the server's store time of the commit in integer milliseconds (6.1
+  "S4" `MlsCommitInfo.created_at`): absent on a body from an older server, never serialized
+  when none, and read with the `issued_at` tolerance of 8.3 (an integer or an integral float
+  in `0 ..= 2^53 - 1`; a negative value, a fraction, a larger value or a string is refused).
+  Only the history walk reads it (3.14.7 `observed_at`).
 
 ### 8.2 Native storage (excluded from key backup in S1)
 
@@ -6860,6 +7265,27 @@ renamed by W3 with a note in its report.
   `observed_at` (history link) or the backed-up value (backup).
 - **S4 replaces "excluded from key backup"** for the rows 8.5 carries; the other text rows
   stay excluded.
+
+**As built (S4-W3, #317; rulings R-W3-5 to R-W3-7, R-W3-14).**
+- The three names are kept. `mls_text_history_keys` has the three extra columns and the
+  CHECKs of 3.14.2 "As built".
+- **18 text tables, not 16** (the count above forgot the two tables S1 W3 added): the 15 of
+  "As built (S2-W3)" plus these three. `TEXT_TABLES` lists all 18 and `has_text_tables` is
+  true only when all exist, so an S2 store goes past the fast path once and gets the three
+  tables and the provenance backfill in one `BEGIN IMMEDIATE`.
+- **Add-device split.** It deletes `mls_text_membership` with the other per-device rows (the
+  membership run is the old leaf's) and KEEPS `mls_text_history_keys` and
+  `mls_text_history_state`, like the epoch keys. It also drops the in-memory walk sessions
+  and wipe consents.
+- **Memory only.** Walk sessions (3.14.8) and the wipe consent (4.9 "S4") are fields of the
+  engine, never rows: both die with the process.
+- **Release note: rolling back past S4 is unsafe (as #239).** An S2 core reopening an S4
+  store cannot parse a held seat list that carries a boundary or `pre_history:wiped` (its
+  parser refuses both lines), so those channels fail. It also writes epoch keys with no
+  provenance row, and they stay without one: the backfill runs only with the table creation,
+  and a later S4 open finds all 18 tables and takes the fast path. Every such epoch is then
+  `StoreCorrupt` (3.14.2, fail closed). No shell may ship an S2 core over a store an S4 core
+  has opened.
 
 ### 8.3 Commands
 
@@ -6999,6 +7425,24 @@ Both new commands follow the full registration list (#167): the permission TOML,
 `capabilities/default.json` allow, `APP_COMMANDS`, `generate_handler!` and the dev grants;
 neither is confirm-gated (the wipe dialog lives in `_seat_list_sign`, which already is).
 
+**As built (S4-W3, #318, #320, #322, #325).** Native at `b688f121`:
+
+| Command | As built |
+|---|---|
+| `e2ee_text_seat_list_sign` | NEW `history: Option<"visible" \| "hidden">`, `history_boundary: Option<String>`, `pre_history: Option<"kept" \| "wiped">` and `wipe_count: Option<u64>`, in that order after `recovery` and before the display arguments. `history` is not in the S4-W0 row above (ruling R-W3-1); `pre_history` is accepted on a later list too (4.9 "S4" "As built"). `wipe_count` is the bridge's number of messages: it is shown in the wipe dialog and decides nothing (R-W3-20). The argument errors and their order: 4.9 "S4" |
+| `e2ee_text_commit_won` | `history_link` is also filled when the answer is `duplicate`; a build error gives `None` and never fails the commit (3.14.6 "As built") |
+| `e2ee_text_history_link_build` | async. At most 200 candidates (`InvalidArgument { field: "candidates" }`); a group id that is not 64 hex or an epoch outside `0 ..= 2^53 - 1` is `InvalidArgument`; an unknown group `MlsGroupNotFound`; a call-plane id `WrongGroupKind`. Any group state: a closed or `left` holder still builds. `refused`: `not_derived` also when this device holds no leaf in the holder roster and when it does not hold the holder epoch at all (the row above said `hidden` for an absent record); the order is `not_derived`, `hidden`, `too_large` (3.14.6 "As built"). `mismatched_writers` is filled on `too_large` and on a discharged duty too. Writes nothing |
+| `e2ee_text_history_import` | async. Refused before anything is read: more than 200 link rows over the call's steps (`InvalidArgument { field: "steps" }`) and **a step with more than 3 probes (`InvalidArgument { field: "probes" }`)**. Probes of a step belong to that step's holder, and choosing them (distinct authors who wrote no candidate carrying that epoch's keys) is the bridge's duty (3.14.7 "Evidence"). A step for an unexpected holder is `InvalidArgument { field: "steps" }`, a fresh session at an epoch without a sealed history key `InvalidArgument { field: "holder_epoch" }`. `need_more` stays `true` after a commit until a stop or an anchor (3.14.8 "As built"); `stopped` is `null` for an anchored end; `floor` is set only when the session ended. `IdentityPinRequired` fails the call with nothing written (3.14.7 step 3). Each `refused` entry serializes exactly like the `HistoryLinkInvalid` error (`type`, `group_id`, `epoch`, `reason`). At most 4 sessions in memory |
+| `e2ee_text_decrypt` | `TextDecrypted.timing_unverified` is always serialized. Steps 5, 8 and 9 as 3.9 "S4" |
+
+- `MlsCommitInfo` inside `HistoryImportStep` takes `created_at` (6.1 "S4"): an integer or an
+  integral float in `0 ..= 2^53 - 1`; a negative value, a fraction, a larger value or a
+  string fails the argument's deserialization, so the whole call is refused.
+- **Text protocol (ruling R-W3-15).** `TEXT_PROTOCOL` stays `2`, so the protocol floor does
+  not tell an S4 device from an S2 one. The cost is a checklist item for turning
+  `history_setting` on: every device runs an S4 build first, because an S2 device neither
+  writes links nor parses a list with a boundary.
+
 ### 8.4 Typed errors (added to `e2ee-core` `Error`, serde tag `type`, snake_case)
 
 No variant carries key material (invariant 6). Plan-pinned: `UnknownEpoch`, `BadSig`,
@@ -7059,6 +7503,15 @@ version + 1, and a wrong `prev` at the held authority version + 1 (4.4.1 "As bui
 `IdentityPinRequired` (W3 D5; 3.14.7 step 3). `SeatListRejection` gains `future_boundary` (fix
 F15): `_seat_list_sign` refuses a boundary more than 2 minutes after the local clock (4.9
 "S4"); a parser still answers `malformed` for `ulid_time(B) > issued_at`.
+**As built (S4-W3, #319; ruling R-W3-22).** `UnknownEpoch` is `{ group_id, epoch,
+oldest_held: Option<i64>, current: i64, removed_self: bool }`, and EVERY field is always
+serialized: `oldest_held` as `null` when there is none, `removed_self` as `false` when not
+set, never omitted (every error-wire field is pinned present; a reader that predates the
+field ignores it). `current` and `oldest_held` are computed as 3.9 "S4" step 4 "As built"
+says. `HistoryLinkInvalid` is appended after the S2 variants (the order rule above) and is
+returned inside `HistoryImported.refused`, not thrown; the two new commands add the
+`InvalidArgument` fields `candidates`, `steps`, `probes` and `holder_epoch`, and
+`_seat_list_sign` adds `history`, `history_boundary`, `pre_history` and `seats` (8.3 "S4").
 
 ### 8.5 Key backup text section (S4-D10, S4a; closes R4)
 
@@ -7073,6 +7526,12 @@ budget rule and the tests are the plan's.
   `deny_unknown_fields`), hence the `Value` (S4-PA-11). A new reader checks `text_v` first and
   parses `BackupText { text_v: 1, ... }` inside a fallible block that maps ANY error (an
   unknown `text_v`, a type change, a malformed row) to `text_skipped`, never a failed restore.
+  **As built (S4-W3, #323; ruling R-W3-27).** `text` is also `skip_serializing_if` none, and
+  **no section is written when the store holds no carried text row at all**, so the payload
+  of a store that never used Protected channels is byte-identical to a pre-S4 one.
+  `BackupText` ignores unknown fields, as `BackupPayload` does; a writer that changes what a
+  field MEANS bumps `text_v`. The restore writes the section under a savepoint: any error
+  rolls back the whole section and the rest of the restore goes on.
 - **Contents (`text_v: 1`).** `truncated` (`"none"`, `"oldest"` or `"all"`); `groups`
   (`group_id`, `channel_id`, `generation`, `superseded_by`); `rosters` (`{ sha256, roster }`,
   each distinct canonical roster JSON once); `epoch_keys` (`group_id`, `epoch`, `text_key`,
@@ -7081,6 +7540,23 @@ budget rule and the tests are the plan's.
   anti-rollback floor; `owner_pins` (without the pending signer); `forced_removals`;
   `consumed_rejoin_intents`; `own_device_pins` (status preserved, O-8); `history_state`
   (`channel_id`, `earliest_issued_at`).
+  **As built (S4-W3, #323; wave-audit M1, rulings R-W3-25, R-W3-27).**
+  - `groups` entries also carry `state` (the stored state, so a `poisoned` group restores
+    `poisoned`).
+  - `epoch_keys` entries also carry **`source`**: the provenance the epoch was HELD under on
+    the device that wrote the backup (`derived`, `history_link`, `history_link_disputed` or
+    `backup`). It is omitted only for an epoch key that had no history-key row, which is not
+    refused at backup time. `history_key` is also absent for a provenance-only epoch.
+  - An epoch needs an EPOCH-KEY row to be carried. A keyless link import (a history key and
+    no text key, 3.14.7 "Text key") is not: it decrypts nothing, and after a restore the walk
+    fetches it again.
+  - **The candidate rosters of a disputed epoch are NOT carried.** A restored
+    `history_link_disputed` epoch has its recorded roster only (3.9 "S4" step 5, 3.14.7
+    "Sticky after a restore"; R31 (a)). An additive `candidates` field here is owed before the
+    `history_setting` flag is turned on.
+  - `history_state` is read for the channels of the carried rows (groups, lists,
+    authorities, pins, forced removals). S2-W3 built no schema marker (8.2), so there is none
+    to carry or skip.
 - **Never restored** (re-derived against the CURRENT table list, S2's `mls_text_authorities`
   and S4's tables included): OpenMLS state (`mls_state`, `mls_groups`), the MLS signature key
   (`mls_signature_key`), KeyPackages (`mls_key_packages`), `mls_text_pending_commits`,
@@ -7093,6 +7569,10 @@ budget rule and the tests are the plan's.
   `mls_text_consumed_rejoin_intents`, `mls_text_own_device_pins` and
   `mls_text_history_state` (its `earliest_issued_at` only: the floor columns restore NULL and
   the next walk re-derives them). Every text table is in exactly one of the two lists.
+  **As built (S4-W3; ruling R-W3-6).** S2-W3's `mls_text_admitted_intents` and
+  `mls_text_owner_alerts` are in the never-restored set too. Of `mls_text_history_keys` the
+  key and the `source` are carried; `history_visible`, `list_version`, `roster` and
+  `candidates` are not.
 - **Restore.** Every group restores as `left` (a `poisoned` one stays `poisoned`), `last_epoch`
   NULL; keys are re-sealed under the FRESH master with `source = 'backup'`, `history_visible`
   NULL and `first_seen_at` the backed-up value (R7 "S4"); a carried epoch without a history
@@ -7100,6 +7580,21 @@ budget rule and the tests are the plan's.
   walks the gap anchored at both ends (3.14.7 "Anchor"). Copy: "Restoring replaces your old
   device." (Restoring onto a second live machine clones the device; for text groups each
   clone could evict the other through rule 6.)
+  **As built (S4-W3, #323; wave-audit M1).** "`source = 'backup'`" for every key laundered
+  link provenance: a writer's claimed `observed_at` became a hard `RemovedSender` clause and
+  a disputed epoch verified senders again. The restore now maps the carried `source`:
+
+  | Carried `source` | Restored as |
+  |---|---|
+  | `derived`, `backup`, or absent | `backup` |
+  | `history_link` | `history_link` |
+  | `history_link_disputed` | `history_link_disputed` (without candidates) |
+  | any other value | the epoch is SKIPPED, the rest of the section restores |
+
+  A restore never makes a key's provenance stronger than it was, and no source restores as
+  `derived`, so a restored key never builds a link (3.14.6). An epoch carried without a
+  history key gets a provenance-only row of that same restored source (3.14.2). A row that
+  conflicts or is malformed still fails the whole section (`text_skipped`).
 - **Size (S4-PA-12; fix F13).** The section's budget is
   `min(2 MiB, MAX_BACKUP_CIPHERTEXT - BACKUP_SIZE_HEADROOM - fixed)`, `fixed` being the
   invariant sections that `build_payload` measures, inside the same 8 MiB cap
@@ -7111,6 +7606,14 @@ budget rule and the tests are the plan's.
   spills into the fixed budget of `build_payload`. Otherwise epoch-key entries are added
   newest first until the budget, the oldest are dropped, rosters no longer referenced are
   dropped with them, and `truncated` is `"oldest"`. Pins and lists are never truncated.
+  **As built (S4-W3; rulings R-W3-26, R-W3-27).** "Newest first" is by `first_seen_at`
+  descending, ties by group id and then epoch, both descending. Adding stops at the first
+  entry that does not fit, and `truncated` is `"oldest"` also when NO epoch key fits.
+  **An unopenable carried row fails `backup_create`** (`StoreCorrupt`): every sealed text row
+  is opened to be carried, and one that does not open fails the whole backup, direct
+  messages included, instead of shortening it. That is fail closed and costs availability.
+  Planned, not built, and owed before the flag: degrade to a backup without the text section
+  plus a field that reports it.
 - **Zeroize (fix F13).** The section is a `serde_json::Value`, whose strings are not
   zeroized on drop, so `zeroize_payload_secrets` WALKS the `Value` tree and zeroizes every
   string in it (every `text_key` and `history_key` among them), and the typed `BackupText`
@@ -7121,6 +7624,20 @@ budget rule and the tests are the plan's.
 - **`RestoreReport`** gains `text_epochs: usize`, `text_truncated` (the section's
   `truncated`) and `text_skipped: bool` (the fallible parse failed; **DECISION (S4-W0)**: a
   separate field, since the plan names `text_skipped` as that outcome).
+  **As built (S4-W3, #323).** All three are omitted when default (`text_epochs` when `0`,
+  `text_truncated` when there was no section or it was skipped, `text_skipped` when
+  `false`). `text_epochs` counts the epochs restored. **`text_skipped` has two meanings:**
+  (1) the section was present and could not be read or written (an unknown `text_v`, a type
+  change, a malformed or conflicting row): NOTHING of it was restored, `text_epochs` is
+  absent and so is `text_truncated`; (2) the section restored, but at least one epoch named
+  a `source` this build does not know and was left out alone: `text_epochs` counts the rest
+  and `text_truncated` is still reported. The bridge tells them apart by `text_truncated`
+  being present (W4).
+- **`BackupBundle.text_truncated` (As built (S4-W3), wave-audit m7).** The upload bundle
+  gains `text_truncated: Option<"none" | "oldest" | "all">`, the `truncated` of the section
+  it was built with, omitted when the bundle has no text section.
+  It is what `RestoreReport.text_truncated` will report, known at create time. The existing
+  `BackupBundle.truncated: bool` still reports MESSAGE truncation only.
 - **The two `store.rs` tests are REPLACED, not deleted (S4-PA-14; one lane with
   `backup.rs`).** `every_store_table_is_classified_for_backup` becomes a THREE-way tripwire
   (`BACKED_UP`, `TEXT_SECTION`, `EXCLUDED`): every store table in exactly one list, and every
@@ -7359,7 +7876,9 @@ string goes through lingui.
 - gray "Sent after you were removed." (`UnknownEpoch.removed_self`: keyed on native's explicit
   `removed_self` record for that group, never on a bare `left` state; S4-PA-21);
 - informational "Sender couldn't be verified (history)." (an imported epoch whose roster names
-  a device missing from the directory, 3.14.7 step 3; never green);
+  a device missing from the directory, 3.14.7 step 3; never green); as built (S4-W3), also
+  EVERY sender of an epoch imported `history_link_disputed`, this device's own messages
+  included (3.9 "S4" steps 5 and 8);
 - grey informational "Timing of this message can't be verified." (`timing_unverified`, fix F4:
   a removed-sender time verdict that rests on imported history timing is never red);
 - the permanent divider "Messages above weren't protected" and the informational marker on an
@@ -7434,7 +7953,9 @@ rows stay.
 - Wipe (S4-D23): "Earlier messages and their files will be deleted from Sloga's servers. This
   can't be undone. Copies on people's devices, forwards, crossposts and reports may remain."
   Native dialog: "Delete {N} earlier unencrypted messages from Sloga's servers? This can't be
-  undone."
+  undone." As built (S4-W3), native owns that dialog's strings (they are not lingui strings):
+  the singular and the no-count variants, the scope paragraph and the "number is not
+  verified" line are in 4.9 "S4" "Copy".
 - History setting (S4-D2b, S4-D8): toggle "New members can read earlier messages"; on: "People
   who join later can read messages sent while this is on, and so can a new device of anyone in
   the channel. Anyone in the channel can still share what they read."; off: "New members only
@@ -7999,6 +8520,20 @@ plan's lane rules. Native `wire::MlsEnvelope` is W3 L3b.
     refuses a writer with `member_added >= e'`; a message at exactly epoch r after a removal
     establishing r is "sent after you were removed"; a history switch is followed at once by
     the switching device's Update commit.
+  - **As-built obligations (S4-W3, #317 to #324).** One forger's duplicate leaf or pre-placed
+    `removed` entry gives a disputed epoch, never a stopped walk; a probe prunes the roster
+    it contradicts, and a forger's own message does not
+    prune the honest roster; the honest roster survives both variant caps; a fresh session at
+    a disputed epoch starts from its stored candidates, and one without candidates never
+    imports undisputed; decrypt reads a sender from any candidate roster and never verifies
+    it; an imported epoch without the leaf does not mask a later derived one; a derive over
+    an identical link import upgrades it and a different key
+    is a fork; the builder refuses without its own leaf; a step with 4 probes is refused; a
+    backup round trip keeps `history_link` and `history_link_disputed`, restores `derived` as
+    `backup` and skips an unknown source alone; `created_at` refuses a negative value, a
+    fraction and a value above `2^53 - 1`; a later `kept -> wiped` list that changes anything
+    else is refused before signing; the wipe consent is granted only by the commit after the
+    dialog and ends after 5 signatures or 60 s.
   - **Crypto lens (O-1):** S4-W0's dedicated `media-e2ee-reviewer` re-checks the chain first
     (candidates, roster diff, bridge), then the exporter use and the seal AAD; S4-D1 is on the
     independent-audit list.
@@ -9641,6 +10176,61 @@ fix round and of W2, and what the W1 and W2 lanes built).
      channel ids. Amends #140 and #155 (7.2, 7.5). Amended by the fix round (F6): the source
      also blanks the author name and the channel copy's name, description and icon; the
      author id stays for the mass-mention author-skip.
+
+Added in the S4-W3 native doc pass (2026-11-23; native `feat/protected-s4-native` at
+`b688f121`, rulings R-W3-1 to R-W3-35 of the W3 addendum, its wave audit and re-review).
+Nothing of S4 is landed or enabled.
+
+317. S4-W3 as built, storage: `mls_text_history_keys` gains `list_version`, `roster` and
+     `candidates` with their CHECKs and two seal suffixes; one writer per kind of write puts
+     both rows in the caller's transaction; a derive over an identical link import replaces
+     it (wave-audit m4); 18 text tables; the add-device split deletes `mls_text_membership`;
+     rolling back past S4 is unsafe. CORRECTED: a provenance-only row's `source` is not
+     sealed, so relabelling one is not detected (wave-audit m2); a sealed marker is a
+     follow-up (3.14.2, 8.2).
+318. S4-W3 as built, the record and the builder: the visibility record fails closed to
+     hidden and is stored with its list version; the builder needs its own leaf in the
+     holder roster and answers `not_derived` for an epoch it does not hold; the committer's
+     link is also built on a `duplicate` `_commit_won`, and a build error never fails the
+     commit; the contest comparison counts only member-signed candidates (3.14.3, 3.14.6,
+     6.2, 8.3).
+319. S4-W3 as built, decrypt: a disputed epoch takes the sender leaf from the recorded or
+     any candidate roster and never verifies it; the hard time clause is applied to the
+     first `derived` or `backup` epoch without the leaf past link-sourced ones, and
+     `timing_unverified` is set only when that does not fire (wave-audit m1); `UnknownEpoch`
+     always serializes all five fields (1.3 R7, 3.9, 8.4). Amends #288.
+320. DECISION (W3 wave audit M2 and its re-review N1 to N5; ruling R-W3-34): the merged
+     roster of #302 is replaced by per-candidate roster variants (vouch with the union,
+     derive from each variant, prune by probe, collapse, rank by fewest writers against,
+     caps of 5 kept and 25 built, sticky after a restore). Also as built: at most 3 probes
+     per step (more is an argument error) and the bridge's duty to pick them; the pin rules
+     of step 3; `seat_list_version` is log-only; the importer does not check the bound list
+     of an epoch 0 (ruling R-W3-30); a session continues below a commit (1.3 R34, 3.14.7,
+     3.14.8, 8.3). Amends #301, #302 and #304.
+321. S4-W3, residual R31 as it stands, and what must close before `history_setting` is
+     turned on: the backup text section carries a disputed epoch's candidate rosters (R31
+     (a)); the degrade of an unopenable carried row to a backup without the section (8.5);
+     a sealed marker for provenance-only rows (3.14.2); an explicit confirmation token and a
+     monotonic clock for the wipe consent (4.9); every device on an S4 build (8.3). Accepted
+     as residual: R31 (b) to (d) (1.3).
+322. S4-W3 as built, seat-list sign: a `history` input; `pre_history` on a later list (the
+     wipe list, identical otherwise, the `authority` line included); a boundary genesis
+     seats only the signer natively too; the `issued_at` max rule only under a boundary; the
+     S4 argument checks run before the signer rules; the wipe dialog's copy variants; growth
+     dialog then wipe dialog; the consent is granted by the commit after the dialog (4.4.1,
+     4.9, 8.3, 9.5). Amends #265.
+323. S4-W3 as built, key backup: `source` per epoch and the restore mapping (wave-audit
+     M1: link provenance is kept, `derived` restores as `backup`, an unknown source is
+     skipped alone); `state` on groups; no section when nothing is carried; the ordering;
+     `text_skipped`'s two meanings; `BackupBundle.text_truncated`; an unopenable carried row
+     fails `backup_create` (ruling R-W3-26); candidate rosters and keyless imports are not
+     carried (3.14.2, 8.5). Amends #278.
+324. S4-W3 lane W3-BE as built: `MlsCommitInfo.created_at`, integer milliseconds, last,
+     always served, optional for old bodies; the native reader refuses a negative value, a
+     fraction and a value above `2^53 - 1` (6.1, 8.1, 8.3).
+325. S4-W3 as built, the command surface: the `_seat_list_sign` arguments, the two history
+     commands (async, their argument errors, 4 sessions in memory), `TEXT_PROTOCOL` stays 2
+     (ruling R-W3-15) (8.3, 8.4).
 
 ---
 
