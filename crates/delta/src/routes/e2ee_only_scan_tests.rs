@@ -106,7 +106,9 @@ const EXEMPT: &[(&str, &str)] = &[
     ),
     (
         "servers/member_remove.rs",
-        "server members only: decides whether a kick or ban needs a reason, writes no message",
+        "server channels only: the protected check decides whether a kick or ban needs a \
+         reason; the server-written system row goes to the server's system channel, the \
+         reason to the audit log",
     ),
     (
         "servers/server_edit.rs",
