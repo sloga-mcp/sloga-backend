@@ -59,6 +59,22 @@ pub trait AbstractPasskeys: Sync + Send {
     /// NotFound when the id does not exist or belongs to another user.
     async fn delete_passkey(&self, user_id: &str, id: &str) -> Result<()>;
 
+    /// Delete one of a user's passkeys, unless it is the last way in.
+    ///
+    /// Another way in is a usable password, a linked Google or Apple sign-in
+    /// (`Account::can_sign_in_without_passkey`), or another passkey of this
+    /// user. The account is read inside the op, never taken from the caller.
+    ///
+    /// NotFound when the id does not exist or belongs to another user;
+    /// UnknownUser when the user has no account; InvalidOperation when the
+    /// passkey is the only way left to sign in. Nothing is deleted in any of
+    /// the three.
+    ///
+    /// The Reference driver decides and deletes under one lock. MongoDB has
+    /// no single statement across the two collections: see the comments in
+    /// its implementation for what it does instead and what race is left.
+    async fn delete_passkey_unless_last_way_in(&self, user_id: &str, id: &str) -> Result<()>;
+
     /// Account-deletion cascade: delete every passkey of a user (no-op if
     /// there are none)
     async fn delete_passkeys_for_user(&self, user_id: &str) -> Result<()>;
@@ -69,7 +85,7 @@ mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_result::ErrorType;
 
-    use crate::Passkey;
+    use crate::{Account, EmailVerification, Passkey};
 
     /// A whole-second timestamp, so it round-trips through Mongo's
     /// millisecond encoding unchanged
@@ -105,6 +121,38 @@ mod tests {
 
     fn is_not_found<T>(result: revolt_result::Result<T>) -> bool {
         matches!(result, Err(error) if matches!(error.error_type, ErrorType::NotFound))
+    }
+
+    fn is_invalid_operation<T>(result: revolt_result::Result<T>) -> bool {
+        matches!(result, Err(error) if matches!(error.error_type, ErrorType::InvalidOperation))
+    }
+
+    /// An account with a usable password and no linked sign-in
+    fn account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            email: format!("{id}@example.test"),
+            email_normalised: format!("{id}@example.test"),
+            password: "hash-original".to_string(),
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+            mfa: Default::default(),
+            google_id: None,
+            apple_id: None,
+            password_absent: false,
+            email_absent: false,
+        }
+    }
+
+    /// An account whose only way in can be a passkey
+    fn passkey_only_account(id: &str) -> Account {
+        Account {
+            password_absent: true,
+            ..account(id)
+        }
     }
 
     #[tokio::test]
@@ -326,6 +374,174 @@ mod tests {
             db.delete_passkeys_for_user("user_nobody").await.unwrap();
             assert_eq!(db.count_passkeys("user_b").await.unwrap(), 1);
             assert_eq!(db.count_passkeys("user_c").await.unwrap(), 1);
+        });
+    }
+
+    /// Fails if: a password, a Google link, an Apple link or another passkey
+    /// stops counting as another way in.
+    #[tokio::test]
+    async fn the_last_passkey_goes_when_another_way_in_remains() {
+        database_test!(|db| async move {
+            let with_password = account("01PKACCOUNTPASSWORD0000000");
+            let with_google = Account {
+                google_id: Some("google-sub-way-in".to_string()),
+                ..passkey_only_account("01PKACCOUNTGOOGLE000000000")
+            };
+            let with_apple = Account {
+                apple_id: Some("apple-sub-way-in".to_string()),
+                ..passkey_only_account("01PKACCOUNTAPPLE0000000000")
+            };
+
+            for (n, acct) in [(1, &with_password), (2, &with_google), (3, &with_apple)] {
+                db.save_account(acct).await.unwrap();
+                db.insert_passkey(&passkey(n, &acct.id)).await.unwrap();
+                assert_eq!(db.count_passkeys(&acct.id).await.unwrap(), 1);
+
+                db.delete_passkey_unless_last_way_in(&acct.id, &id(n))
+                    .await
+                    .unwrap_or_else(|error| panic!("{}: {error:?}", acct.id));
+                assert_eq!(db.count_passkeys(&acct.id).await.unwrap(), 0, "{}", acct.id);
+            }
+
+            // Nothing but passkeys: one of two may go
+            let only_passkeys = passkey_only_account("01PKACCOUNTTWOPASSKEYS0000");
+            db.save_account(&only_passkeys).await.unwrap();
+            db.insert_passkey(&passkey(10, &only_passkeys.id))
+                .await
+                .unwrap();
+            db.insert_passkey(&passkey(11, &only_passkeys.id))
+                .await
+                .unwrap();
+
+            db.delete_passkey_unless_last_way_in(&only_passkeys.id, &id(10))
+                .await
+                .unwrap();
+            assert_eq!(
+                ids(&db.fetch_passkeys(&only_passkeys.id).await.unwrap()),
+                [id(11)]
+            );
+        });
+    }
+
+    /// Fails if: the only way left to sign in can be removed, another user's
+    /// passkeys are counted as this user's, or a refusal alters the row.
+    #[tokio::test]
+    async fn the_last_way_in_cannot_be_removed() {
+        database_test!(|db| async move {
+            let acct = passkey_only_account("01PKACCOUNTLASTWAYIN000000");
+            db.save_account(&acct).await.unwrap();
+            let last = passkey(1, &acct.id);
+            db.insert_passkey(&last).await.unwrap();
+
+            // Somebody else has plenty of ways in; none of them are this
+            // account's
+            let other = account("01PKACCOUNTLASTWAYINOTHER0");
+            db.save_account(&other).await.unwrap();
+            db.insert_passkey(&passkey(2, &other.id)).await.unwrap();
+            db.insert_passkey(&passkey(3, &other.id)).await.unwrap();
+
+            assert!(is_invalid_operation(
+                db.delete_passkey_unless_last_way_in(&acct.id, &id(1)).await
+            ));
+            assert_eq!(db.fetch_passkey(&acct.id, &id(1)).await.unwrap(), last);
+            assert_eq!(db.count_passkeys(&acct.id).await.unwrap(), 1);
+            assert_eq!(db.count_passkeys(&other.id).await.unwrap(), 2);
+
+            // The control: a second passkey makes the first removable, and
+            // then the second is the last
+            let second = passkey(4, &acct.id);
+            db.insert_passkey(&second).await.unwrap();
+            db.delete_passkey_unless_last_way_in(&acct.id, &id(1))
+                .await
+                .unwrap();
+            assert!(is_invalid_operation(
+                db.delete_passkey_unless_last_way_in(&acct.id, &id(4)).await
+            ));
+            assert_eq!(db.fetch_passkey(&acct.id, &id(4)).await.unwrap(), second);
+        });
+    }
+
+    /// Fails if: the op trusts anything but the stored account. The account
+    /// loses its password and its Google link between two removals, and the
+    /// second removal must see that.
+    #[tokio::test]
+    async fn the_account_is_read_when_the_passkey_is_removed() {
+        database_test!(|db| async move {
+            let mut acct = Account {
+                google_id: Some("google-sub-fresh-read".to_string()),
+                ..account("01PKACCOUNTFRESHREAD000000")
+            };
+            db.save_account(&acct).await.unwrap();
+            db.insert_passkey(&passkey(1, &acct.id)).await.unwrap();
+            db.insert_passkey(&passkey(2, &acct.id)).await.unwrap();
+            db.insert_passkey(&passkey(3, &acct.id)).await.unwrap();
+
+            // The password goes: the Google link still counts
+            acct.password_absent = true;
+            db.save_account(&acct).await.unwrap();
+            db.delete_passkey_unless_last_way_in(&acct.id, &id(1))
+                .await
+                .unwrap();
+            db.delete_passkey_unless_last_way_in(&acct.id, &id(2))
+                .await
+                .unwrap();
+
+            // The link goes too: the one passkey left is the last way in
+            db.unlink_account_oauth(&acct.id).await.unwrap();
+            assert!(is_invalid_operation(
+                db.delete_passkey_unless_last_way_in(&acct.id, &id(3)).await
+            ));
+            assert_eq!(ids(&db.fetch_passkeys(&acct.id).await.unwrap()), [id(3)]);
+        });
+    }
+
+    /// Fails if: an unknown id or another user's passkey is anything but
+    /// NotFound, a user with no account can remove a passkey, or any of
+    /// these deletes a row.
+    #[tokio::test]
+    async fn conditional_removal_of_a_missing_or_foreign_passkey_is_refused() {
+        database_test!(|db| async move {
+            let owner = account("01PKACCOUNTFOREIGNOWNER000");
+            let thief = account("01PKACCOUNTFOREIGNTHIEF000");
+            db.save_account(&owner).await.unwrap();
+            db.save_account(&thief).await.unwrap();
+            db.insert_passkey(&passkey(1, &owner.id)).await.unwrap();
+            db.insert_passkey(&passkey(2, &owner.id)).await.unwrap();
+
+            assert!(is_not_found(
+                db.delete_passkey_unless_last_way_in(&thief.id, &id(1)).await
+            ));
+            assert!(is_not_found(
+                db.delete_passkey_unless_last_way_in(&owner.id, &id(9)).await
+            ));
+            assert_eq!(db.count_passkeys(&owner.id).await.unwrap(), 2);
+
+            // A passkey whose user has no account row is left alone
+            db.insert_passkey(&passkey(5, "01PKACCOUNTNOSUCHACCOUNT00"))
+                .await
+                .unwrap();
+            let error = db
+                .delete_passkey_unless_last_way_in("01PKACCOUNTNOSUCHACCOUNT00", &id(5))
+                .await
+                .expect_err("no account, no removal");
+            assert!(
+                matches!(error.error_type, ErrorType::UnknownUser),
+                "expected UnknownUser, got {:?}",
+                error.error_type
+            );
+            assert_eq!(
+                db.count_passkeys("01PKACCOUNTNOSUCHACCOUNT00").await.unwrap(),
+                1
+            );
+
+            // The control: the owner removes one, and it is gone for good
+            db.delete_passkey_unless_last_way_in(&owner.id, &id(1))
+                .await
+                .unwrap();
+            assert!(is_not_found(
+                db.delete_passkey_unless_last_way_in(&owner.id, &id(1)).await
+            ));
+            assert_eq!(ids(&db.fetch_passkeys(&owner.id).await.unwrap()), [id(2)]);
         });
     }
 

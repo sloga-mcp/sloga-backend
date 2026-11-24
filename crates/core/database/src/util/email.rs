@@ -41,6 +41,32 @@ pub fn normalise_email(original: String) -> String {
     clean.to_lowercase()
 }
 
+/// Domain of the address stored on an account that has no email
+pub const NO_EMAIL_DOMAIN: &str = "noemail.invalid";
+
+/// A fresh stand-in address for an account that has no email: 32 lower-case
+/// hex characters from 128 random bits, at `NO_EMAIL_DOMAIN`.
+///
+/// Never derived from an id. The local part has no `.` or `+`, so
+/// `normalise_email` leaves it as it is and it fits both unique indexes.
+/// It never leaves the model: nothing is mailed to it and the API never
+/// returns it.
+pub fn generate_placeholder_email() -> String {
+    format!("{:032x}@{}", rand::random::<u128>(), NO_EMAIL_DOMAIN)
+}
+
+/// Whether this is a stand-in address, or any other address under the
+/// reserved `.invalid` top-level domain. No such address is ever accepted
+/// from a client, looked up, or mailed.
+pub fn is_placeholder_email(email: &str) -> bool {
+    let Some((_, domain)) = email.trim().rsplit_once('@') else {
+        return false;
+    };
+
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    domain == "invalid" || domain.ends_with(".invalid")
+}
+
 /// Email template
 #[derive(Clone)]
 pub struct Template {
@@ -77,6 +103,23 @@ pub struct Templates {
     pub deletion_cancelled: Template,
     /// Template for suspention
     pub suspension: Template,
+
+    // Passkey sign-up and recovery. Send these with `send_email_safe`: the
+    // first two go to an address anyone could have typed.
+    /// The 8-digit code that confirms an email address, at passkey sign-up
+    /// and at "add an email". Variables: `username`, `code`, `email` (the
+    /// address being confirmed)
+    pub email_code: Template,
+    /// Sent instead of the code when a passkey sign-up names an address that
+    /// already has an account. Variables: `email`, `url` (this template's
+    /// `url`, the sign-in page)
+    pub signup_existing: Template,
+    /// The lost-passkey recovery link. Variables: `email`, `url` (this
+    /// template's `url` followed by the one-time token)
+    pub passkey_recovery: Template,
+    /// Notice that a passkey was added to the account. Variables: `email`,
+    /// `url` (this template's `url`, the sign-in page)
+    pub passkey_added: Template,
 
     // Take It Down. Send these with `send_email_safe`, which also renders
     // the title. Variables: `reference`, plus `url` (received), `reason`
@@ -195,6 +238,129 @@ fn takedown_sloga_templates(status_url_base: &str) -> TakedownTemplates {
     }
 }
 
+/// The passkey sign-up and recovery templates (see the fields of the same
+/// names on `Templates`)
+struct PasskeyTemplates {
+    email_code: Template,
+    signup_existing: Template,
+    passkey_recovery: Template,
+    passkey_added: Template,
+}
+
+/// Short stand-ins for tests, with the same variables as the real ones. The
+/// code and the recovery token come first in `[[...]]`, where
+/// `TestHarness::assert_email` reads them; the urls stay empty for the same
+/// reason as the deletion ones.
+fn passkey_test_templates() -> PasskeyTemplates {
+    let template = |title: &str, text: &str| Template {
+        title: title.into(),
+        text: text.into(),
+        url: "".into(),
+        html: None,
+    };
+
+    PasskeyTemplates {
+        email_code: template("email_code", "[[{{{code}}}]] {{{username}}} {{{email}}}"),
+        signup_existing: template("signup_existing", "[[{{{url}}}]] {{{email}}}"),
+        passkey_recovery: template("passkey_recovery", "[[{{{url}}}]] {{{email}}}"),
+        passkey_added: template("passkey_added", "[[{{{url}}}]] {{{email}}}"),
+    }
+}
+
+// wording: draft, owner approval pending
+const EMAIL_CODE_TEXT: &str = "Someone is creating or changing a Sloga account named {{{username}}} with this email address.
+
+Confirmation code: {{{code}}}
+
+Type this code into Sloga to confirm the address. It works for 15 minutes.
+
+If this was not you, ignore this email. Nothing happens without the code.
+
+This email is intended for {{{email}}}
+Sent by Sloga
+
+Sloga Technologies LLC
+";
+
+// wording: draft, owner approval pending
+const SIGNUP_EXISTING_TEXT: &str = "Someone tried to create a Sloga account with this email address, but it already has one.
+
+If this was you, sign in instead: {{{url}}}
+
+If this was not you, ignore this email. Nothing was changed.
+
+This email is intended for {{{email}}}
+Sent by Sloga
+
+Sloga Technologies LLC
+";
+
+// wording: draft, owner approval pending
+const PASSKEY_RECOVERY_TEXT: &str = "Someone asked to get back into the Sloga account for this email address because its passkey was lost.
+
+Open this link to create a new passkey. It works once, for 30 minutes:
+
+{{{url}}}
+
+Creating the new passkey removes every other passkey on the account and signs out every device.
+
+If this was not you, ignore this email. Nothing happens unless the link is used.
+
+This email is intended for {{{email}}}
+Sent by Sloga
+
+Sloga Technologies LLC
+";
+
+// wording: draft, owner approval pending
+const PASSKEY_ADDED_TEXT: &str = "A passkey was added to your Sloga account. A passkey can be used to sign in.
+
+If this was you, there is nothing to do.
+
+If this was not you, sign in and remove the passkey under Settings: {{{url}}}
+Then write to support@sloga.gg.
+
+This email is intended for {{{email}}}
+Sent by Sloga
+
+Sloga Technologies LLC
+";
+
+/// The Sloga passkey templates (production and whitelabel share them).
+/// Text only for now. `app` is `hosts.app`.
+fn passkey_sloga_templates(app: &str) -> PasskeyTemplates {
+    PasskeyTemplates {
+        // wording: draft, owner approval pending
+        email_code: Template {
+            title: "Your Sloga confirmation code".into(),
+            text: EMAIL_CODE_TEXT.into(),
+            url: "".into(),
+            html: None,
+        },
+        // wording: draft, owner approval pending
+        signup_existing: Template {
+            title: "You already have a Sloga account".into(),
+            text: SIGNUP_EXISTING_TEXT.into(),
+            url: format!("{}/login", app),
+            html: None,
+        },
+        // wording: draft, owner approval pending
+        passkey_recovery: Template {
+            title: "Create a new passkey for your Sloga account".into(),
+            text: PASSKEY_RECOVERY_TEXT.into(),
+            url: format!("{}/login/passkey/recover/", app),
+            html: None,
+        },
+        // wording: draft, owner approval pending
+        passkey_added: Template {
+            title: "A passkey was added to your Sloga account".into(),
+            text: PASSKEY_ADDED_TEXT.into(),
+            url: format!("{}/login", app),
+            html: None,
+        },
+    }
+}
+
 pub async fn email_templates() -> Templates {
     let config = config().await;
     let status_url_base = &config.features.takedown.status_url_base;
@@ -214,6 +380,7 @@ pub async fn email_templates() -> Templates {
 fn build_templates(test: bool, production: bool, app: &str, status_url_base: &str) -> Templates {
     if test {
         let takedown = takedown_test_templates(status_url_base);
+        let passkey = passkey_test_templates();
 
         Templates {
             verify: Template {
@@ -256,6 +423,10 @@ fn build_templates(test: bool, production: bool, app: &str, status_url_base: &st
                 url: "".into(),
                 html: None,
             },
+            email_code: passkey.email_code,
+            signup_existing: passkey.signup_existing,
+            passkey_recovery: passkey.passkey_recovery,
+            passkey_added: passkey.passkey_added,
             takedown_received: takedown.received,
             takedown_needs_info: takedown.needs_info,
             takedown_removed: takedown.removed,
@@ -267,6 +438,7 @@ fn build_templates(test: bool, production: bool, app: &str, status_url_base: &st
         }
     } else if production {
         let takedown = takedown_sloga_templates(status_url_base);
+        let passkey = passkey_sloga_templates(app);
 
         Templates {
             verify: Template {
@@ -305,6 +477,10 @@ fn build_templates(test: bool, production: bool, app: &str, status_url_base: &st
                 text: include_str!("../../templates/suspension.txt").to_owned(),
                 url: Default::default(),
             },
+            email_code: passkey.email_code,
+            signup_existing: passkey.signup_existing,
+            passkey_recovery: passkey.passkey_recovery,
+            passkey_added: passkey.passkey_added,
             takedown_received: takedown.received,
             takedown_needs_info: takedown.needs_info,
             takedown_removed: takedown.removed,
@@ -316,6 +492,7 @@ fn build_templates(test: bool, production: bool, app: &str, status_url_base: &st
         }
     } else {
         let takedown = takedown_sloga_templates(status_url_base);
+        let passkey = passkey_sloga_templates(app);
 
         Templates {
             verify: Template {
@@ -361,6 +538,10 @@ fn build_templates(test: bool, production: bool, app: &str, status_url_base: &st
                 url: Default::default(),
                 html: None,
             },
+            email_code: passkey.email_code,
+            signup_existing: passkey.signup_existing,
+            passkey_recovery: passkey.passkey_recovery,
+            passkey_added: passkey.passkey_added,
             takedown_received: takedown.received,
             takedown_needs_info: takedown.needs_info,
             takedown_removed: takedown.removed,
@@ -575,6 +756,14 @@ pub fn validate_email(email: &str) -> Result<()> {
         }));
     }
 
+    // `.invalid` is where accounts with no email keep their stand-in
+    // address; nobody may type one in
+    if is_placeholder_email(email) {
+        return Err(create_error!(IncorrectData {
+            with: "email".to_string()
+        }));
+    }
+
     // Check if the email is blacklisted
     if let Some(domain) = email.split('@').next_back() {
         if REVOLT_SOURCE_LIST.contains(&domain.to_string()) {
@@ -718,6 +907,209 @@ mod tests {
 
         assert!(text.contains("This suspension has no end date."));
         assert!(!text.contains("again in"));
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use std::collections::HashSet;
+
+    use revolt_result::ErrorType;
+
+    use super::{
+        generate_placeholder_email, is_placeholder_email, normalise_email, validate_email,
+        NO_EMAIL_DOMAIN,
+    };
+
+    /// Fails if: the stand-in address is not 32 lower-case hex characters at
+    /// `noemail.invalid`, is changed by `normalise_email`, or repeats.
+    #[test]
+    fn a_placeholder_is_32_hex_characters_and_never_repeats() {
+        let mut seen = HashSet::new();
+
+        for _ in 0..500 {
+            let placeholder = generate_placeholder_email();
+            let (local, domain) = placeholder.split_once('@').expect("an address");
+
+            assert_eq!(domain, "noemail.invalid", "{placeholder}");
+            assert_eq!(domain, NO_EMAIL_DOMAIN);
+            assert_eq!(local.len(), 32, "{placeholder}");
+            assert!(
+                local
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "{placeholder}"
+            );
+
+            // Stored in `email` and `email_normalised` alike
+            assert_eq!(normalise_email(placeholder.clone()), placeholder);
+            assert!(is_placeholder_email(&placeholder));
+            assert!(seen.insert(placeholder), "a placeholder repeated");
+        }
+    }
+
+    /// Fails if: the predicate stops at the exact stand-in domain, is case
+    /// sensitive, or starts matching real domains.
+    #[test]
+    fn the_predicate_matches_every_invalid_address_and_nothing_else() {
+        for placeholder in [
+            "0123456789abcdef0123456789abcdef@noemail.invalid",
+            "someone@noemail.invalid",
+            "someone@NoEmail.INVALID",
+            "someone@other.invalid",
+            "someone@invalid",
+            "someone@noemail.invalid.",
+            "  someone@noemail.invalid\n",
+        ] {
+            assert!(is_placeholder_email(placeholder), "{placeholder:?}");
+        }
+
+        for real in [
+            "someone@example.com",
+            "invalid@example.com",
+            "someone@invalid.example.com",
+            "someone@notinvalid",
+            "someone@example.invalidx",
+            "noemail.invalid",
+            "Deleted User 01ACCOUNT",
+            "",
+        ] {
+            assert!(!is_placeholder_email(real), "{real:?}");
+        }
+    }
+
+    /// Fails if: `validate_email` accepts an address nobody may type in.
+    #[test]
+    fn validate_email_refuses_every_invalid_address() {
+        for refused in [
+            generate_placeholder_email(),
+            "someone@noemail.invalid".to_string(),
+            "someone@NOEMAIL.INVALID".to_string(),
+            "someone@other.invalid".to_string(),
+        ] {
+            let error = validate_email(&refused).expect_err("must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                "{refused}: {:?}",
+                error.error_type
+            );
+        }
+
+        // The control: an ordinary address still passes
+        validate_email("someone@sloga.gg").expect("an ordinary address");
+    }
+}
+
+#[cfg(test)]
+mod passkey_template_tests {
+    use std::collections::BTreeSet;
+
+    use regex::Regex;
+    use serde_json::json;
+
+    use super::{
+        build_templates, passkey_sloga_templates, passkey_test_templates, render_template,
+        PasskeyTemplates, Template,
+    };
+
+    const APP: &str = "https://app.example.test";
+    const STATUS: &str = "https://site.example.test/take-it-down-status.html";
+
+    impl PasskeyTemplates {
+        fn all(&self) -> [&Template; 4] {
+            [
+                &self.email_code,
+                &self.signup_existing,
+                &self.passkey_recovery,
+                &self.passkey_added,
+            ]
+        }
+    }
+
+    fn variable_names(template: &Template) -> BTreeSet<String> {
+        let re = Regex::new(r"\{\{\{?\s*([A-Za-z_]+)\s*\}?\}\}").unwrap();
+        [&template.title, &template.text]
+            .into_iter()
+            .chain(template.html.as_ref())
+            .flat_map(|source| {
+                re.captures_iter(source)
+                    .map(|capture| capture[1].to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Fails if: a test stand-in drifts from the variables the real template
+    /// fills, or a template leaves a variable unrendered.
+    #[test]
+    fn test_templates_use_the_real_variables_and_everything_renders() {
+        let real = passkey_sloga_templates(APP);
+        let test = passkey_test_templates();
+        let variables = json!({
+            "username": "alice",
+            "code": "01234567",
+            "email": "alice@example.test",
+            "url": "https://app.example.test/login/passkey/recover/TOKEN",
+        });
+
+        for (real, test) in real.all().into_iter().zip(test.all()) {
+            assert_eq!(variable_names(real), variable_names(test), "{}", test.title);
+            assert!(!variable_names(real).is_empty());
+
+            for template in [real, test] {
+                for source in [&template.title, &template.text] {
+                    let rendered = render_template(source, &variables).unwrap();
+                    assert!(!rendered.contains("{{") && !rendered.contains("}}"));
+                }
+            }
+        }
+    }
+
+    /// Fails if: the code mail loses the code, the username or the address,
+    /// or stops saying what to do when it was not you.
+    #[test]
+    fn the_code_mail_names_the_username_the_code_and_the_address() {
+        let template = passkey_sloga_templates(APP).email_code;
+        let text = render_template(
+            &template.text,
+            &json!({ "username": "alice", "code": "01234567", "email": "a+b@example.test" }),
+        )
+        .unwrap();
+
+        assert!(text.contains("named alice"), "{text}");
+        assert!(text.contains("Confirmation code: 01234567"), "{text}");
+        assert!(text.contains("intended for a+b@example.test"), "{text}");
+        assert!(text.contains("If this was not you, ignore this email."), "{text}");
+        // The code is not in the subject, where a lock screen would show it
+        assert!(!template.title.contains("{{"), "{}", template.title);
+    }
+
+    /// Fails if: the links move, or the TEST_DB stand-ins gain a url prefix
+    /// (`TestHarness::assert_email` reads a bare token out of `[[...]]`).
+    #[test]
+    fn the_links_point_at_the_app_and_test_urls_stay_empty() {
+        for production in [true, false] {
+            let templates = build_templates(false, production, APP, STATUS);
+            assert_eq!(templates.email_code.url, "");
+            assert_eq!(templates.signup_existing.url, format!("{APP}/login"));
+            assert_eq!(
+                templates.passkey_recovery.url,
+                format!("{APP}/login/passkey/recover/")
+            );
+            assert_eq!(templates.passkey_added.url, format!("{APP}/login"));
+        }
+
+        let templates = build_templates(true, false, APP, STATUS);
+        for template in [
+            &templates.email_code,
+            &templates.signup_existing,
+            &templates.passkey_recovery,
+            &templates.passkey_added,
+        ] {
+            assert_eq!(template.url, "", "{}", template.title);
+            assert!(template.text.starts_with("[["), "{}", template.title);
+        }
+        assert_eq!(templates.email_code.title, "email_code");
     }
 }
 

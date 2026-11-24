@@ -119,6 +119,19 @@ impl AbstractAccounts for ReferenceDb {
         account.lockout = stored.and_then(|stored| stored.lockout.clone());
         account.deletion = stored.and_then(|stored| stored.deletion.clone());
 
+        // A copy that says "no email" never writes the email fields of a row
+        // that exists: it may have been loaded before the first-email op
+        // gave the account its address, and would put the stand-in back. An
+        // insert still stores them, as the MongoDB driver's `$setOnInsert`
+        // does.
+        if account.email_absent {
+            if let Some(stored) = stored {
+                account.email = stored.email.clone();
+                account.email_normalised = stored.email_normalised.clone();
+                account.email_absent = stored.email_absent;
+            }
+        }
+
         accounts.insert(account.id.to_string(), account);
         Ok(())
     }
@@ -297,6 +310,59 @@ impl AbstractAccounts for ReferenceDb {
         account.verification = verification.clone();
         Ok(())
     }
+
+    /// Atomically give an account that has no email its first address
+    async fn set_account_email_if_absent(
+        &self,
+        id: &str,
+        email: &str,
+        email_normalised: &str,
+    ) -> Result<bool> {
+        // The same conditions as the MongoDB filter and its two unique
+        // indexes, checked and applied under one lock
+        let mut accounts = self.accounts.lock().await;
+
+        let taken = accounts.values().any(|other| {
+            other.id != id
+                && (same_address(&other.email, email)
+                    || same_address(&other.email_normalised, email_normalised))
+        });
+        if taken {
+            return Ok(false);
+        }
+
+        match accounts.get_mut(id) {
+            Some(account)
+                if account.email_absent
+                    && !matches!(account.deletion, Some(DeletionInfo::Deleted)) =>
+            {
+                account.email = email.to_string();
+                account.email_normalised = email_normalised.to_string();
+                account.email_absent = false;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Undo a failed sign-up: remove the account row it just inserted
+    async fn rollback_signup_account(&self, id: &str) -> Result<bool> {
+        let mut accounts = self.accounts.lock().await;
+
+        // As the MongoDB filter: never an account that has a password
+        if accounts.get(id).is_some_and(|account| account.password_absent) {
+            accounts.remove(id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+}
+
+/// Whether two addresses are the same to the unique email indexes, which
+/// ignore letter case (collation strength 2)
+fn same_address(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
 }
 
 /// Whether the account holds a pending deletion with this token that has not

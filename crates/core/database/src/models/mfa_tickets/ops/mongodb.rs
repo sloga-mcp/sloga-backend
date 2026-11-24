@@ -111,4 +111,15 @@ impl AbstractMFATickets for MongoDb {
             .map_err(|_| create_database_error!("delete_many", COL))
             .map(|result| result.deleted_count as usize)
     }
+
+    /// Delete every ticket of one account
+    async fn delete_mfa_tickets_for_account(&self, account_id: &str) -> Result<usize> {
+        self.col::<Document>(COL)
+            .delete_many(doc! {
+                "account_id": account_id
+            })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL))
+            .map(|result| result.deleted_count as usize)
+    }
 }

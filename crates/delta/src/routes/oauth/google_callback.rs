@@ -4,6 +4,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use nanoid::nanoid;
 use redis_kiss::{get_connection, redis, AsyncCommands};
 use revolt_config::config;
+use revolt_database::util::email::is_placeholder_email;
 use revolt_database::{Account, Database, EmailVerification, MFATicket};
 use revolt_models::v0;
 use rocket::response::Redirect;
@@ -138,33 +139,31 @@ async fn callback_inner(
     let email = claims.email.clone().ok_or("email_unverified")?;
 
     // Find or create the account: by Google id, then by verified email
-    // (auto-link), then a brand new account.
+    // (auto-link), then a brand new account. The auto-link never picks an
+    // account that has no email (see `account_for_verified_email`).
     let mut account =
         if let Some(account) = fetch_by_google_id(db, &claims.sub).await? {
             account
+        } else if let Some(mut account) = account_for_verified_email(db, &email).await? {
+            account.google_id = Some(claims.sub.clone());
+            account.save(db).await.map_err(|_| "internal")?;
+            account
         } else {
-            let normalised = revolt_database::util::email::normalise_email(email.clone());
-            if let Some(mut account) = db
-                .fetch_account_by_normalised_email(&normalised)
+            Account::new_from_google(db, email, claims.sub.clone())
                 .await
                 .map_err(|_| "internal")?
-            {
-                account.google_id = Some(claims.sub.clone());
-                account.save(db).await.map_err(|_| "internal")?;
-                account
-            } else {
-                Account::new_from_google(db, email, claims.sub.clone())
-                    .await
-                    .map_err(|_| "internal")?
-            }
         };
 
     if account.disabled {
         return Err("disabled_account");
     }
 
-    // Google has verified ownership of this email
-    if let EmailVerification::Pending { .. } = account.verification {
+    // Google has verified ownership of this email. That says nothing about
+    // an account that has no email (found by its Google id): it is stored
+    // `Verified` already, and is not written here in any case.
+    if matches!(account.verification, EmailVerification::Pending { .. })
+        && account.real_email().is_some()
+    {
         account.verification = EmailVerification::Verified;
         account.save(db).await.map_err(|_| "internal")?;
     }
@@ -234,6 +233,29 @@ async fn fetch_by_google_id(
         .map_err(|_| "internal")
 }
 
+/// The existing account a sign-in with this provider-verified email is
+/// linked to, if there is one. `Ok(None)` means: create a new account.
+///
+/// Shared by the Google and Apple callbacks. An account that has no email is
+/// never the answer: the lookup goes through `Account::fetch_by_email`, which
+/// cannot match one, and what it returns is checked again here. A `.invalid`
+/// address is where such accounts keep their stand-in, so a sign-in that
+/// claims one is refused outright (`email_unverified`) and neither links nor
+/// creates anything.
+pub(super) async fn account_for_verified_email(
+    db: &Database,
+    email: &str,
+) -> std::result::Result<Option<Account>, &'static str> {
+    if is_placeholder_email(email) {
+        return Err("email_unverified");
+    }
+
+    Ok(Account::fetch_by_email(db, email)
+        .await
+        .map_err(|_| "internal")?
+        .filter(|account| !account.email_absent && account.real_email().is_some()))
+}
+
 #[cfg(test)]
 mod tests {
     //! The callbacks cannot be driven here: they exchange a code with Google
@@ -241,7 +263,9 @@ mod tests {
     //! directory instead.
     use std::path::Path;
 
-    use crate::util::test::{without_comments, without_whitespace};
+    use revolt_database::Account;
+
+    use crate::util::test::{without_comments, without_whitespace, TestHarness};
 
     const CREATE: &str = ".create_session(";
     const BOUND: &str = "letsession=account";
@@ -340,5 +364,132 @@ mod tests {
         ] {
             assert_eq!(created_and_marked(&shipping(bad)), (1, 0), "{bad}");
         }
+    }
+
+    /// A stored account with no email
+    async fn no_email_account(harness: &TestHarness) -> Account {
+        let account = Account::new_passkey_signup(None).expect("a no-email account");
+        account.save(&harness.db).await.unwrap();
+
+        let stored = harness.db.fetch_account(&account.id).await.unwrap();
+        assert!(stored.email_absent, "the seed must be stored");
+        assert!(stored.email.ends_with("@noemail.invalid"), "{}", stored.email);
+        stored
+    }
+
+    /// Fails if: a Google or Apple sign-in whose verified address equals an
+    /// account's stand-in address (as stored, in another case, or padded)
+    /// is given that account to link, or is told to create a new account
+    /// under a `.invalid` address, instead of being refused.
+    #[test]
+    fn a_placeholder_address_links_and_creates_nothing() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = no_email_account(&harness).await;
+
+            for claimed in [
+                account.email.clone(),
+                account.email.to_uppercase(),
+                format!(" {}\n", account.email),
+                format!("{}.", account.email),
+                // A stand-in nobody holds: the same answer, so nothing is
+                // learned about which ones exist
+                format!("{}@noemail.invalid", TestHarness::rand_string()),
+                format!("{}@elsewhere.invalid", TestHarness::rand_string()),
+            ] {
+                let answer = super::account_for_verified_email(&harness.db, &claimed).await;
+                assert!(
+                    matches!(answer, Err("email_unverified")),
+                    "{:?}: expected the refusal, got {:?}",
+                    claimed,
+                    answer.map(|found| found.map(|account| account.id))
+                );
+            }
+
+            let after = harness.db.fetch_account(&account.id).await.unwrap();
+            assert_eq!(after.google_id, None);
+            assert_eq!(after.apple_id, None);
+            assert!(after.email_absent);
+            assert_eq!(after.email, account.email);
+        })
+    }
+
+    /// Fails if: the auto-link stops finding an ordinary account by its
+    /// address (every returning sign-in would then try to create a second
+    /// account), invents a match for an address nobody has, or returns an
+    /// account that is flagged as having no email.
+    #[test]
+    fn the_auto_link_finds_only_accounts_with_an_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (ordinary, _, _) = harness.new_user().await;
+
+            for claimed in [ordinary.email.clone(), ordinary.email.to_uppercase()] {
+                let found = super::account_for_verified_email(&harness.db, &claimed)
+                    .await
+                    .expect("no refusal")
+                    .expect("the account that holds the address");
+                assert_eq!(found.id, ordinary.id, "{claimed}");
+            }
+
+            let nobody = format!("{}@stoat.chat", TestHarness::rand_string());
+            assert!(super::account_for_verified_email(&harness.db, &nobody)
+                .await
+                .expect("no refusal")
+                .is_none());
+
+            // Flagged as having no email while an ordinary-looking address
+            // is stored: never linked. Seeded as a new row: saving cannot
+            // set the flag on an account that is already stored.
+            let address = format!("{}@stoat.chat", TestHarness::rand_string());
+            let mut flagged =
+                Account::new_passkey_signup(Some(address.clone())).expect("`Account`");
+            flagged.email_absent = true;
+            flagged.save(&harness.db).await.unwrap();
+
+            let seeded = harness.db.fetch_account(&flagged.id).await.unwrap();
+            assert!(seeded.email_absent, "the seed must be stored");
+            assert_eq!(seeded.email, address, "the seed must be stored");
+            assert_eq!(
+                harness
+                    .db
+                    .fetch_account_by_normalised_email(&seeded.email_normalised)
+                    .await
+                    .unwrap()
+                    .map(|found| found.id),
+                Some(flagged.id.clone()),
+                "the control: the stored address does find the row"
+            );
+            assert!(super::account_for_verified_email(&harness.db, &flagged.email)
+                .await
+                .expect("no refusal")
+                .is_none());
+        })
+    }
+
+    /// Fails if: either callback looks the provider's address up in the
+    /// stored email fields again instead of through
+    /// `account_for_verified_email`, or that stops using
+    /// `Account::fetch_by_email`.
+    #[test]
+    fn both_callbacks_link_through_the_wrapper() {
+        let google = shipping(include_str!("google_callback.rs"));
+        let apple = shipping(include_str!("apple_callback.rs"));
+
+        for (file, code) in [("google_callback.rs", &google), ("apple_callback.rs", &apple)] {
+            assert_eq!(
+                code.matches("=account_for_verified_email(db,&email).await?{").count(),
+                1,
+                "{file}: the auto-link must go through `account_for_verified_email`"
+            );
+            assert!(
+                !code.contains("fetch_account_by_normalised_email"),
+                "{}: a raw lookup by email",
+                file
+            );
+            assert!(!code.contains("normalise_email"), "{}", file);
+        }
+
+        assert!(google.contains("Account::fetch_by_email(db,email)"));
     }
 }

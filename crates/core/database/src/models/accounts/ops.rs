@@ -45,6 +45,13 @@ pub trait AbstractAccounts: Sync + Send {
     // whole-document save can neither reset a lockout nor cancel, revive or
     // un-schedule a deletion. Every other field, `disabled` included, is
     // still written.
+    //
+    // A copy with `email_absent` set never writes `email`,
+    // `email_normalised` or `email_absent` of a row that exists (an insert
+    // stores them): the address of such an account arrives only through
+    // `set_account_email_if_absent`, and a copy loaded before that write
+    // must not put the stand-in back. So a save can clear `email_absent`
+    // but never set it on a stored row.
     async fn save_account(&self, account: &Account) -> Result<()>;
 
     /// Overwrite the deletion state, and nothing else
@@ -122,6 +129,32 @@ pub trait AbstractAccounts: Sync + Send {
         id: &str,
         verification: &EmailVerification,
     ) -> Result<()>;
+
+    /// Atomically give an account that has no email its first address
+    ///
+    /// Sets `email` and `email_normalised` and clears `email_absent`, only
+    /// if the account still has `email_absent` set, was not deleted, and no
+    /// other account holds the address in either field (compared without
+    /// regard to case, as the unique indexes do). `Ok(true)` if it applied.
+    /// Otherwise `Ok(false)` and nothing changed; a missing account is
+    /// `Ok(false)` too. The caller normalises: use
+    /// `Account::set_first_email`.
+    async fn set_account_email_if_absent(
+        &self,
+        id: &str,
+        email: &str,
+        email_normalised: &str,
+    ) -> Result<bool>;
+
+    /// Undo a failed sign-up: remove the account row it just inserted
+    ///
+    /// This is NOT how a user's account is deleted (that is
+    /// `Account::schedule_deletion`, then the purge). It removes one row and
+    /// nothing that hangs off it, and exists only so a sign-up that failed
+    /// after its first write leaves no half-made account behind. It only
+    /// removes a row that has no usable password (`password_absent`), which
+    /// every passkey sign-up row has. `Ok(true)` if a row was removed.
+    async fn rollback_signup_account(&self, id: &str) -> Result<bool>;
 }
 
 #[cfg(test)]
@@ -146,6 +179,19 @@ mod tests {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
+        }
+    }
+
+    /// An account with no email: the flag, and a stand-in in both fields
+    fn no_email_account(id: &str) -> Account {
+        let placeholder = crate::util::email::generate_placeholder_email();
+        Account {
+            email: placeholder.clone(),
+            email_normalised: placeholder,
+            password_absent: true,
+            email_absent: true,
+            ..account(id)
         }
     }
 
@@ -402,6 +448,92 @@ mod tests {
                 fetched.password, "hash-changed",
                 "the save still writes every other field"
             );
+        });
+    }
+
+    /// Fails if: a copy loaded while the account had no email, saved after
+    /// the first-email op landed, puts the stand-in or the flag back; or
+    /// that save stops writing the other fields.
+    #[tokio::test]
+    async fn stale_save_keeps_an_added_email() {
+        database_test!(|db| async move {
+            let acct = no_email_account("01ACCOUNTSTALEEMAIL0000000");
+            db.save_account(&acct).await.unwrap();
+
+            let mut stale = db.fetch_account(&acct.id).await.unwrap();
+            assert!(stale.email_absent, "the control: loaded with no email");
+
+            assert!(db
+                .set_account_email_if_absent(&acct.id, "Ad.ded@example.test", "added@example.test")
+                .await
+                .unwrap());
+
+            stale.password = "hash-changed".to_string();
+            db.save_account(&stale).await.unwrap();
+
+            let stored = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(
+                stored,
+                Account {
+                    email: "Ad.ded@example.test".to_string(),
+                    email_normalised: "added@example.test".to_string(),
+                    email_absent: false,
+                    password: "hash-changed".to_string(),
+                    ..acct.clone()
+                },
+                "the added email stays, and the save still writes the rest"
+            );
+            assert_eq!(stored.real_email(), Some("Ad.ded@example.test"));
+
+            // The same copy saved again changes nothing either
+            db.save_account(&stale).await.unwrap();
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap(), stored);
+        });
+    }
+
+    /// Fails if: the first save of an account with no email stops storing
+    /// the stand-in and the flag; a later save of such a copy rewrites the
+    /// email fields of the stored row; or a copy that has an email stops
+    /// writing them.
+    #[tokio::test]
+    async fn save_writes_email_fields_on_insert_and_for_a_copy_with_an_email() {
+        database_test!(|db| async move {
+            // Insert: all three are stored
+            let absent = no_email_account("01ACCOUNTSAVEEMAILABSENT00");
+            db.save_account(&absent).await.unwrap();
+            let stored = db.fetch_account(&absent.id).await.unwrap();
+            assert_eq!(stored, absent);
+            assert!(stored.email_absent);
+
+            // A copy that says "no email" cannot change the stored fields
+            let mut edited = absent.clone();
+            edited.email = "typed@example.test".to_string();
+            edited.email_normalised = "typed@example.test".to_string();
+            edited.disabled = true;
+            db.save_account(&edited).await.unwrap();
+            assert_eq!(
+                db.fetch_account(&absent.id).await.unwrap(),
+                Account {
+                    disabled: true,
+                    ..absent.clone()
+                }
+            );
+
+            // Nor can it set the flag on a row that has an email
+            let with_email = account("01ACCOUNTSAVEEMAILHASONE00");
+            db.save_account(&with_email).await.unwrap();
+            let mut flagged = with_email.clone();
+            flagged.email_absent = true;
+            flagged.email = "other@example.test".to_string();
+            db.save_account(&flagged).await.unwrap();
+            assert_eq!(db.fetch_account(&with_email.id).await.unwrap(), with_email);
+
+            // The control: a copy that has an email saves as before
+            let mut moved = with_email.clone();
+            moved.email = "Mo.ved@example.test".to_string();
+            moved.email_normalised = "moved@example.test".to_string();
+            db.save_account(&moved).await.unwrap();
+            assert_eq!(db.fetch_account(&with_email.id).await.unwrap(), moved);
         });
     }
 
@@ -1354,6 +1486,186 @@ mod tests {
                 "expected UnknownUser, got {:?}",
                 missing.error_type
             );
+        });
+    }
+
+    /// Fails if: the first-email write does not store both fields and clear
+    /// the flag, touches anything else, or applies a second time.
+    #[tokio::test]
+    async fn first_email_applies_once() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+
+            let acct = no_email_account("01ACCOUNTFIRSTEMAILONCE000");
+            db.save_account(&acct).await.unwrap();
+
+            assert!(db
+                .set_account_email_if_absent(&acct.id, "Fi.rst@example.test", "first@example.test")
+                .await
+                .unwrap());
+
+            let stored = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(
+                stored,
+                Account {
+                    email: "Fi.rst@example.test".to_string(),
+                    email_normalised: "first@example.test".to_string(),
+                    email_absent: false,
+                    ..acct.clone()
+                },
+                "only the two email fields and the flag change"
+            );
+
+            // The account has an email now, so the write is spent
+            assert!(!db
+                .set_account_email_if_absent(&acct.id, "second@example.test", "second@example.test")
+                .await
+                .unwrap());
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap(), stored);
+        });
+    }
+
+    /// Fails if: an address another account holds, in either field or in
+    /// another letter case, can be written; or a refusal changes anything.
+    #[tokio::test]
+    async fn first_email_is_refused_when_another_account_holds_it() {
+        database_test!(|db| async move {
+            // On MongoDB the unique indexes are what settle a race
+            db.migrate_database().await.expect("schema");
+
+            let holder = Account {
+                email: "Ta.ken@example.test".to_string(),
+                email_normalised: "taken@example.test".to_string(),
+                ..account("01ACCOUNTFIRSTEMAILHOLDER0")
+            };
+            db.save_account(&holder).await.unwrap();
+
+            let acct = no_email_account("01ACCOUNTFIRSTEMAILDUP0000");
+            db.save_account(&acct).await.unwrap();
+
+            for (email, email_normalised) in [
+                // The same normalised address behind another spelling
+                ("taken+alias@example.test", "taken@example.test"),
+                ("T.aken@example.test", "TAKEN@EXAMPLE.TEST"),
+                // The same typed address
+                ("Ta.ken@example.test", "other@example.test"),
+                ("ta.KEN@example.test", "other@example.test"),
+            ] {
+                assert!(
+                    !db.set_account_email_if_absent(&acct.id, email, email_normalised)
+                        .await
+                        .unwrap(),
+                    "{email} / {email_normalised}"
+                );
+                assert_eq!(
+                    db.fetch_account(&acct.id).await.unwrap(),
+                    acct,
+                    "{email} / {email_normalised}: a refusal changes nothing"
+                );
+            }
+            assert_eq!(db.fetch_account(&holder.id).await.unwrap(), holder);
+
+            // The control: an address nobody holds is written
+            assert!(db
+                .set_account_email_if_absent(&acct.id, "free@example.test", "free@example.test")
+                .await
+                .unwrap());
+            assert!(!db.fetch_account(&acct.id).await.unwrap().email_absent);
+        });
+    }
+
+    /// Fails if: the write applies to an account that already has an email,
+    /// to a deleted one, or reports success for an account that is not there.
+    #[tokio::test]
+    async fn first_email_is_refused_unless_the_account_has_none() {
+        database_test!(|db| async move {
+            db.migrate_database().await.expect("schema");
+
+            let with_email = account("01ACCOUNTFIRSTEMAILHASONE0");
+            db.save_account(&with_email).await.unwrap();
+
+            let deleted = no_email_account("01ACCOUNTFIRSTEMAILDELETED");
+            db.save_account(&deleted).await.unwrap();
+            db.set_account_deletion(&deleted.id, Some(DeletionInfo::Deleted))
+                .await
+                .unwrap();
+            let deleted = db.fetch_account(&deleted.id).await.unwrap();
+
+            for acct in [&with_email, &deleted] {
+                let applied = db
+                    .set_account_email_if_absent(&acct.id, "new@example.test", "new@example.test")
+                    .await
+                    .unwrap();
+                assert!(!applied, "{}", acct.id);
+                assert_eq!(&db.fetch_account(&acct.id).await.unwrap(), acct);
+            }
+
+            assert!(!db
+                .set_account_email_if_absent(
+                    "01ACCOUNTMISSING0000000000",
+                    "new@example.test",
+                    "new@example.test"
+                )
+                .await
+                .unwrap());
+            assert!(db
+                .fetch_account_by_normalised_email("new@example.test")
+                .await
+                .unwrap()
+                .is_none());
+
+            // The control: the same address goes to an account with none
+            let absent = no_email_account("01ACCOUNTFIRSTEMAILABSENT0");
+            db.save_account(&absent).await.unwrap();
+            assert!(db
+                .set_account_email_if_absent(&absent.id, "new@example.test", "new@example.test")
+                .await
+                .unwrap());
+        });
+    }
+
+    /// Fails if: the sign-up rollback leaves the row, removes another
+    /// account, or removes an account that has a password.
+    #[tokio::test]
+    async fn signup_rollback_removes_only_the_passkey_signup_row() {
+        database_test!(|db| async move {
+            let fresh = no_email_account("01ACCOUNTROLLBACKFRESH0000");
+            let other = no_email_account("01ACCOUNTROLLBACKOTHER0000");
+            let with_password = account("01ACCOUNTROLLBACKPASSWORD0");
+            for acct in [&fresh, &other, &with_password] {
+                db.save_account(acct).await.unwrap();
+            }
+
+            assert!(db.rollback_signup_account(&fresh.id).await.unwrap());
+            let gone = db
+                .fetch_account(&fresh.id)
+                .await
+                .expect_err("the row must be gone");
+            assert!(
+                matches!(gone.error_type, ErrorType::UnknownUser),
+                "expected UnknownUser, got {:?}",
+                gone.error_type
+            );
+            assert!(db
+                .fetch_account_by_normalised_email(&fresh.email_normalised)
+                .await
+                .unwrap()
+                .is_none());
+
+            // Again, and for an id that never existed: nothing to remove
+            assert!(!db.rollback_signup_account(&fresh.id).await.unwrap());
+            assert!(!db
+                .rollback_signup_account("01ACCOUNTMISSING0000000000")
+                .await
+                .unwrap());
+
+            // An account with a password is never a sign-up to roll back
+            assert!(!db.rollback_signup_account(&with_password.id).await.unwrap());
+            assert_eq!(
+                db.fetch_account(&with_password.id).await.unwrap(),
+                with_password
+            );
+            assert_eq!(db.fetch_account(&other.id).await.unwrap(), other);
         });
     }
 }

@@ -73,12 +73,25 @@ fn refuse_blocked_region(settings: &PaymentsSettings, country: Option<&str>) -> 
     }
 }
 
+/// Refuse a purchase by an account with no confirmed email
+/// (`InvalidOperation`, by `Account::has_confirmed_email`). A failed
+/// account read refuses too.
+pub(super) async fn require_confirmed_email(db: &Database, user_id: &str) -> Result<()> {
+    let account = db.fetch_account(user_id).await?;
+    if account.has_confirmed_email() {
+        Ok(())
+    } else {
+        Err(create_error!(InvalidOperation))
+    }
+}
+
 /// # Start Cipher Checkout
 ///
 /// Create (or reuse) a Stripe Checkout session for a Cipher tier and return
 /// the hosted page to send the user to. Prices and upgrades are quoted by the
 /// server; the body only names the tier wanted. Bots cannot buy. Refused
-/// with `CipherRegionUnavailable` from a country Cipher is not sold to.
+/// with `CipherRegionUnavailable` from a country Cipher is not sold to, and
+/// with `InvalidOperation` for an account that has no confirmed email.
 #[openapi(tag = "Payments")]
 #[post("/cipher/checkout", data = "<data>")]
 pub async fn checkout(
@@ -97,6 +110,10 @@ pub async fn checkout(
     // under a default
     let settings = PaymentsSettings::load().await?;
     refuse_blocked_region(&settings, country.0.as_deref())?;
+
+    // Before the engine: nothing is stored or sent to Stripe for an account
+    // with no confirmed email
+    require_confirmed_email(db, &user.id).await?;
     let data = data.into_inner();
 
     // The engine owns every other gate: payments enabled, sale open, the
@@ -119,7 +136,8 @@ pub async fn checkout(
 
 #[cfg(test)]
 mod test {
-    use revolt_database::{Bot, Database, OrderState};
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{Account, Bot, Database, EmailVerification, OrderState, User};
     use revolt_models::v0::{CipherReturnTo, CipherTier};
     use revolt_payments::engine;
     use revolt_payments::settings::PaymentsSettings;
@@ -278,6 +296,90 @@ mod test {
         assert_eq!(response.status(), Status::Unauthorized);
 
         assert!(harness.stripe.calls().is_empty());
+    }
+
+    /// Fails if: the checkout of an account with no email reaches the engine
+    /// (an order stored, a Stripe call made) instead of being refused with
+    /// `InvalidOperation`; or an account that has a confirmed email is
+    /// refused.
+    #[test]
+    fn an_account_with_no_email_is_refused() {
+        crate::util::test::rt().block_on(an_account_with_no_email_is_refused_case())
+    }
+
+    async fn an_account_with_no_email_is_refused_case() {
+        let harness = TestHarness::new().await;
+
+        let user = User::create(&harness.db, TestHarness::rand_string(), None, None)
+            .await
+            .expect("`User`");
+        let mut account = Account::new_passkey_signup(None).expect("`Account`");
+        account.id = user.id.clone();
+        harness.db.save_account(&account).await.expect("saved");
+        assert_eq!(account.real_email(), None, "the control: no email");
+        let session = account
+            .create_session(&harness.db, String::new())
+            .await
+            .expect("`Session`");
+
+        let response =
+            checkout_with(&harness, session_auth(&session.token), body("T99", "web")).await;
+        assert_refused(response, Status::BadRequest, "InvalidOperation").await;
+
+        assert_eq!(harness.stripe.call_count(CREATE_SESSION), 0);
+        assert_eq!(orders_of(&harness.db, &user.id).await, 0);
+
+        // The control: the same request from an account with an email
+        let (_, session, user) = harness.new_user().await;
+        url_of(checkout_with(&harness, session_auth(&session.token), body("T99", "web")).await)
+            .await;
+        assert_eq!(harness.stripe.call_count(CREATE_SESSION), 1);
+        assert_eq!(orders_of(&harness.db, &user.id).await, 1);
+    }
+
+    /// The rule the checkout gate applies, `Account::has_confirmed_email`.
+    ///
+    /// Fails if: a stand-in address counts as a confirmed email in any
+    /// verification state, an address still waiting for its first
+    /// verification counts, or a confirmed address (mid-move or not) does
+    /// not.
+    #[test]
+    fn only_a_real_confirmed_address_counts() {
+        let moving = || EmailVerification::Moving {
+            new_email: "new@example.test".to_string(),
+            token: "token".to_string(),
+            expiry: Timestamp::now_utc(),
+        };
+        let pending = || EmailVerification::Pending {
+            token: "token".to_string(),
+            expiry: Timestamp::now_utc(),
+        };
+        let account = |email: Option<&str>, verification: Option<EmailVerification>| {
+            let mut account =
+                Account::new_passkey_signup(email.map(str::to_string)).expect("`Account`");
+            if let Some(verification) = verification {
+                account.verification = verification;
+            }
+            account
+        };
+
+        for (email, verification, expected) in [
+            (None, None, false),
+            (None, Some(moving()), false),
+            (None, Some(pending()), false),
+            (Some("one@example.test"), None, true),
+            (Some("one@example.test"), Some(moving()), true),
+            (Some("one@example.test"), Some(pending()), false),
+        ] {
+            let account = account(email, verification);
+            assert_eq!(
+                account.has_confirmed_email(),
+                expected,
+                "email {:?}, {:?}",
+                email,
+                account.verification
+            );
+        }
     }
 
     /// While an order is Pending and unexpired, asking again for the same

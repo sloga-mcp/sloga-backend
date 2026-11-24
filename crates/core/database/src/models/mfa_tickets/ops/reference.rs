@@ -71,4 +71,14 @@ impl AbstractMFATickets for ReferenceDb {
 
         Ok(before - tickets.len())
     }
+
+    /// Delete every ticket of one account
+    async fn delete_mfa_tickets_for_account(&self, account_id: &str) -> Result<usize> {
+        let mut tickets = self.tickets.lock().await;
+
+        let before = tickets.len();
+        tickets.retain(|_, ticket| ticket.account_id != account_id);
+
+        Ok(before - tickets.len())
+    }
 }

@@ -1,7 +1,9 @@
 pub mod boosts;
 pub mod dice;
+pub mod email_code;
 pub mod interactions;
 pub mod passkey;
+pub mod passkey_signup;
 pub mod polls;
 pub mod ratelimits;
 pub mod slowmode;

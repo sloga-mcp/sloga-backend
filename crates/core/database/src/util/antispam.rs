@@ -719,6 +719,16 @@ fn is_new_account(author: &User, now_ms: i64) -> bool {
     }
 }
 
+/// Whether the account behind `user_id` has no email address (an account's
+/// id is its user's). One read. A failed read, or no account at all, counts
+/// as having none.
+async fn has_no_email(db: &Database, user_id: &str) -> bool {
+    match db.fetch_account(user_id).await {
+        Ok(account) => account.real_email().is_none(),
+        Err(_) => true,
+    }
+}
+
 /// Everyone who shares a Group with `user_id` (both current recipients),
 /// from the server's own channel data
 async fn co_members(db: &Database, user_id: &str) -> Result<HashSet<String>> {
@@ -795,8 +805,10 @@ async fn without_staff<'a>(db: &Database, ids: &[&'a str]) -> Result<Vec<&'a str
 ///   `antispam:e2ee:out:{author}:{hour}`. A plaintext writer found is
 ///   remembered in the author's reply memory.
 /// - At `e2ee_fanout_threshold` distinct strangers in the window
-///   (`e2ee_fanout_new_account_threshold` for accounts younger than 14 days;
-///   at most 50) up to `max(threshold, 10)` of them are re-checked. If enough
+///   (`e2ee_fanout_new_account_threshold` for accounts younger than 14 days,
+///   and for accounts with no email address at any age: one read of the
+///   author's account once that lower threshold is reached; at most 50) up
+///   to `max(threshold, 10)` of them are re-checked. If enough
 ///   still stand, staff get a system report holding counts only (no message,
 ///   no recipient). With `e2ee_fanout_pause` the author also gets a [`DmGuard`]
 ///   (`fingerprint` [`E2EE_FANOUT_FINGERPRINT`]) that closing the report
@@ -995,7 +1007,21 @@ async fn observe_fanout(
         .arg(&out_keys[..]);
 
     let (counted,): (HashSet<String>,) = pipeline.query_async(&mut *conn).await?;
-    let threshold = cfg.e2ee_fanout_threshold_for(is_new_account(author, now));
+
+    // The new-account threshold is never the higher one, so below it nothing
+    // can flag whoever the author is
+    let new_account_threshold = cfg.e2ee_fanout_threshold_for(true);
+    if counted.len() < new_account_threshold {
+        return Ok(());
+    }
+
+    // An account with no email stays new however old it is. The account is
+    // read only for an author old enough not to be new anyway, and only when
+    // the answer can change the threshold.
+    let new_account = is_new_account(author, now)
+        || (new_account_threshold < cfg.e2ee_fanout_threshold_for(false)
+            && has_no_email(db, &author.id).await);
+    let threshold = cfg.e2ee_fanout_threshold_for(new_account);
     if counted.len() < threshold {
         return Ok(());
     }
@@ -1220,7 +1246,7 @@ mod tests {
     use revolt_result::ErrorType;
 
     use super::*;
-    use crate::{ForwardedSnapshot, Relationship, SYSTEM_USER_ID};
+    use crate::{Account, EmailVerification, ForwardedSnapshot, Relationship, SYSTEM_USER_ID};
 
     const TIFFANY: &str = "Hi! I love your profile picture, can I use it for an art project for my client? I'll pay you and credit you.";
 
@@ -1866,12 +1892,61 @@ mod tests {
         }
     }
 
-    /// A stored user created `days` ago (account age is read from the id)
-    async fn stored_user_aged(db: &Database, days: u64) -> User {
+    /// An account for `user_id` with an email address
+    fn account_with_email(user_id: &str) -> Account {
+        let email = format!("{}@example.test", user_id.to_lowercase());
+        Account {
+            id: user_id.to_string(),
+            email: email.clone(),
+            email_normalised: email,
+            password: "not-a-real-hash".to_string(),
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+            mfa: Default::default(),
+            google_id: None,
+            apple_id: None,
+            password_absent: false,
+            email_absent: false,
+        }
+    }
+
+    /// A stored user created `days` ago with no account behind it (account
+    /// age is read from the id)
+    async fn stored_user_aged_without_account(db: &Database, days: u64) -> User {
         let mut author = user(&[]);
         let created_ms = now_ms() as u64 - days * DAY_MS as u64;
         author.id = Ulid::from_parts(created_ms, Ulid::new().random()).to_string();
         db.insert_user(&author).await.unwrap();
+        author
+    }
+
+    /// A stored user created `days` ago (account age is read from the id),
+    /// with an account that has an email address, as every person's does
+    /// unless they signed up without one
+    async fn stored_user_aged(db: &Database, days: u64) -> User {
+        let author = stored_user_aged_without_account(db, days).await;
+        db.save_account(&account_with_email(&author.id))
+            .await
+            .unwrap();
+        author
+    }
+
+    /// A stored user created `days` ago whose account has no email address
+    async fn stored_user_aged_no_email(db: &Database, days: u64) -> User {
+        let author = stored_user_aged_without_account(db, days).await;
+        let stand_in = crate::util::email::generate_placeholder_email();
+        db.save_account(&Account {
+            email: stand_in.clone(),
+            email_normalised: stand_in,
+            password_absent: true,
+            email_absent: true,
+            ..account_with_email(&author.id)
+        })
+        .await
+        .unwrap();
         author
     }
 
@@ -2136,6 +2211,60 @@ mod tests {
             fan_out(&db, &cfg, &older, &strangers(5)).await;
             assert_eq!(out_count(&older.id).await, 5);
             assert_not_flagged(&db, &older, "an older account needs ten").await;
+        })
+    }
+
+    /// Fails if: an account with no email is held to the older-account
+    /// threshold once it is fourteen days old, an account that cannot be
+    /// read (none stored) passes as an established one, giving the account
+    /// an email does not lift it to the older-account threshold, or an old
+    /// account with an email is treated as new. Requires Redis (local
+    /// default URI).
+    #[test]
+    fn e2ee_fanout_no_email_account_stays_new() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let cfg = fanout_pausing();
+
+            // Thirty days old, no email: still held to five
+            let no_email = stored_user_aged_no_email(&db, 30).await;
+            assert!(!is_new_account(&no_email, now_ms()), "old by its id");
+            assert!(has_no_email(&db, &no_email.id).await);
+            let peers = strangers(5);
+            fan_out(&db, &cfg, &no_email, &peers[..4]).await;
+            assert_not_flagged(&db, &no_email, "four strangers are below five").await;
+
+            fan_out(&db, &cfg, &no_email, &peers[4..]).await;
+            let guard = fanout_guard(&db, &no_email, "the fifth stranger flags it").await;
+            assert_eq!(guard.recipients, 5);
+            assert_eq!(system_reports_about(&db, &no_email.id).await, 1);
+
+            // Thirty days old, no account to read: counted as new too
+            let unreadable = stored_user_aged_without_account(&db, 30).await;
+            assert!(has_no_email(&db, &unreadable.id).await);
+            fan_out(&db, &cfg, &unreadable, &strangers(5)).await;
+            let guard = fanout_guard(&db, &unreadable, "a failed read counts as new").await;
+            assert_eq!(guard.recipients, 5);
+
+            // Thirty days old, no email at first: four strangers, then it
+            // gets an address, and the threshold of ten applies from then on
+            let later = stored_user_aged_no_email(&db, 30).await;
+            fan_out(&db, &cfg, &later, &strangers(4)).await;
+            assert!(db
+                .set_account_email_if_absent(&later.id, "later@example.test", "later@example.test")
+                .await
+                .unwrap());
+            assert!(!has_no_email(&db, &later.id).await);
+            fan_out(&db, &cfg, &later, &strangers(5)).await;
+            assert_eq!(out_count(&later.id).await, 9);
+            assert_not_flagged(&db, &later, "with an email it needs ten").await;
+
+            // Thirty days old with an email all along: unchanged
+            let established = stored_user_aged(&db, 30).await;
+            assert!(!has_no_email(&db, &established.id).await);
+            fan_out(&db, &cfg, &established, &strangers(9)).await;
+            assert_eq!(out_count(&established.id).await, 9);
+            assert_not_flagged(&db, &established, "an older account needs ten").await;
         })
     }
 

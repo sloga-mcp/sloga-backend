@@ -2301,9 +2301,14 @@ impl From<crate::VoiceInformation> for VoiceInformation {
 
 impl From<crate::Account> for AccountInfo {
     fn from(item: crate::Account) -> Self {
+        // An account with no email answers "": its stand-in address never
+        // leaves the model
+        let email = item.real_email().unwrap_or_default().to_string();
+
         AccountInfo {
             id: item.id,
-            email: item.email,
+            email,
+            email_absent: item.email_absent,
         }
     }
 }
@@ -2991,5 +2996,35 @@ mod e2ee_only_bridge_tests {
                 matches!(back, crate::Channel::Group { e2ee_only, .. } if e2ee_only == mark)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod account_info_tests {
+    use revolt_models::v0;
+
+    /// Fails if: the stand-in address of an account with no email reaches
+    /// the API model, the flag is not carried, or an ordinary account stops
+    /// showing its address.
+    #[test]
+    fn an_account_with_no_email_answers_an_empty_address() {
+        let absent = crate::Account::new_passkey_signup(None).unwrap();
+        let id = absent.id.clone();
+        assert!(
+            absent.email.ends_with(".invalid"),
+            "the control: the model holds the stand-in"
+        );
+
+        let info: v0::AccountInfo = absent.into();
+        assert_eq!(info.id, id);
+        assert_eq!(info.email, "");
+        assert!(info.email_absent);
+        assert!(!serde_json::to_string(&info).unwrap().contains("invalid"));
+
+        let with_email =
+            crate::Account::new_passkey_signup(Some("Some.One@example.test".to_string())).unwrap();
+        let info: v0::AccountInfo = with_email.into();
+        assert_eq!(info.email, "Some.One@example.test");
+        assert!(!info.email_absent);
     }
 }

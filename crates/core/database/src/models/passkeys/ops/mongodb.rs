@@ -1,9 +1,9 @@
 use bson::{Bson, Document};
 use iso8601_timestamp::Timestamp;
 use mongodb::options::FindOptions;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 
-use crate::{MongoDb, Passkey};
+use crate::{AbstractAccounts, MongoDb, Passkey};
 
 use super::AbstractPasskeys;
 
@@ -145,6 +145,79 @@ impl AbstractPasskeys for MongoDb {
             Ok(())
         } else {
             Err(create_error!(NotFound))
+        }
+    }
+
+    async fn delete_passkey_unless_last_way_in(&self, user_id: &str, id: &str) -> Result<()> {
+        // The account and the passkeys are two collections, so the check
+        // and the delete cannot be one statement. Instead: read the account
+        // and count immediately before the delete, then look again after it
+        // and put the row back if the account was left with no way in.
+        //
+        // What is left: (1) for the moment between the delete and the
+        // put-back the account has no way in, and a process that dies there
+        // leaves it so; (2) a put-back that fails twice leaves it so too,
+        // and that is logged and answered with the database error; (3) two
+        // removals racing for the last two passkeys both put theirs back and
+        // both are refused; (4) a change to the account after the second
+        // look is not seen.
+        let filter = doc! {
+            "_id": id,
+            "user_id": user_id
+        };
+
+        // NotFound for an unknown id and for another user's passkey alike,
+        // before anything about the account is said
+        let exists = self
+            .col::<Document>(COL)
+            .count_documents(filter.clone())
+            .await
+            .map_err(|_| create_database_error!("count_documents", COL))?;
+        if exists == 0 {
+            return Err(create_error!(NotFound));
+        }
+
+        let account = self.fetch_account(user_id).await?;
+        if !account.can_sign_in_without_passkey() && self.count_passkeys(user_id).await? <= 1 {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        // The row comes back exactly as it was when it was removed, so a
+        // put-back cannot roll back a signature counter written in between
+        let removed = self
+            .col::<Passkey>(COL)
+            .find_one_and_delete(filter)
+            .await
+            .map_err(|_| create_database_error!("find_one_and_delete", COL))?
+            .ok_or_else(|| create_error!(NotFound))?;
+
+        // Look again. An account that is gone has nothing to be locked out
+        // of; any other failed read is taken as no way in.
+        let way_in_remains = match self.fetch_account(user_id).await {
+            Ok(account) => {
+                account.can_sign_in_without_passkey()
+                    || matches!(self.count_passkeys(user_id).await, Ok(left) if left > 0)
+            }
+            Err(error) => matches!(error.error_type, ErrorType::UnknownUser),
+        };
+
+        if way_in_remains {
+            return Ok(());
+        }
+
+        let mut written = self.insert_passkey(&removed).await;
+        if written.is_err() {
+            written = self.insert_passkey(&removed).await;
+        }
+
+        match written {
+            Ok(()) => Err(create_error!(InvalidOperation)),
+            Err(error) => {
+                error!(
+                    "passkeys: could not put back the last passkey of account {user_id} after a removal race"
+                );
+                Err(error)
+            }
         }
     }
 

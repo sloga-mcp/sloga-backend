@@ -27,6 +27,12 @@ pub trait AbstractMFATickets: Sync + Send {
 
     /// Delete all expired tickets
     async fn delete_expired_tickets(&self) -> Result<usize>;
+
+    /// Delete every ticket of one account, validated or not, expired or not
+    ///
+    /// Returns how many were deleted; none is `Ok(0)`. A ticket deleted here
+    /// can no longer be fetched, reserved or claimed.
+    async fn delete_mfa_tickets_for_account(&self, account_id: &str) -> Result<usize>;
 }
 
 #[cfg(test)]
@@ -162,6 +168,63 @@ mod tests {
             assert_eq!(won, 1, "exactly one concurrent claim may succeed");
 
             assert!(db.fetch_ticket_by_token(&ticket.token).await.is_err());
+        });
+    }
+
+    /// Fails if: the per-account delete leaves any ticket of that account
+    /// (validated, unvalidated or expired) usable, reports the wrong count,
+    /// or touches another account's ticket.
+    #[tokio::test]
+    async fn delete_for_account_removes_only_that_accounts_tickets() {
+        database_test!(|db| async move {
+            let validated = MFATicket::new(TARGET_ACCOUNT.to_string(), true);
+            let unvalidated = MFATicket::new(TARGET_ACCOUNT.to_string(), false);
+            let expired = aged_ticket(TARGET_ACCOUNT, Duration::from_secs(10 * 60));
+            let bystander = MFATicket::new(OTHER_ACCOUNT.to_string(), true);
+            for ticket in [&validated, &unvalidated, &expired, &bystander] {
+                db.save_ticket(ticket).await.unwrap();
+            }
+
+            // The control: the tickets are there to be used
+            db.fetch_ticket_by_token(&validated.token).await.unwrap();
+            db.fetch_ticket_by_token(&unvalidated.token).await.unwrap();
+
+            assert_eq!(
+                db.delete_mfa_tickets_for_account(TARGET_ACCOUNT)
+                    .await
+                    .unwrap(),
+                3
+            );
+
+            for ticket in [&validated, &unvalidated, &expired] {
+                assert_invalid_token(
+                    db.fetch_ticket_by_token(&ticket.token).await,
+                    "fetch after the delete",
+                );
+                assert_invalid_token(
+                    db.reserve_ticket_attempt(&ticket.id).await,
+                    "reserve after the delete",
+                );
+                assert_invalid_token(db.delete_ticket(&ticket.id).await, "claim after the delete");
+            }
+
+            let kept = db.fetch_ticket_by_token(&bystander.token).await.unwrap();
+            assert_eq!(kept, bystander, "another account's ticket must be untouched");
+
+            // Nothing left, and an account that never had a ticket
+            assert_eq!(
+                db.delete_mfa_tickets_for_account(TARGET_ACCOUNT)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                db.delete_mfa_tickets_for_account("01ACCOUNTNOTICKETS00000000")
+                    .await
+                    .unwrap(),
+                0
+            );
+            db.fetch_ticket_by_token(&bystander.token).await.unwrap();
         });
     }
 

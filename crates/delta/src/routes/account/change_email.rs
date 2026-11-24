@@ -16,8 +16,8 @@ pub struct DataChangeEmail {
     pub email: String,
     /// Current password
     ///
-    /// Left out only by an account that has no password, which sends a
-    /// validated MFA ticket (`X-MFA-Ticket`) instead.
+    /// Required. Optional in the body only so that leaving it out is
+    /// answered as a wrong password is.
     pub current_password: Option<String>,
 }
 
@@ -25,9 +25,9 @@ pub struct DataChangeEmail {
 ///
 /// Change the associated account email.
 ///
-/// An account that has a password must send it, and with MFA enabled a
-/// validated MFA ticket as well. An account that has no password sends
-/// the ticket alone.
+/// The current password must be sent, and with MFA enabled a validated MFA
+/// ticket as well. An account that has no email or no password is refused
+/// (`InvalidOperation`): it sets a password first.
 #[openapi(tag = "Account")]
 #[patch("/change/email", data = "<data>")]
 pub async fn change_email(
@@ -37,6 +37,26 @@ pub async fn change_email(
     data: Json<DataChangeEmail>,
 ) -> Result<EmptyResponse> {
     let data = data.into_inner();
+
+    // This route moves an existing address by a confirmation link. An
+    // account with no email has nothing to move: it gets its first address
+    // through a code typed into the app. Refused before anything in the
+    // request is looked at, so the answer is the same whatever was sent, no
+    // password is checked and no attempt is counted. `start_email_move`
+    // refuses the same way; this keeps the refusal ahead of the checks.
+    if account.real_email().is_none() {
+        return Err(create_error!(InvalidOperation));
+    }
+
+    // Nor does an account that has no password (created with a passkey, or
+    // through Google or Apple) move its address here: this route confirms
+    // by a clicked link, and such an account takes an address only through
+    // a code typed into the app. Same answer as above, and as early, so
+    // nothing sent is checked or counted. Until a typed-code move exists,
+    // such an account sets a password first.
+    if account.password_absent {
+        return Err(create_error!(InvalidOperation));
+    }
 
     validate_email(&data.email)?;
 
@@ -53,15 +73,7 @@ pub async fn change_email(
         return Err(create_error!(InvalidCredentials));
     }
 
-    if account.password_absent {
-        // No password exists, so none is checked and no attempt is counted:
-        // a guess could never be right, and counting it would let whoever
-        // holds a session lock the owner out. Only a ticket will do, and
-        // the refusal reads as a wrong password does
-        if validated_ticket.is_none() {
-            return Err(create_error!(InvalidCredentials));
-        }
-    } else if let Some(current_password) = &data.current_password {
+    if let Some(current_password) = &data.current_password {
         // Ensure given password is correct, counting a wrong one
         if let Err(error) = account.verify_password(current_password) {
             db.bump_lockout_count(&account.id).await?;
@@ -84,7 +96,7 @@ pub async fn change_email(
 mod tests {
     use crate::{rocket, util::test::TestHarness};
     use revolt_config::overwrite_config;
-    use revolt_database::{Account, MFATicket, Session, Totp};
+    use revolt_database::{Account, EmailVerification, MFATicket, Session, Totp};
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
     use rocket::http::{ContentType, Header, Status};
@@ -340,8 +352,21 @@ mod tests {
         })
     }
 
-    /// R9: an account with no password gets the wrong-password answer for
-    /// any password, the stored hash's own included, and nothing is counted
+    /// The answer every request of an account with no password gets
+    fn assert_no_password_refusal(row: &str, answer: &(Status, Option<ErrorType>)) {
+        assert_eq!(answer.0, Status::BadRequest, "{}", row);
+        assert!(
+            matches!(answer.1, Some(ErrorType::InvalidOperation)),
+            "{}: expected `InvalidOperation`, got {:?}",
+            row,
+            answer.1
+        );
+    }
+
+    /// Fails if: an account with no password gets anything other than
+    /// `InvalidOperation` for a password (the stored hash's own included, so
+    /// the route never looked), for a wrong one or for none; counts an
+    /// attempt; or changes the address.
     #[test]
     fn no_password_account_refuses_every_password() {
         crate::util::test::rt().block_on(async {
@@ -352,10 +377,11 @@ mod tests {
                 json!({ "email": "validexample@valid.com", "current_password": "password_insecure" }),
                 json!({ "email": "validexample@valid.com", "current_password": "wrong password" }),
                 json!({ "email": "validexample@valid.com" }),
+                json!({ "email": "not an email" }),
             ] {
-                let (status, error) = send(&harness, &session, None, body).await;
-                assert_eq!(status, Status::Unauthorized);
-                assert!(matches!(error, Some(ErrorType::InvalidCredentials)));
+                let row = body.to_string();
+                let answer = send(&harness, &session, None, body).await;
+                assert_no_password_refusal(&row, &answer);
             }
 
             let after = stored(&harness, &account).await;
@@ -364,34 +390,61 @@ mod tests {
         })
     }
 
-    /// An account with no password changes its email with a validated
-    /// ticket and no password field, and the ticket is used up
+    /// Until this step an account with no password changed its email here
+    /// with a validated ticket alone.
+    ///
+    /// Fails if: it still can (with SMTP off as here the address would move
+    /// at once, with SMTP on a link would be mailed and a move left
+    /// pending), with or without a password next to the ticket; the refusal
+    /// is not `InvalidOperation`; or an attempt is counted.
     #[test]
-    fn no_password_account_changes_email_with_a_ticket() {
+    fn no_password_account_is_refused_with_a_ticket() {
         crate::util::test::rt().block_on(async {
             let harness = harness_without_smtp().await;
             let (account, session) = without_password(&harness).await;
-            let ticket = saved_ticket(&harness, &account.id, true).await;
+
+            for body in [
+                json!({ "email": "validexample@valid.com" }),
+                json!({ "email": "validexample@valid.com", "current_password": "password_insecure" }),
+            ] {
+                let row = body.to_string();
+                let ticket = saved_ticket(&harness, &account.id, true).await;
+                let answer = send(&harness, &session, Some(&ticket), body).await;
+                assert_no_password_refusal(&row, &answer);
+            }
+
+            let after = stored(&harness, &account).await;
+            assert_eq!(after.email, account.email);
+            assert_eq!(after.email_normalised, account.email_normalised);
+            assert!(
+                matches!(after.verification, EmailVerification::Verified),
+                "no move is pending"
+            );
+            assert_eq!(attempts(&after), None);
+
+            // The control: the same account, once it has a password, moves
+            // its address with that password
+            let mut with_password = after;
+            with_password.password_absent = false;
+            with_password.save(&harness.db).await.unwrap();
 
             let (status, _) = send(
                 &harness,
                 &session,
-                Some(&ticket),
-                json!({ "email": "validexample@valid.com" }),
+                None,
+                json!({ "email": "validexample@valid.com", "current_password": "password_insecure" }),
             )
             .await;
-
-            assert_eq!(status, Status::NoContent);
-
-            let after = stored(&harness, &account).await;
-            assert_eq!(after.email, "validexample@valid.com");
-            assert_eq!(attempts(&after), None);
-            assert!(!ticket_exists(&harness, &ticket).await, "the ticket is single use");
+            assert_eq!(status, Status::NoContent, "the control");
+            assert_eq!(
+                stored(&harness, &account).await.email,
+                "validexample@valid.com"
+            );
         })
     }
 
-    /// A validated ticket minted on another account proves nothing here,
-    /// and it is not burned
+    /// Fails if: a validated ticket minted on another account changes the
+    /// answer or the address of an account with no password, or is burned.
     #[test]
     fn no_password_account_refuses_a_foreign_ticket() {
         crate::util::test::rt().block_on(async {
@@ -400,16 +453,14 @@ mod tests {
             let (other, _, _) = harness.new_user().await;
             let ticket = saved_ticket(&harness, &other.id, true).await;
 
-            let (status, error) = send(
+            let answer = send(
                 &harness,
                 &session,
                 Some(&ticket),
                 json!({ "email": "validexample@valid.com" }),
             )
             .await;
-
-            assert_eq!(status, Status::Unauthorized);
-            assert!(matches!(error, Some(ErrorType::InvalidCredentials)));
+            assert_no_password_refusal("a foreign ticket", &answer);
 
             let after = stored(&harness, &account).await;
             assert_eq!(after.email, account.email);
@@ -418,7 +469,8 @@ mod tests {
         })
     }
 
-    /// A ticket that was never validated is no proof
+    /// Fails if: a ticket that was never validated changes the answer or
+    /// the address of an account with no password.
     #[test]
     fn no_password_account_refuses_an_unvalidated_ticket() {
         crate::util::test::rt().block_on(async {
@@ -426,16 +478,14 @@ mod tests {
             let (account, session) = without_password(&harness).await;
             let ticket = saved_ticket(&harness, &account.id, false).await;
 
-            let (status, error) = send(
+            let answer = send(
                 &harness,
                 &session,
                 Some(&ticket),
                 json!({ "email": "validexample@valid.com" }),
             )
             .await;
-
-            assert_eq!(status, Status::Unauthorized);
-            assert!(matches!(error, Some(ErrorType::InvalidCredentials)));
+            assert_no_password_refusal("an unvalidated ticket", &answer);
             assert_eq!(stored(&harness, &account).await.email, account.email);
         })
     }
@@ -514,6 +564,70 @@ mod tests {
             let after = stored(&harness, &account).await;
             assert_eq!(after.email, account.email);
             assert_eq!(attempts(&after), Some(1));
+        })
+    }
+
+    /// Fails if: an account with no email can start (or, with SMTP off as
+    /// here, complete at once) a link-based email move, with a validated
+    /// ticket or with any password; or the refusal is anything other than
+    /// `InvalidOperation`, depends on what was sent, or counts an attempt.
+    #[test]
+    fn no_email_account_is_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = harness_without_smtp().await;
+
+            let account = Account::new_passkey_signup(None).expect("a no-email account");
+            account.save(&harness.db).await.unwrap();
+            let session = account
+                .create_session(&harness.db, String::new())
+                .await
+                .unwrap();
+            let before = stored(&harness, &account).await;
+            assert!(before.email_absent, "the seed must be stored");
+
+            // The control: an account WITH an email and a password changes
+            // the address in this harness
+            {
+                let (ordinary, ordinary_session, _) = harness.new_user().await;
+                let (status, _) = send(
+                    &harness,
+                    &ordinary_session,
+                    None,
+                    json!({ "email": "control@valid.com", "current_password": "password_insecure" }),
+                )
+                .await;
+                assert_eq!(status, Status::NoContent, "the control");
+                assert_eq!(stored(&harness, &ordinary).await.email, "control@valid.com");
+            }
+
+            let ticket = saved_ticket(&harness, &account.id, true).await;
+            for (ticket, body) in [
+                (Some(&ticket), json!({ "email": "validexample@valid.com" })),
+                (
+                    None,
+                    json!({ "email": "validexample@valid.com", "current_password": "password_insecure" }),
+                ),
+                (None, json!({ "email": "validexample@valid.com" })),
+                (None, json!({ "email": "not an email" })),
+            ] {
+                let (status, error) = send(&harness, &session, ticket, body).await;
+                assert_eq!(status, Status::BadRequest);
+                assert!(
+                    matches!(error, Some(ErrorType::InvalidOperation)),
+                    "expected `InvalidOperation`, got {:?}",
+                    error
+                );
+            }
+
+            let after = stored(&harness, &account).await;
+            assert_eq!(after.email, before.email);
+            assert_eq!(after.email_normalised, before.email_normalised);
+            assert!(after.email_absent);
+            assert!(
+                matches!(after.verification, EmailVerification::Verified),
+                "no move is pending"
+            );
+            assert_eq!(attempts(&after), None, "no attempt may be counted");
         })
     }
 }

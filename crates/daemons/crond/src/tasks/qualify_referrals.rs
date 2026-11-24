@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use log::{error, info, warn};
 use revolt_database::{
-    now_ms, Database, EmailVerification, FieldsUser, PartialUser, Referral, ReferralStatus,
-    ReferralVerdict, User, AMQP, DAY_MS, TIER_CUSTOM_BADGE, WELCOME_TRIAL_DAYS,
+    now_ms, Account, Database, EmailVerification, FieldsUser, PartialUser, Referral,
+    ReferralStatus, ReferralVerdict, User, AMQP, DAY_MS, TIER_CUSTOM_BADGE, WELCOME_TRIAL_DAYS,
 };
 use revolt_models::v0::UserFlags;
 use revolt_result::{ErrorType, Result};
@@ -180,6 +180,18 @@ pub async fn run_once(db: &Database, now_ms: i64, window_from_ms: i64) -> Result
     Ok(sweep.summary)
 }
 
+/// Whether the invitee's email lets the referral qualify.
+///
+/// `Account::has_confirmed_email` (an account with no email never passes,
+/// whatever its `verification` says), and stricter in one case: an account
+/// part way through an email move does not qualify until the move is
+/// confirmed. It waits; nothing is lost if the move completes inside the
+/// qualification window.
+fn email_qualifies(account: &Account) -> bool {
+    account.has_confirmed_email()
+        && !matches!(account.verification, EmailVerification::Moving { .. })
+}
+
 /// Evaluate one pending referral and apply the verdict.
 ///
 /// `referral` was read at the start of the sweep and may be stale, so every
@@ -216,7 +228,7 @@ async fn process_referral(
     let email_verified = db
         .fetch_account(&invitee.id)
         .await
-        .map(|account| !matches!(account.verification, EmailVerification::Pending { .. }))
+        .map(|account| email_qualifies(&account))
         .unwrap_or(false);
 
     // The weekly cap includes what this sweep has already credited
@@ -390,7 +402,7 @@ fn created_before(user_id: &str, cutoff_ms: i64) -> bool {
 mod tests {
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
-        day_index, Account, BotInformation, ReferenceDb, ReferralSource, QUALIFY_WEEKLY_CAP,
+        day_index, BotInformation, ReferenceDb, ReferralSource, QUALIFY_WEEKLY_CAP,
     };
 
     use super::*;
@@ -456,9 +468,120 @@ mod tests {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
         })
         .await
         .unwrap();
+    }
+
+    /// Fails if: an invitee with no email qualifies (its account is stored
+    /// `Verified`, so the old "not Pending" test let it through), or a
+    /// `Moving` state lets an account with no email through; an invitee
+    /// part way through an email move qualifies before the move is
+    /// confirmed, or is expired instead of left waiting, or does not
+    /// qualify once it is confirmed; or an invitee with a confirmed email
+    /// stops qualifying.
+    #[tokio::test]
+    async fn an_invitee_with_no_email_never_qualifies() {
+        let db = reference_db();
+        let now = now_ms();
+
+        insert_user(&db, user("referrer")).await;
+
+        let moving = || EmailVerification::Moving {
+            new_email: "new@example.com".to_string(),
+            token: "token".to_string(),
+            expiry: Timestamp::now_utc(),
+        };
+
+        // Meets every rule, has no email
+        let no_email = ulid::Ulid::new().to_string();
+        let mut account = Account::new_passkey_signup(None).unwrap();
+        account.id = no_email.clone();
+        assert!(
+            matches!(account.verification, EmailVerification::Verified),
+            "the control: an account with no email is stored Verified"
+        );
+
+        // The same, in a state the model never produces: no email and Moving
+        let no_email_moving = ulid::Ulid::new().to_string();
+        let mut stray = Account::new_passkey_signup(None).unwrap();
+        stray.id = no_email_moving.clone();
+        stray.verification = moving();
+
+        // The control: a passkey sign-up with a confirmed email. And an
+        // account part way through an email change, which has a confirmed
+        // email and still waits
+        let with_email = ulid::Ulid::new().to_string();
+        let mut confirmed =
+            Account::new_passkey_signup(Some(format!("{with_email}@example.com"))).unwrap();
+        confirmed.id = with_email.clone();
+
+        let mid_move = ulid::Ulid::new().to_string();
+        let mut mover =
+            Account::new_passkey_signup(Some(format!("{mid_move}@example.com"))).unwrap();
+        mover.id = mid_move.clone();
+        mover.verification = moving();
+
+        for account in [&account, &stray, &confirmed, &mover] {
+            insert_user(&db, invitee(&account.id)).await;
+            db.save_account(account).await.unwrap();
+            db.insert_referral_if_absent(&eligible(&account.id, "referrer", now))
+                .await
+                .unwrap();
+        }
+
+        assert!(!email_qualifies(&account));
+        assert!(!email_qualifies(&stray));
+        assert!(email_qualifies(&confirmed));
+        assert!(
+            mover.has_confirmed_email(),
+            "the control: the mover's own address is confirmed"
+        );
+        assert!(!email_qualifies(&mover));
+
+        let summary = run_once(&db, now, now - HOUR_MS).await.unwrap();
+        assert_eq!(summary.qualified, 1);
+        assert_eq!(summary.expired, 0);
+
+        assert_eq!(
+            status(&db, &with_email).await,
+            ReferralStatus::Qualified,
+            "{with_email}"
+        );
+
+        // No email, or mid-move: still waiting, still tracked, nothing
+        // granted
+        for id in [&no_email, &no_email_moving, &mid_move] {
+            assert_eq!(status(&db, id).await, ReferralStatus::Pending, "{id}");
+            let user = db.fetch_user(id).await.unwrap();
+            assert_eq!(user.referral_pending, Some(true), "{id}");
+            assert_eq!(user.welcomed_at, None, "{id}");
+        }
+        assert_eq!(
+            db.fetch_user("referrer").await.unwrap().referral_count,
+            Some(1)
+        );
+
+        // The move is confirmed: the next sweep qualifies it, and only it
+        mover.verification = EmailVerification::Verified;
+        db.save_account(&mover).await.unwrap();
+
+        let next = run_once(&db, now + HOUR_MS, now).await.unwrap();
+        assert_eq!(next.qualified, 1);
+        assert_eq!(next.expired, 0);
+        assert_eq!(
+            status(&db, &mid_move).await,
+            ReferralStatus::Qualified,
+            "{mid_move}"
+        );
+        for id in [&no_email, &no_email_moving] {
+            assert_eq!(status(&db, id).await, ReferralStatus::Pending, "{id}");
+        }
+        assert_eq!(
+            db.fetch_user("referrer").await.unwrap().referral_count,
+            Some(2)
+        );
     }
 
     /// A pending referral recorded `age_days` ago

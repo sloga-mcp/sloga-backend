@@ -4,7 +4,9 @@ use rocket::Route;
 mod assert;
 mod login;
 mod manage;
+mod recover;
 mod register;
+mod signup;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
@@ -16,6 +18,14 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         manage::list,
         manage::rename,
         manage::remove,
+        signup::signup_start,
+        signup::signup_code,
+        signup::signup_resend,
+        signup::signup_options,
+        signup::signup_finish,
+        recover::recover_send,
+        recover::recover_start,
+        recover::recover_finish,
     ]
 }
 

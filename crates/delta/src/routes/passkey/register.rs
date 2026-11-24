@@ -94,6 +94,24 @@ async fn authorize_add(
         return Ok(AddProof::Ticket);
     }
 
+    if fresh_session_suffices(db, account, session).await? {
+        Ok(AddProof::FreshSession)
+    } else {
+        Err(create_error!(NotPrivileged))
+    }
+}
+
+/// Whether the first-passkey rule holds for this account and session right
+/// now. Gathers the facts from server state and asks the one rule.
+///
+/// Both steps call it: the finish step to decide, the start step only to
+/// tell the app whether the finish step will want more. It takes the
+/// account and the session and nothing from the request.
+async fn fresh_session_suffices(
+    db: &Database,
+    account: &Account,
+    session: &Session,
+) -> Result<bool> {
     let facts = TicketlessFacts {
         passkeys: db.count_passkeys(&account.id).await?,
         mfa_active: account.mfa.is_active(),
@@ -103,11 +121,7 @@ async fn authorize_add(
         session_age_ms: now_ms().and_then(|now| session_age_ms(&session.id, now)),
     };
 
-    if may_register_without_ticket(&facts) {
-        Ok(AddProof::FreshSession)
-    } else {
-        Err(create_error!(NotPrivileged))
-    }
+    Ok(may_register_without_ticket(&facts))
 }
 
 /// Delete a passkey that was stored a moment ago and may not stay. Tried
@@ -122,9 +136,96 @@ async fn take_back(db: &Database, account_id: &str, passkey_id: &str) {
     }
 
     log::error!(
-        "passkeys: could not take back a passkey added without a ticket \
+        "passkeys: could not take back a passkey that may not stay \
          (account {account_id}, passkey {passkey_id}); remove it by hand"
     );
+}
+
+/// After any add: the new passkey stays only while the session that added
+/// it still exists.
+///
+/// A password reset removes the account's passkeys and, when asked, its
+/// sessions. An add that was already past the session guard can store its
+/// row after that purge; without this look the passkey of whoever held the
+/// old session would outlive the reset. A session that is gone means the
+/// row is taken back and the request answered as a failed ceremony. A
+/// session that cannot be read is treated the same way, with the database
+/// error as the answer.
+async fn settle_add_after_session_check(
+    db: &Database,
+    session_id: &str,
+    account_id: &str,
+    passkey_id: &str,
+) -> Result<()> {
+    match db.fetch_session(session_id).await {
+        Ok(session) if session.user_id == account_id => Ok(()),
+        Ok(_) => {
+            take_back(db, account_id, passkey_id).await;
+            Err(create_error!(InvalidCredentials))
+        }
+        Err(error) => {
+            take_back(db, account_id, passkey_id).await;
+            Err(match error.error_type {
+                ErrorType::UnknownUser | ErrorType::InvalidSession | ErrorType::NotFound => {
+                    create_error!(InvalidCredentials)
+                }
+                _ => error,
+            })
+        }
+    }
+}
+
+/// Err unless the session was made after the account's passkeys were last
+/// purged, or no purge is on record.
+///
+/// A password reset stamps the time of its purge
+/// (`passkey::mark_passkeys_purged`). A session whose id is older than the
+/// stamp, or carries no time, belonged to whoever could sign in before the
+/// reset: `InvalidCredentials`, the answer of a failed ceremony. A session
+/// minted in the very millisecond of the stamp is counted as older. A stamp
+/// that cannot be read is treated as a purge, with that error as the
+/// answer.
+///
+/// Both steps ask it: the start step before it hands out a challenge, so
+/// the device makes no passkey that could not stay, and the finish step
+/// after the store, for a reset that came in between.
+async fn refuse_session_older_than_purge(session_id: &str, account_id: &str) -> Result<()> {
+    let Some(purged_ms) = passkey::purged_since(account_id).await? else {
+        return Ok(());
+    };
+
+    // From the id, as `session_age_ms` reads it: a client cannot set it
+    let minted_ms = ulid::Ulid::from_string(session_id)
+        .ok()
+        .map(|id| id.timestamp_ms());
+
+    if matches!(minted_ms, Some(minted_ms) if minted_ms > purged_ms) {
+        Ok(())
+    } else {
+        Err(create_error!(InvalidCredentials))
+    }
+}
+
+/// After any add: the new passkey stays only if the session that added it
+/// was made after the account's passkeys were last purged.
+///
+/// A password reset that keeps the sessions leaves the session re-check
+/// nothing to find: the session is still there. This asks
+/// `refuse_session_older_than_purge`, and on any refusal takes the new
+/// passkey back before answering with it.
+async fn settle_add_after_purge_check(
+    db: &Database,
+    session_id: &str,
+    account_id: &str,
+    passkey_id: &str,
+) -> Result<()> {
+    match refuse_session_older_than_purge(session_id, account_id).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            take_back(db, account_id, passkey_id).await;
+            Err(error)
+        }
+    }
 }
 
 /// After a ticketless add: the new passkey stays only while it is the
@@ -155,18 +256,36 @@ async fn settle_ticketless_add(db: &Database, account_id: &str, passkey_id: &str
 /// Takes no MFA ticket, and a ticket sent here is left unused: this step
 /// only hands out a challenge bound to this account and this session. The
 /// finish step decides whether the passkey may be stored.
+///
+/// `ticket_required` says whether the finish step will ask for an MFA
+/// ticket, by the rule it applies itself, read now. It is a hint for the
+/// app and decides nothing: the finish step reads the rule again, and a
+/// session that was young enough here may be too old there.
+///
+/// A session older than the account's last password reset gets no
+/// challenge: the finish step would take its passkey back, so it is refused
+/// here, before the device makes one, with the answer the finish step
+/// gives.
 #[openapi(tag = "Passkey")]
 #[post("/register/start")]
 pub async fn register_start(
     db: &State<Database>,
     account: Account,
     session: Session,
-) -> Result<Json<v0::ResponsePasskeyOptions>> {
+) -> Result<Json<v0::ResponsePasskeyRegisterStart>> {
     passkey::assert_available().await?;
 
-    passkey::start_registration(db, &account, &session.id)
-        .await
-        .map(Json)
+    // The finish step asks again, after the store
+    refuse_session_older_than_purge(&session.id, &account.id).await?;
+
+    let started = passkey::start_registration(db, &account, &session.id).await?;
+    let ticket_required = !fresh_session_suffices(db, &account, &session).await?;
+
+    Ok(Json(v0::ResponsePasskeyRegisterStart {
+        challenge_id: started.challenge_id,
+        options: started.options,
+        ticket_required,
+    }))
 }
 
 /// # Finish Adding a Passkey
@@ -201,6 +320,12 @@ pub async fn register_finish(
     )
     .await?;
 
+    // An add that a password reset overtook does not stay
+    settle_add_after_session_check(db, &session.id, &account.id, &stored.id).await?;
+
+    // Nor does one from a session older than a reset that kept the sessions
+    settle_add_after_purge_check(db, &session.id, &account.id, &stored.id).await?;
+
     // A ticketless add that raced another one does not stay
     if proof == AddProof::FreshSession {
         settle_ticketless_add(db, &account.id, &stored.id).await?;
@@ -221,6 +346,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use iso8601_timestamp::Timestamp;
+    use redis_kiss::{get_connection, redis};
     use revolt_database::{Account, Session, Totp};
     use revolt_result::ErrorType;
     use rocket::http::{ContentType, Status};
@@ -232,10 +358,11 @@ mod tests {
         harness_with_passkeys_on, keys, kind, seed_passkey, send, switched_off_kind, ticket_for,
     };
     use super::{
-        may_register_without_ticket, session_age_ms, settle_ticketless_add, take_back,
-        TicketlessFacts, TICKETLESS_SESSION_MAX_AGE_MS,
+        may_register_without_ticket, session_age_ms, settle_add_after_purge_check,
+        settle_add_after_session_check, settle_ticketless_add, take_back, TicketlessFacts,
+        TICKETLESS_SESSION_MAX_AGE_MS,
     };
-    use crate::util::passkey::mark_oauth_session;
+    use crate::util::passkey::{mark_oauth_session, mark_passkeys_purged, purged_since};
     use crate::util::passkey_soft::SoftPasskey;
     use crate::util::test::{rt, without_comments, without_whitespace, TestHarness};
 
@@ -277,8 +404,13 @@ mod tests {
         account: &Account,
         age: Duration,
     ) -> Session {
+        session_minted_at(harness, account, SystemTime::now() - age).await
+    }
+
+    /// A session of `account` whose id says it was minted at `at`
+    async fn session_minted_at(harness: &TestHarness, account: &Account, at: SystemTime) -> Session {
         let session = Session {
-            id: Ulid::from_datetime(SystemTime::now() - age).to_string(),
+            id: Ulid::from_datetime(at).to_string(),
             user_id: account.id.clone(),
             token: format!(
                 "{}{}",
@@ -372,13 +504,36 @@ mod tests {
     }
 
     /// The finish step passes the gate before anything is verified or
-    /// stored, the start step names no ticket at all (so one sent there is
-    /// never claimed), and the route code reads nothing a client can set and
-    /// never asks which ticket methods exist
+    /// stored, the start step reads and claims no ticket (so one sent there
+    /// is never spent), and the route code reads nothing a client can set
+    /// and never asks which ticket methods exist.
+    ///
+    /// The start step may say `ticket_required`: that is an answer field,
+    /// worked out from the account and the session by the helper the finish
+    /// step uses. It is the only "ticket" the start step may name. With it
+    /// set aside, the word must not appear there at all, so a ticket guard
+    /// (`ticket: Option<ValidatedTicket>`), a ticket lookup or a call to the
+    /// gate all still fail this test. The helper is held to the same: apart
+    /// from the rule and its facts, it names no ticket.
+    ///
+    /// Fails if: the start step takes a ticket guard, looks one up, claims
+    /// one or runs the gate; the start step hands out a challenge before
+    /// it reads the purge stamp, or stops reading it; the helper behind
+    /// `ticket_required` reads a ticket; the finish step verifies before
+    /// the gate; or the session
+    /// re-check or the purge check after the store is dropped or moved
+    /// ahead of it.
     #[test]
     fn both_steps_pass_the_one_gate() {
         const GATE: &str = "authorize_add(db,&account,&session,&ticket).await?";
         const STORE: &str = "passkey::finish_registration(";
+        const SESSION_CHECK: &str =
+            "settle_add_after_session_check(db,&session.id,&account.id,&stored.id).await?;";
+        const PURGE_CHECK: &str =
+            "settle_add_after_purge_check(db,&session.id,&account.id,&stored.id).await?;";
+        const START_PURGE_CHECK: &str =
+            "refuse_session_older_than_purge(&session.id,&account.id).await?;";
+        const HELPER: &str = "asyncfnfresh_session_suffices(";
 
         let source = include_str!("register.rs");
         let routes = source
@@ -398,16 +553,55 @@ mod tests {
         let start_route = &code[start_at..finish_at];
         let finish_route = &code[finish_at..];
 
-        // Start: account and session only
+        // Start: account and session only. `ticket_required` is the answer
+        // field; no other "ticket" may stand in the route
         assert!(
-            !start_route.to_lowercase().contains("ticket"),
-            "the start route names a ticket"
+            start_route.contains("ticket_required"),
+            "the control: the start route answers `ticket_required`"
+        );
+        assert!(
+            !start_route
+                .to_lowercase()
+                .replace("ticket_required", "")
+                .contains("ticket"),
+            "the start route names a ticket other than `ticket_required`"
         );
         assert!(
             !start_route.contains("authorize_add"),
             "the start route runs the gate"
         );
         assert!(start_route.contains("passkey::assert_available().await?;"));
+        assert!(
+            start_route.contains(
+                "letticket_required=!fresh_session_suffices(db,&account,&session).await?;"
+            ),
+            "`ticket_required` must come from the helper the finish step uses"
+        );
+
+        // Start: the purge stamp is read before a challenge is handed out
+        let start_purge_at = start_route
+            .find(START_PURGE_CHECK)
+            .expect("start reads the purge stamp");
+        let challenge_at = start_route
+            .find("passkey::start_registration(")
+            .expect("start hands out a challenge");
+        assert!(
+            start_purge_at < challenge_at,
+            "the purge check must come before the challenge"
+        );
+
+        // The helper: the rule and its facts, and no ticket
+        let helper_at = code.find(HELPER).expect("the helper");
+        let helper_end = helper_at
+            + code[helper_at..]
+                .find("asyncfntake_back(")
+                .expect("the helper is expected above `take_back`");
+        let helper = code[helper_at..helper_end]
+            .to_lowercase()
+            .replace("may_register_without_ticket", "")
+            .replace("ticketlessfacts", "");
+        assert!(!helper.contains("ticket"), "the helper names a ticket");
+        assert!(!helper.contains("claim"), "the helper claims something");
 
         // Finish: the gate, then the verifier
         assert!(finish_route.contains("ticket:Option<ValidatedTicket>"));
@@ -416,6 +610,26 @@ mod tests {
         let gate_at = finish_route.find(GATE).expect("finish passes the gate");
         let store_at = finish_route.find(STORE).expect("finish stores the passkey");
         assert!(gate_at < store_at, "the gate must come before the verifier");
+
+        // Then the session is read again, before the route answers
+        assert_eq!(code.matches(SESSION_CHECK).count(), 1);
+        let check_at = finish_route
+            .find(SESSION_CHECK)
+            .expect("finish re-reads the session");
+        assert!(
+            store_at < check_at,
+            "the session re-check must come after the store"
+        );
+
+        // And the purge stamp is read, also after the store
+        assert_eq!(code.matches(PURGE_CHECK).count(), 1);
+        let purge_at = finish_route
+            .find(PURGE_CHECK)
+            .expect("finish reads the purge stamp");
+        assert!(
+            store_at < purge_at,
+            "the purge check must come after the store"
+        );
 
         assert_eq!(
             code.matches("may_register_without_ticket(").count(),
@@ -665,6 +879,442 @@ mod tests {
         assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
     }
 
+    /// What the start step answers for `ticket_required`
+    async fn ticket_required(harness: &TestHarness, session: &Session, ticket: Option<&str>) -> bool {
+        let (status, body) = send(start(harness), session, ticket).await;
+        assert_eq!(status, Status::Ok, "{}", body);
+        body["ticket_required"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("`ticket_required` is not a boolean: {}", body))
+    }
+
+    #[test]
+    fn start_says_whether_finish_wants_a_ticket() {
+        rt().block_on(start_says_whether_finish_wants_a_ticket_case())
+    }
+
+    /// Each row asks the start step, then checks the finish gate agrees.
+    ///
+    /// Fails if: `ticket_required` is a constant, is worked out by another
+    /// rule than the finish gate's, reads a ticket sent with the start step
+    /// (a ticket there must not turn it false), or spends that ticket.
+    async fn start_says_whether_finish_wants_a_ticket_case() {
+        let harness = harness_with_passkeys_on().await;
+
+        // No usable password, signed in just now: no ticket needed
+        let (passwordless, young) = passwordless_user(&harness).await;
+        assert!(!ticket_required(&harness, &young, None).await);
+        assert_gate_passes(&harness, &young, None).await;
+
+        // The same account from a session minted eleven minutes ago
+        let old = session_minted_ago(&harness, &passwordless, Duration::from_secs(11 * 60)).await;
+        assert!(ticket_required(&harness, &old, None).await);
+        assert_gate_refuses(&harness, &old, None).await;
+
+        // A password account: a ticket is needed, and sending one with the
+        // start step neither changes the answer nor spends it
+        let (plain, plain_session, _) = harness.new_user().await;
+        assert!(ticket_required(&harness, &plain_session, None).await);
+        let ticket = ticket_for(&harness, &plain).await;
+        assert!(ticket_required(&harness, &plain_session, Some(&ticket)).await);
+        assert!(
+            harness.db.fetch_ticket_by_token(&ticket).await.is_ok(),
+            "the start step claimed the ticket"
+        );
+        assert_gate_refuses(&harness, &plain_session, None).await;
+
+        // Linked to Google with its password kept: only the session the
+        // callback marked needs no ticket
+        let (mut linked, password_session, _) = harness.new_user().await;
+        linked.google_id = Some(format!("google-{}", TestHarness::rand_string()));
+        linked.save(&harness.db).await.unwrap();
+        assert!(ticket_required(&harness, &password_session, None).await);
+
+        let google_session = session_minted_ago(&harness, &linked, Duration::from_secs(60)).await;
+        mark_oauth_session(&google_session.id).await;
+        assert!(!ticket_required(&harness, &google_session, None).await);
+        assert_gate_passes(&harness, &google_session, None).await;
+
+        // Once a passkey exists, every further one needs a ticket
+        seed_passkey(&harness, &passwordless, "Phone").await;
+        assert!(ticket_required(&harness, &young, None).await);
+        assert_gate_refuses(&harness, &young, None).await;
+    }
+
+    #[test]
+    fn an_add_whose_session_is_gone_is_taken_back() {
+        rt().block_on(an_add_whose_session_is_gone_is_taken_back_case())
+    }
+
+    /// The step after the store, on the state a password reset that
+    /// overtook the add leaves behind: the row is in, the session is not.
+    /// Driven on the step itself, since nothing can remove a session in the
+    /// middle of one request; `both_steps_pass_the_one_gate` pins that the
+    /// finish route runs it after the store.
+    ///
+    /// Fails if: a passkey stays after the session that added it was
+    /// removed, the refusal is not the failed-ceremony answer, a live
+    /// session's passkey is taken back, or another passkey is removed.
+    async fn an_add_whose_session_is_gone_is_taken_back_case() {
+        let harness = TestHarness::new().await;
+        let (account, session, _) = harness.new_user().await;
+        let (other, other_session, _) = harness.new_user().await;
+
+        // The session is there: the row stays
+        let kept = seed_passkey(&harness, &account, "Phone").await;
+        settle_add_after_session_check(&harness.db, &session.id, &account.id, &kept.id)
+            .await
+            .expect("the session is live, so the passkey stays");
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
+
+        // What "sign out everywhere" on a reset does, then the late store
+        account.delete_all_sessions(&harness.db, None).await.unwrap();
+        assert!(
+            harness.db.fetch_session(&session.id).await.is_err(),
+            "the control: the session is gone"
+        );
+        let late = seed_passkey(&harness, &account, "Planted").await;
+
+        let refused =
+            settle_add_after_session_check(&harness.db, &session.id, &account.id, &late.id)
+                .await
+                .expect_err("an add whose session is gone is refused");
+        assert!(
+            matches!(refused.error_type, ErrorType::InvalidCredentials),
+            "{:?}",
+            refused
+        );
+
+        // Only the late row went
+        let left = harness.db.fetch_passkeys(&account.id).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, kept.id);
+
+        // A session of another account does not vouch for the add
+        let planted = seed_passkey(&harness, &account, "Planted").await;
+        let refused = settle_add_after_session_check(
+            &harness.db,
+            &other_session.id,
+            &account.id,
+            &planted.id,
+        )
+        .await
+        .expect_err("another account's session vouches for nothing");
+        assert!(
+            matches!(refused.error_type, ErrorType::InvalidCredentials),
+            "{:?}",
+            refused
+        );
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
+        assert_eq!(harness.db.count_passkeys(&other.id).await.unwrap(), 0);
+    }
+
+    /// When the id of `session` says it was minted, in Unix milliseconds
+    fn minted_ms(session: &Session) -> u64 {
+        Ulid::from_string(&session.id)
+            .expect("a ULID")
+            .timestamp_ms()
+    }
+
+    #[test]
+    fn an_add_from_a_session_older_than_a_purge_is_taken_back() {
+        rt().block_on(an_add_from_a_session_older_than_a_purge_is_taken_back_case())
+    }
+
+    /// The step after the store, on the state a password reset that kept
+    /// the sessions leaves behind: the stamp is written, the passkeys are
+    /// gone, and the session that was open before the reset is still
+    /// there. Driven on the step itself, as the session re-check is;
+    /// `both_steps_pass_the_one_gate` pins that the finish route runs it
+    /// after the store.
+    ///
+    /// Fails if: a passkey added from a session older than the purge stamp
+    /// stays, the refusal is not the failed-ceremony answer, an add with no
+    /// stamp on record or from a session made after the stamp is taken
+    /// back, a session id that carries no time vouches for an add, or
+    /// another passkey of the account is removed.
+    async fn an_add_from_a_session_older_than_a_purge_is_taken_back_case() {
+        let harness = TestHarness::new().await;
+        let (account, _, _) = harness.new_user().await;
+        let old = session_minted_ago(&harness, &account, Duration::from_secs(60)).await;
+
+        // No purge on record: the row stays
+        assert_eq!(
+            purged_since(&account.id).await.expect("redis"),
+            None,
+            "the control: no stamp yet"
+        );
+        let first = seed_passkey(&harness, &account, "Phone").await;
+        settle_add_after_purge_check(&harness.db, &old.id, &account.id, &first.id)
+            .await
+            .expect("no purge is on record, so the passkey stays");
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
+
+        // What a reset that keeps the sessions does: the stamp, then the
+        // purge
+        mark_passkeys_purged(&account.id).await.expect("the stamp");
+        harness
+            .db
+            .delete_passkeys_for_user(&account.id)
+            .await
+            .unwrap();
+        let stamp = purged_since(&account.id)
+            .await
+            .expect("redis")
+            .expect("the control: the stamp is on record");
+        assert!(minted_ms(&old) < stamp, "the control: an older session");
+        assert!(
+            harness.db.fetch_session(&old.id).await.is_ok(),
+            "the control: the session outlived the reset"
+        );
+
+        // A session made after the reset, by whoever knows the new password
+        let new = session_minted_at(
+            &harness,
+            &account,
+            SystemTime::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(minted_ms(&new) > stamp, "the control: a newer session");
+        let kept = seed_passkey(&harness, &account, "After the reset").await;
+        settle_add_after_purge_check(&harness.db, &new.id, &account.id, &kept.id)
+            .await
+            .expect("a session made after the purge keeps its passkey");
+
+        // The late store of the session that was open before the reset
+        let late = seed_passkey(&harness, &account, "Planted").await;
+        let refused = settle_add_after_purge_check(&harness.db, &old.id, &account.id, &late.id)
+            .await
+            .expect_err("an add from a session older than the purge is refused");
+        assert!(
+            matches!(refused.error_type, ErrorType::InvalidCredentials),
+            "{:?}",
+            refused
+        );
+
+        // Only the late row went
+        let left = harness.db.fetch_passkeys(&account.id).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, kept.id);
+
+        // An id with no time in it vouches for nothing
+        let planted = seed_passkey(&harness, &account, "Planted").await;
+        let refused =
+            settle_add_after_purge_check(&harness.db, "not a ulid", &account.id, &planted.id)
+                .await
+                .expect_err("a session id with no time is refused");
+        assert!(
+            matches!(refused.error_type, ErrorType::InvalidCredentials),
+            "{:?}",
+            refused
+        );
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
+    }
+
+    #[test]
+    fn an_add_is_taken_back_when_the_purge_stamp_cannot_be_read() {
+        rt().block_on(an_add_is_taken_back_when_the_purge_stamp_cannot_be_read_case())
+    }
+
+    /// A stamp that is there and is not a time, which `purged_since`
+    /// answers with an error, as it does when Redis is down.
+    ///
+    /// Fails if: an unreadable purge stamp is taken for "no purge" and the
+    /// passkey stays, the request is answered as a success, or another
+    /// passkey of the account is removed.
+    async fn an_add_is_taken_back_when_the_purge_stamp_cannot_be_read_case() {
+        let harness = TestHarness::new().await;
+        let (account, session, _) = harness.new_user().await;
+        let kept = seed_passkey(&harness, &account, "Phone").await;
+
+        // The key of `passkey::mark_passkeys_purged`
+        let mut conn = get_connection().await.expect("redis").into_inner();
+        let set: Option<String> = redis::cmd("SET")
+            .arg(format!("passkey:purged:{}", account.id))
+            .arg("not a time")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut conn)
+            .await
+            .expect("SET");
+        assert!(set.is_some(), "the control: the stamp is stored");
+        assert!(
+            purged_since(&account.id).await.is_err(),
+            "the control: the stamp cannot be read"
+        );
+
+        let late = seed_passkey(&harness, &account, "Planted").await;
+        let refused =
+            settle_add_after_purge_check(&harness.db, &session.id, &account.id, &late.id)
+                .await
+                .expect_err("an add whose purge stamp cannot be read is refused");
+        assert!(
+            matches!(refused.error_type, ErrorType::InternalError),
+            "{:?}",
+            refused
+        );
+
+        let left = harness.db.fetch_passkeys(&account.id).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, kept.id);
+    }
+
+    /// Store something that is not a time as the purge stamp of `account`
+    /// (the key of `passkey::mark_passkeys_purged`)
+    async fn unreadable_purge_stamp(account: &Account) {
+        let mut conn = get_connection().await.expect("redis").into_inner();
+        let set: Option<String> = redis::cmd("SET")
+            .arg(format!("passkey:purged:{}", account.id))
+            .arg("not a time")
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut conn)
+            .await
+            .expect("SET");
+        assert!(set.is_some(), "the control: the stamp is stored");
+        assert!(
+            purged_since(&account.id).await.is_err(),
+            "the control: the stamp cannot be read"
+        );
+    }
+
+    #[test]
+    fn start_refuses_a_session_older_than_a_purge() {
+        rt().block_on(start_refuses_a_session_older_than_a_purge_case())
+    }
+
+    /// Over HTTP, on the state a password reset that kept the sessions
+    /// leaves behind: the stamp is written and the session that was open
+    /// before it is still there.
+    ///
+    /// Fails if: `register/start` hands a challenge to a session older than
+    /// the purge stamp (the device would make a passkey the finish step
+    /// takes back), refuses it with anything but the failed-ceremony
+    /// answer, takes an unreadable stamp for "no purge", or refuses a
+    /// session with no stamp on record, a session made after the stamp, or
+    /// another account's session.
+    async fn start_refuses_a_session_older_than_a_purge_case() {
+        let harness = harness_with_passkeys_on().await;
+        let (account, _) = passwordless_user(&harness).await;
+        let old = session_minted_ago(&harness, &account, Duration::from_secs(60)).await;
+        let (_, bystander) = passwordless_user(&harness).await;
+
+        // The control: no purge on record, the same session gets a challenge
+        assert_start_answers(&harness, &old, None).await;
+
+        mark_passkeys_purged(&account.id).await.expect("the stamp");
+        let stamp = purged_since(&account.id)
+            .await
+            .expect("redis")
+            .expect("the control: the stamp is on record");
+        assert!(minted_ms(&old) < stamp, "the control: an older session");
+
+        let (status, body) = send(start(&harness), &old, None).await;
+        assert_eq!(status, Status::Unauthorized, "{}", body);
+        assert_eq!(kind(&body), "InvalidCredentials", "{}", body);
+        assert!(body.get("challenge_id").is_none(), "{}", body);
+        assert!(body.get("options").is_none(), "{}", body);
+
+        // A ticket does not change that
+        let ticket = ticket_for(&harness, &account).await;
+        let (status, body) = send(start(&harness), &old, Some(&ticket)).await;
+        assert_eq!(status, Status::Unauthorized, "{}", body);
+        assert!(body.get("challenge_id").is_none(), "{}", body);
+
+        // A session made after the reset, and another account, go ahead
+        let new = session_minted_at(
+            &harness,
+            &account,
+            SystemTime::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(minted_ms(&new) > stamp, "the control: a newer session");
+        assert_start_answers(&harness, &new, None).await;
+        assert_start_answers(&harness, &bystander, None).await;
+
+        // A stamp that cannot be read refuses, whatever the session
+        let (unread, unread_session) = passwordless_user(&harness).await;
+        unreadable_purge_stamp(&unread).await;
+        let (status, body) = send(start(&harness), &unread_session, None).await;
+        assert_eq!(status, Status::InternalServerError, "{}", body);
+        assert_eq!(kind(&body), "InternalError", "{}", body);
+        assert!(body.get("challenge_id").is_none(), "{}", body);
+    }
+
+    #[test]
+    fn finish_refuses_when_a_purge_lands_after_start() {
+        rt().block_on(finish_refuses_when_a_purge_lands_after_start_case())
+    }
+
+    /// Over HTTP, with real ceremonies: the reset comes in after the start
+    /// step answered and before the device's passkey comes back.
+    ///
+    /// Fails if: `register/finish` keeps a passkey whose session is older
+    /// than a purge stamp written after `register/start` (the start check
+    /// alone does not see that reset), answers anything but the
+    /// failed-ceremony answer, or refuses the same ceremony from a session
+    /// made after the stamp.
+    async fn finish_refuses_when_a_purge_lands_after_start_case() {
+        let harness = harness_with_passkeys_on().await;
+        let (account, _) = passwordless_user(&harness).await;
+        let old = session_minted_ago(&harness, &account, Duration::from_secs(60)).await;
+
+        // Start goes through: nothing is on record yet
+        let (status, started) = send(start(&harness), &old, None).await;
+        assert_eq!(status, Status::Ok, "{}", started);
+        assert_eq!(started["ticket_required"], false, "{}", started);
+        let credential = SoftPasskey::new().create(&started["options"], ORIGIN);
+        let challenge_id = started["challenge_id"].as_str().unwrap();
+
+        // The reset: the stamp, then the purge
+        mark_passkeys_purged(&account.id).await.expect("the stamp");
+        harness
+            .db
+            .delete_passkeys_for_user(&account.id)
+            .await
+            .unwrap();
+        let stamp = purged_since(&account.id)
+            .await
+            .expect("redis")
+            .expect("the control: the stamp is on record");
+        assert!(minted_ms(&old) < stamp, "the control: an older session");
+
+        let (status, body) = send(
+            finish(&harness, challenge_id, credential, Some("Planted")),
+            &old,
+            None,
+        )
+        .await;
+        assert_eq!(status, Status::Unauthorized, "{}", body);
+        assert_eq!(kind(&body), "InvalidCredentials", "{}", body);
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 0);
+
+        // The control: a session made after the reset does the same
+        // ceremony and keeps its passkey. Its id lies a few seconds ahead
+        // so that it is surely newer than the stamp; an id from the future
+        // has no age, so this add brings a ticket.
+        let new = session_minted_at(
+            &harness,
+            &account,
+            SystemTime::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(minted_ms(&new) > stamp, "the control: a newer session");
+        let (status, started) = send(start(&harness), &new, None).await;
+        assert_eq!(status, Status::Ok, "{}", started);
+        let credential = SoftPasskey::new().create(&started["options"], ORIGIN);
+        let challenge_id = started["challenge_id"].as_str().unwrap();
+        let ticket = ticket_for(&harness, &account).await;
+        let (status, info) = send(
+            finish(&harness, challenge_id, credential, Some("Phone")),
+            &new,
+            Some(&ticket),
+        )
+        .await;
+        assert_eq!(status, Status::Ok, "{}", info);
+        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 1);
+    }
+
     #[test]
     fn a_bad_ticket_counts_as_no_ticket() {
         rt().block_on(a_bad_ticket_counts_as_no_ticket_case())
@@ -704,7 +1354,8 @@ mod tests {
         // First passkey, no ticket on either step
         let (status, started) = send(start(&harness), &session, None).await;
         assert_eq!(status, Status::Ok, "{}", started);
-        assert_eq!(keys(&started), ["challenge_id", "options"]);
+        assert_eq!(keys(&started), ["challenge_id", "options", "ticket_required"]);
+        assert_eq!(started["ticket_required"], false, "{}", started);
 
         let credential = SoftPasskey::new().create(&started["options"], ORIGIN);
         let challenge_id = started["challenge_id"].as_str().unwrap();
@@ -727,9 +1378,11 @@ mod tests {
         assert!(after.password_absent, "adding a passkey cleared the flag");
         assert!(!after.mfa.is_active());
 
-        // Second passkey. The start step asks for nothing more
+        // Second passkey. The start step asks for nothing more, and says
+        // the finish step will
         let (status, started) = send(start(&harness), &session, None).await;
         assert_eq!(status, Status::Ok, "{}", started);
+        assert_eq!(started["ticket_required"], true, "{}", started);
 
         let mut second = SoftPasskey::new();
         let credential = second.create(&started["options"], ORIGIN);

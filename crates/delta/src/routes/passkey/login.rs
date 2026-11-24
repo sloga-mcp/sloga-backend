@@ -62,7 +62,7 @@ pub async fn login_finish(
     // Whatever went wrong, the caller learns one thing only. No lockout
     // attempt is written for a failure: nothing here can be guessed, and
     // the account is not even known until the assertion verifies.
-    let account_id = passkey::finish_login(db, &challenge_id, credential)
+    let login = passkey::finish_login(db, &challenge_id, credential)
         .await
         .map_err(|error| {
             // Anything but a refused assertion is an outage (Redis, the
@@ -78,7 +78,74 @@ pub async fn login_finish(
             create_error!(InvalidCredentials)
         })?;
 
-    sign_in(db, &account_id, friendly_name).await.map(Json)
+    let answer = sign_in(db, &login.account_id, friendly_name).await?;
+
+    // A reset or a removal that overtook this sign-in took the passkey away
+    withdraw_if_passkey_gone(db, &login.account_id, &login.passkey_id, answer)
+        .await
+        .map(Json)
+}
+
+/// After the session is made: the sign-in stands only while the passkey
+/// that made it is still stored for this account.
+///
+/// A password reset removes the account's passkeys, and a removal takes
+/// one; either can land between the verifier and `create_session`, and the
+/// session would then outlive the passkey it came from. So the row is read
+/// again here, by the row id the verifier handed back: the request body
+/// names nothing in this look. If the row is gone, belongs to another
+/// account or cannot be read, the session just made is deleted and the
+/// answer is that of a failed assertion.
+///
+/// An answer that carries no session (a disabled account) passes through.
+async fn withdraw_if_passkey_gone(
+    db: &Database,
+    account_id: &str,
+    passkey_id: &str,
+    answer: v0::ResponseLogin,
+) -> Result<v0::ResponseLogin> {
+    let v0::ResponseLogin::Success(session) = &answer else {
+        return Ok(answer);
+    };
+
+    // The owner is part of the lookup: another account's row is not found
+    if db.fetch_passkey(account_id, passkey_id).await.is_ok() {
+        return Ok(answer);
+    }
+
+    discard_session(db, &session.id).await;
+    Err(create_error!(InvalidCredentials))
+}
+
+/// Delete the session a withdrawn sign-in made. Its token was never handed
+/// out. Tried twice; a session that is already gone is as good as deleted.
+async fn discard_session(db: &Database, session_id: &str) {
+    for _ in 0..2 {
+        let removed = match db.fetch_session(session_id).await {
+            // Through the model, so the event that announced the session is
+            // followed by the one that takes it back
+            Ok(session) => session.delete(db).await,
+            Err(error) => Err(error),
+        };
+
+        match removed {
+            Ok(()) => return,
+            Err(error)
+                if matches!(
+                    error.error_type,
+                    ErrorType::UnknownUser | ErrorType::InvalidSession
+                ) =>
+            {
+                return
+            }
+            Err(_) => {}
+        }
+    }
+
+    log::error!(
+        "passkeys: could not remove session {session_id} of a sign-in whose passkey was \
+         removed; revoke it by hand"
+    );
 }
 
 /// Signs in the account a verified assertion belongs to.
@@ -801,6 +868,207 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// The step after `create_session`, with the passkey removed between
+    /// the two as a reset or a removal that overtook the sign-in leaves it.
+    /// Driven on the step itself (`sign_in`, delete the rows, then
+    /// `withdraw_if_passkey_gone`): nothing can remove a row in the middle
+    /// of one request. `finish_looks_for_the_passkey_after_the_session`
+    /// pins that the route runs it there.
+    ///
+    /// Fails if: a session outlives the passkey that made it, the refusal
+    /// is not `InvalidCredentials`, a passkey of another account or an id
+    /// that names no row keeps the session, a sign-in whose passkey is
+    /// still stored loses its session, or another session of the account
+    /// is removed.
+    #[test]
+    fn a_sign_in_whose_passkey_is_gone_is_withdrawn() {
+        crate::util::test::rt().block_on(async {
+            let harness = enabled_harness().await;
+
+            // The id of the row a credential id is stored under, which is
+            // what the verifier hands back
+            let row_id = |credential_id: String| {
+                let db = harness.db.clone();
+                async move {
+                    db.fetch_passkey_by_credential_id(&credential_id)
+                        .await
+                        .expect("the lookup")
+                        .expect("a stored passkey")
+                        .id
+                }
+            };
+
+            let account = new_account(&harness).await;
+            let soft = registered_passkey(&harness, &account).await;
+            let passkey_id = row_id(b64u(&soft.cred_id)).await;
+
+            let other = new_account(&harness).await;
+            let foreign = row_id(stored_passkey(&harness, &other.id).await).await;
+
+            let session_ids = |account_id: String| {
+                let db = harness.db.clone();
+                async move {
+                    let sessions = db.fetch_sessions(&account_id).await.unwrap();
+                    let mut ids: Vec<String> =
+                        sessions.into_iter().map(|session| session.id).collect();
+                    ids.sort();
+                    ids
+                }
+            };
+            let withdrawn = |result: revolt_result::Result<v0::ResponseLogin>, row: &str| {
+                match result {
+                    Err(error) => assert!(
+                        matches!(error.error_type, ErrorType::InvalidCredentials),
+                        "{}: expected `InvalidCredentials`, got {:?}",
+                        row,
+                        error
+                    ),
+                    Ok(other) => panic!("{}: expected a refusal, got {:?}", row, other),
+                }
+            };
+
+            // The control: the passkey is still stored, so the session stays
+            let kept = signs_in(&harness, &account.id, Some("Kept"), "control").await;
+            let kept_id = kept.id.clone();
+            let answer = super::withdraw_if_passkey_gone(
+                &harness.db,
+                &account.id,
+                &passkey_id,
+                v0::ResponseLogin::Success(kept),
+            )
+            .await;
+            match answer {
+                Ok(v0::ResponseLogin::Success(session)) => assert_eq!(session.id, kept_id),
+                other => panic!("control: expected `Success`, got {:?}", other),
+            }
+            assert_eq!(session_ids(account.id.clone()).await, vec![kept_id.clone()]);
+
+            // A passkey of another account vouches for nothing
+            let late = signs_in(&harness, &account.id, Some("Late"), "foreign").await;
+            withdrawn(
+                super::withdraw_if_passkey_gone(
+                    &harness.db,
+                    &account.id,
+                    &foreign,
+                    v0::ResponseLogin::Success(late),
+                )
+                .await,
+                "foreign",
+            );
+            assert_eq!(session_ids(account.id.clone()).await, vec![kept_id.clone()]);
+
+            // Nor does an id that names no row. The credential id of the
+            // account's own passkey is one: it is not the row id
+            for (row, unknown) in [
+                ("unknown", "01NOSUCHPASSKEY".to_string()),
+                ("a credential id", b64u(&soft.cred_id)),
+            ] {
+                let late = signs_in(&harness, &account.id, Some("Late"), row).await;
+                withdrawn(
+                    super::withdraw_if_passkey_gone(
+                        &harness.db,
+                        &account.id,
+                        &unknown,
+                        v0::ResponseLogin::Success(late),
+                    )
+                    .await,
+                    row,
+                );
+            }
+            assert_eq!(session_ids(account.id.clone()).await, vec![kept_id.clone()]);
+
+            // The assertion verified and the session was made; then the
+            // reset's purge of the passkeys lands
+            let late = signs_in(&harness, &account.id, Some("Late"), "gone").await;
+            harness
+                .db
+                .delete_passkeys_for_user(&account.id)
+                .await
+                .unwrap();
+            withdrawn(
+                super::withdraw_if_passkey_gone(
+                    &harness.db,
+                    &account.id,
+                    &passkey_id,
+                    v0::ResponseLogin::Success(late),
+                )
+                .await,
+                "gone",
+            );
+
+            // Only the session of that sign-in went
+            assert_eq!(session_ids(account.id.clone()).await, vec![kept_id.clone()]);
+            assert!(session_ids(other.id.clone()).await.is_empty());
+
+            // An answer with no session passes through untouched
+            let refused = v0::ResponseLogin::Disabled {
+                user_id: account.id.clone(),
+                suspended_until: None,
+            };
+            match super::withdraw_if_passkey_gone(&harness.db, &account.id, &passkey_id, refused)
+                .await
+            {
+                Ok(v0::ResponseLogin::Disabled { user_id, .. }) => assert_eq!(user_id, account.id),
+                other => panic!("expected `Disabled`, got {:?}", other),
+            }
+        })
+    }
+
+    /// Fails if: `login_finish` stops looking for the passkey after the
+    /// session is made, looks before it, hands the session out without
+    /// going through the look, or looks under anything but the account and
+    /// the passkey row the verifier handed back (a value read from the
+    /// request body again, the credential's `rawId` or `id` included).
+    #[test]
+    fn finish_looks_for_the_passkey_after_the_session() {
+        use crate::util::test::{without_comments, without_whitespace};
+
+        // The verifier's answer is the only thing bound to `login`
+        const KEY: &str = "letlogin=passkey::finish_login(";
+        const VERIFY: &str = "passkey::finish_login(db,&challenge_id,credential)";
+        const SESSION: &str = "letanswer=sign_in(db,&login.account_id,friendly_name).await?;";
+        const LOOK: &str =
+            "withdraw_if_passkey_gone(db,&login.account_id,&login.passkey_id,answer).await.map(Json)}";
+
+        let source = include_str!("login.rs");
+        let routes = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the code above the tests");
+        let code = without_whitespace(&without_comments(routes));
+
+        let at = |needle: &str| {
+            assert_eq!(code.matches(needle).count(), 1, "`{}` once", needle);
+            code.find(needle).unwrap()
+        };
+
+        assert!(at(KEY) < at(SESSION));
+        assert!(at(VERIFY) < at(SESSION));
+        assert!(at(SESSION) < at(LOOK));
+
+        // `login` is bound once, so both values of the look are the
+        // verifier's
+        assert_eq!(code.matches("letlogin=").count(), 1);
+        assert_eq!(code.matches("letmutlogin").count(), 0);
+
+        // The look is by row id and owner, and nothing above the tests
+        // reads a credential id out of the request body
+        assert!(code.contains("db.fetch_passkey(account_id,passkey_id).await"));
+        for banned in [
+            "rawId",
+            "credential.get(",
+            "credential[",
+            "fetch_passkey_by_credential_id",
+        ] {
+            assert!(!code.contains(banned), "the route code reads `{}`", banned);
+        }
+
+        // `sign_in` is called from the route only, so no session leaves
+        // this file another way
+        assert_eq!(code.matches("sign_in(db,").count(), 1);
+        assert_eq!(code.matches("complete_login(").count(), 1);
     }
 
     /// The body: the session name is optional, and a credential of any JSON

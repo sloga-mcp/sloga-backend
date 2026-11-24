@@ -381,6 +381,7 @@ impl TestHarness {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
         };
 
         self.db.save_account(&account).await.expect("`Account`");
@@ -391,6 +392,29 @@ impl TestHarness {
             .expect("`Session`");
 
         (account, session)
+    }
+
+    /// A passkey-created account with no email address (`email_absent`, a
+    /// stand-in in `email`), its user and a session. No passkey is stored.
+    pub async fn new_no_email_user(&self) -> (Account, Session, User) {
+        let account = Account::new_passkey_signup(None).expect("`Account`");
+        self.db.save_account(&account).await.expect("`Account`");
+
+        let user = User::create(
+            &self.db,
+            TestHarness::rand_string(),
+            Some(account.id.clone()),
+            None,
+        )
+        .await
+        .expect("`User`");
+
+        let session = account
+            .create_session(&self.db, String::new())
+            .await
+            .expect("`Session`");
+
+        (account, session, user)
     }
 
     pub async fn new_server(&self, user: &User) -> (Server, Vec<Channel>) {

@@ -1,7 +1,8 @@
 use revolt_database::{
-    events::client::EventV1, util::permissions::DatabasePermissionQuery, Channel, Database,
-    Message, Report, SealedRequester, Snapshot, SnapshotContent, TakedownSource, TakedownTarget,
-    UnresolvableKind, User,
+    events::client::EventV1,
+    util::{email::is_placeholder_email, permissions::DatabasePermissionQuery},
+    Channel, Database, Message, Report, SealedRequester, Snapshot, SnapshotContent,
+    TakedownSource, TakedownTarget, UnresolvableKind, User,
 };
 use revolt_models::v0::{
     ContentReportReason, DataInAppTakedown, ReportStatus, ReportedContent, ReportedMessageSnapshot,
@@ -439,8 +440,22 @@ pub async fn report_content(
     Ok(EmptyResponse)
 }
 
+/// The answer to a Take It Down report with no usable contact address: the
+/// reporter's account has no email and none was typed. Fixed text, nothing
+/// from the request.
+fn takedown_contact_required() -> revolt_result::Error {
+    create_error!(FailedValidation {
+        error: "takedown.email is required".to_string()
+    })
+}
+
 /// Seal the Take It Down request an in-app report files. Contact is the
 /// given address or the account's; the signature doubles as the name.
+///
+/// An account with no email has no address to fall back on, so its report
+/// must carry one (`takedown_contact_required` otherwise). The stand-in such
+/// an account stores is never used, and a typed `.invalid` address is
+/// refused like any other bad address.
 async fn prepare_in_app_request(
     db: &Database,
     user: &User,
@@ -460,8 +475,12 @@ async fn prepare_in_app_request(
     } = takedown;
 
     let email = match email.filter(|email| !email.trim().is_empty()) {
+        Some(email) if is_placeholder_email(&email) => return Err(invalid_takedown_body()),
         Some(email) => email,
-        None => db.fetch_account(&user.id).await?.email,
+        None => match db.fetch_account(&user.id).await?.real_email() {
+            Some(email) => email.to_string(),
+            None => return Err(takedown_contact_required()),
+        },
     };
 
     let ReportedObject {
@@ -1202,6 +1221,69 @@ mod takedown_test {
                 requester.role,
                 revolt_database::TakedownRole::Authorized
             ));
+        })
+    }
+
+    /// Fails if: a Take It Down report from an account with no email is
+    /// filed without a typed contact (the account's stand-in address would
+    /// be sealed as the contact, mailed and shown to staff), a typed
+    /// `.invalid` address is accepted, a refusal leaves a report or request
+    /// behind or echoes an address, or a typed real address stops working
+    /// for such an account.
+    #[test]
+    fn a_no_email_account_must_type_its_takedown_contact() {
+        crate::util::test::rt().block_on(async {
+            enable_takedown().await;
+            let harness = TestHarness::new().await;
+            let (account, session, reporter) = harness.new_no_email_user().await;
+            let (_, _, reported) = harness.new_user().await;
+            assert!(account.email_absent);
+            assert!(account.real_email().is_none());
+
+            let body = |takedown: Value| {
+                json!({
+                    "content": {
+                        "type": "User",
+                        "id": reported.id,
+                        "report_reason": "NonConsensualIntimateImage"
+                    },
+                    "takedown": takedown
+                })
+            };
+
+            // Three reports: exactly the per-window report budget
+
+            // No typed contact: nothing to fall back on
+            let (status, text) = report(&harness, &session, body(takedown_fields())).await;
+            assert_eq!(status, Status::BadRequest, "{text}");
+            assert!(text.contains("FailedValidation"), "{text}");
+            assert!(!text.contains(".invalid"), "{text}");
+            assert!(!text.contains("SECRET"), "{text}");
+
+            // The stand-in itself, typed in
+            let mut stand_in = takedown_fields();
+            stand_in["email"] = json!(account.email);
+            let (status, text) = report(&harness, &session, body(stand_in)).await;
+            assert_eq!(status, Status::BadRequest, "{text}");
+            assert!(text.contains("FailedValidation"), "{text}");
+            assert!(!text.contains(".invalid"), "{text}");
+
+            assert!(reports_by(&harness, &reporter).await.is_empty());
+            assert!(recent(&harness.db).await.is_empty());
+
+            // A typed address files the report and its request
+            let mut typed = takedown_fields();
+            typed["email"] = json!("typed-contact@example.com");
+            let (status, text) = report(&harness, &session, body(typed)).await;
+            assert_eq!(status, Status::NoContent, "{text}");
+
+            let reports = reports_by(&harness, &reporter).await;
+            assert_eq!(reports.len(), 1);
+            let request = linked_request(&harness, &reports[0])
+                .await
+                .expect("a linked request");
+            assert_eq!(recent(&harness.db).await.len(), 1);
+            assert_eq!(open(&request).email, "typed-contact@example.com");
         })
     }
 

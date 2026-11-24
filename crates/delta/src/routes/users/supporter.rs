@@ -151,10 +151,16 @@ pub async fn claim_supporter(
         return Err(create_error!(NotFound));
     }
 
+    // A claim is matched on the account's email. An account with none is
+    // refused before the donation is read; its stand-in address is never
+    // hashed or compared.
     let account = db.fetch_account(&user.id).await?;
+    let Some(email) = account.real_email() else {
+        return Err(create_error!(InvalidOperation));
+    };
+
     let outcome =
-        Donation::claim_by_transaction(db, &user, &account.email, &data.transaction_id, key)
-            .await?;
+        Donation::claim_by_transaction(db, &user, email, &data.transaction_id, key).await?;
 
     Ok(Json(v0::SupporterClaimResult { outcome }))
 }
@@ -416,5 +422,82 @@ mod test {
             .await
             .expect("fetch claim code");
         assert!(stored.is_none(), "no claim code may be handed out");
+    }
+
+    async fn claim(
+        harness: &TestHarness,
+        session: &revolt_database::Session,
+        transaction_id: &str,
+    ) -> (Status, serde_json::Value) {
+        let response = TestHarness::with_session(
+            session.clone(),
+            harness
+                .client
+                .post("/users/@me/supporter/claim")
+                .header(ContentType::JSON)
+                .body(json!({ "transaction_id": transaction_id }).to_string()),
+        )
+        .await;
+        let status = response.status();
+        let body = response
+            .into_json::<serde_json::Value>()
+            .await
+            .expect("claim body");
+        (status, body)
+    }
+
+    #[test]
+    fn claim_is_refused_for_an_account_with_no_email() {
+        crate::util::test::rt().block_on(async {
+            // Once per process (nextest): the claim route answers NotFound
+            // before it reads the account while this key is empty
+            revolt_config::overwrite_config(|settings| {
+                settings.api.kofi.email_hmac_key = "test-kofi-email-hmac-key".to_string();
+            })
+            .await;
+            claim_is_refused_for_an_account_with_no_email_case().await
+        })
+    }
+
+    /// Fails if: the claim route goes on to the donation lookup (and the
+    /// email HMAC) for an account with no email, instead of refusing with
+    /// `InvalidOperation`; or an account that has an email is refused the
+    /// same way.
+    async fn claim_is_refused_for_an_account_with_no_email_case() {
+        let harness = TestHarness::new().await;
+        assert!(
+            !revolt_config::config()
+                .await
+                .api
+                .kofi
+                .email_hmac_key
+                .is_empty(),
+            "the control: the claim route is configured for this test"
+        );
+
+        // The control: an ordinary account gets past the email check and
+        // reaches the donation lookup, which finds nothing
+        let (_, session, _) = harness.new_user().await;
+        let (status, body) = claim(&harness, &session, "txn-no-such-donation").await;
+        assert_eq!(status, Status::NotFound, "{body}");
+        assert_eq!(body["type"], "NotFound");
+
+        // No email: refused before the lookup
+        let user =
+            revolt_database::User::create(&harness.db, TestHarness::rand_string(), None, None)
+                .await
+                .expect("`User`");
+        let mut account = revolt_database::Account::new_passkey_signup(None).expect("`Account`");
+        account.id = user.id.clone();
+        harness.db.save_account(&account).await.expect("saved");
+        assert_eq!(account.real_email(), None, "the control: no email");
+        let session = account
+            .create_session(&harness.db, String::new())
+            .await
+            .expect("`Session`");
+
+        let (status, body) = claim(&harness, &session, "txn-no-such-donation").await;
+        assert_eq!(status, Status::BadRequest, "{body}");
+        assert_eq!(body["type"], "InvalidOperation");
     }
 }

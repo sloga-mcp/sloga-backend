@@ -8,7 +8,10 @@ use serde_json::json;
 use crate::{
     events::client::EventV1,
     util::{
-        email::{email_templates, normalise_email, send_email},
+        email::{
+            email_templates, generate_placeholder_email, is_placeholder_email, normalise_email,
+            send_email,
+        },
         password::hash_password,
     },
     Database, MFATicket, Session, MFA_TICKET_MAX_ATTEMPTS,
@@ -70,6 +73,17 @@ auto_derived_partial!(
         /// turn this off again if `false` is part of the document
         #[serde(default)]
         pub password_absent: bool,
+
+        /// Whether the account has no email address
+        ///
+        /// `email` and `email_normalised` then hold a random stand-in at
+        /// `noemail.invalid` (the unique indexes need a value), and the
+        /// account is stored `Verified`. Read the address through
+        /// [`Account::real_email`], never from the fields.
+        ///
+        /// Always serialised, for the same reason as `password_absent`
+        #[serde(default)]
+        pub email_absent: bool,
     },
     "PartialAccount"
 );
@@ -318,6 +332,150 @@ impl Account {
         db.save_account(self).await
     }
 
+    /// The account's email address, if it has one
+    ///
+    /// `None` when the account has no email (`email_absent`), when it was
+    /// deleted, or when the stored address is a stand-in. Together with
+    /// `EmailVerification::Verified` this is the only test for "has a
+    /// confirmed email". Nothing may be mailed to, shown from or looked up by
+    /// the `email` field directly.
+    pub fn real_email(&self) -> Option<&str> {
+        if self.email_absent
+            || matches!(self.deletion, Some(DeletionInfo::Deleted))
+            || is_placeholder_email(&self.email)
+        {
+            None
+        } else {
+            Some(&self.email)
+        }
+    }
+
+    /// Whether the account has an email address its owner has confirmed
+    ///
+    /// A real address (never the stand-in of an account with no email, and
+    /// never a deleted account's) that is not waiting for its first
+    /// verification. `Moving` passes: `start_email_move` refuses a `Pending`
+    /// account and one with no email, so an account in `Moving` confirmed
+    /// the address still in `email` before the move began.
+    pub fn has_confirmed_email(&self) -> bool {
+        self.real_email().is_some()
+            && matches!(
+                self.verification,
+                EmailVerification::Verified | EmailVerification::Moving { .. }
+            )
+    }
+
+    /// Whether the account can sign in with something other than a passkey:
+    /// a usable password, or a linked Google or Apple sign-in
+    ///
+    /// A password only counts together with an email address: the password
+    /// login finds the account by email, so an account with no email cannot
+    /// use one.
+    ///
+    /// The rule `delete_passkey_unless_last_way_in` applies, together with
+    /// the count of the account's other passkeys.
+    pub fn can_sign_in_without_passkey(&self) -> bool {
+        (!self.password_absent && self.real_email().is_some())
+            || self.google_id.is_some()
+            || self.apple_id.is_some()
+    }
+
+    /// Find the account that holds this email address
+    ///
+    /// The one lookup by email: it normalises the address itself, and it
+    /// never matches an account that has no email. A `.invalid` address
+    /// finds nothing without a query.
+    pub async fn fetch_by_email(db: &Database, email: &str) -> Result<Option<Account>> {
+        if is_placeholder_email(email) {
+            return Ok(None);
+        }
+
+        let normalised = normalise_email(email.to_string());
+        if is_placeholder_email(&normalised) {
+            return Ok(None);
+        }
+
+        Ok(db
+            .fetch_account_by_normalised_email(&normalised)
+            .await?
+            .filter(|account| account.real_email().is_some()))
+    }
+
+    /// Build the account of a brand-new passkey sign-up. Nothing is stored
+    /// and no event is sent: the caller decides when to insert it.
+    ///
+    /// `confirmed_email` is an address the person has already proved they
+    /// read (the code typed into the app), or `None` for an account with no
+    /// email, which gets a stand-in address and `email_absent`. Either way
+    /// the account is `Verified` and has no usable password. A `.invalid`
+    /// address is refused with `IncorrectData`.
+    pub fn new_passkey_signup(confirmed_email: Option<String>) -> Result<Account> {
+        let (email, email_absent) = match confirmed_email {
+            Some(email) if is_placeholder_email(&email) => {
+                return Err(create_error!(IncorrectData {
+                    with: "email".to_string()
+                }));
+            }
+            Some(email) => (email, false),
+            None => (generate_placeholder_email(), true),
+        };
+
+        let email_normalised = normalise_email(email.clone());
+
+        // As for an OAuth account: the hash of a random string nobody knows
+        let password = hash_password(nanoid!(64))?;
+
+        Ok(Account {
+            id: ulid::Ulid::new().to_string(),
+
+            email,
+            email_normalised,
+            password,
+
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+
+            mfa: Default::default(),
+            google_id: None,
+            apple_id: None,
+            password_absent: true,
+            email_absent,
+        })
+    }
+
+    /// Give an account that has no email its first address
+    ///
+    /// Call only after the person typed the code mailed to `email`. One
+    /// conditional write (see `set_account_email_if_absent`): `Ok(true)`
+    /// and this copy updated if it applied, `Ok(false)` and nothing changed
+    /// if the account already has an email, was deleted, or another account
+    /// holds the address. A `.invalid` address is `Ok(false)` as well.
+    pub async fn set_first_email(&mut self, db: &Database, email: String) -> Result<bool> {
+        if is_placeholder_email(&email) {
+            return Ok(false);
+        }
+
+        let email_normalised = normalise_email(email.clone());
+        if is_placeholder_email(&email_normalised) {
+            return Ok(false);
+        }
+
+        if !db
+            .set_account_email_if_absent(&self.id, &email, &email_normalised)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.email = email;
+        self.email_normalised = email_normalised;
+        self.email_absent = false;
+        Ok(true)
+    }
+
     /// Create a new account
     pub async fn new(
         db: &Database,
@@ -325,14 +483,18 @@ impl Account {
         plaintext_password: String,
         verify_email: bool,
     ) -> Result<Account> {
+        // `.invalid` is where accounts with no email keep their stand-in
+        if is_placeholder_email(&email) {
+            return Err(create_error!(IncorrectData {
+                with: "email".to_string()
+            }));
+        }
+
         // Get a normalised representation of the user's email
         let email_normalised = normalise_email(email.clone());
 
         // Try to find an existing account
-        if let Some(mut account) = db
-            .fetch_account_by_normalised_email(&email_normalised)
-            .await?
-        {
+        if let Some(mut account) = Account::fetch_by_email(db, &email).await? {
             // Resend account verification or send password reset
             if let EmailVerification::Pending { .. } = &account.verification {
                 account.start_email_verification(db).await?;
@@ -363,6 +525,7 @@ impl Account {
                 google_id: None,
                 apple_id: None,
                 password_absent: false,
+                email_absent: false,
             };
 
             // Send email verification, then insert the account; the
@@ -438,6 +601,7 @@ impl Account {
             apple_id,
             // The hash above is of a random string nobody knows
             password_absent: true,
+            email_absent: false,
         };
 
         account.save(db).await?;
@@ -544,9 +708,13 @@ impl Account {
             return;
         }
 
+        // An account with no email gets no mail
+        let Some(email) = self.real_email().map(str::to_string) else {
+            return;
+        };
+
         let template = email_templates().await.deletion_cancelled;
         let smtp = config.api.smtp;
-        let email = self.email.clone();
         let account_id = self.id.clone();
 
         tokio::spawn(async move {
@@ -582,7 +750,14 @@ impl Account {
     }
 
     /// Send the verification email and update `verification` in memory
+    ///
+    /// An account with no email is left as it is: there is nothing to mail
+    /// and nothing to verify.
     async fn prepare_email_verification(&mut self) -> Result<()> {
+        let Some(email) = self.real_email().map(str::to_string) else {
+            return Ok(());
+        };
+
         let config = config().await;
 
         if !config.api.smtp.host.is_empty() {
@@ -593,10 +768,10 @@ impl Account {
 
             send_email(
                 &config.api.smtp,
-                self.email.clone(),
+                email.clone(),
                 &templates.verify,
                 json!({
-                    "email": self.email.clone(),
+                    "email": email,
                     "url": url
                 }),
             )?;
@@ -624,6 +799,20 @@ impl Account {
             return Err(create_error!(UnverifiedAccount));
         }
 
+        // An account with no email gets its first address through the code
+        // flow (`Account::set_first_email`), never through a link. Refused
+        // before anything is mailed or written, on the no-SMTP branch too.
+        if self.real_email().is_none() {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        // Nobody moves to a stand-in address
+        if is_placeholder_email(&new_email) {
+            return Err(create_error!(IncorrectData {
+                with: "email".to_string()
+            }));
+        }
+
         let config = config().await;
 
         if !config.api.smtp.host.is_empty() {
@@ -632,12 +821,13 @@ impl Account {
             let token = nanoid!(32);
             let url = format!("{}{}", templates.verify.url, token);
 
+            // "This email is intended for" names the mailbox it is sent to
             send_email(
                 &config.api.smtp,
                 new_email.clone(),
                 &templates.verify,
                 json!({
-                    "email": self.email.clone(),
+                    "email": new_email.clone(),
                     "url": url
                 }),
             )?;
@@ -671,6 +861,12 @@ impl Account {
         db: &Database,
         existing_account: bool,
     ) -> Result<()> {
+        // An account with no email has nowhere to receive the link, so no
+        // token is stored either. Not an error.
+        let Some(email) = self.real_email().map(str::to_string) else {
+            return Ok(());
+        };
+
         let config = config().await;
 
         if !config.api.smtp.host.is_empty() {
@@ -687,10 +883,10 @@ impl Account {
 
             send_email(
                 &config.api.smtp,
-                self.email.clone(),
+                email.clone(),
                 template,
                 json!({
-                    "email": self.email.clone(),
+                    "email": email,
                     "url": url
                 }),
             )?;
@@ -715,7 +911,15 @@ impl Account {
     /// Begin account deletion process by sending confirmation email
     ///
     /// If email verification is not on, the account will be marked for deletion instantly
+    ///
+    /// An account with no email cannot confirm by link: for it this stores
+    /// nothing, mails nothing and returns `Ok`. Its deletion goes through
+    /// `schedule_deletion`, behind the checks the route makes.
     pub async fn start_account_deletion(&mut self, db: &Database) -> Result<()> {
+        let Some(email) = self.real_email().map(str::to_string) else {
+            return Ok(());
+        };
+
         let config = config().await;
 
         if !config.api.smtp.host.is_empty() {
@@ -746,10 +950,10 @@ impl Account {
 
             send_email(
                 &config.api.smtp,
-                self.email.clone(),
+                email.clone(),
                 &templates.deletion,
                 json!({
-                    "email": self.email.clone(),
+                    "email": email,
                     "url": url
                 }),
             )
@@ -1047,6 +1251,8 @@ impl Account {
 
     /// Removes all information from the account and marks it as fully deleted
     pub async fn mark_deleted(&mut self, db: &Database) -> Result<()> {
+        // An account with no email keeps its stand-in in the stored row:
+        // `save_account` does not write the email fields of such a copy
         self.email = format!("Deleted User {}", &self.id);
         self.email_normalised = format!("Deleted User {}", &self.id);
 
@@ -1133,6 +1339,7 @@ mod tests {
                 google_id: None,
                 apple_id: None,
                 password_absent: false,
+                email_absent: false,
             };
 
             let kept = identity(&account.id, "a", "S_current");
@@ -1186,6 +1393,7 @@ mod tests {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
         }
     }
 
@@ -2111,6 +2319,531 @@ mod tests {
             assert_eq!(stored.password, "hash-original");
             assert!(stored.password_absent);
             assert!(acct.ticket_methods(&db).await.unwrap().is_empty());
+        });
+    }
+}
+
+#[cfg(test)]
+mod no_email_tests {
+    use revolt_result::ErrorType;
+    use serde_json::json;
+
+    use crate::{util::email::is_placeholder_email, Account, DeletionInfo, EmailVerification};
+
+    fn account(id: &str, email: &str, email_normalised: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            email: email.to_string(),
+            email_normalised: email_normalised.to_string(),
+            password: "hash-original".to_string(),
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+            mfa: Default::default(),
+            google_id: None,
+            apple_id: None,
+            password_absent: false,
+            email_absent: false,
+        }
+    }
+
+    /// A stored account with no email, as passkey sign-up builds it
+    fn no_email_account(id: &str) -> Account {
+        let mut account = Account::new_passkey_signup(None).expect("an account");
+        account.id = id.to_string();
+        account
+    }
+
+    /// Fails if: `real_email` hands out a stand-in, the address of an account
+    /// flagged as having none, or the tombstone of a deleted account; or
+    /// stops returning the address of an ordinary or deletion-pending one.
+    #[test]
+    fn real_email_is_none_without_an_email_and_after_deletion() {
+        let normal = account(
+            "01ACCOUNTREALEMAIL00000000",
+            "A.b@example.test",
+            "ab@example.test",
+        );
+        assert_eq!(normal.real_email(), Some("A.b@example.test"));
+
+        // Still mailable while a deletion is only requested or scheduled
+        let mut scheduled = normal.clone();
+        scheduled.deletion = Some(DeletionInfo::Scheduled {
+            after: iso8601_timestamp::Timestamp::now_utc(),
+        });
+        assert_eq!(scheduled.real_email(), Some("A.b@example.test"));
+
+        let absent = no_email_account("01ACCOUNTREALEMAIL00000001");
+        assert!(absent.email_absent, "the control: the flag is set");
+        assert_eq!(absent.real_email(), None);
+
+        // The flag alone decides, whatever the fields hold
+        let mut flagged = normal.clone();
+        flagged.email_absent = true;
+        assert_eq!(flagged.real_email(), None);
+
+        // A stand-in is never handed out, flag or no flag
+        let mut unflagged = absent.clone();
+        unflagged.email_absent = false;
+        assert_eq!(unflagged.real_email(), None);
+
+        // Deleted: as `mark_deleted` leaves it, and with the address intact
+        let mut deleted = normal.clone();
+        deleted.deletion = Some(DeletionInfo::Deleted);
+        assert_eq!(deleted.real_email(), None);
+        deleted.email = format!("Deleted User {}", deleted.id);
+        deleted.email_normalised = deleted.email.clone();
+        assert_eq!(deleted.real_email(), None);
+    }
+
+    /// Fails if: a password counts as a way in for an account that has no
+    /// email to sign in with (or a deleted one); a password with an email,
+    /// or a Google or Apple link, stops counting; or an account with none of
+    /// them counts.
+    #[test]
+    fn a_password_is_a_way_in_only_with_an_email() {
+        let with_email = account(
+            "01ACCOUNTWAYIN000000000000",
+            "way.in@example.test",
+            "wayin@example.test",
+        );
+        assert!(!with_email.password_absent, "the control: a password");
+        assert!(with_email.can_sign_in_without_passkey());
+
+        // No usable password and nothing linked
+        let mut no_password = with_email.clone();
+        no_password.password_absent = true;
+        assert!(!no_password.can_sign_in_without_passkey());
+
+        // A password, but no email to sign in with
+        let mut no_email = no_email_account("01ACCOUNTWAYIN000000000001");
+        no_email.password_absent = false;
+        assert!(!no_email.can_sign_in_without_passkey());
+
+        // The flag alone decides, whatever the fields hold
+        let mut flagged = with_email.clone();
+        flagged.email_absent = true;
+        assert!(!flagged.can_sign_in_without_passkey());
+
+        // A stand-in is no email, flag or no flag
+        let mut unflagged = no_email.clone();
+        unflagged.email_absent = false;
+        assert!(!unflagged.can_sign_in_without_passkey());
+
+        let mut deleted = with_email.clone();
+        deleted.deletion = Some(DeletionInfo::Deleted);
+        assert!(!deleted.can_sign_in_without_passkey());
+
+        // A linked sign-in counts with or without an email or a password
+        for base in [&no_password, &no_email, &flagged] {
+            let mut google = base.clone();
+            google.google_id = Some("google-sub".to_string());
+            assert!(google.can_sign_in_without_passkey(), "{}", base.id);
+
+            let mut apple = base.clone();
+            apple.apple_id = Some("apple-sub".to_string());
+            assert!(apple.can_sign_in_without_passkey(), "{}", base.id);
+        }
+
+        // As passkey sign-up builds it: nothing but passkeys
+        assert!(!no_email_account("01ACCOUNTWAYIN000000000002").can_sign_in_without_passkey());
+    }
+
+    /// Fails if: an account with no email, a stand-in address, a deleted
+    /// account or one still waiting for its first verification counts as
+    /// having a confirmed email; or `Verified` or `Moving` with a real
+    /// address stops counting.
+    #[test]
+    fn has_confirmed_email_needs_a_real_address_that_was_verified() {
+        let expiry = iso8601_timestamp::Timestamp::now_utc();
+        let pending = || EmailVerification::Pending {
+            token: "token".to_string(),
+            expiry,
+        };
+        let moving = || EmailVerification::Moving {
+            new_email: "new@example.test".to_string(),
+            token: "token".to_string(),
+            expiry,
+        };
+
+        let with_email = account(
+            "01ACCOUNTCONFIRMED00000000",
+            "confirmed@example.test",
+            "confirmed@example.test",
+        );
+        let no_email = no_email_account("01ACCOUNTCONFIRMED00000001");
+
+        let mut flagged = with_email.clone();
+        flagged.email_absent = true;
+
+        let mut unflagged = no_email.clone();
+        unflagged.email_absent = false;
+
+        let mut deleted = with_email.clone();
+        deleted.deletion = Some(DeletionInfo::Deleted);
+
+        for (base, what, verified, moved) in [
+            (&with_email, "an email", true, true),
+            (&no_email, "no email", false, false),
+            (&flagged, "flagged as no email", false, false),
+            (&unflagged, "a stand-in without the flag", false, false),
+            (&deleted, "deleted", false, false),
+        ] {
+            let mut acct = base.clone();
+            assert_eq!(acct.verification, EmailVerification::Verified);
+            assert_eq!(acct.has_confirmed_email(), verified, "{what}, Verified");
+
+            acct.verification = moving();
+            assert_eq!(acct.has_confirmed_email(), moved, "{what}, Moving");
+
+            acct.verification = pending();
+            assert!(!acct.has_confirmed_email(), "{what}, Pending");
+        }
+    }
+
+    /// Fails if: `email_absent` stops defaulting to false for a document
+    /// written before the field existed, or stops being written when false
+    /// (`save_account` is a `$set`: a key left out could never be cleared).
+    #[test]
+    fn an_account_stored_before_the_field_existed_still_loads() {
+        let old: Account = serde_json::from_value(json!({
+            "_id": "01ACCOUNTOLDDOCUMENT000000",
+            "email": "Old@example.test",
+            "email_normalised": "old@example.test",
+            "password": "hash-original",
+            "verification": { "status": "Verified" },
+            "password_reset": null,
+            "deletion": null,
+            "mfa": {}
+        }))
+        .expect("a document from before the field existed");
+
+        assert!(!old.email_absent);
+        assert!(!old.password_absent);
+        assert_eq!(old.real_email(), Some("Old@example.test"));
+
+        let stored = serde_json::to_value(&old).unwrap();
+        assert_eq!(stored.get("email_absent"), Some(&json!(false)), "{stored}");
+
+        let absent = no_email_account("01ACCOUNTOLDDOCUMENT000001");
+        let stored = serde_json::to_value(&absent).unwrap();
+        assert_eq!(stored.get("email_absent"), Some(&json!(true)), "{stored}");
+        assert_eq!(serde_json::from_value::<Account>(stored).unwrap(), absent);
+    }
+
+    /// The same through the database: a row saved before the field existed
+    /// (MongoDB: the key removed from the stored document) reads as having
+    /// an email, and the lookup still finds it.
+    ///
+    /// Fails if: a missing key reads as `true`, or fails to deserialize.
+    #[tokio::test]
+    async fn a_stored_row_without_the_key_reads_as_having_an_email() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTOLDROW00000000000";
+            let acct = account(id, "old.row@example.test", "oldrow@example.test");
+            db.save_account(&acct).await.unwrap();
+
+            #[cfg(feature = "mongodb")]
+            {
+                if let crate::Database::MongoDb(mongo) = &db {
+                    let accounts = mongo.col::<bson::Document>("accounts");
+                    accounts
+                        .update_one(
+                            bson::doc! { "_id": id },
+                            bson::doc! { "$unset": { "email_absent": "" } },
+                        )
+                        .await
+                        .unwrap();
+
+                    // Prove the control: the key is gone
+                    let raw = accounts
+                        .find_one(bson::doc! { "_id": id })
+                        .await
+                        .unwrap()
+                        .expect("account exists");
+                    assert!(raw.get("email_absent").is_none());
+                }
+            }
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert!(!stored.email_absent);
+            assert_eq!(stored.real_email(), Some("old.row@example.test"));
+            assert_eq!(
+                Account::fetch_by_email(&db, "Old.Row@example.test")
+                    .await
+                    .unwrap()
+                    .map(|found| found.id),
+                Some(id.to_string())
+            );
+        });
+    }
+
+    /// Fails if: the constructor stores anything other than a `Verified`
+    /// account with no usable password; gives a no-email account a real or
+    /// repeated address; alters a confirmed address; or accepts `.invalid`.
+    #[test]
+    fn new_passkey_signup_builds_a_verified_account_with_no_usable_password() {
+        let first = Account::new_passkey_signup(None).unwrap();
+        let second = Account::new_passkey_signup(None).unwrap();
+
+        for account in [&first, &second] {
+            assert!(account.email_absent);
+            assert!(account.password_absent);
+            assert_eq!(account.verification, EmailVerification::Verified);
+            assert!(!account.disabled);
+            assert_eq!(account.deletion, None);
+            assert_eq!(account.password_reset, None);
+            assert_eq!(account.lockout, None);
+            assert_eq!(account.google_id, None);
+            assert_eq!(account.apple_id, None);
+            assert!(!account.mfa.is_active());
+            assert!(ulid::Ulid::from_string(&account.id).is_ok());
+
+            // The stand-in fills both fields, unchanged by normalisation
+            assert_eq!(account.email, account.email_normalised);
+            assert!(is_placeholder_email(&account.email));
+            assert!(account.email.ends_with("@noemail.invalid"));
+            assert_eq!(account.email.len(), 32 + "@noemail.invalid".len());
+            assert!(!account.email.contains(&account.id.to_lowercase()));
+            assert_eq!(account.real_email(), None);
+
+            // No password a person could know opens it
+            for guess in ["", "password", account.email.as_str(), account.id.as_str()] {
+                assert!(account.verify_password(guess).is_err(), "{guess:?}");
+            }
+        }
+
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.email, second.email);
+        assert_ne!(first.password, second.password);
+
+        let with_email =
+            Account::new_passkey_signup(Some("Some.One+tag@Example.test".to_string())).unwrap();
+        assert!(!with_email.email_absent);
+        assert!(with_email.password_absent);
+        assert_eq!(with_email.verification, EmailVerification::Verified);
+        assert_eq!(with_email.email, "Some.One+tag@Example.test");
+        assert_eq!(with_email.email_normalised, "someone@example.test");
+        assert_eq!(with_email.real_email(), Some("Some.One+tag@Example.test"));
+
+        for refused in ["someone@noemail.invalid", "someone@Other.INVALID"] {
+            let error = Account::new_passkey_signup(Some(refused.to_string()))
+                .expect_err("a .invalid address must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                "{refused}: {:?}",
+                error.error_type
+            );
+        }
+    }
+
+    /// Fails if: the lookup finds an account by its stand-in address (typed
+    /// in full, or reached through the flag being ignored), or stops finding
+    /// an ordinary account by any spelling of its address.
+    #[tokio::test]
+    async fn fetch_by_email_never_matches_an_account_with_no_email() {
+        database_test!(|db| async move {
+            let absent = no_email_account("01ACCOUNTLOOKUPABSENT00000");
+            db.save_account(&absent).await.unwrap();
+
+            // Flagged, but its fields hold an ordinary-looking address
+            let mut flagged = account(
+                "01ACCOUNTLOOKUPFLAGGED0000",
+                "flagged@example.test",
+                "flagged@example.test",
+            );
+            flagged.email_absent = true;
+            db.save_account(&flagged).await.unwrap();
+
+            let real = account(
+                "01ACCOUNTLOOKUPREAL0000000",
+                "Real.Person@example.test",
+                "realperson@example.test",
+            );
+            db.save_account(&real).await.unwrap();
+
+            // The control: the plain op does find both, so it is the wrapper
+            // that refuses
+            assert_eq!(
+                db.fetch_account_by_normalised_email(&absent.email_normalised)
+                    .await
+                    .unwrap()
+                    .map(|found| found.id),
+                Some(absent.id.clone())
+            );
+            assert_eq!(
+                db.fetch_account_by_normalised_email("flagged@example.test")
+                    .await
+                    .unwrap()
+                    .map(|found| found.id),
+                Some(flagged.id.clone())
+            );
+
+            for typed in [
+                absent.email.clone(),
+                absent.email.to_uppercase(),
+                format!(" {} ", absent.email),
+                "flagged@example.test".to_string(),
+                "nobody@noemail.invalid".to_string(),
+            ] {
+                assert_eq!(
+                    Account::fetch_by_email(&db, &typed).await.unwrap(),
+                    None,
+                    "{typed:?}"
+                );
+            }
+
+            for typed in [
+                "Real.Person@example.test",
+                "realperson@example.test",
+                "real.person+tag@EXAMPLE.test",
+            ] {
+                assert_eq!(
+                    Account::fetch_by_email(&db, typed)
+                        .await
+                        .unwrap()
+                        .map(|found| found.id),
+                    Some(real.id.clone()),
+                    "{typed}"
+                );
+            }
+
+            assert_eq!(
+                Account::fetch_by_email(&db, "unknown@example.test")
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
+    }
+
+    /// Fails if: a mail flow fails, stores a token, or leaves `Verified` for
+    /// an account with no email; or the link-based email change accepts one.
+    #[tokio::test]
+    async fn an_account_with_no_email_gets_no_mail_and_no_token() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTNOMAIL00000000000";
+            let mut acct = no_email_account(id);
+            db.save_account(&acct).await.unwrap();
+            let before = db.fetch_account(id).await.unwrap();
+
+            acct.start_password_reset(&db, true).await.unwrap();
+            acct.start_password_reset(&db, false).await.unwrap();
+            acct.start_email_verification(&db).await.unwrap();
+            acct.start_account_deletion(&db).await.unwrap();
+
+            let error = acct
+                .start_email_move(&db, "new@example.test".to_string())
+                .await
+                .expect_err("the link flow must refuse an account with no email");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "{:?}",
+                error.error_type
+            );
+
+            assert_eq!(acct.password_reset, None);
+            assert_eq!(acct.verification, EmailVerification::Verified);
+            assert_eq!(acct.deletion, None);
+            assert_eq!(
+                db.fetch_account(id).await.unwrap(),
+                before,
+                "nothing may be written"
+            );
+        });
+    }
+
+    /// Fails if: an account with an email can start a move to a `.invalid`
+    /// address.
+    #[tokio::test]
+    async fn an_email_move_to_a_placeholder_is_refused() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMOVEINVALID000000";
+            let mut acct = account(id, "mover@example.test", "mover@example.test");
+            db.save_account(&acct).await.unwrap();
+
+            let error = acct
+                .start_email_move(&db, "someone@noemail.invalid".to_string())
+                .await
+                .expect_err("a .invalid address must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::IncorrectData { .. }),
+                "{:?}",
+                error.error_type
+            );
+            assert_eq!(db.fetch_account(id).await.unwrap(), acct);
+        });
+    }
+
+    /// Fails if: `set_first_email` writes a `.invalid` address, leaves this
+    /// copy stale after a write, or changes it after a refusal.
+    #[tokio::test]
+    async fn set_first_email_updates_this_copy_only_when_it_applied() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTFIRSTEMAIL0000000";
+            let mut acct = no_email_account(id);
+            db.save_account(&acct).await.unwrap();
+            let placeholder = acct.email.clone();
+
+            assert!(!acct
+                .set_first_email(&db, "someone@other.invalid".to_string())
+                .await
+                .unwrap());
+            assert!(acct.email_absent);
+            assert_eq!(acct.email, placeholder);
+            assert_eq!(db.fetch_account(id).await.unwrap(), acct);
+
+            assert!(acct
+                .set_first_email(&db, "First.Email@example.test".to_string())
+                .await
+                .unwrap());
+            assert!(!acct.email_absent);
+            assert_eq!(acct.email, "First.Email@example.test");
+            assert_eq!(acct.email_normalised, "firstemail@example.test");
+            assert_eq!(acct.real_email(), Some("First.Email@example.test"));
+            assert_eq!(db.fetch_account(id).await.unwrap(), acct);
+
+            // Once only: the account has an email now
+            assert!(!acct
+                .set_first_email(&db, "second@example.test".to_string())
+                .await
+                .unwrap());
+            assert_eq!(acct.email, "First.Email@example.test");
+            assert_eq!(db.fetch_account(id).await.unwrap(), acct);
+        });
+    }
+
+    /// Fails if: `mark_deleted` on an account with no email fails, leaves
+    /// the row not `Deleted`, overwrites the stored stand-in (the row keeps
+    /// it: `save_account` does not write the email fields of such a copy),
+    /// clears `email_absent`, or the deleted row hands out an address.
+    #[tokio::test]
+    async fn mark_deleted_keeps_the_stand_in_of_a_no_email_account() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTNOEMAILDELETED000";
+            let mut acct = no_email_account(id);
+            db.save_account(&acct).await.unwrap();
+            let placeholder = acct.email.clone();
+            let placeholder_normalised = acct.email_normalised.clone();
+            assert!(
+                is_placeholder_email(&placeholder),
+                "the control: a stand-in is stored"
+            );
+
+            acct.mark_deleted(&db).await.unwrap();
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert_eq!(stored.deletion, Some(DeletionInfo::Deleted));
+            assert!(stored.email_absent);
+            assert_eq!(stored.email, placeholder);
+            assert_eq!(stored.email_normalised, placeholder_normalised);
+            assert_eq!(stored.real_email(), None);
+
+            // The copy in hand is deleted too, and has no address either
+            assert_eq!(acct.deletion, Some(DeletionInfo::Deleted));
+            assert_eq!(acct.real_email(), None);
         });
     }
 }

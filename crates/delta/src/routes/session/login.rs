@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    util::{email::normalise_email, password::assert_safe},
+    util::password::assert_safe,
     Account, Database, DeletionInfo, EmailVerification, MFATicket, MfaPurpose,
 };
 use revolt_models::v0;
@@ -31,20 +31,20 @@ pub async fn login(
             password,
             friendly_name,
         } => {
-            // Try to find the account we want
-            let email_normalised = normalise_email(email);
-
-            // Lookup the email in database
-            if let Some(mut account) = db
-                .fetch_account_by_normalised_email(&email_normalised)
-                .await?
-            {
+            // Look the email up. The wrapper normalises it and never matches
+            // an account that has no email, so the stand-in address of such
+            // an account answers as a missing email does
+            if let Some(mut account) = Account::fetch_by_email(db, &email).await? {
                 // An account with no password (created through Google or
                 // Apple) answers as a missing email does: there is nothing
                 // to verify, and counting the attempt would let anyone who
                 // knows the email lock its owner out. This sits before the
                 // lockout check, so the answer is the same while locked.
-                if account.password_absent {
+                //
+                // The same for an account with no email, whatever password
+                // it has: nobody signs in to it by email. The lookup above
+                // cannot return one; this holds if that ever changes.
+                if account.password_absent || account.real_email().is_none() {
                     return Err(create_error!(InvalidCredentials));
                 }
 
@@ -248,7 +248,9 @@ fn login_refused(user_id: String, suspended_until: Option<Timestamp>) -> v0::Res
 /// Checks that only an existing account can fail, so they run once its
 /// password is proven
 async fn assert_login_allowed(account: &Account, password: &str) -> Result<()> {
-    // Make sure the account has been verified
+    // Make sure the account has been verified. Only an account found by its
+    // email gets here, so it has one; an account with no email is stored
+    // `Verified` and is refused before this, at the lookup
     if let EmailVerification::Pending { .. } = account.verification {
         return Err(create_error!(UnverifiedAccount));
     }
@@ -1168,9 +1170,14 @@ mod tests {
         })
     }
 
-    /// A confirmed or finished deletion refuses the login as a disabled
-    /// account does, even with `disabled` false (a stale whole-document save
-    /// can write it back), and stores no session
+    /// A confirmed or finished deletion refuses the login, even with
+    /// `disabled` false (a stale whole-document save can write it back), and
+    /// stores no session
+    ///
+    /// A confirmed deletion answers as a disabled account does. A finished
+    /// one has no email any more (`Account::real_email`), so the email
+    /// lookup does not find it and it answers as a missing email does; the
+    /// gate's own refusal of it is row (e) of `login_gate_table`.
     #[test]
     fn deletion_scheduled_or_deleted_is_refused() {
         crate::util::test::rt().block_on(async {
@@ -1184,16 +1191,26 @@ mod tests {
 
                 let (status, body) =
                     sec009_login(&harness, &account.email, "password_insecure").await;
-                assert_eq!(status, Status::Ok, "{:?}: {}", deletion, body);
-                match serde_json::from_str::<v0::ResponseLogin>(&body).expect("`ResponseLogin`") {
-                    v0::ResponseLogin::Disabled {
-                        user_id,
-                        suspended_until,
-                    } => {
-                        assert_eq!(user_id, account.id);
-                        assert_eq!(suspended_until, None);
+
+                if matches!(deletion, DeletionInfo::Deleted) {
+                    let unknown =
+                        sec009_login(&harness, &sec009_email(), "password_insecure").await;
+                    assert_eq!((status, body), unknown, "{:?}", deletion);
+                    assert_eq!(status, Status::Unauthorized, "{:?}", deletion);
+                } else {
+                    assert_eq!(status, Status::Ok, "{:?}: {}", deletion, body);
+                    match serde_json::from_str::<v0::ResponseLogin>(&body)
+                        .expect("`ResponseLogin`")
+                    {
+                        v0::ResponseLogin::Disabled {
+                            user_id,
+                            suspended_until,
+                        } => {
+                            assert_eq!(user_id, account.id);
+                            assert_eq!(suspended_until, None);
+                        }
+                        other => panic!("{:?}: expected `Disabled`, got {:?}", deletion, other),
                     }
-                    other => panic!("{:?}: expected `Disabled`, got {:?}", deletion, other),
                 }
 
                 assert!(
@@ -1644,6 +1661,67 @@ mod tests {
                 );
                 assert!(session_ids(&harness, &account.id).await.is_empty(), "d");
             }
+        })
+    }
+
+    /// An account with no email, stored, that DOES have a password its owner
+    /// knows (`password_insecure`): the worst case for a login by email
+    async fn no_email_account_with_password(harness: &TestHarness) -> Account {
+        let mut account = Account::new_passkey_signup(None).expect("a no-email account");
+        account.password =
+            revolt_database::util::password::hash_password("password_insecure".to_string())
+                .unwrap();
+        account.password_absent = false;
+        account.save(&harness.db).await.unwrap();
+
+        let stored = harness.db.fetch_account(&account.id).await.unwrap();
+        assert!(stored.email_absent, "the seed must be stored");
+        assert!(!stored.password_absent, "the seed must be stored");
+        assert!(stored.email.ends_with("@noemail.invalid"), "{}", stored.email);
+        assert!(
+            stored.verify_password("password_insecure").is_ok(),
+            "the control: the stored hash matches the password the rows send"
+        );
+        stored
+    }
+
+    /// Fails if: the login looks an account up by the stored `email` or
+    /// `email_normalised` fields again instead of `Account::fetch_by_email`,
+    /// so that typing an account's stand-in address (as stored, or in
+    /// another case) with the right password signs in, counts a lockout
+    /// attempt, or answers differently from an address nobody has.
+    #[test]
+    fn typed_placeholder_matches_unknown_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = no_email_account_with_password(&harness).await;
+
+            let unknown = sec009_login(&harness, &sec009_email(), "password_insecure").await;
+            assert_eq!(unknown.0, Status::Unauthorized);
+            assert!(matches!(
+                serde_json::from_str::<Error>(&unknown.1).unwrap().error_type,
+                ErrorType::InvalidCredentials,
+            ));
+
+            for typed in [account.email.clone(), account.email.to_uppercase()] {
+                for password in ["password_insecure", "wrong_password"] {
+                    assert_eq!(
+                        sec009_login(&harness, &typed, password).await,
+                        unknown,
+                        "{typed} / {password}"
+                    );
+                }
+            }
+
+            assert_eq!(
+                r9_lockout(&harness, &account.id).await,
+                None,
+                "no lockout attempt is written"
+            );
+            assert!(
+                session_ids(&harness, &account.id).await.is_empty(),
+                "no session is stored"
+            );
         })
     }
 }

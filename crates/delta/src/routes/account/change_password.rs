@@ -28,7 +28,8 @@ pub struct DataChangePassword {
 /// Change the current account password.
 ///
 /// An account that has a password must send it. An account that has none
-/// sets its first one with a validated MFA ticket.
+/// sets its first one with a validated MFA ticket. An account that has no
+/// email is refused (`InvalidOperation`): it adds an email first.
 #[openapi(tag = "Account")]
 #[patch("/change/password", data = "<data>")]
 pub async fn change_password(
@@ -38,6 +39,15 @@ pub async fn change_password(
     data: Json<DataChangePassword>,
 ) -> Result<EmptyResponse> {
     let data = data.into_inner();
+
+    // The password login finds an account by its email, so an account with
+    // no email could never sign in with a password, and one stored on it
+    // would only look like a way in. Refused before anything in the request
+    // is looked at, so the answer is the same whatever was sent and no
+    // attempt is counted.
+    if account.real_email().is_none() {
+        return Err(create_error!(InvalidOperation));
+    }
 
     // A locked account cannot probe the ticket or the password
     if let Some(lockout) = &account.lockout {
@@ -515,6 +525,64 @@ mod tests {
             let after = stored(&harness, &account).await;
             assert!(after.password_absent);
             assert_eq!(after.password, account.password);
+        })
+    }
+
+    /// Fails if: an account with no email can set a password (with a
+    /// validated ticket, with any current password or with nothing), the
+    /// refusal is anything other than `InvalidOperation` or depends on what
+    /// was sent, or an attempt is counted; or an account that has an email
+    /// and no password can no longer set its first one.
+    #[test]
+    fn no_email_account_is_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let (account, session, _) = harness.new_no_email_user().await;
+
+            let before = stored(&harness, &account).await;
+            assert!(before.real_email().is_none(), "the seed must be stored");
+            assert!(before.password_absent);
+
+            let ticket = saved_ticket(&harness, &account.id, true).await;
+            for (ticket, body) in [
+                (Some(&ticket), json!({ "password": "new password" })),
+                (
+                    None,
+                    json!({ "password": "new password", "current_password": "password_insecure" }),
+                ),
+                (None, json!({ "password": "new password" })),
+                (None, json!({ "password": "short" })),
+            ] {
+                let row = body.to_string();
+                let (status, error) = send(&harness, &session, ticket, body).await;
+                assert_eq!(status, Status::BadRequest, "{}", row);
+                assert!(
+                    matches!(error, Some(ErrorType::InvalidOperation)),
+                    "{}: expected `InvalidOperation`, got {:?}",
+                    row,
+                    error
+                );
+            }
+
+            let after = stored(&harness, &account).await;
+            assert_eq!(after.password, before.password, "the password is untouched");
+            assert!(after.password_absent);
+            assert!(after.real_email().is_none());
+            assert_eq!(attempts(&after), None, "no attempt may be counted");
+
+            // The control: with an email, the same request (a validated
+            // ticket and no current password) sets the first password
+            let (ordinary, ordinary_session) = without_password(&harness).await;
+            let ticket = saved_ticket(&harness, &ordinary.id, true).await;
+            let (status, _) = send(
+                &harness,
+                &ordinary_session,
+                Some(&ticket),
+                json!({ "password": "new password" }),
+            )
+            .await;
+            assert_eq!(status, Status::NoContent, "the control");
+            assert!(!stored(&harness, &ordinary).await.password_absent);
         })
     }
 

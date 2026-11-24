@@ -1,7 +1,7 @@
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{Passkey, ReferenceDb};
+use crate::{Account, Passkey, ReferenceDb};
 
 use super::AbstractPasskeys;
 
@@ -104,6 +104,33 @@ impl AbstractPasskeys for ReferenceDb {
         } else {
             Err(create_error!(NotFound))
         }
+    }
+
+    async fn delete_passkey_unless_last_way_in(&self, user_id: &str, id: &str) -> Result<()> {
+        // Both locks are held across the decision and the delete, so the
+        // account cannot change and no other passkey can go in between.
+        // Order: accounts, then passkeys. Nothing else takes both.
+        let accounts = self.accounts.lock().await;
+        let mut passkeys = self.passkeys.lock().await;
+
+        if !passkeys.get(id).is_some_and(|row| row.user_id == user_id) {
+            return Err(create_error!(NotFound));
+        }
+
+        let account: &Account = accounts
+            .get(user_id)
+            .ok_or_else(|| create_error!(UnknownUser))?;
+
+        let other_passkeys = passkeys
+            .values()
+            .any(|row| row.user_id == user_id && row.id != id);
+
+        if !account.can_sign_in_without_passkey() && !other_passkeys {
+            return Err(create_error!(InvalidOperation));
+        }
+
+        passkeys.remove(id);
+        Ok(())
     }
 
     async fn delete_passkeys_for_user(&self, user_id: &str) -> Result<()> {

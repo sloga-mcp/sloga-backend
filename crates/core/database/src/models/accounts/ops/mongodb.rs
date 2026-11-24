@@ -69,6 +69,24 @@ fn return_after() -> FindOneAndUpdateOptions {
         .build()
 }
 
+/// Whether a write was refused by a unique index
+fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+    matches!(
+        *error.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+            ref write_error,
+        )) if write_error.code == 11000
+    )
+}
+
+/// The collation of the unique `email` and `email_normalised` indexes
+fn email_collation() -> Collation {
+    Collation::builder()
+        .locale("en")
+        .strength(CollationStrength::Secondary)
+        .build()
+}
+
 /// `$set` the given fields of one account, and nothing else
 async fn set_account_fields(db: &MongoDb, id: &str, fields: Document) -> Result<()> {
     update_account(db, id, doc! { "$set": fields }).await
@@ -220,14 +238,28 @@ impl AbstractAccounts for MongoDb {
         // stores none.
         document.remove("deletion");
 
+        // A copy that says "no email" never writes the email fields of a row
+        // that exists: it may have been loaded before the first-email op
+        // gave the account its address, and would put the stand-in back. An
+        // insert still stores them.
+        let mut update = Document::new();
+        if account.email_absent {
+            let mut on_insert = Document::new();
+            for key in ["email", "email_normalised", "email_absent"] {
+                if let Some(value) = document.remove(key) {
+                    on_insert.insert(key, value);
+                }
+            }
+            update.insert("$setOnInsert", on_insert);
+        }
+        update.insert("$set", document);
+
         self.col::<Account>(COL)
             .update_one(
                 doc! {
                     "_id": &account.id
                 },
-                doc! {
-                    "$set": document
-                },
+                update,
             )
             .with_options(UpdateOptions::builder().upsert(true).build())
             .await
@@ -458,5 +490,80 @@ impl AbstractAccounts for MongoDb {
         let verification =
             to_bson(verification).map_err(|_| create_database_error!("to_bson", COL))?;
         set_account_fields(self, id, doc! { "verification": verification }).await
+    }
+
+    /// Atomically give an account that has no email its first address
+    async fn set_account_email_if_absent(
+        &self,
+        id: &str,
+        email: &str,
+        email_normalised: &str,
+    ) -> Result<bool> {
+        // Looked up first so the common refusal is not a failed write, and
+        // so a database without the indexes still refuses. It is the unique
+        // indexes, in the write below, that settle two requests racing for
+        // one address.
+        let holder = self
+            .col::<Document>(COL)
+            .find_one(doc! {
+                "_id": { "$ne": id },
+                "$or": [
+                    { "email": email },
+                    { "email_normalised": email_normalised }
+                ]
+            })
+            .with_options(
+                FindOneOptions::builder()
+                    .collation(email_collation())
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find_one", COL))?;
+
+        if holder.is_some() {
+            return Ok(false);
+        }
+
+        // Every condition is in the filter: an account that gained an email
+        // or was deleted since it was read matches nothing. `$ne` also
+        // matches an account with no `deletion` key.
+        let result = self
+            .col::<Document>(COL)
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "email_absent": true,
+                    "deletion.status": { "$ne": "Deleted" }
+                },
+                doc! {
+                    "$set": {
+                        "email": email,
+                        "email_normalised": email_normalised,
+                        "email_absent": false
+                    }
+                },
+            )
+            .await;
+
+        match result {
+            Ok(result) => Ok(result.matched_count == 1),
+            // Another account took the address between the lookup and here
+            Err(error) if is_duplicate_key(&error) => Ok(false),
+            Err(_) => Err(create_database_error!("update_one", COL)),
+        }
+    }
+
+    /// Undo a failed sign-up: remove the account row it just inserted
+    async fn rollback_signup_account(&self, id: &str) -> Result<bool> {
+        // `password_absent` is in the filter, so this can never remove an
+        // account that has a password
+        self.col::<Document>(COL)
+            .delete_one(doc! {
+                "_id": id,
+                "password_absent": true
+            })
+            .await
+            .map(|result| result.deleted_count == 1)
+            .map_err(|_| create_database_error!("delete_one", COL))
     }
 }

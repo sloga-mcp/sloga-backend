@@ -564,6 +564,16 @@ impl User {
         Ok(())
     }
 
+    /// Run the checks `User::create` runs on a new username (homoglyph
+    /// clean-up, then the name filter) without creating anything, and give
+    /// back the cleaned-up name. For flows that must refuse a bad name before
+    /// their first write.
+    pub async fn check_new_username(username: &str) -> Result<String> {
+        let cleaned = User::sanitise_username(username).await?;
+        User::validate_username(&cleaned)?;
+        Ok(cleaned)
+    }
+
     /// Sanitise a username
     ///
     /// This will clean up Unicode homoglyphs and pad to the min username length with underscores.
@@ -1303,7 +1313,9 @@ impl User {
         )
         .await?;
 
-        if let Some(reason) = reason {
+        // An account with no email gets no mail: the suspension above is
+        // already applied and stands
+        if let (Some(reason), Some(email)) = (reason, suspension_mail_address(&account)) {
             let config = config().await;
 
             if !config.api.smtp.host.is_empty() {
@@ -1311,10 +1323,10 @@ impl User {
 
                 send_email(
                     &config.api.smtp,
-                    account.email.clone(),
+                    email.clone(),
                     &templates.suspension,
                     json!({
-                        "email": account.email,
+                        "email": email,
                         "list": reason.join(", "),
                         "duration": duration_days,
                         "duration_display": if duration_days.is_some() {
@@ -1599,11 +1611,73 @@ impl User {
     }
 }
 
+/// Where the suspension notice goes: the account's own address, or `None`
+/// for an account that has no email (never its stand-in address)
+fn suspension_mail_address(account: &crate::Account) -> Option<String> {
+    account.real_email().map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use revolt_models::v0::{self, UserBadges, UserFlags, UserPerks, USER_BADGES_DYNAMIC_MASK};
 
     use crate::{FieldsUser, PartialUser, Supporter, User};
+
+    /// Fails if: the suspension notice is addressed to the stand-in address
+    /// of an account with no email, or an ordinary account stops getting it
+    /// at its own address.
+    #[test]
+    fn suspension_mail_goes_only_to_a_real_address() {
+        let absent = crate::Account::new_passkey_signup(None).expect("an account");
+        assert!(
+            absent.email.ends_with("@noemail.invalid"),
+            "the control: the account holds a stand-in address"
+        );
+        assert_eq!(super::suspension_mail_address(&absent), None);
+
+        let ordinary =
+            crate::Account::new_passkey_signup(Some("Some.One@example.test".to_string()))
+                .expect("an account");
+        assert_eq!(
+            super::suspension_mail_address(&ordinary).as_deref(),
+            Some("Some.One@example.test")
+        );
+    }
+
+    /// Fails if: suspending an account with no email, with a reason given,
+    /// returns an error or leaves the suspension unapplied. With SMTP
+    /// configured and unreachable, mailing the stand-in address answers
+    /// `InternalError` here.
+    #[tokio::test]
+    async fn suspend_with_a_reason_succeeds_for_an_account_with_no_email() {
+        database_test!(|db| async move {
+            let mut user = User {
+                id: "01JA0000000000000000000NE1".to_string(),
+                username: "NoEmail".to_string(),
+                discriminator: "1005".to_string(),
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+
+            let mut account = crate::Account::new_passkey_signup(None).expect("an account");
+            account.id = user.id.clone();
+            db.save_account(&account).await.unwrap();
+            assert_eq!(
+                db.fetch_account(&user.id).await.unwrap().real_email(),
+                None,
+                "the control: the stored account has no email"
+            );
+
+            user.suspend(&db, Some(7), Some(vec!["spam".to_string()]))
+                .await
+                .expect("the suspension goes ahead without a mail");
+
+            let stored = db.fetch_user(&user.id).await.unwrap();
+            assert_eq!(stored.flags, Some(UserFlags::SuspendedUntil as i32));
+            assert!(stored.suspended_until.is_some());
+            assert!(db.fetch_account(&user.id).await.unwrap().disabled);
+        });
+    }
 
     #[test]
     fn username_validation_blocked_names() {

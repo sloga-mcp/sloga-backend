@@ -2049,7 +2049,7 @@ pub struct PasskeyFeatures {
     pub signup: bool,
 
     /// Sign-up with no email. Also needs `signup_without_email_per_hour`
-    /// above 0
+    /// and `signup_without_email_per_day` above 0
     #[serde(default = "PasskeyFeatures::default_signup_without_email")]
     pub signup_without_email: bool,
 
@@ -2076,6 +2076,11 @@ pub struct PasskeyFeatures {
     /// whatever `signup_without_email` says
     #[serde(default = "PasskeyFeatures::default_signup_without_email_per_hour")]
     pub signup_without_email_per_hour: u32,
+
+    /// Site-wide cap on sign-ups with no email, per day. 0 = none allowed,
+    /// whatever `signup_without_email` and the hourly cap say
+    #[serde(default = "PasskeyFeatures::default_signup_without_email_per_day")]
+    pub signup_without_email_per_day: u32,
 }
 
 impl Default for PasskeyFeatures {
@@ -2088,6 +2093,7 @@ impl Default for PasskeyFeatures {
             rp_id: Self::default_rp_id(),
             origins: Self::default_origins(),
             signup_without_email_per_hour: Self::default_signup_without_email_per_hour(),
+            signup_without_email_per_day: Self::default_signup_without_email_per_day(),
         }
     }
 }
@@ -2118,6 +2124,10 @@ impl PasskeyFeatures {
     }
 
     fn default_signup_without_email_per_hour() -> u32 {
+        0
+    }
+
+    fn default_signup_without_email_per_day() -> u32 {
         0
     }
 
@@ -3658,6 +3668,7 @@ mod passkey_features_tests {
         assert_eq!(passkeys.rp_id, "app.sloga.gg");
         assert_eq!(passkeys.origins, ["https://app.sloga.gg"]);
         assert_eq!(passkeys.signup_without_email_per_hour, 0);
+        assert_eq!(passkeys.signup_without_email_per_day, 0);
     }
 
     #[test]
@@ -3695,6 +3706,7 @@ mod passkey_features_tests {
                 "rp_id = \"sloga.gg\"\n",
                 "origins = [\"https://sloga.gg\", \"android:apk-key-hash:AbC_dEf-123\"]\n",
                 "signup_without_email_per_hour = 25\n",
+                "signup_without_email_per_day = 200\n",
             )
         );
         let passkeys = build(&toml, &[]).features.passkeys;
@@ -3708,6 +3720,7 @@ mod passkey_features_tests {
             ["https://sloga.gg", "android:apk-key-hash:AbC_dEf-123"]
         );
         assert_eq!(passkeys.signup_without_email_per_hour, 25);
+        assert_eq!(passkeys.signup_without_email_per_day, 200);
     }
 
     /// Each key on its own is read and leaves the others at their defaults
@@ -3737,6 +3750,7 @@ mod passkey_features_tests {
             assert_eq!(passkeys.rp_id, "app.sloga.gg", "{line}");
             assert_eq!(passkeys.origins, ["https://app.sloga.gg"], "{line}");
             assert_eq!(passkeys.signup_without_email_per_hour, 0, "{line}");
+            assert_eq!(passkeys.signup_without_email_per_day, 0, "{line}");
         }
 
         let passkeys = only("rp_id = \"sloga.gg\"");
@@ -3753,6 +3767,14 @@ mod passkey_features_tests {
         // The cap alone turns nothing on
         let passkeys = only("signup_without_email_per_hour = 3");
         assert_eq!(passkeys.signup_without_email_per_hour, 3);
+        assert_eq!(passkeys.signup_without_email_per_day, 0);
+        assert_eq!(on(&passkeys), [false; 4]);
+
+        // The daily cap is its own key: it neither sets the hourly one nor
+        // turns anything on
+        let passkeys = only("signup_without_email_per_day = 40");
+        assert_eq!(passkeys.signup_without_email_per_day, 40);
+        assert_eq!(passkeys.signup_without_email_per_hour, 0);
         assert_eq!(on(&passkeys), [false; 4]);
     }
 
@@ -3773,6 +3795,7 @@ mod passkey_features_tests {
                     "https://sloga.gg, android:apk-key-hash:AbC_dEf-123,",
                 ),
                 ("REVOLT__FEATURES__PASSKEYS__SIGNUP_WITHOUT_EMAIL_PER_HOUR", "25"),
+                ("REVOLT__FEATURES__PASSKEYS__SIGNUP_WITHOUT_EMAIL_PER_DAY", "200"),
             ],
         )
         .features
@@ -3787,6 +3810,7 @@ mod passkey_features_tests {
             ["https://sloga.gg", "android:apk-key-hash:AbC_dEf-123"]
         );
         assert_eq!(passkeys.signup_without_email_per_hour, 25);
+        assert_eq!(passkeys.signup_without_email_per_day, 200);
 
         // One variable on a config without the table
         let passkeys = build(

@@ -284,7 +284,7 @@ pub struct PasskeysFeature {
 /// (`util::passkey::assert_available`), so the advert never offers what
 /// every passkey route would refuse. Nothing is advertised without it,
 /// whatever the config asks for. The relying party id, the origin list and
-/// the hourly cap stay on the server.
+/// the hourly and daily caps stay on the server.
 pub fn passkeys_feature(
     passkeys: &revolt_config::PasskeyFeatures,
     usable: bool,
@@ -296,10 +296,11 @@ pub fn passkeys_feature(
         available,
         signup,
         // A sign-up without an email is still a sign-up, and a cap of 0
-        // allows none
+        // (per hour or per day) allows none
         signup_without_email: signup
             && passkeys.signup_without_email
-            && passkeys.signup_without_email_per_hour > 0,
+            && passkeys.signup_without_email_per_hour > 0
+            && passkeys.signup_without_email_per_day > 0,
         backup_unlock: available && passkeys.backup_unlock,
     }
 }
@@ -1364,11 +1365,12 @@ mod test {
     }
 
     /// The passkey advert for every combination of the four switches, the
-    /// hourly cap and the verifier's answer.
+    /// hourly cap, the daily cap and the verifier's answer.
     ///
     /// Fails if: a sub-flag stops depending on `available`, `available`
-    /// stops depending on the verifier's answer, or `signup_without_email`
-    /// stops depending on the cap or on `signup`.
+    /// stops depending on the verifier's answer, `signup` stops depending
+    /// on its own flag, or `signup_without_email` stops depending on its
+    /// flag, on either cap or on `signup`.
     #[test]
     fn passkeys_advert_table() {
         let base = crate::util::test::rt()
@@ -1384,49 +1386,56 @@ mod test {
                     for without_email in [false, true] {
                         for backup_unlock in [false, true] {
                             for per_hour in [0u32, 1, 25] {
-                                let mut passkeys = base.clone();
-                                passkeys.available = available;
-                                passkeys.signup = signup;
-                                passkeys.signup_without_email = without_email;
-                                passkeys.backup_unlock = backup_unlock;
-                                passkeys.signup_without_email_per_hour = per_hour;
+                                for per_day in [0u32, 1, 40] {
+                                    let mut passkeys = base.clone();
+                                    passkeys.available = available;
+                                    passkeys.signup = signup;
+                                    passkeys.signup_without_email = without_email;
+                                    passkeys.backup_unlock = backup_unlock;
+                                    passkeys.signup_without_email_per_hour = per_hour;
+                                    passkeys.signup_without_email_per_day = per_day;
 
-                                let on = usable && available;
-                                let expected = super::PasskeysFeature {
-                                    available: on,
-                                    signup: on && signup,
-                                    signup_without_email: on
-                                        && signup
-                                        && without_email
-                                        && per_hour > 0,
-                                    backup_unlock: on && backup_unlock,
-                                };
+                                    let on = usable && available;
+                                    let expected = super::PasskeysFeature {
+                                        available: on,
+                                        signup: on && signup,
+                                        signup_without_email: on
+                                            && signup
+                                            && without_email
+                                            && per_hour > 0
+                                            && per_day > 0,
+                                        backup_unlock: on && backup_unlock,
+                                    };
 
-                                let advert = super::passkeys_feature(&passkeys, usable);
-                                assert_eq!(
-                                    advert,
-                                    expected,
-                                    "usable {usable}, available {available}, signup {signup}, \
-                                     without email {without_email}, backup {backup_unlock}, \
-                                     per hour {per_hour}"
-                                );
-
-                                // Stated outright as well, not only through
-                                // the expression above
-                                if !advert.available {
-                                    assert!(
-                                        !advert.signup
-                                            && !advert.signup_without_email
-                                            && !advert.backup_unlock
+                                    let advert = super::passkeys_feature(&passkeys, usable);
+                                    assert_eq!(
+                                        advert,
+                                        expected,
+                                        "usable {usable}, available {available}, signup {signup}, \
+                                         without email {without_email}, backup {backup_unlock}, \
+                                         per hour {per_hour}, per day {per_day}"
                                     );
-                                }
-                                if per_hour == 0 {
-                                    assert!(!advert.signup_without_email);
-                                }
 
-                                rows += 1;
-                                if advert.signup_without_email {
-                                    advertised_without_email += 1;
+                                    // Stated outright as well, not only
+                                    // through the expression above
+                                    if !advert.available {
+                                        assert!(
+                                            !advert.signup
+                                                && !advert.signup_without_email
+                                                && !advert.backup_unlock
+                                        );
+                                    }
+                                    if !signup {
+                                        assert!(!advert.signup && !advert.signup_without_email);
+                                    }
+                                    if !without_email || per_hour == 0 || per_day == 0 {
+                                        assert!(!advert.signup_without_email);
+                                    }
+
+                                    rows += 1;
+                                    if advert.signup_without_email {
+                                        advertised_without_email += 1;
+                                    }
                                 }
                             }
                         }
@@ -1435,10 +1444,10 @@ mod test {
             }
         }
 
-        assert_eq!(rows, 96);
+        assert_eq!(rows, 288);
         // usable, available, signup and the switch all on, either backup
-        // state, and a cap of 1 or 25
-        assert_eq!(advertised_without_email, 4);
+        // state, an hourly cap of 1 or 25 and a daily cap of 1 or 40
+        assert_eq!(advertised_without_email, 8);
     }
 
     /// The wire shape: exactly the four switches, as booleans
@@ -1451,6 +1460,7 @@ mod test {
         passkeys.signup_without_email = true;
         passkeys.backup_unlock = true;
         passkeys.signup_without_email_per_hour = 3_999_999_979;
+        passkeys.signup_without_email_per_day = 3_999_999_937;
         passkeys.rp_id = "rp-id-marker.example".to_string();
         passkeys.origins = vec!["https://origin-marker.example".to_string()];
 
@@ -1468,7 +1478,14 @@ mod test {
 
             // Nothing else about the passkey config is on the wire
             let text = body.to_string();
-            for kept in ["rp-id-marker", "origin-marker", "3999999979", "per_hour"] {
+            for kept in [
+                "rp-id-marker",
+                "origin-marker",
+                "3999999979",
+                "3999999937",
+                "per_hour",
+                "per_day",
+            ] {
                 assert!(!text.contains(kept), "GET / carries `{kept}`");
             }
         }
@@ -1478,13 +1495,14 @@ mod test {
     /// Android app origin
     const ANDROID_ORIGIN: &str = "android:apk-key-hash:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    /// `GET /` with every passkey switch on, a cap of `per_hour` and the
-    /// given origins. Every case is its own `#[test]`: `overwrite_config`
+    /// `GET /` with every passkey switch on, caps of `per_hour` and
+    /// `per_day`, and the given origins. Every case is its own `#[test]`: `overwrite_config`
     /// runs once per process (nextest)
     async fn passkeys_advert(
         available: bool,
         origins: &[&str],
         per_hour: u32,
+        per_day: u32,
     ) -> serde_json::Value {
         let origins: Vec<String> = origins.iter().map(|origin| origin.to_string()).collect();
         revolt_config::overwrite_config(move |settings| {
@@ -1494,6 +1512,7 @@ mod test {
             passkeys.signup_without_email = true;
             passkeys.backup_unlock = true;
             passkeys.signup_without_email_per_hour = per_hour;
+            passkeys.signup_without_email_per_day = per_day;
             passkeys.rp_id = "app.sloga.gg".to_string();
             passkeys.origins = origins;
         })
@@ -1537,7 +1556,7 @@ mod test {
     fn passkeys_advert_is_all_false_while_switched_off() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(false, &["https://app.sloga.gg"], 25).await,
+                passkeys_advert(false, &["https://app.sloga.gg"], 25, 40).await,
                 passkeys_json(false, false, false, false)
             );
         })
@@ -1548,7 +1567,7 @@ mod test {
     fn passkeys_advert_follows_a_valid_config() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(true, &["https://app.sloga.gg", ANDROID_ORIGIN], 25).await,
+                passkeys_advert(true, &["https://app.sloga.gg", ANDROID_ORIGIN], 25, 40).await,
                 passkeys_json(true, true, true, true)
             );
         })
@@ -1559,7 +1578,19 @@ mod test {
     fn passkeys_advert_without_an_hourly_cap_offers_no_emailless_signup() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(true, &["https://app.sloga.gg"], 0).await,
+                passkeys_advert(true, &["https://app.sloga.gg"], 0, 40).await,
+                passkeys_json(true, true, false, true)
+            );
+        })
+    }
+
+    /// Fails if: the advert offers sign-up without an email under a daily
+    /// cap of 0, or stops offering sign-up with an email there.
+    #[test]
+    fn passkeys_advert_without_a_daily_cap_offers_no_emailless_signup() {
+        crate::util::test::rt().block_on(async {
+            assert_eq!(
+                passkeys_advert(true, &["https://app.sloga.gg"], 25, 0).await,
                 passkeys_json(true, true, false, true)
             );
         })
@@ -1571,7 +1602,13 @@ mod test {
     fn passkeys_advert_is_all_false_with_an_origin_off_the_relying_party() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(true, &["https://app.sloga.gg", "https://evil.example"], 25).await,
+                passkeys_advert(
+                    true,
+                    &["https://app.sloga.gg", "https://evil.example"],
+                    25,
+                    40
+                )
+                .await,
                 passkeys_json(false, false, false, false)
             );
         })
@@ -1581,7 +1618,7 @@ mod test {
     fn passkeys_advert_is_all_false_with_an_empty_origin_list() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(true, &[], 25).await,
+                passkeys_advert(true, &[], 25, 40).await,
                 passkeys_json(false, false, false, false)
             );
         })
@@ -1592,7 +1629,7 @@ mod test {
     fn passkeys_advert_is_all_false_without_an_https_origin() {
         crate::util::test::rt().block_on(async {
             assert_eq!(
-                passkeys_advert(true, &[ANDROID_ORIGIN], 25).await,
+                passkeys_advert(true, &[ANDROID_ORIGIN], 25, 40).await,
                 passkeys_json(false, false, false, false)
             );
         })

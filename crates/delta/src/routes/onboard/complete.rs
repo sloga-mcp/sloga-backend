@@ -23,13 +23,13 @@ pub static RE_USERNAME: Lazy<Regex> = Lazy::new(|| Regex::new(r"^(\p{L}|[\d_.-])
 pub struct DataOnboard {
     /// New username which will be used to identify the user on the platform
     #[validate(length(min = 2, max = 32), regex = "RE_USERNAME")]
-    username: String,
+    pub(crate) username: String,
     /// Referral code of the user who invited this one
     #[validate(length(min = 1, max = 32))]
-    referral_code: Option<String>,
+    pub(crate) referral_code: Option<String>,
     /// Server invite code this user signed up through
     #[validate(length(min = 1, max = 128))]
-    invite_code: Option<String>,
+    pub(crate) invite_code: Option<String>,
 }
 
 /// Whether a user can be credited with a referral
@@ -53,26 +53,35 @@ async fn referrer_from_invite(db: &Database, input: &str) -> Option<(String, Ref
     Some((creator.id, ReferralSource::ServerInvite { code }))
 }
 
-/// # Complete Onboarding
-///
-/// This sets a new username, completes onboarding and allows a user to start using Revolt.
-#[openapi(tag = "Onboarding")]
-#[post("/complete", data = "<data>")]
-pub async fn complete(
-    db: &State<Database>,
-    session: Session,
-    user: std::result::Result<User, Error>,
-    data: Json<DataOnboard>,
-) -> Result<Json<v0::User>> {
-    match user {
-        Ok(_) => return Err(create_error!(AlreadyOnboarded)),
-        // No user yet: the session exists but onboarding has not run
-        Err(error) if is_invalid_session(&error) => {}
-        // A failed lookup is not "no user yet": going on would create a user over an existing one
-        Err(error) => return Err(error),
-    }
+/// Onboarding that passed every check and has written nothing yet
+pub(crate) struct ValidOnboarding {
+    username: String,
+    /// Who gets the referral, and how they were found
+    referral: Option<(String, ReferralSource)>,
+}
 
-    let data = data.into_inner();
+/// A user that was just created, with the follow-up writes still to run
+pub(crate) struct OnboardedUser {
+    pub(crate) user: User,
+    referral: Option<(String, ReferralSource)>,
+}
+
+/// Check everything onboarding asks for. Writes nothing, so it can run more
+/// than once for one sign-up (passkey sign-up runs it at start and again at
+/// finish).
+///
+/// `FailedValidation` for a bad username or code shape, `InvalidReferralCode`
+/// for a referral code that names nobody who can be credited, `UsernameTaken`
+/// when the name has no discriminator left. A server invite code never
+/// refuses: it only finds a referrer, or none.
+///
+/// The name filter and the homoglyph clean-up run here and again inside
+/// `User::create` (which also picks the discriminator) in
+/// `create_onboarded_user`.
+pub(crate) async fn validate_onboarding(
+    db: &Database,
+    data: DataOnboard,
+) -> Result<ValidOnboarding> {
     data.validate().map_err(|error| {
         create_error!(FailedValidation {
             error: error.to_string()
@@ -111,10 +120,31 @@ pub async fn complete(
         None
     };
 
+    // The name passes the filter, and its cleaned-up form still has a
+    // discriminator free. `User::create` runs both again, and its answer is
+    // the one that counts
+    let cleaned = User::check_new_username(&username).await?;
+    User::find_discriminator(db, &cleaned, None).await?;
+
+    Ok(ValidOnboarding { username, referral })
+}
+
+/// Create the user of account `account_id` (the two share one id): name
+/// filter, discriminator and policy stamp through `User::create`.
+///
+/// This is the one write here that can fail. The follow-up writes wait in
+/// the answer: run `OnboardedUser::settle` once nothing can undo the user.
+pub(crate) async fn create_onboarded_user(
+    db: &Database,
+    account_id: String,
+    valid: ValidOnboarding,
+) -> Result<OnboardedUser> {
+    let ValidOnboarding { username, referral } = valid;
+
     let user = User::create(
         db,
         username,
-        session.user_id,
+        account_id,
         referral.as_ref().map(|_| PartialUser {
             referral_pending: Some(true),
             ..Default::default()
@@ -122,41 +152,82 @@ pub async fn complete(
     )
     .await?;
 
-    // Best-effort: a pending flag left without a referral is cleared by
-    // the qualification sweep
-    if let Some((referrer, source)) = referral {
-        if let Err(err) = Referral::create_for_invitee(db, &user.id, &referrer, source).await {
-            log::warn!(
-                "Failed to record referral of {} by {referrer}: {err:?}",
-                user.id
-            );
-        }
-    }
+    Ok(OnboardedUser { user, referral })
+}
 
-    // Auto-join the configured welcome / landing-spot server, if one is set.
-    // Best-effort: onboarding must never fail because of this. We ignore a
-    // missing/misconfigured server id, an existing membership, a ban, etc.
-    if let Some(welcome_id) = config()
-        .await
-        .features
-        .welcome_server
-        .as_deref()
-        .filter(|id| !id.is_empty())
-    {
-        match db.fetch_server(welcome_id).await {
-            Ok(server) => {
-                if let Err(err) = Member::create(db, &server, &user, None).await {
+impl OnboardedUser {
+    /// The writes that follow a new user: the referral row and the
+    /// welcome-server join. Both are best-effort and never fail onboarding.
+    pub(crate) async fn settle(self, db: &Database) -> User {
+        let OnboardedUser { user, referral } = self;
+
+        // Best-effort: a pending flag left without a referral is cleared by
+        // the qualification sweep
+        if let Some((referrer, source)) = referral {
+            if let Err(err) = Referral::create_for_invitee(db, &user.id, &referrer, source).await {
+                log::warn!(
+                    "Failed to record referral of {} by {referrer}: {err:?}",
+                    user.id
+                );
+            }
+        }
+
+        // Auto-join the configured welcome / landing-spot server, if one is set.
+        // Best-effort: onboarding must never fail because of this. We ignore a
+        // missing/misconfigured server id, an existing membership, a ban, etc.
+        if let Some(welcome_id) = config()
+            .await
+            .features
+            .welcome_server
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            match db.fetch_server(welcome_id).await {
+                Ok(server) => {
+                    if let Err(err) = Member::create(db, &server, &user, None).await {
+                        log::warn!(
+                            "Failed to auto-join user {} to welcome server {welcome_id}: {err:?}",
+                            user.id
+                        );
+                    }
+                }
+                Err(err) => {
                     log::warn!(
-                        "Failed to auto-join user {} to welcome server {welcome_id}: {err:?}",
-                        user.id
-                    );
+                        "welcome_server {welcome_id} is set but could not be fetched: {err:?}"
+                    )
                 }
             }
-            Err(err) => {
-                log::warn!("welcome_server {welcome_id} is set but could not be fetched: {err:?}")
-            }
         }
+
+        user
     }
+}
+
+/// # Complete Onboarding
+///
+/// This sets a new username, completes onboarding and allows a user to start using Revolt.
+#[openapi(tag = "Onboarding")]
+#[post("/complete", data = "<data>")]
+pub async fn complete(
+    db: &State<Database>,
+    session: Session,
+    user: std::result::Result<User, Error>,
+    data: Json<DataOnboard>,
+) -> Result<Json<v0::User>> {
+    match user {
+        Ok(_) => return Err(create_error!(AlreadyOnboarded)),
+        // No user yet: the session exists but onboarding has not run
+        Err(error) if is_invalid_session(&error) => {}
+        // A failed lookup is not "no user yet": going on would create a user over an existing one
+        Err(error) => return Err(error),
+    }
+
+    // The same three steps a passkey sign-up runs (`routes/passkey/signup.rs`)
+    let valid = validate_onboarding(db, data.into_inner()).await?;
+    let user = create_onboarded_user(db, session.user_id, valid)
+        .await?
+        .settle(db)
+        .await;
 
     Ok(Json(user.into_self(false).await))
 }

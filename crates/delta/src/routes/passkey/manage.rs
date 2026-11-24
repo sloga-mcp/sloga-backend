@@ -2,26 +2,14 @@
 //! GET /passkey
 //! PATCH /passkey/:id
 //! DELETE /passkey/:id
-use revolt_database::{Account, Database, Passkey, ValidatedTicket};
+use revolt_database::{Account, Database, ValidatedTicket};
 use revolt_models::v0;
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::serde::json::Json;
 use rocket::State;
 use rocket_empty::EmptyResponse;
 
 use crate::util::passkey;
-
-/// Whether removing one passkey would leave the account with no way to sign
-/// in: no usable password, no Google or Apple sign-in, and no other passkey
-fn removal_leaves_no_sign_in(password_absent: bool, oauth_linked: bool, passkeys: u64) -> bool {
-    password_absent && !oauth_linked && passkeys <= 1
-}
-
-/// The same rule read after the delete: `remaining` passkeys are left. True
-/// when two removals raced past the check above and took the last ones.
-fn removal_left_no_sign_in(password_absent: bool, oauth_linked: bool, remaining: u64) -> bool {
-    removal_leaves_no_sign_in(password_absent, oauth_linked, remaining.saturating_add(1))
-}
 
 /// # List Passkeys
 ///
@@ -82,48 +70,18 @@ pub async fn remove(
 ) -> Result<EmptyResponse> {
     passkey::assert_available().await?;
 
-    // NotFound for an unknown id and for another account's passkey alike
-    let row = db.fetch_passkey(&account.id, &id).await?;
-
-    let oauth_linked = account.google_id.is_some() || account.apple_id.is_some();
-    let passkeys = db.count_passkeys(&account.id).await?;
-    if removal_leaves_no_sign_in(account.password_absent, oauth_linked, passkeys) {
-        return Err(create_error!(InvalidOperation));
-    }
-
-    db.delete_passkey(&account.id, &id).await?;
-
-    // The count and the delete are not one step: two removals can both see
-    // two passkeys and take one each. Look again, and put this one back if
-    // nothing is left to sign in with. (Both racers may put theirs back.)
-    // A count that cannot be read is taken as none left
-    let remaining = db.count_passkeys(&account.id).await.unwrap_or(0);
-    if removal_left_no_sign_in(account.password_absent, oauth_linked, remaining) {
-        return put_back(db, &row).await;
-    }
-
-    Ok(EmptyResponse)
-}
-
-/// Undo a removal that turned out to take the last way in, and refuse it.
-/// Tried twice. If the row cannot be written back the database error is the
-/// answer: the passkey is gone and the caller must not be told otherwise.
-async fn put_back(db: &Database, row: &Passkey) -> Result<EmptyResponse> {
-    let mut written = db.insert_passkey(row).await;
-    if written.is_err() {
-        written = db.insert_passkey(row).await;
-    }
-
-    match written {
-        Ok(()) => Err(create_error!(InvalidOperation)),
-        Err(error) => {
-            log::error!(
-                "passkeys: could not put back the last passkey of account {} after a removal race",
-                row.user_id
-            );
-            Err(error)
-        }
-    }
+    // One op decides and deletes, reading the account itself: the copy the
+    // session guard loaded may be stale by now. Its answers are the route's:
+    // NotFound for an unknown id and for another account's passkey alike,
+    // InvalidOperation for the last way in. An account that went away under
+    // the request has no passkey left to remove, so that is NotFound too.
+    db.delete_passkey_unless_last_way_in(&account.id, &id)
+        .await
+        .map(|_| EmptyResponse)
+        .map_err(|error| match error.error_type {
+            ErrorType::UnknownUser => create_error!(NotFound),
+            _ => error,
+        })
 }
 
 #[cfg(test)]
@@ -136,11 +94,9 @@ mod tests {
         harness_with_passkeys_on, keys, kind, seed_passkey, send, switched_off_kind, ticket_for,
         STORED_CREDENTIAL_MARKER,
     };
-    use super::{put_back, removal_leaves_no_sign_in, removal_left_no_sign_in};
-    use revolt_result::ErrorType;
 
     use crate::util::passkey::MAX_PASSKEY_NAME_LEN;
-    use crate::util::test::{rt, TestHarness};
+    use crate::util::test::{rt, without_comments, without_whitespace, TestHarness};
 
     const LIST: &str = "/auth/passkey";
 
@@ -160,92 +116,52 @@ mod tests {
         harness.client.delete(one(id))
     }
 
+    /// The remove route decides nothing itself: the switch, the ticket
+    /// guard, then the one database op that checks for another way in and
+    /// deletes. The rule and its race handling are tested with the op
+    /// (`revolt_database`, passkeys ops).
+    ///
+    /// Fails if: the route goes back to counting and deleting in separate
+    /// steps, deletes without the last-way-in check, makes the ticket
+    /// optional, or does anything before the switch is read.
     #[test]
-    fn last_way_in_table() {
-        // (no password, oauth, passkeys) -> refused
-        for (password_absent, oauth_linked, passkeys, refused) in [
-            (true, false, 1, true),
-            // Cannot happen through the route (the passkey was found), and
-            // must not read as "something else is left"
-            (true, false, 0, true),
-            (true, false, 2, false),
-            (true, true, 1, false),
-            (false, false, 1, false),
-            (false, true, 1, false),
-            (false, false, 2, false),
-            (true, true, 2, false),
-        ] {
-            assert_eq!(
-                removal_leaves_no_sign_in(password_absent, oauth_linked, passkeys),
-                refused,
-                "{:?}",
-                (password_absent, oauth_linked, passkeys)
-            );
-        }
-    }
+    fn remove_is_the_one_conditional_delete() {
+        const SWITCH: &str = "passkey::assert_available().await?;";
+        const DELETE: &str = "db.delete_passkey_unless_last_way_in(&account.id,&id).await";
 
-    #[test]
-    fn last_way_in_after_the_delete_table() {
-        // (no password, oauth, passkeys left) -> the removal is undone
-        for (password_absent, oauth_linked, remaining, undone) in [
-            // Two removals raced and nothing is left
-            (true, false, 0, true),
-            // The usual case: one of two went
-            (true, false, 1, false),
-            (true, false, 9, false),
-            (true, true, 0, false),
-            (false, false, 0, false),
-            (false, true, 0, false),
-            // No overflow at the top
-            (true, false, u64::MAX, false),
-        ] {
-            assert_eq!(
-                removal_left_no_sign_in(password_absent, oauth_linked, remaining),
-                undone,
-                "{:?}",
-                (password_absent, oauth_linked, remaining)
-            );
-        }
-    }
+        let source = include_str!("manage.rs");
+        let routes = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the code above the tests");
+        let code = without_whitespace(&without_comments(routes));
 
-    #[test]
-    fn a_removal_that_took_the_last_way_in_is_put_back() {
-        rt().block_on(a_removal_that_took_the_last_way_in_is_put_back_case())
-    }
+        let route_at = code.find("pubasyncfnremove(").expect("the remove route");
+        let route = &code[route_at..];
 
-    /// The undo step, on what a lost race leaves: the row already deleted
-    async fn a_removal_that_took_the_last_way_in_is_put_back_case() {
-        let harness = TestHarness::new().await;
-        let (account, _, _) = harness.new_user().await;
+        // The guard is not optional, so the route never runs without a
+        // validated ticket of this account
+        assert!(route.contains("_ticket:ValidatedTicket,"), "{}", route);
+        assert!(!route.contains("Option<ValidatedTicket>"));
 
-        let row = seed_passkey(&harness, &account, "Phone").await;
-        harness
-            .db
-            .delete_passkey(&account.id, &row.id)
-            .await
-            .unwrap();
-        assert_eq!(harness.db.count_passkeys(&account.id).await.unwrap(), 0);
-
-        let refused = match put_back(&harness.db, &row).await {
-            Err(error) => error,
-            Ok(_) => panic!("the removal is refused"),
-        };
+        let body_at = route.find("->Result<EmptyResponse>{").expect("the body")
+            + "->Result<EmptyResponse>{".len();
         assert!(
-            matches!(refused.error_type, ErrorType::InvalidOperation),
-            "{:?}",
-            refused
+            route[body_at..].starts_with(SWITCH),
+            "the switch must be read first"
         );
 
-        // The same row is back, credential and all
-        let back = harness
-            .db
-            .fetch_passkey(&account.id, &row.id)
-            .await
-            .expect("the passkey is back");
-        assert_eq!(back.credential_id, row.credential_id);
-        assert_eq!(back.credential, row.credential);
-        assert_eq!(back.user_handle, row.user_handle);
-        assert_eq!(back.name, "Phone");
+        assert_eq!(code.matches(DELETE).count(), 1);
+        assert!(route.find(SWITCH).unwrap() < route.find(DELETE).expect("the op"));
+
+        for gone in [
+            "delete_passkey(",
+            "count_passkeys(",
+            "insert_passkey(",
+            "password_absent",
+        ] {
+            assert!(!route.contains(gone), "the remove route uses `{}`", gone);
+        }
     }
 
     #[test]

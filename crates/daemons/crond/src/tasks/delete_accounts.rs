@@ -434,6 +434,7 @@ mod tests {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
         }
     }
 

@@ -14,6 +14,8 @@ use rocket::form::Form;
 use rocket::response::Redirect;
 use rocket::State;
 
+use super::google_callback::account_for_verified_email;
+
 #[derive(FromForm)]
 pub struct AppleCallbackForm {
     code: Option<String>,
@@ -172,32 +174,31 @@ async fn callback_inner(
     // Find or create the account: by Apple id, then by verified email
     // (auto-link), then a brand new account. Note the email may be a
     // @privaterelay.appleid.com address if the user hid their real one.
+    // The auto-link never picks an account that has no email (see
+    // `account_for_verified_email`, shared with the Google callback).
     let mut account =
         if let Some(account) = fetch_by_apple_id(db, &claims.sub).await? {
             account
+        } else if let Some(mut account) = account_for_verified_email(db, &email).await? {
+            account.apple_id = Some(claims.sub.clone());
+            account.save(db).await.map_err(|_| "internal")?;
+            account
         } else {
-            let normalised = revolt_database::util::email::normalise_email(email.clone());
-            if let Some(mut account) = db
-                .fetch_account_by_normalised_email(&normalised)
+            Account::new_from_apple(db, email, claims.sub.clone())
                 .await
                 .map_err(|_| "internal")?
-            {
-                account.apple_id = Some(claims.sub.clone());
-                account.save(db).await.map_err(|_| "internal")?;
-                account
-            } else {
-                Account::new_from_apple(db, email, claims.sub.clone())
-                    .await
-                    .map_err(|_| "internal")?
-            }
         };
 
     if account.disabled {
         return Err("disabled_account");
     }
 
-    // Apple has verified ownership of this email
-    if let EmailVerification::Pending { .. } = account.verification {
+    // Apple has verified ownership of this email. That says nothing about
+    // an account that has no email (found by its Apple id): it is stored
+    // `Verified` already, and is not written here in any case.
+    if matches!(account.verification, EmailVerification::Pending { .. })
+        && account.real_email().is_some()
+    {
         account.verification = EmailVerification::Verified;
         account.save(db).await.map_err(|_| "internal")?;
     }

@@ -482,6 +482,20 @@ mod passkey_mount_tests {
         ("GET", "/auth/passkey"),
         ("PATCH", "/auth/passkey/<id>"),
         ("DELETE", "/auth/passkey/<id>"),
+        ("POST", "/auth/passkey/signup/start"),
+        ("POST", "/auth/passkey/signup/code"),
+        ("POST", "/auth/passkey/signup/resend"),
+        ("POST", "/auth/passkey/signup/options"),
+        ("POST", "/auth/passkey/signup/finish"),
+        ("POST", "/auth/passkey/recover/send"),
+        ("POST", "/auth/passkey/recover/start"),
+        ("POST", "/auth/passkey/recover/finish"),
+    ];
+
+    /// The passkey routes that live under `/auth/account`
+    const PASSKEY_ACCOUNT_ROUTES: &[(&str, &str)] = &[
+        ("POST", "/auth/account/email/add/start"),
+        ("POST", "/auth/account/email/add/finish"),
     ];
 
     /// A route path without doubled or trailing slashes
@@ -527,7 +541,7 @@ mod passkey_mount_tests {
             };
 
             assert!(has("PUT", "/auth/mfa/ticket"), "{label}: the control route");
-            for (method, path) in PASSKEY_ROUTES {
+            for (method, path) in PASSKEY_ROUTES.iter().chain(PASSKEY_ACCOUNT_ROUTES) {
                 assert!(has(method, path), "{label}: {method} {path} is not mounted");
             }
 
@@ -621,6 +635,113 @@ mod passkey_mount_tests {
                     .header(Header::new("X-MFA-Ticket", ticket.token.clone())),
             ),
         ] {
+            let (status, body) = answer(request).await;
+            answers.push((label, status, body));
+        }
+
+        answers
+    }
+
+    /// Call each sign-up, recovery and add-an-email route once, with a
+    /// body its guard can parse and nothing any of them would accept. The
+    /// first eight carry no session; the last two are sent as `session`,
+    /// each with a validated ticket of its own.
+    async fn call_each_step2(
+        harness: &TestHarness,
+        account: &Account,
+        session: &Session,
+    ) -> Vec<(&'static str, Status, Value)> {
+        let client = &harness.client;
+        let id = "0".repeat(64);
+        // 32 bytes of unpadded base64url: the shape of a recovery token
+        let token = "A".repeat(43);
+
+        let mut requests = vec![
+            (
+                "POST signup/start",
+                json_body(
+                    client.post("/auth/passkey/signup/start"),
+                    json!({
+                        "username": TestHarness::rand_string(),
+                        "email": "nobody@example.com"
+                    }),
+                ),
+            ),
+            (
+                "POST signup/code",
+                json_body(
+                    client.post("/auth/passkey/signup/code"),
+                    json!({ "signup_id": id, "code": "00000000" }),
+                ),
+            ),
+            (
+                "POST signup/resend",
+                json_body(
+                    client.post("/auth/passkey/signup/resend"),
+                    json!({ "signup_id": id }),
+                ),
+            ),
+            (
+                "POST signup/options",
+                json_body(
+                    client.post("/auth/passkey/signup/options"),
+                    json!({ "signup_id": id }),
+                ),
+            ),
+            (
+                "POST signup/finish",
+                json_body(
+                    client.post("/auth/passkey/signup/finish"),
+                    json!({ "challenge_id": id, "credential": {} }),
+                ),
+            ),
+            (
+                "POST recover/send",
+                json_body(
+                    client.post("/auth/passkey/recover/send"),
+                    json!({ "email": "nobody@example.com" }),
+                ),
+            ),
+            (
+                "POST recover/start",
+                json_body(
+                    client.post("/auth/passkey/recover/start"),
+                    json!({ "token": token }),
+                ),
+            ),
+            (
+                "POST recover/finish",
+                json_body(
+                    client.post("/auth/passkey/recover/finish"),
+                    json!({ "token": token, "challenge_id": id, "credential": {} }),
+                ),
+            ),
+        ];
+
+        for (label, path, body) in [
+            (
+                "POST email/add/start",
+                "/auth/account/email/add/start",
+                json!({ "email": "nobody@example.com" }),
+            ),
+            (
+                "POST email/add/finish",
+                "/auth/account/email/add/finish",
+                json!({ "code": "00000000" }),
+            ),
+        ] {
+            let ticket = MFATicket::new(account.id.clone(), true);
+            ticket.save(&harness.db).await.unwrap();
+
+            requests.push((
+                label,
+                json_body(as_session(client.post(path), session), body)
+                    .header(Header::new("X-MFA-Ticket", ticket.token.clone())),
+            ));
+        }
+
+        let mut answers = Vec::new();
+        for (label, request) in requests {
             let (status, body) = answer(request).await;
             answers.push((label, status, body));
         }
@@ -813,9 +934,13 @@ mod passkey_mount_tests {
         rt().block_on(every_passkey_route_is_refused_with_the_switch_off_case())
     }
 
-    /// Fails if: a passkey route stops asking `assert_available` first, or
-    /// the harness's mount list loses `/auth/passkey` (Rocket's 404 carries
-    /// no error type).
+    /// Both switches off, as shipped.
+    ///
+    /// Fails if: a Step 1 passkey route stops asking `assert_available`
+    /// first, a sign-up, recovery or add-an-email route asks neither switch
+    /// (each of their two gates is pinned by itself further down), or the
+    /// harness's mount list loses `/auth/passkey` (Rocket's 404 carries no
+    /// error type).
     async fn every_passkey_route_is_refused_with_the_switch_off_case() {
         let harness = TestHarness::new().await;
         let off = passkey::assert_available()
@@ -826,8 +951,12 @@ mod passkey_mount_tests {
 
         let (account, session, _) = harness.new_user().await;
 
-        let answers = call_each(&harness, &account, &session).await;
-        assert_eq!(answers.len(), 8);
+        let mut answers = call_each(&harness, &account, &session).await;
+        answers.extend(call_each_step2(&harness, &account, &session).await);
+        assert_eq!(
+            answers.len(),
+            PASSKEY_ROUTES.len() + PASSKEY_ACCOUNT_ROUTES.len()
+        );
         for (label, status, body) in &answers {
             assert!(reached_a_route(*status, body), "{label}: {status} {body}");
             assert_eq!(
@@ -842,5 +971,100 @@ mod passkey_mount_tests {
         let stored = harness.db.fetch_passkeys(&account.id).await.unwrap();
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].name, "Phone");
+    }
+
+    /// The sign-up, recovery and add-an-email routes need two switches:
+    /// passkeys (`available`) and passkey sign-up (`signup`). With both off,
+    /// as in the test above, either gate alone refuses, so a route that lost
+    /// one of them would still pass there. Each of the two tests below
+    /// leaves exactly one switch off.
+    ///
+    /// Sets the two switches (process-wide, once, before the harness), calls
+    /// every one of those routes, and checks each is refused the way the
+    /// gate of the switch that is off refuses, which names `feature`.
+    async fn assert_step2_routes_refuse(available: bool, signup: bool, feature: &str) {
+        use crate::util::passkey_signup::assert_signup_on;
+
+        revolt_config::overwrite_config(move |settings| {
+            let passkeys = &mut settings.features.passkeys;
+            passkeys.available = available;
+            passkeys.signup = signup;
+            passkeys.rp_id = "app.sloga.gg".to_string();
+            passkeys.origins = vec!["https://app.sloga.gg".to_string()];
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+
+        // The control: the switches are as asked, so only one gate refuses
+        assert_eq!(
+            passkey::assert_available().await.is_ok(),
+            available,
+            "the control: `available`"
+        );
+        assert_eq!(
+            assert_signup_on().await.is_ok(),
+            signup,
+            "the control: `signup`"
+        );
+        assert_ne!(available, signup, "the control: exactly one switch is off");
+
+        // What the one gate that is shut answers
+        let refusal = match available {
+            true => assert_signup_on().await,
+            false => passkey::assert_available().await,
+        };
+        let refusal = refusal.expect_err("the control: the gate under test refuses");
+        let refusal = serde_json::to_value(&refusal.error_type).expect("an error type");
+        assert_eq!(refusal["type"], "FeatureDisabled");
+        assert_eq!(refusal["feature"], feature, "the control: which gate");
+
+        let (account, session, _) = harness.new_user().await;
+
+        let answers = call_each_step2(&harness, &account, &session).await;
+        assert_eq!(answers.len(), 10);
+        for (label, status, body) in &answers {
+            assert!(reached_a_route(*status, body), "{label}: {status} {body}");
+            assert_eq!(
+                *status,
+                Status::BadRequest,
+                "{label}: answered {status} with `{feature}` off"
+            );
+            assert_eq!(body["type"], refusal["type"], "{label}: {status} {body}");
+            assert_eq!(
+                body["feature"], refusal["feature"],
+                "{label}: {status} {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn signup_recovery_and_add_email_are_refused_with_only_signup_off() {
+        rt().block_on(signup_recovery_and_add_email_are_refused_with_only_signup_off_case())
+    }
+
+    /// Passkeys on, passkey sign-up off (as Step 1 shipped).
+    ///
+    /// Fails if: a sign-up, recovery or add-an-email route stops asking
+    /// `passkey_signup::assert_signup_on` (with passkeys themselves on, the
+    /// route would go ahead), asks it after something else that answers
+    /// first, or answers that refusal with another error.
+    async fn signup_recovery_and_add_email_are_refused_with_only_signup_off_case() {
+        assert_step2_routes_refuse(true, false, "passkey_signup").await
+    }
+
+    #[test]
+    fn signup_recovery_and_add_email_are_refused_with_only_passkeys_off() {
+        rt().block_on(signup_recovery_and_add_email_are_refused_with_only_passkeys_off_case())
+    }
+
+    /// Passkey sign-up on, passkeys themselves off.
+    ///
+    /// Fails if: a sign-up, recovery or add-an-email route stops asking
+    /// `passkey::assert_available` (with passkey sign-up on, the route
+    /// would go ahead), asks it after something else that answers first,
+    /// or answers that refusal with another error.
+    async fn signup_recovery_and_add_email_are_refused_with_only_passkeys_off_case() {
+        assert_step2_routes_refuse(false, true, "passkeys").await
     }
 }

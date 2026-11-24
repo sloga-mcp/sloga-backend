@@ -7,6 +7,7 @@ pub mod confirm_deletion;
 pub mod create_account;
 pub mod delete_account;
 pub mod disable_account;
+pub mod email_add;
 pub mod fetch_account;
 pub mod password_reset;
 pub mod resend_verification;
@@ -25,6 +26,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         change_email::change_email,
         verify_email::verify_email,
         password_reset::password_reset,
-        send_password_reset::send_password_reset
+        send_password_reset::send_password_reset,
+        email_add::email_add_start,
+        email_add::email_add_finish
     ]
 }

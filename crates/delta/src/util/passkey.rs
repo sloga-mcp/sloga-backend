@@ -1,4 +1,10 @@
-//! Passkey (WebAuthn) verifier: the three ceremonies and their challenge state.
+//! Passkey (WebAuthn) verifier: the ceremonies and their challenge state.
+//!
+//! Three ceremonies belong to an account that is signed in or signing in
+//! (register, sign-in, ticket). Two more create a passkey with no session:
+//! sign-up, bound to a pending sign-up, and recovery, bound to an account and
+//! the hash of its emailed token. Those two verify and hand the passkey back
+//! unstored; the routes decide when it is written.
 //!
 //! Everything a client could forge is decided here, on the server:
 //!
@@ -19,6 +25,7 @@
 //! ticket: the routes decide that.
 
 use std::convert::TryFrom;
+use std::fmt;
 use std::sync::OnceLock;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -59,6 +66,9 @@ const HANDLE_PIN_TTL_SECS: u64 = 900;
 
 /// How long a session stays marked as minted by a Google or Apple sign-in
 const OAUTH_MARK_TTL_SECS: u64 = 600;
+
+/// How long the note that an account's passkeys were purged is kept
+const PURGE_STAMP_TTL_SECS: u64 = 900;
 
 /// Origin form Android's Credential Manager reports
 const ANDROID_ORIGIN_PREFIX: &str = "android:apk-key-hash:";
@@ -279,6 +289,89 @@ pub async fn is_oauth_session(session_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Purge stamp
+// ---------------------------------------------------------------------------
+
+fn purged_key(account_id: &str) -> String {
+    format!("passkey:purged:{account_id}")
+}
+
+/// Now, in milliseconds since the Unix epoch: the clock a ULID carries
+fn unix_ms_now() -> Result<u64> {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| create_error!(InternalError))?;
+
+    u64::try_from(since_epoch.as_millis()).map_err(|_| create_error!(InternalError))
+}
+
+/// Note that every passkey of `account_id` is being removed now (a password
+/// reset). The stamp is the time in Unix milliseconds and lasts 15 minutes,
+/// longer than any challenge or handle pin started before it.
+///
+/// Call BEFORE the purge. An error means the stamp may not be there: the
+/// caller must fail the reset, since a registration finishing after the
+/// purge would then go unnoticed.
+pub async fn mark_passkeys_purged(account_id: &str) -> Result<()> {
+    if account_id.is_empty() {
+        return Err(create_error!(InternalError));
+    }
+
+    let now = unix_ms_now()?;
+
+    let mut conn = get_connection()
+        .await
+        .map_err(|_| create_error!(InternalError))?
+        .into_inner();
+
+    let set: Option<String> = redis::cmd("SET")
+        .arg(purged_key(account_id))
+        .arg(now)
+        .arg("EX")
+        .arg(PURGE_STAMP_TTL_SECS)
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| create_error!(InternalError))?;
+
+    if set.is_none() {
+        return Err(create_error!(InternalError));
+    }
+
+    Ok(())
+}
+
+/// When the passkeys of `account_id` were last purged, in Unix milliseconds,
+/// or None when no purge is on record for the last 15 minutes.
+///
+/// A session older than the stamp (by the time in its ULID) must not keep a
+/// passkey it registers. An error (Redis down, or a stamp that is not a
+/// number) is not "no purge": the caller takes the new row back.
+pub async fn purged_since(account_id: &str) -> Result<Option<u64>> {
+    if account_id.is_empty() {
+        return Err(create_error!(InternalError));
+    }
+
+    let mut conn = get_connection()
+        .await
+        .map_err(|_| create_error!(InternalError))?
+        .into_inner();
+
+    let stamp: Option<String> = redis::cmd("GET")
+        .arg(purged_key(account_id))
+        .query_async(&mut conn)
+        .await
+        .map_err(|_| create_error!(InternalError))?;
+
+    match stamp {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| create_error!(InternalError)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Challenge state
 // ---------------------------------------------------------------------------
 
@@ -303,6 +396,22 @@ enum Ceremony {
         /// library checked the signature counter against these copies.
         snapshot: Vec<(String, String)>,
     },
+    /// The first passkey of an account that does not exist yet
+    Signup {
+        state: PasskeyRegistration,
+        /// The user handle the options carried (a UUID)
+        user_handle: String,
+        /// The pending sign-up the challenge was started for
+        signup_id: String,
+    },
+    /// A new passkey for an account whose owner followed a recovery link
+    Recover {
+        state: PasskeyRegistration,
+        /// The user handle the options carried (a UUID)
+        user_handle: String,
+        /// SHA-256 hex of the recovery token the challenge was started under
+        token_hash: String,
+    },
 }
 
 /// The blob stored in Redis under `passkey:challenge:<challenge_id>`.
@@ -310,9 +419,10 @@ enum Ceremony {
 /// Holds server-made values only; nothing a client sent is ever stored.
 #[derive(Serialize, Deserialize)]
 struct StoredChallenge {
-    /// Account the challenge was started for (None for sign-in)
+    /// Account the challenge was started for (None for sign-in and sign-up)
     account_id: Option<String>,
-    /// Session that started the challenge (None for sign-in)
+    /// Session that started the challenge (None for sign-in, sign-up and
+    /// recovery: none of them has one)
     session_id: Option<String>,
     ceremony: Ceremony,
 }
@@ -1008,6 +1118,288 @@ pub async fn finish_registration(
 }
 
 // ---------------------------------------------------------------------------
+// Sign-up and recovery
+// ---------------------------------------------------------------------------
+
+/// A passkey that passed a registration ceremony and is not stored yet.
+///
+/// Every value comes from the verified attestation or from the challenge
+/// state; none is a string the client sent.
+pub struct VerifiedPasskey {
+    /// Unpadded base64url of the verified credential id
+    pub credential_id: String,
+    /// The user handle the options carried (a UUID)
+    pub user_handle: String,
+    /// The library credential, as stored on a row
+    credential: String,
+}
+
+impl fmt::Debug for VerifiedPasskey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("VerifiedPasskey(..)")
+    }
+}
+
+impl VerifiedPasskey {
+    /// The row for `account_id`, not written anywhere. `name` is stored as
+    /// given: pass it through `normalise_passkey_name` first.
+    pub fn into_row(self, account_id: &str, name: String) -> Passkey {
+        Passkey::new(
+            account_id.to_string(),
+            self.credential_id,
+            self.user_handle,
+            self.credential,
+            name,
+        )
+    }
+
+    /// Store the passkey on `account_id` and return the row.
+    ///
+    /// `FailedValidation` for a bad name; `NoEffect` when the credential is
+    /// already registered, on this account or any other (the same look
+    /// before and after the insert as `finish_registration`). No cap and no
+    /// handle check: the caller owns the account's other rows.
+    pub async fn store(
+        self,
+        db: &Database,
+        account_id: &str,
+        name: Option<&str>,
+    ) -> Result<Passkey> {
+        let name = normalise_passkey_name(name)?;
+
+        if db
+            .fetch_passkey_by_credential_id(&self.credential_id)
+            .await?
+            .is_some()
+        {
+            return Err(create_error!(NoEffect));
+        }
+
+        let row = self.into_row(account_id, name);
+
+        if let Err(error) = db.insert_passkey(&row).await {
+            // Lost a race with another registration of the same credential?
+            return match db.fetch_passkey_by_credential_id(&row.credential_id).await {
+                Ok(Some(_)) => Err(create_error!(NoEffect)),
+                _ => Err(error),
+            };
+        }
+
+        Ok(row)
+    }
+}
+
+/// Run a registration response through the R1 gates and the library, against
+/// the state of the challenge it answers
+fn verify_registration(
+    verifier: &Verifier,
+    state: &PasskeyRegistration,
+    credential: Value,
+    user_handle: String,
+) -> Result<VerifiedPasskey> {
+    let registration =
+        parse_registration(credential).ok_or_else(|| create_error!(InvalidCredentials))?;
+
+    let verified = verifier
+        .webauthn
+        .finish_passkey_registration(&registration, state)
+        .map_err(|_| create_error!(InvalidCredentials))?;
+
+    Ok(VerifiedPasskey {
+        // From the verified attestation, never the `id` string the client sent
+        credential_id: credential_id_text(verified.cred_id().as_slice()),
+        user_handle,
+        credential: serde_json::to_string(&verified).map_err(|_| create_error!(InternalError))?,
+    })
+}
+
+/// Sign-up: options to create the first passkey of an account that does not
+/// exist yet. Bound to (Signup, signup_id); there is no account and no
+/// session.
+///
+/// `signup_id` is the id of the pending sign-up (64 lower-case hex),
+/// `user_handle` the UUID that sign-up holds, `username` what the platform's
+/// passkey sheet shows. All three come from the pending sign-up, not from the
+/// request.
+pub async fn start_signup_registration(
+    signup_id: &str,
+    user_handle: &str,
+    username: &str,
+) -> Result<v0::ResponsePasskeyOptions> {
+    let verifier = verifier().await?;
+
+    if !is_challenge_id(signup_id) {
+        return Err(create_error!(InvalidCredentials));
+    }
+
+    let handle = Uuid::parse_str(user_handle).map_err(|_| create_error!(InternalError))?;
+
+    let label = match username.trim() {
+        "" => "Sloga account",
+        name => name,
+    };
+
+    let (response, state) = verifier
+        .webauthn
+        .start_passkey_registration(handle, label, label, None)
+        .map_err(|_| create_error!(InternalError))?;
+
+    let options = creation_options(&response, &verifier.rp_id, &[])?;
+
+    let challenge_id = store_challenge(&StoredChallenge {
+        account_id: None,
+        session_id: None,
+        ceremony: Ceremony::Signup {
+            state,
+            user_handle: handle.to_string(),
+            signup_id: signup_id.to_string(),
+        },
+    })
+    .await?;
+
+    Ok(v0::ResponsePasskeyOptions {
+        challenge_id,
+        options,
+    })
+}
+
+/// Verifies a sign-up passkey; returns the id of the pending sign-up the
+/// challenge was started for and the passkey, NOT stored.
+///
+/// Reads nothing but the challenge id and the response: which sign-up this
+/// is comes from the challenge. Not checked here: whether the credential id
+/// is already registered (`VerifiedPasskey::store` answers `NoEffect`).
+///
+/// Every ceremony failure is `InvalidCredentials`.
+pub async fn finish_signup_registration(
+    challenge_id: &str,
+    credential: Value,
+) -> Result<(String, VerifiedPasskey)> {
+    let verifier = verifier().await?;
+
+    let (state, user_handle, signup_id) = match take_challenge(challenge_id).await? {
+        Some(StoredChallenge {
+            account_id: None,
+            session_id: None,
+            ceremony:
+                Ceremony::Signup {
+                    state,
+                    user_handle,
+                    signup_id,
+                },
+        }) => (state, user_handle, signup_id),
+        _ => return Err(create_error!(InvalidCredentials)),
+    };
+
+    let passkey = verify_registration(verifier, &state, credential, user_handle)?;
+
+    Ok((signup_id, passkey))
+}
+
+/// Recovery: options for whoever holds a recovery token of `account` to
+/// create a new passkey. Bound to (Recover, account.id, token_hash).
+///
+/// The options never list the account's existing credential ids: the token
+/// holder has proven a mailbox, nothing more. The user handle is the one the
+/// account's passkeys already carry, so an authenticator that still holds the
+/// old passkey replaces it.
+pub async fn start_recover_registration(
+    db: &Database,
+    token_hash: &str,
+    account: &Account,
+) -> Result<v0::ResponsePasskeyOptions> {
+    let verifier = verifier().await?;
+
+    if !is_challenge_id(token_hash) {
+        return Err(create_error!(InvalidCredentials));
+    }
+
+    let rows = db.fetch_passkeys(&account.id).await?;
+    let user_handle = match rows.first() {
+        Some(row) => Uuid::parse_str(&row.user_handle).map_err(|_| create_error!(InternalError))?,
+        None => pinned_user_handle(&account.id).await?,
+    };
+
+    let (user_name, display_name) = match db.fetch_user(&account.id).await {
+        Ok(user) => (
+            format!("{}#{}", user.username, user.discriminator),
+            user.display_name.unwrap_or(user.username),
+        ),
+        Err(_) => ("Sloga account".to_string(), "Sloga account".to_string()),
+    };
+
+    let (response, state) = verifier
+        .webauthn
+        .start_passkey_registration(user_handle, &user_name, &display_name, None)
+        .map_err(|_| create_error!(InternalError))?;
+
+    let options = creation_options(&response, &verifier.rp_id, &[])?;
+
+    // Fail closed if the list ever gets in some other way
+    if options.get("excludeCredentials").is_some() {
+        return Err(create_error!(InternalError));
+    }
+
+    let challenge_id = store_challenge(&StoredChallenge {
+        account_id: Some(account.id.clone()),
+        session_id: None,
+        ceremony: Ceremony::Recover {
+            state,
+            user_handle: user_handle.to_string(),
+            token_hash: token_hash.to_string(),
+        },
+    })
+    .await?;
+
+    Ok(v0::ResponsePasskeyOptions {
+        challenge_id,
+        options,
+    })
+}
+
+/// Verifies a recovery passkey for `account` under `token_hash`; returns the
+/// passkey, NOT stored.
+///
+/// `InvalidCredentials` for every ceremony failure, a challenge started for
+/// another account or under another token included; `NoEffect` when the
+/// credential is already registered, on this account or any other.
+pub async fn finish_recover_registration(
+    db: &Database,
+    challenge_id: &str,
+    credential: Value,
+    token_hash: &str,
+    account: &Account,
+) -> Result<VerifiedPasskey> {
+    let verifier = verifier().await?;
+
+    let (state, user_handle) = match take_challenge(challenge_id).await? {
+        Some(StoredChallenge {
+            account_id: Some(for_account),
+            session_id: None,
+            ceremony:
+                Ceremony::Recover {
+                    state,
+                    user_handle,
+                    token_hash: for_token,
+                },
+        }) if for_account == account.id && for_token == token_hash => (state, user_handle),
+        _ => return Err(create_error!(InvalidCredentials)),
+    };
+
+    let passkey = verify_registration(verifier, &state, credential, user_handle)?;
+
+    if db
+        .fetch_passkey_by_credential_id(&passkey.credential_id)
+        .await?
+        .is_some()
+    {
+        return Err(create_error!(NoEffect));
+    }
+
+    Ok(passkey)
+}
+
+// ---------------------------------------------------------------------------
 // Sign-in
 // ---------------------------------------------------------------------------
 
@@ -1035,13 +1427,29 @@ pub async fn start_login() -> Result<v0::ResponsePasskeyOptions> {
     })
 }
 
+/// Who a verified sign-in assertion belongs to, and which passkey made it.
+///
+/// Both values come from the row the assertion was verified against, never
+/// from a string the client sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyLogin {
+    /// The account that owns the passkey
+    pub account_id: String,
+    /// The id of the passkey row (`Passkey::id`), not the credential id
+    pub passkey_id: String,
+}
+
 /// Verifies the assertion, advances the stored credential, returns the
-/// owner's account id.
+/// owner's account id and the id of the passkey row that signed in.
 ///
 /// Every failure (unknown credential, bad signature, orphan row, stale
 /// challenge, lost CAS) is the SAME error: InvalidCredentials. Only a Redis
 /// or database outage, which does not depend on what was sent, says otherwise.
-pub async fn finish_login(db: &Database, challenge_id: &str, credential: Value) -> Result<String> {
+pub async fn finish_login(
+    db: &Database,
+    challenge_id: &str,
+    credential: Value,
+) -> Result<PasskeyLogin> {
     let verifier = verifier().await?;
 
     let state = match take_challenge(challenge_id).await? {
@@ -1092,7 +1500,10 @@ pub async fn finish_login(db: &Database, challenge_id: &str, credential: Value) 
 
     commit_use(db, &row, stored, &result).await?;
 
-    Ok(row.user_id)
+    Ok(PasskeyLogin {
+        account_id: row.user_id,
+        passkey_id: row.id,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,7 +1722,7 @@ mod tests {
             .expect("registration")
     }
 
-    /// A whole sign-in
+    /// A whole sign-in; the account id it signed in
     async fn login_with(
         db: &Database,
         soft: &SoftPasskey,
@@ -1321,7 +1732,9 @@ mod tests {
         let started = start_login().await?;
         let mut credential = soft.get(&started.options, origin);
         tamper(&mut credential);
-        finish_login(db, &started.challenge_id, credential).await
+        finish_login(db, &started.challenge_id, credential)
+            .await
+            .map(|login| login.account_id)
     }
 
     async fn login(db: &Database, soft: &SoftPasskey) -> Result<String> {
@@ -2020,6 +2433,111 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Purge stamp
+    // -----------------------------------------------------------------------
+
+    /// Fails if: `mark_passkeys_purged` writes another key, a value that is
+    /// not the current time in milliseconds, or no expiry; or `purged_since`
+    /// reports a stamp for an account that has none, or reads a stamp that is
+    /// not a number as "no purge".
+    #[test]
+    fn the_purge_stamp_is_per_account_holds_the_time_and_expires() {
+        rt().block_on(async {
+            // The harness reads the config, which tells Redis where to be found
+            let _harness = TestHarness::new().await;
+            let mut conn = get_connection().await.expect("redis").into_inner();
+
+            let purged = Ulid::new().to_string();
+            let other = Ulid::new().to_string();
+            let key = format!("passkey:purged:{purged}");
+            assert_eq!(purged_key(&purged), key);
+
+            assert_eq!(purged_since(&purged).await.expect("read"), None, "never");
+
+            let before = unix_ms_now().expect("clock");
+            mark_passkeys_purged(&purged).await.expect("mark");
+            let after = unix_ms_now().expect("clock");
+
+            let stamp = purged_since(&purged)
+                .await
+                .expect("read")
+                .expect("a stamp");
+            assert!((before..=after).contains(&stamp), "stamp {stamp}");
+            // Milliseconds, the unit of a ULID's time: a session made after
+            // the purge is newer than the stamp, one made before is older
+            assert!(Ulid::new().timestamp_ms() >= stamp);
+            assert!(Ulid::from_string(&purged).expect("ulid").timestamp_ms() <= stamp);
+
+            // Reading does not consume, and another account has no stamp
+            assert_eq!(purged_since(&purged).await.expect("read"), Some(stamp));
+            assert_eq!(purged_since(&other).await.expect("read"), None);
+
+            // The stored value is the number itself, for at most 15 minutes
+            let value: Option<String> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .expect("GET");
+            assert_eq!(value, Some(stamp.to_string()));
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .expect("TTL");
+            assert!((1..=900).contains(&ttl), "ttl {}", ttl);
+
+            // A second purge moves the stamp forward and renews the expiry
+            let _: i64 = redis::cmd("EXPIRE")
+                .arg(&key)
+                .arg(60)
+                .query_async(&mut conn)
+                .await
+                .expect("EXPIRE");
+            mark_passkeys_purged(&purged).await.expect("mark again");
+            let again = purged_since(&purged)
+                .await
+                .expect("read")
+                .expect("a stamp");
+            assert!(again >= stamp);
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .expect("TTL");
+            assert!((61..=900).contains(&ttl), "ttl after a second purge {}", ttl);
+
+            // A stamp that cannot be read is an error, never "no purge"
+            for unreadable in ["", "soon", "-1", "1.5"] {
+                let _: () = redis::cmd("SET")
+                    .arg(&key)
+                    .arg(unreadable)
+                    .arg("EX")
+                    .arg(60)
+                    .query_async(&mut conn)
+                    .await
+                    .expect("SET");
+                assert_eq!(
+                    outcome(purged_since(&purged).await),
+                    "InternalError",
+                    "value {unreadable:?}"
+                );
+            }
+
+            // Expired is deleted
+            let _: i64 = redis::cmd("DEL")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .expect("DEL");
+            assert_eq!(purged_since(&purged).await.expect("read"), None, "expired");
+
+            // No account, no stamp
+            assert_eq!(outcome(mark_passkeys_purged("").await), "InternalError");
+            assert_eq!(outcome(purged_since("").await), "InternalError");
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Round trips
     // -----------------------------------------------------------------------
 
@@ -2572,7 +3090,7 @@ mod tests {
             let db = &harness.db;
             let (account, session, _) = harness.new_user().await;
             let mut soft = SoftPasskey::new();
-            register(db, &account, &session.id, &mut soft).await;
+            let row = register(db, &account, &session.id, &mut soft).await;
 
             // Success, then a replay
             let started = start_login().await.expect("start");
@@ -2581,7 +3099,10 @@ mod tests {
                 finish_login(db, &started.challenge_id, credential.clone())
                     .await
                     .expect("sign-in"),
-                account.id
+                PasskeyLogin {
+                    account_id: account.id.clone(),
+                    passkey_id: row.id.clone(),
+                }
             );
             assert_eq!(
                 outcome(finish_login(db, &started.challenge_id, credential).await),
@@ -3632,6 +4153,501 @@ mod tests {
                 outcome(start_registration(db, &account, "").await),
                 "InvalidSession"
             );
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Sign-up and recovery
+    // -----------------------------------------------------------------------
+
+    /// The Redis blob of a challenge, as JSON
+    async fn challenge_blob(challenge_id: &str) -> Value {
+        let mut conn = get_connection().await.expect("redis").into_inner();
+        let blob: Option<String> = redis::cmd("GET")
+            .arg(challenge_key(challenge_id))
+            .query_async(&mut conn)
+            .await
+            .expect("GET");
+        serde_json::from_str(&blob.expect("blob")).expect("json")
+    }
+
+    /// Fails if: `start_signup_registration` / `finish_signup_registration`
+    /// stop carrying the sign-up id and the handle through the challenge,
+    /// take the credential id from the client, drop the challenge TTL, or
+    /// emit options a client cannot use.
+    #[test]
+    fn signup_round_trip_returns_the_signup_and_a_storable_passkey() {
+        rt().block_on(async {
+            let harness = setup().await;
+            let db = &harness.db;
+            let signup_id = new_challenge_id();
+            let handle = Uuid::new_v4();
+
+            let started = start_signup_registration(&signup_id, &handle.to_string(), "newcomer")
+                .await
+                .expect("start");
+            assert!(is_challenge_id(&started.challenge_id));
+            assert_ne!(started.challenge_id, signup_id);
+            assert_eq!(
+                started.options["user"]["id"],
+                json!(b64u(handle.as_bytes())),
+                "the handle of the pending sign-up"
+            );
+            assert_eq!(started.options["user"]["name"], json!("newcomer"));
+            assert_eq!(
+                started.options["authenticatorSelection"]["residentKey"],
+                json!("required")
+            );
+            assert!(started.options.get("excludeCredentials").is_none());
+            assert_no_extension_members(&started.options, "sign-up");
+
+            // Bound to the sign-up, to no account and no session, for five
+            // minutes
+            let blob = challenge_blob(&started.challenge_id).await;
+            assert_eq!(blob["account_id"], Value::Null);
+            assert_eq!(blob["session_id"], Value::Null);
+            assert_eq!(blob["ceremony"]["Signup"]["signup_id"], json!(signup_id));
+            let mut conn = get_connection().await.expect("redis").into_inner();
+            let ttl: i64 = redis::cmd("TTL")
+                .arg(challenge_key(&started.challenge_id))
+                .query_async(&mut conn)
+                .await
+                .expect("TTL");
+            assert!((1..=300).contains(&ttl), "ttl {}", ttl);
+
+            // The client's `id` string is not what is returned
+            let mut soft = SoftPasskey::new();
+            let mut credential = soft.create(&started.options, WEB_ORIGIN);
+            credential["id"] = json!("AAAA");
+            credential["rawId"] = json!("AAAA");
+            let (for_signup, passkey) =
+                finish_signup_registration(&started.challenge_id, credential)
+                    .await
+                    .expect("finish");
+            assert_eq!(for_signup, signup_id);
+            assert_eq!(passkey.credential_id, b64u(&soft.cred_id));
+            assert_eq!(passkey.user_handle, handle.to_string());
+            assert_eq!(format!("{passkey:?}"), "VerifiedPasskey(..)");
+
+            // Nothing was stored; once stored on a new account it signs in
+            assert!(db
+                .fetch_passkey_by_credential_id(&b64u(&soft.cred_id))
+                .await
+                .unwrap()
+                .is_none());
+            let (account, _, _) = harness.new_no_email_user().await;
+            let row = passkey
+                .store(db, &account.id, None)
+                .await
+                .expect("store");
+            assert_eq!(row.user_id, account.id);
+            assert_eq!(row.name, "Passkey");
+            assert_eq!(row.user_handle, handle.to_string());
+            assert_eq!(login(db, &soft).await.expect("sign-in"), account.id);
+
+            // The same credential on a second sign-up: one fixed answer
+            let again = start_signup_registration(&new_challenge_id(), &handle.to_string(), "x")
+                .await
+                .expect("start");
+            let (_, duplicate) = finish_signup_registration(
+                &again.challenge_id,
+                soft.create(&again.options, WEB_ORIGIN),
+            )
+            .await
+            .expect("the ceremony itself passes");
+            let (other, _, _) = harness.new_no_email_user().await;
+            assert_eq!(
+                outcome(duplicate.store(db, &other.id, None).await),
+                "NoEffect"
+            );
+            assert_eq!(db.count_passkeys(&other.id).await.unwrap(), 0);
+
+            // A malformed sign-up id starts nothing
+            for id in [
+                String::new(),
+                "x".to_string(),
+                "F".repeat(64),
+                "f".repeat(63),
+            ] {
+                assert_eq!(
+                    outcome(start_signup_registration(&id, &handle.to_string(), "x").await),
+                    REFUSED,
+                    "id {id:?}"
+                );
+            }
+        })
+    }
+
+    /// Fails if: `finish_signup_registration` reads the challenge with GET
+    /// instead of GETDEL, or a failed finish stops spending it.
+    #[test]
+    fn a_signup_challenge_cannot_be_finished_twice() {
+        rt().block_on(async {
+            let _harness = setup().await;
+            let handle = Uuid::new_v4().to_string();
+
+            // Success, then the same id and response again
+            let started = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            finish_signup_registration(&started.challenge_id, credential.clone())
+                .await
+                .expect("first finish");
+            assert_eq!(
+                outcome(finish_signup_registration(&started.challenge_id, credential).await),
+                REFUSED,
+                "replay"
+            );
+
+            // A failed finish burns it for the good response too
+            let started = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            assert_eq!(
+                outcome(finish_signup_registration(&started.challenge_id, json!({})).await),
+                REFUSED,
+                "garbage"
+            );
+            assert_eq!(
+                outcome(finish_signup_registration(&started.challenge_id, credential).await),
+                REFUSED,
+                "burned by the failed finish"
+            );
+
+            // Unknown and malformed ids
+            let started = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            for id in ["f".repeat(64), "x".to_string(), String::new()] {
+                assert_eq!(
+                    outcome(finish_signup_registration(&id, credential.clone()).await),
+                    REFUSED,
+                    "id {id:?}"
+                );
+            }
+        })
+    }
+
+    /// Fails if: `finish_signup_registration` accepts another `Ceremony`
+    /// variant, or `finish_registration` / `finish_recover_registration`
+    /// accept a `Signup` challenge.
+    #[test]
+    fn signup_and_account_challenges_do_not_cross() {
+        rt().block_on(async {
+            let harness = setup().await;
+            let db = &harness.db;
+            let (alice, session, _) = harness.new_user().await;
+            let handle = Uuid::new_v4().to_string();
+            let token_hash = new_challenge_id();
+
+            // A sign-up challenge finished as an account registration and as
+            // a recovery
+            let signup = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&signup.options, WEB_ORIGIN);
+            let as_register = finish_registration(
+                db,
+                &alice,
+                &session.id,
+                &signup.challenge_id,
+                credential,
+                None,
+            )
+            .await;
+            assert_eq!(outcome(as_register), REFUSED, "sign-up as registration");
+
+            let signup = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&signup.options, WEB_ORIGIN);
+            let as_recover = finish_recover_registration(
+                db,
+                &signup.challenge_id,
+                credential,
+                &token_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(as_recover), REFUSED, "sign-up as recovery");
+            assert_eq!(db.count_passkeys(&alice.id).await.unwrap(), 0);
+
+            // Every other challenge finished as a sign-up (alice needs a
+            // passkey for the ticket start)
+            let registration = start_registration(db, &alice, &session.id)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&registration.options, WEB_ORIGIN);
+            assert_eq!(
+                outcome(finish_signup_registration(&registration.challenge_id, credential).await),
+                REFUSED,
+                "registration as sign-up"
+            );
+
+            let recovery = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&recovery.options, WEB_ORIGIN);
+            assert_eq!(
+                outcome(finish_signup_registration(&recovery.challenge_id, credential).await),
+                REFUSED,
+                "recovery as sign-up"
+            );
+
+            let mut first = SoftPasskey::new();
+            register(db, &alice, &session.id, &mut first).await;
+            let login_id = start_login().await.expect("start login").challenge_id;
+            let ticket_id = start_assertion(db, &alice, &session.id)
+                .await
+                .expect("start assertion")
+                .challenge_id;
+            for (what, foreign_id) in [("sign-in", login_id), ("ticket", ticket_id)] {
+                let signup = start_signup_registration(&new_challenge_id(), &handle, "newcomer")
+                    .await
+                    .expect("start");
+                let credential = SoftPasskey::new().create(&signup.options, WEB_ORIGIN);
+                assert_eq!(
+                    outcome(finish_signup_registration(&foreign_id, credential).await),
+                    REFUSED,
+                    "{what} as sign-up"
+                );
+            }
+
+            assert_eq!(db.count_passkeys(&alice.id).await.unwrap(), 1);
+        })
+    }
+
+    /// Fails if: `start_recover_registration` passes the account's rows to
+    /// `creation_options` (or to the library) as an exclude list.
+    #[test]
+    fn recover_options_do_not_list_the_accounts_credentials() {
+        rt().block_on(async {
+            let harness = setup().await;
+            let db = &harness.db;
+            let (account, session, _) = harness.new_user().await;
+            let mut soft = SoftPasskey::new();
+            let row = register(db, &account, &session.id, &mut soft).await;
+
+            let started = start_recover_registration(db, &new_challenge_id(), &account)
+                .await
+                .expect("start");
+            assert!(
+                started.options.get("excludeCredentials").is_none(),
+                "{}",
+                started.options
+            );
+            assert!(
+                !started.options.to_string().contains(&row.credential_id),
+                "the options name an existing credential"
+            );
+            assert_no_extension_members(&started.options, "recovery");
+            assert_eq!(
+                started.options["authenticatorSelection"]["residentKey"],
+                json!("required")
+            );
+
+            // The handle is the one the account already has
+            let handle = Uuid::parse_str(&row.user_handle).expect("uuid");
+            assert_eq!(
+                started.options["user"]["id"],
+                json!(b64u(handle.as_bytes()))
+            );
+
+            // Nothing about the credential is in the stored state either
+            let blob = challenge_blob(&started.challenge_id).await;
+            assert!(!blob.to_string().contains(&row.credential_id));
+            assert_eq!(blob["account_id"], json!(account.id));
+            assert_eq!(blob["session_id"], Value::Null);
+
+            // The control: a signed-in registration does list it
+            let listed = start_registration(db, &account, &session.id)
+                .await
+                .expect("start");
+            assert_eq!(
+                listed.options["excludeCredentials"][0]["id"],
+                json!(row.credential_id)
+            );
+
+            // A malformed token hash starts nothing
+            for hash in [String::new(), "token".to_string(), "F".repeat(64)] {
+                assert_eq!(
+                    outcome(start_recover_registration(db, &hash, &account).await),
+                    REFUSED,
+                    "hash {hash:?}"
+                );
+            }
+        })
+    }
+
+    /// Fails if: `finish_recover_registration` drops the account or the token
+    /// hash from its match guard, stops spending the challenge, or loses the
+    /// duplicate check.
+    #[test]
+    fn a_recover_challenge_is_bound_to_the_token_and_the_account() {
+        rt().block_on(async {
+            let harness = setup().await;
+            let db = &harness.db;
+            let (alice, alice_session, _) = harness.new_user().await;
+            let (bob, _, _) = harness.new_user().await;
+            let mut old = SoftPasskey::new();
+            register(db, &alice, &alice_session.id, &mut old).await;
+            let token_hash = new_challenge_id();
+            let other_hash = new_challenge_id();
+
+            // Another token hash, and the attempt burns the challenge
+            let started = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            let wrong_token = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                credential.clone(),
+                &other_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(wrong_token), REFUSED, "another token");
+            let burned = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                credential,
+                &token_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(burned), REFUSED, "burned by the failed finish");
+
+            // Another account under the right token hash
+            let started = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            let wrong_account = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                credential,
+                &token_hash,
+                &bob,
+            )
+            .await;
+            assert_eq!(outcome(wrong_account), REFUSED, "another account");
+
+            // A registration challenge of the same account is not a recovery
+            let registration = start_registration(db, &alice, &alice_session.id)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&registration.options, WEB_ORIGIN);
+            let crossed = finish_recover_registration(
+                db,
+                &registration.challenge_id,
+                credential,
+                &token_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(crossed), REFUSED, "registration as recovery");
+
+            // And a recovery challenge is not a registration
+            let started = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let credential = SoftPasskey::new().create(&started.options, WEB_ORIGIN);
+            let crossed = finish_registration(
+                db,
+                &alice,
+                &alice_session.id,
+                &started.challenge_id,
+                credential,
+                None,
+            )
+            .await;
+            assert_eq!(outcome(crossed), REFUSED, "recovery as registration");
+
+            // A credential that is already registered: one fixed answer
+            let started = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let duplicate = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                old.create(&started.options, WEB_ORIGIN),
+                &token_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(duplicate), "NoEffect");
+
+            // The right token, the right account: verified, nothing stored
+            let mut fresh = SoftPasskey::new();
+            let started = start_recover_registration(db, &token_hash, &alice)
+                .await
+                .expect("start");
+            let credential = fresh.create(&started.options, WEB_ORIGIN);
+            let passkey = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                credential.clone(),
+                &token_hash,
+                &alice,
+            )
+            .await
+            .expect("finish");
+            assert_eq!(passkey.credential_id, b64u(&fresh.cred_id));
+            assert_eq!(passkey.user_handle, only_row(db, &alice).await.user_handle);
+            assert_eq!(db.count_passkeys(&alice.id).await.unwrap(), 1);
+
+            let replay = finish_recover_registration(
+                db,
+                &started.challenge_id,
+                credential,
+                &token_hash,
+                &alice,
+            )
+            .await;
+            assert_eq!(outcome(replay), REFUSED, "replay");
+
+            // Stored, it signs in as the account
+            passkey
+                .store(db, &alice.id, Some("  Recovered "))
+                .await
+                .expect("store");
+            assert_eq!(login(db, &fresh).await.expect("sign-in"), alice.id);
+            assert_eq!(db.count_passkeys(&bob.id).await.unwrap(), 0);
+        })
+    }
+
+    /// Fails if: any of the four sign-up / recovery entry points stops
+    /// calling `verifier()` first.
+    #[test]
+    fn feature_off_refuses_the_signup_and_recover_entry_points() {
+        rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.passkeys.available = false;
+                settings.features.passkeys.rp_id = RP_ID.to_string();
+                settings.features.passkeys.origins = vec![WEB_ORIGIN.to_string()];
+            })
+            .await;
+            let harness = TestHarness::new().await;
+            let (account, _, _) = harness.new_user().await;
+            let db = &harness.db;
+            let id = "0".repeat(64);
+            let handle = Uuid::new_v4().to_string();
+            let off = "FeatureDisabled";
+
+            assert!(outcome(start_signup_registration(&id, &handle, "x").await).starts_with(off));
+            assert!(outcome(finish_signup_registration(&id, json!({})).await).starts_with(off));
+            assert!(outcome(start_recover_registration(db, &id, &account).await).starts_with(off));
+            assert!(outcome(
+                finish_recover_registration(db, &id, json!({}), &id, &account).await
+            )
+            .starts_with(off));
+
+            // Even with arguments that would be refused for another reason
+            assert!(outcome(start_signup_registration("x", "x", "").await).starts_with(off));
         })
     }
 }

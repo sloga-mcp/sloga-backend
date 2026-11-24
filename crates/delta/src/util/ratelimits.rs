@@ -1837,4 +1837,76 @@ mod tests {
             Status::Ok
         );
     }
+
+    /// Fails if: a recovery route leaves the passkey counter (the passkey
+    /// arm is narrowed or moved below the auth arm), or an add-an-email
+    /// route stops resolving to "auth" (it sits under /auth/account, not
+    /// /auth/passkey, so the passkey arm does not match it) or falls to
+    /// "any".
+    #[test]
+    fn recovery_and_add_email_routes_resolve_to_their_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = passkey_client();
+
+        // The resolver, including the versioned prefix. Every route here is
+        // a POST.
+        for (path, expected) in [
+            ("/auth/passkey/recover/send", "passkey"),
+            ("/auth/passkey/recover/start", "passkey"),
+            ("/auth/passkey/recover/finish", "passkey"),
+            ("/0.8/auth/passkey/recover/send", "passkey"),
+            ("/0.8/auth/passkey/recover/start", "passkey"),
+            ("/0.8/auth/passkey/recover/finish", "passkey"),
+            // The rest of sign-up shares it too
+            ("/auth/passkey/signup/code", "passkey"),
+            ("/auth/passkey/signup/resend", "passkey"),
+            ("/auth/passkey/signup/options", "passkey"),
+            ("/auth/passkey/signup/finish", "passkey"),
+            // Add an email: an account route, on the login and MFA counter
+            ("/auth/account/email/add/start", "auth"),
+            ("/auth/account/email/add/finish", "auth"),
+            ("/0.8/auth/account/email/add/start", "auth"),
+            ("/0.8/auth/account/email/add/finish", "auth"),
+        ] {
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*client.post(path)),
+                (expected, None),
+                "POST {path}"
+            );
+        }
+
+        // Through the fairing. Nothing is mounted at these paths, so each
+        // request 404s after the fairing has counted it. With no session,
+        // recovery is keyed by the caller's address and spends the counter
+        // passkey sign-in spends.
+        let login = client.post("/auth/passkey/login/start").dispatch();
+        assert_eq!(limit(&login), 15);
+        let send = client.post("/auth/passkey/recover/send").dispatch();
+        assert_eq!(limit(&send), 15);
+        assert_eq!(bucket(&send), bucket(&login));
+        let finish = client.post("/auth/passkey/recover/finish").dispatch();
+        assert_eq!(bucket(&finish), bucket(&login));
+        assert_eq!(
+            finish.headers().get_one("X-RateLimit-Remaining"),
+            Some("12"),
+            "recovery spent the passkey counter"
+        );
+
+        // Add an email spends the counter password login spends, not the
+        // passkey one
+        let password = client.post("/auth/session/login").dispatch();
+        assert_eq!(limit(&password), 15);
+        let add_start = client.post("/auth/account/email/add/start").dispatch();
+        assert_eq!(limit(&add_start), 15);
+        assert_eq!(bucket(&add_start), bucket(&password));
+        let add_finish = client.post("/auth/account/email/add/finish").dispatch();
+        assert_eq!(bucket(&add_finish), bucket(&password));
+        assert_eq!(
+            add_finish.headers().get_one("X-RateLimit-Remaining"),
+            Some("12"),
+            "add-an-email spent the auth counter"
+        );
+        assert_ne!(bucket(&add_start), bucket(&send));
+    }
 }

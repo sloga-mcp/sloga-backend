@@ -596,6 +596,7 @@ mod test {
                 google_id: None,
                 apple_id: None,
                 password_absent: false,
+                email_absent: false,
             })
             .await
             .expect("save account");
@@ -1206,6 +1207,7 @@ mod test {
             google_id: None,
             apple_id: None,
             password_absent: false,
+            email_absent: false,
         };
 
         assert!(matches!(
