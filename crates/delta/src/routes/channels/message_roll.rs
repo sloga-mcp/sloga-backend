@@ -1,3 +1,6 @@
+use revolt_config::config;
+use revolt_database::util::antispam;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -62,8 +65,27 @@ pub async fn message_roll(
         return Err(create_error!(ChannelProtected));
     }
 
+    // A roll is a plain message too, which an encrypted-only account or
+    // group never takes. Refused in the same place as above: after the
+    // SendMessage check, before slowmode and the nonce.
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await?;
+
     // Archived or locked threads reject rolls exactly like normal messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
+
+    // A paused account cannot reach a stranger through a roll either.
+    // Checked before any side effect (slowmode key, nonce, message). No
+    // observer: the content is built from the parsed dice notation.
+    let dm_peer = if let Channel::DirectMessage { recipients, .. } = &channel {
+        recipients.iter().find(|id| *id != &user.id).cloned()
+    } else {
+        None
+    };
+    if let Some(peer) = &dm_peer {
+        let antispam = config().await.features.antispam.clone();
+        antispam::dm_send_allowed(db, &antispam, &user, channel.id(), peer).await?;
+    }
 
     crate::util::slowmode::enforce_slowmode(&user, &channel, &permissions).await?;
 
@@ -124,11 +146,19 @@ pub async fn message_roll(
 
 #[cfg(test)]
 mod test {
-    use crate::{rocket, util::test::TestHarness};
+    use crate::{
+        rocket,
+        util::test::{statement_at, without_comments, without_whitespace, TestHarness},
+    };
     use revolt_database::MessageFlagsValue;
     use revolt_models::v0::{self, MessageFlags};
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::json;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_marked_group, e2ee_messages_in,
+        e2ee_request, set_e2ee_only,
+    };
 
     #[test]
     fn roll_dice_creates_flagged_message() {
@@ -240,6 +270,243 @@ mod test {
             Status::Ok,
             "regular send must not accept the DiceRoll flag"
         );
+    }
+
+    /// A roll into a direct message or group is refused for each side, and
+    /// stores nothing and spends no nonce. Control: with the flags lifted
+    /// the same roll, nonce included, is sent.
+    #[test]
+    fn e2ee_only_roll_refused_without_side_effects() {
+        crate::util::test::rt()
+            .block_on(Box::pin(e2ee_only_roll_refused_without_side_effects_case()))
+    }
+
+    async fn e2ee_only_roll_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let dm_path = format!("/channels/{}/roll", dm.id());
+        let group_path = format!("/channels/{}/roll", group.id());
+        let roll = json!({ "notation": "1d20", "nonce": ulid::Ulid::new().to_string() });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &peer_session,
+            Some(&json!({ "notation": "1d20" })),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "the encrypted-only peer rolling back");
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &group_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_encryption_required(&answer, "group", "a marked group");
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 0, "the DM");
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 0, "the group");
+
+        // Control: no flags, the same roll and nonce
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_accepted(&answer, "no flags, the refused rolls' nonce");
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 1);
+    }
+
+    /// With `only_enforced = false` the same rolls are sent
+    #[test]
+    fn e2ee_only_roll_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_roll_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_roll_allowed_when_not_enforced_case() {
+        assert!(
+            !revolt_config::config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (session, channel_id, case) in [
+            (
+                &author_session,
+                dm.id(),
+                "an encrypted-only author and peer",
+            ),
+            (&peer_session, dm.id(), "the peer rolling back"),
+            (&author_session, group.id(), "a marked group"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &format!("/channels/{channel_id}/roll"),
+                session,
+                Some(&json!({ "notation": "1d20" })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 2);
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 1);
+    }
+
+    /// A paused account cannot reach a stranger who never wrote back with a
+    /// roll, and nothing is stored; once the stranger has written, the same
+    /// roll is sent
+    #[test]
+    #[ignore = "needs REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"]
+    fn antispam_route_roll_paused_refused() {
+        crate::util::test::rt().block_on(Box::pin(antispam_route_roll_paused_refused_case()))
+    }
+
+    async fn antispam_route_roll_paused_refused_case() {
+        assert!(
+            revolt_config::config()
+                .await
+                .features
+                .antispam
+                .dm_dupe_enabled,
+            "run with REVOLT__FEATURES__ANTISPAM__DM_DUPE_ENABLED=true"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, author, _, peer, dm) = e2ee_dm(&harness).await;
+        let dm_path = format!("/channels/{}/roll", dm.id());
+        let roll = json!({ "notation": "1d20", "nonce": ulid::Ulid::new().to_string() });
+
+        // Pause the author the way the detector would; the route loads the
+        // caller from the session on every request
+        let now = revolt_database::iso8601_timestamp::Timestamp::now_utc();
+        assert!(
+            harness
+                .db
+                .claim_dm_guard(
+                    &author.id,
+                    &revolt_database::DmGuard {
+                        report_id: ulid::Ulid::new().to_string(),
+                        flagged_at: now,
+                        paused: true,
+                        cleared_at: None,
+                        recipients: 3,
+                        fingerprint: "test".into(),
+                    },
+                    now,
+                )
+                .await
+                .expect("claim_dm_guard"),
+            "the fresh user must take the guard"
+        );
+
+        let (status, body) = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_eq!(status, Status::Forbidden, "{body}");
+        assert_eq!(body["type"], "DirectMessagesPaused", "{body}");
+        assert_eq!(
+            e2ee_messages_in(&harness, dm.id()).await,
+            0,
+            "nothing stored"
+        );
+
+        // The stranger writes: a real conversation, and the same roll and
+        // nonce go through
+        harness
+            .db
+            .insert_message(&revolt_database::Message {
+                id: ulid::Ulid::new().to_string(),
+                channel: dm.id().to_string(),
+                author: peer.id.clone(),
+                content: Some("hello".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("reply");
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&roll),
+        )
+        .await;
+        assert_accepted(&answer, "a peer who wrote back");
+    }
+
+    /// Both direct message gates run before every side effect of the route:
+    /// the slowmode key, the nonce and the message
+    #[test]
+    fn the_plain_write_gates_precede_every_side_effect() {
+        let source = include_str!("message_roll.rs");
+        let shipping = &source[..source.find("#[cfg(test)]").expect("a test module")];
+        let code = without_whitespace(&without_comments(shipping));
+
+        for gate in [
+            "e2ee_only::plain_write_allowed(db,&e2ee_config,&user,&channel,None).await?;",
+            "antispam::dm_send_allowed(db,&antispam,&user,channel.id(),peer).await?;",
+        ] {
+            let gate_at = statement_at(&code, gate);
+            for side_effect in [
+                "crate::util::slowmode::enforce_slowmode(&user,&channel,&permissions).await?;",
+                "idempotency.consume_nonce(data.nonce).await.map_err(|_|create_error!(InvalidOperation))?;",
+            ] {
+                assert!(
+                    gate_at < statement_at(&code, side_effect),
+                    "`{gate}` must precede `{side_effect}`"
+                );
+            }
+        }
     }
 }
 

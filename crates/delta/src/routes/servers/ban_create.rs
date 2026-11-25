@@ -6,7 +6,8 @@ use revolt_database::{
     },
     voice::{remove_user_from_server_voice, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Database, Message,
-    RemovalIntention, RemovalOutcome, ServerBan, User,
+    RemovalIntention, RemovalOutcome, ServerBan, User, PROTECTED_SCOPE_SEATS,
+    PROTECTED_SCOPE_TEXT_GROUP,
 };
 use revolt_models::v0;
 use std::time::{Duration, SystemTime};
@@ -17,6 +18,8 @@ use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use ulid::Ulid;
 use validator::Validate;
+
+use super::member_remove::refuse_removal_without_reason;
 
 /// # Ban User
 ///
@@ -68,7 +71,8 @@ pub async fn ban(
     //    request created is then recorded in the audit log, before the
     //    eviction, so an eviction error cannot lose the entry.
     // 4. The target's seats in the server's protected channels are released,
-    //    member or not (protected channels 6.3).
+    //    member or not (protected channels 6.3), and each channel the release
+    //    wrote is announced (7.5).
     // 5. The target is evicted from every call in the server, member or not.
     //    A failed removal or release (step 3 or 4) is answered only now, so
     //    it skips neither the record nor the eviction (audit C3).
@@ -108,11 +112,18 @@ pub async fn ban(
     // `newly_banned` is set only when this request's create succeeded; an
     // existing ban, or one a concurrent request won the insert for (that
     // request records its own), is not.
+    //
+    // Protected channels 6.3 (S2-D20, O-2): a new ban in a server with a
+    // protected channel needs a reason, member, seated or not, checked
+    // BEFORE the create so a refusal persists nothing. The reason is the
+    // sanitized body reason the entry records (blank is none), never a
+    // header. An "already banned" retry records nothing, so it needs none.
     let audit_reason = data.reason.as_deref().and_then(sanitize_reason_text);
     let mut newly_banned = false;
     let ban = match db.fetch_ban(&server.id, target.id).await {
         Ok(existing) => existing,
         Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+            refuse_removal_without_reason(db, &server.id, audit_reason.as_deref()).await?;
             match ServerBan::create(db, &server, target.id, data.reason).await {
                 Ok(ban) => {
                     newly_banned = true;
@@ -185,6 +196,24 @@ pub async fn ban(
         .release_channel_seats_for_user(target.id, Some(&server.id), Timestamp::now_utc())
         .await;
 
+    // 7.5 (S2-D18, W2 audit MAJOR-1): each channel the release wrote is
+    // announced on its own topic (viewers only), right away, so neither the
+    // eviction nor the purge failing can lose it. The release returns one
+    // list for its seat releases, pending removals and `signer_lost` writes,
+    // so both scopes go out. A failed release (`Err`) announces nothing: its
+    // transaction wrote nothing, and the retry's release announces.
+    for channel_id in released.iter().flatten() {
+        EventV1::ProtectedChannelChanged {
+            id: channel_id.clone(),
+            scope: vec![
+                PROTECTED_SCOPE_SEATS.to_string(),
+                PROTECTED_SCOPE_TEXT_GROUP.to_string(),
+            ],
+        }
+        .p(channel_id.clone())
+        .await;
+    }
+
     // Outside the member check (S-3 F-4): a hit-and-run spammer who already
     // left can still hold a connection. Every call in the server is reached,
     // not only the one the per-server pointer names (S-3 F-3).
@@ -215,6 +244,7 @@ pub(crate) mod test {
     use crate::util::test::TestHarness;
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
+        events::client::EventV1,
         seat_cooldown_until,
         voice::{
             create_voice_state, delete_channel_node, delete_channel_voice_state,
@@ -223,7 +253,8 @@ pub(crate) mod test {
             UserVoiceChannel,
         },
         AuditLogAction, AuditLogChange, AuditLogEntry, AuditValue, Channel, ChannelSeat, Database,
-        Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember, Server,
+        Member, Message, MlsGroup, MlsGroupKind, MlsMemberDevice, MongoDb, PartialMember,
+        SeatReleaseCause, Server, PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1278,6 +1309,8 @@ pub(crate) mod test {
             seated_at: Timestamp::now_utc(),
             released_at: None,
             cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
         };
         match db {
             Database::Reference(reference) => {
@@ -1332,8 +1365,9 @@ pub(crate) mod test {
             .block_on(a_ban_releases_the_targets_seats_in_that_server_only_case())
     }
 
-    /// A seated member is banned: their seat in the server's protected
-    /// channel is released and cooling. Their seat in another server's
+    /// A seated member who had received the keys is banned: their seat in
+    /// the server's protected channel is released and cooling. Their seat
+    /// in another server's
     /// protected channel, and the owner's seat, stay active. Mutations: every
     /// release dropped (the ban's and `Member::remove`'s); the release
     /// unscoped (`None`).
@@ -1347,6 +1381,9 @@ pub(crate) mod test {
         let (_elsewhere, elsewhere) = harness.new_protectable_channel(&owner).await;
         harness.grant_entitlement(&elsewhere, 10, None).await;
         seat_raw(&harness.db, elsewhere.id(), &target.id).await;
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
         assert!(
             seat_of(&harness.db, protected.channel.id(), &target.id)
                 .await
@@ -1389,8 +1426,9 @@ pub(crate) mod test {
     }
 
     /// A former member still seated (the membership gone, the seat left
-    /// behind, as by a removal whose second release failed) is banned: the
-    /// ban releases the seat with no member to remove, and records the ban.
+    /// behind, as by a removal whose second release failed; the keys
+    /// received) is banned: the ban releases the seat with no member to
+    /// remove, and records the ban.
     /// Mutations: the ban's release dropped; the release moved inside the
     /// member check.
     async fn a_ban_releases_a_former_members_seat_case() {
@@ -1424,6 +1462,9 @@ pub(crate) mod test {
                 .is_active(),
             "precondition: the former member is still seated"
         );
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
 
         let response = ban_user(
             &harness,
@@ -1442,6 +1483,123 @@ pub(crate) mod test {
         let entries = audit_entries(&harness, &protected.server.id).await;
         assert_eq!(entries.len(), 1, "one ban, one audit entry: {entries:?}");
         ban_entry(&entries, &owner.id, &target.id);
+    }
+
+    /// The 7.5 event a ban's release publishes for `channel_id`
+    fn ban_release_event(channel_id: &str) -> impl Fn(&EventV1) -> bool + '_ {
+        move |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+            if id == channel_id
+                && *scope
+                    == vec![
+                        PROTECTED_SCOPE_SEATS.to_string(),
+                        PROTECTED_SCOPE_TEXT_GROUP.to_string(),
+                    ])
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_announces_the_former_members_released_seat() {
+        crate::util::test::rt().block_on(a_ban_announces_the_former_members_released_seat_case())
+    }
+
+    /// 7.5 (S2-D18, W2 audit MAJOR-1): a ban that releases a former
+    /// member's seat publishes `ProtectedChannelChanged` on that channel's
+    /// topic. A former member, so no `Member::remove` runs: the event is the
+    /// ban's own. Control: the ban's publish dropped.
+    async fn a_ban_announces_the_former_members_released_seat_case() {
+        let mut harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let channel_id = protected.channel.id().to_string();
+        let member = harness
+            .db
+            .fetch_member(&protected.server.id, &target.id)
+            .await
+            .expect("the target joined");
+        harness
+            .db
+            .soft_delete_member(&member.id)
+            .await
+            .expect("the membership removed, the seat left behind");
+        assert!(
+            seat_of(&harness.db, &channel_id, &target.id)
+                .await
+                .is_active(),
+            "precondition: the former member is still seated"
+        );
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "left",
+        )
+        .await;
+        ban_answered(response, "banning a seated former member").await;
+
+        assert!(
+            !seat_of(&harness.db, &channel_id, &target.id)
+                .await
+                .is_active(),
+            "the ban released the seat"
+        );
+        harness
+            .wait_for_event(&channel_id, ban_release_event(&channel_id))
+            .await;
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_that_releases_nothing_announces_nothing() {
+        crate::util::test::rt().block_on(a_ban_that_releases_nothing_announces_nothing_case())
+    }
+
+    /// 7.5: a ban of a user who holds no seat in the protected server (never
+    /// a member) releases nothing, so no `ProtectedChannelChanged` reaches
+    /// the channel's topic. A marker on the owner's private topic is
+    /// published and awaited first: the harness reads every topic through
+    /// ONE subscription, FIFO, and the route awaited its publishes before it
+    /// answered, so anything it published is buffered by then.
+    async fn a_ban_that_releases_nothing_announces_nothing_case() {
+        let mut harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness.new_protected_channel(&owner, &session_a, &[]).await;
+        let channel_id = protected.channel.id().to_string();
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "never seated",
+        )
+        .await;
+        ban_answered(response, "banning a user with no seat").await;
+
+        let marker = ulid::Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: marker.clone(),
+            user: owner.id.clone(),
+            message_id: marker.clone(),
+        }
+        .private(owner.id.clone())
+        .await;
+        harness
+            .wait_for_event(&format!("{}!", owner.id), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+        harness.assert_no_buffered_event(&channel_id, |event| {
+            matches!(event, EventV1::ProtectedChannelChanged { .. })
+        });
     }
 
     // Compile-only without RabbitMQ and Redis: see the section note above.
@@ -1463,6 +1621,10 @@ pub(crate) mod test {
             .new_protected_channel(&owner, &session_a, &[&target])
             .await;
         let server_id = protected.server.id.clone();
+        // The target had received the keys, in both channels below
+        harness
+            .mark_keys_received(protected.channel.id(), &target.id)
+            .await;
 
         let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "first").await;
         ban_answered(response, "the first ban").await;
@@ -1477,6 +1639,7 @@ pub(crate) mod test {
         let later = harness.new_channel(&server).await;
         harness.grant_entitlement(&later, 10, None).await;
         seat_raw(&harness.db, later.id(), &target.id).await;
+        harness.mark_keys_received(later.id(), &target.id).await;
 
         let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "second").await;
         let ban = ban_answered(response, "banning an already banned user").await;
@@ -1491,6 +1654,47 @@ pub(crate) mod test {
             entries.len(),
             1,
             "an already-banned retry must write no second audit entry: {entries:?}"
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_frees_a_never_joined_seat_at_once() {
+        crate::util::test::rt().block_on(a_ban_frees_a_never_joined_seat_at_once_case())
+    }
+
+    /// 2.3 (S2-D21): banning a seated member who never received the keys
+    /// releases the seat as `DeviceNeverJoined` with no cooldown, so the
+    /// slot is free at once
+    async fn a_ban_frees_a_never_joined_seat_at_once_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &protected.server.id,
+            &target.id,
+            "never joined",
+        )
+        .await;
+        ban_answered(response, "banning a never-joined member").await;
+
+        let seat = seat_of(&harness.db, protected.channel.id(), &target.id).await;
+        assert!(!seat.is_active(), "released: {seat:?}");
+        assert_eq!(
+            seat.release_cause,
+            Some(SeatReleaseCause::DeviceNeverJoined),
+            "{seat:?}"
+        );
+        assert_eq!(seat.cooldown_until, None, "{seat:?}");
+        assert!(
+            !seat.is_cooling(Timestamp::now_utc()),
+            "a never-joined seat must not cool: {seat:?}"
         );
     }
 
@@ -1524,8 +1728,10 @@ pub(crate) mod test {
         // An active seat whose release is refused: a collection validator
         // admits no `channel_seats` row with `released_at` set. (An
         // undecodable row no longer fails a release: since C9 the release
-        // projects and `update_many`s, decoding no row.)
+        // projects and `update_many`s, decoding no row.) The keys were
+        // received, so the release cools; stamped before the validator.
         seat_raw(&harness.db, channel.id(), &target.id).await;
+        harness.mark_keys_received(channel.id(), &target.id).await;
         let seat_validator = |validator: Document| {
             doc! {
                 "collMod": "channel_seats",
@@ -1631,6 +1837,9 @@ pub(crate) mod test {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
         mongo
             .col::<MlsGroup>("mls_groups")
@@ -1720,6 +1929,14 @@ pub(crate) mod test {
             &[&owner.id, &target.id],
         )
         .await;
+        // Cools via the Text group naming the target: pre-S2 fallback `text_group_user_ids`, W1 (l)
+        assert_eq!(
+            seat_of(&harness.db, protected.channel.id(), &target.id)
+                .await
+                .keys_received_at,
+            None,
+            "precondition: the target never received the keys"
+        );
 
         let channel = voice_channel(&harness, &protected.server, "Ended").await;
         let uvc = UserVoiceChannel::from_channel(&channel);
@@ -1780,6 +1997,370 @@ pub(crate) mod test {
             "the banned member's seat",
         );
         let entries = audit_entries(&harness, &server_id).await;
+        assert_eq!(
+            entries.len(),
+            1,
+            "the retry records no second ban: {entries:?}"
+        );
+    }
+
+    // ---- protected channels: the removal reason (6.3, S2-D20) --------------
+    //
+    // In a server with a protected channel a new ban needs a reason, member,
+    // seated or not (O-2). It is the body reason, sanitized as the audit
+    // entry records it; the check is the kick's
+    // (`member_remove::refuse_removal_without_reason`).
+
+    /// Whether `user_id` holds an active seat in `channel_id`
+    async fn seated(harness: &TestHarness, channel_id: &str, user_id: &str) -> bool {
+        harness
+            .db
+            .fetch_channel_seats(channel_id)
+            .await
+            .expect("the seats read")
+            .iter()
+            .any(|seat| seat.user_id == user_id && seat.is_active())
+    }
+
+    /// Whether `user_id` is banned from `server_id`, failing on any read
+    /// error but NotFound
+    async fn banned(harness: &TestHarness, server_id: &str, user_id: &str) -> bool {
+        match harness.db.fetch_ban(server_id, user_id).await {
+            Ok(_) => true,
+            Err(error) if matches!(error.error_type, ErrorType::NotFound) => false,
+            Err(error) => panic!("the ban read failed: {:?}", error),
+        }
+    }
+
+    /// Every `member_ban_add` entry of `server_id`
+    async fn ban_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        audit_entries(harness, server_id)
+            .await
+            .into_iter()
+            .filter(|entry| entry.action == AuditLogAction::MemberBanAdd)
+            .collect()
+    }
+
+    /// The status and the JSON body of a response
+    async fn answer(
+        response: rocket::local::asynchronous::LocalResponse<'_>,
+    ) -> (Status, serde_json::Value) {
+        let status = response.status();
+        let body = response.into_string().await.unwrap_or_default();
+        let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+        (status, value)
+    }
+
+    fn reason_required() -> (Status, serde_json::Value) {
+        (
+            Status::BadRequest,
+            serde_json::json!({ "type": "RemovalReasonRequired" }),
+        )
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_without_a_reason_in_a_protected_server_is_refused_seated_or_not() {
+        crate::util::test::rt()
+            .block_on(a_ban_without_a_reason_in_a_protected_server_is_refused_seated_or_not_case())
+    }
+
+    /// A ban with no reason in a server with a protected channel is refused
+    /// with `RemovalReasonRequired` and nothing is persisted: no ban row, the
+    /// member still a member and still seated, nothing recorded. A member
+    /// who holds no seat, and a user who was never a member, get the very
+    /// same answer (O-2: no seat-keyed oracle). Controls: the reason check
+    /// after `ServerBan::create`; the check made seat-keyed; the check
+    /// removed; the af713874 route.
+    async fn a_ban_without_a_reason_in_a_protected_server_is_refused_seated_or_not_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, seated_target) = harness.new_user().await;
+        let (_c, _session_c, unseated_target) = harness.new_user().await;
+        let (_d, _session_d, outsider) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&seated_target])
+            .await;
+        let server_id = protected.server.id.clone();
+        let channel_id = protected.channel.id().to_string();
+        harness
+            .join_server(&protected.server, &unseated_target)
+            .await;
+        assert!(
+            seated(&harness, &channel_id, &seated_target.id).await,
+            "precondition: the first target is seated"
+        );
+        for unseated in [&unseated_target, &outsider] {
+            assert!(
+                !seated(&harness, &channel_id, &unseated.id).await,
+                "precondition: {} holds no seat",
+                unseated.id
+            );
+        }
+
+        let mut answers = vec![];
+        for (what, target, member) in [
+            ("seated member", &seated_target, true),
+            ("unseated member", &unseated_target, true),
+            ("non-member", &outsider, false),
+        ] {
+            let response = ban_with(
+                &harness,
+                &session_a.token,
+                &server_id,
+                &target.id,
+                serde_json::json!({}),
+            )
+            .await;
+            let refusal = answer(response).await;
+            assert_eq!(refusal, reason_required(), "the {what}");
+            assert!(
+                !banned(&harness, &server_id, &target.id).await,
+                "a refused ban of the {} must persist nothing",
+                what
+            );
+            assert_eq!(
+                harness
+                    .db
+                    .fetch_member(&server_id, &target.id)
+                    .await
+                    .is_ok(),
+                member,
+                "a refused ban must leave the {what}'s membership as it was"
+            );
+            answers.push(refusal);
+        }
+        assert!(
+            answers.iter().all(|refusal| *refusal == answers[0]),
+            "the refusal must not tell a seated target from any other: {:?}",
+            answers
+        );
+        assert!(
+            seated(&harness, &channel_id, &seated_target.id).await,
+            "a refused ban releases no seat"
+        );
+        let entries = ban_entries(&harness, &server_id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused ban records nothing: {:?}",
+            entries
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_blank_ban_reason_is_no_reason_in_a_protected_server() {
+        crate::util::test::rt()
+            .block_on(a_blank_ban_reason_is_no_reason_in_a_protected_server_case())
+    }
+
+    /// A body reason that is blank once sanitized (empty, whitespace, or
+    /// only invisible format characters) is refused like a missing one, and
+    /// a reason header sent alongside does not stand in for it (the ban
+    /// reads none, plan audit M4). Control: the check fed the raw body
+    /// reason (the invisible-only reason then passes).
+    async fn a_blank_ban_reason_is_no_reason_in_a_protected_server_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+
+        for body in [
+            serde_json::json!({ "reason": "" }),
+            serde_json::json!({ "reason": " \t\n " }),
+            serde_json::json!({ "reason": "\u{200B}\u{202E}" }),
+            serde_json::json!({ "reason": null }),
+        ] {
+            let response = ban_with(
+                &harness,
+                &session_a.token,
+                &server_id,
+                &target.id,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(answer(response).await, reason_required(), "{body}");
+            assert!(
+                !banned(&harness, &server_id, &target.id).await,
+                "{}: a refused ban must persist nothing",
+                body
+            );
+        }
+
+        let response = harness
+            .client
+            .put(format!("/servers/{server_id}/bans/{}", target.id))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session_a.token.to_string()))
+            .header(Header::new("X-Audit-Log-Reason", "header%20reason"))
+            .body(serde_json::json!({}).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(
+            answer(response).await,
+            reason_required(),
+            "a reason header does not stand in for the body reason"
+        );
+        assert!(!banned(&harness, &server_id, &target.id).await);
+        assert!(
+            harness
+                .db
+                .fetch_member(&server_id, &target.id)
+                .await
+                .is_ok(),
+            "a refused ban must leave the target a member"
+        );
+        let entries = ban_entries(&harness, &server_id).await;
+        assert!(
+            entries.is_empty(),
+            "a refused ban records nothing: {:?}",
+            entries
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_with_a_reason_in_a_protected_server_lands_and_records_it() {
+        crate::util::test::rt()
+            .block_on(a_ban_with_a_reason_in_a_protected_server_lands_and_records_it_case())
+    }
+
+    /// With a body reason the ban goes through in a server with a protected
+    /// channel: the ban is stored with the body reason, the member removed,
+    /// the seat released, and the one `member_ban_add` entry carries the
+    /// sanitized reason.
+    async fn a_ban_with_a_reason_in_a_protected_server_lands_and_records_it_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+        let channel_id = protected.channel.id().to_string();
+
+        let response = ban_user(
+            &harness,
+            &session_a.token,
+            &server_id,
+            &target.id,
+            "  raided the channel  ",
+        )
+        .await;
+        let ban = ban_answered(response, "a ban with a reason").await;
+        assert_eq!(ban.reason.as_deref(), Some("  raided the channel  "));
+
+        assert!(banned(&harness, &server_id, &target.id).await);
+        assert!(harness
+            .db
+            .fetch_member(&server_id, &target.id)
+            .await
+            .is_err());
+        assert!(
+            !seated(&harness, &channel_id, &target.id).await,
+            "the banned member's seat is released"
+        );
+        let entries = ban_entries(&harness, &server_id).await;
+        assert_eq!(entries.len(), 1, "one ban, one entry: {entries:?}");
+        assert_eq!(
+            ban_entry(&entries, &owner.id, &target.id).reason.as_deref(),
+            Some("raided the channel")
+        );
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn a_ban_needs_no_reason_without_a_protected_channel() {
+        crate::util::test::rt().block_on(a_ban_needs_no_reason_without_a_protected_channel_case())
+    }
+
+    /// As in S1, a ban needs no reason in a server with no protected
+    /// channel: one with no entitlement at all, and one whose channel holds
+    /// an entitlement but was never protected. Control: the check keyed on
+    /// the entitlements alone (the second ban is then refused).
+    async fn a_ban_needs_no_reason_without_a_protected_channel_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, plain_target) = harness.new_user().await;
+        let (_c, _session_c, granted_target) = harness.new_user().await;
+
+        let (plain, _channels) = harness.new_server(&owner).await;
+        harness.join_server(&plain, &plain_target).await;
+
+        let (granted, channel) = harness.new_protectable_channel(&owner).await;
+        harness.grant_entitlement(&channel, 10, None).await;
+        harness.join_server(&granted, &granted_target).await;
+        assert!(
+            !harness
+                .db
+                .fetch_channel(channel.id())
+                .await
+                .expect("the channel")
+                .is_protected(),
+            "precondition: the entitled channel is not protected"
+        );
+
+        for (what, server, target) in [
+            ("no entitlement", &plain, &plain_target),
+            ("an unprotected entitlement", &granted, &granted_target),
+        ] {
+            let response = ban_with(
+                &harness,
+                &session_a.token,
+                &server.id,
+                &target.id,
+                serde_json::json!({}),
+            )
+            .await;
+            ban_answered(response, what).await;
+            assert!(
+                banned(&harness, &server.id, &target.id).await,
+                "{}: the target is banned",
+                what
+            );
+            let entries = ban_entries(&harness, &server.id).await;
+            assert_eq!(entries.len(), 1, "{what}: {entries:?}");
+            assert_eq!(entries[0].reason, None, "{what}");
+        }
+    }
+
+    // Compile-only without RabbitMQ and Redis: see the section note above.
+    #[test]
+    fn an_already_banned_retry_needs_no_reason() {
+        crate::util::test::rt().block_on(an_already_banned_retry_needs_no_reason_case())
+    }
+
+    /// The reason is checked for a NEW ban only: an "already banned" retry
+    /// in a server with a protected channel, which re-runs the removal, the
+    /// release and the eviction and records nothing, needs no reason, and
+    /// answers the existing ban. Control: the check moved above the ban
+    /// read.
+    async fn an_already_banned_retry_needs_no_reason_case() {
+        let harness = TestHarness::new().await;
+        let (_a, session_a, owner) = harness.new_user().await;
+        let (_b, _session_b, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &session_a, &[&target])
+            .await;
+        let server_id = protected.server.id.clone();
+
+        let response = ban_user(&harness, &session_a.token, &server_id, &target.id, "first").await;
+        ban_answered(response, "the first ban").await;
+
+        let response = ban_with(
+            &harness,
+            &session_a.token,
+            &server_id,
+            &target.id,
+            serde_json::json!({}),
+        )
+        .await;
+        let ban = ban_answered(response, "an already-banned retry with no reason").await;
+        assert_eq!(ban.reason.as_deref(), Some("first"), "the existing ban");
+        let entries = ban_entries(&harness, &server_id).await;
         assert_eq!(
             entries.len(),
             1,
@@ -2135,6 +2716,49 @@ pub(crate) mod test {
             !body.contains("server.channels"),
             "W3A: `server.channels` misses threads and forum posts and must not scope \
              the purge: {}",
+            body
+        );
+    }
+
+    /// Protected channels 6.3 (S2-D20): the removal reason is checked once,
+    /// with the sanitized body reason, after the rank check and the ban read,
+    /// inside the not-found arm right before `ServerBan::create`: a refusal
+    /// persists nothing, and an "already banned" retry is not asked for one.
+    /// Controls: the check moved above the ban read; the check moved after
+    /// the create; the raw body reason checked.
+    #[test]
+    fn the_ban_checks_the_removal_reason_before_creating_a_new_ban() {
+        const ABSENT: &str =
+            "Err(error) if matches!(error.error_type, ErrorType::NotFound) => \u{7b}";
+        const REASON: &str =
+            "refuse_removal_without_reason(db, &server.id, audit_reason.as_deref()).await?;";
+
+        let body = route_body();
+        assert_eq!(
+            body.matches("refuse_removal_without_reason(").count(),
+            1,
+            "one reason check: {body}"
+        );
+        let mut last = 0;
+        for needle in [RANK, FETCH, ABSENT, REASON, CREATE] {
+            assert_eq!(
+                body.matches(needle).count(),
+                1,
+                "the ban must carry `{needle}` exactly once: {body}"
+            );
+            let at = body.find(needle).expect("counted above");
+            assert!(last < at, "`{}` is out of order: {}", needle, body);
+            last = at;
+        }
+        let reason = body.find(REASON).expect("counted above");
+        assert_eq!(
+            depth_at(&body, reason),
+            depth_at(&body, body.find(CREATE).expect("counted above")),
+            "the reason check sits in the create's own arm: {body}"
+        );
+        assert!(
+            depth_at(&body, reason) > 1,
+            "the reason check is not a statement of the route itself: {}",
             body
         );
     }

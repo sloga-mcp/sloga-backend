@@ -1,9 +1,15 @@
+use std::collections::BTreeSet;
+use std::future::Future;
+
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use ed25519_dalek::{Signature, VerifyingKey};
 use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
-use crate::{events::client::EventV1, Database, MlsJoinIntent, MlsMemberDevice, MlsRemovedReason};
+use crate::{
+    events::client::EventV1, Database, MlsJoinIntent, MlsMemberDevice, MlsRemovedReason,
+    PROTECTED_SCOPE_TEXT_GROUP,
+};
 
 /// Current (and minimum accepted) E2EE protocol version.
 ///
@@ -261,6 +267,12 @@ auto_derived!(
         pub key_package_ref: String,
         /// Join-intent signature
         pub signature: String,
+        /// Text join payload only (design §3.13): the signed generation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub generation: Option<u32>,
+        /// Text join payload only (design §3.13): the signed issue time (ms)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub issued_at: Option<i64>,
     }
 );
 
@@ -275,6 +287,8 @@ impl MlsEnvelopeRejoinIntent {
             device_id: intent.device_id.clone(),
             key_package_ref: intent.key_package_ref.clone(),
             signature: intent.signature.clone(),
+            generation: intent.generation,
+            issued_at: intent.issued_at,
         }
     }
 }
@@ -754,8 +768,18 @@ impl E2EEIdentity {
     /// Revoke a device: delete its identity, one-time keys and queued
     /// envelopes, then notify. Idempotent; returns whether the device existed.
     ///
+    /// While `[features.protected_channels] formats_v2` is on, the delete
+    /// sits between two pending passes (6.3 "Device revocation", S2-D17a,
+    /// #219): every open Text group holding the device queues it for
+    /// removal (or gets `signer_lost` if it signed the channel's list,
+    /// S2-D15), and each channel written gets `ProtectedChannelChanged`.
+    /// A failed pending pass fails the revocation closed. With the flag
+    /// off this is the S1 revocation.
+    ///
     /// Wired into: `DELETE /e2ee/keys/{device}`, session revocation/logout
-    /// (`Session::delete`) and the account-deletion cascade (`User::delete`).
+    /// (`Session::delete`), every sign-out-everywhere path
+    /// (`Account::delete_all_sessions`, behind `Account::disable`) and the
+    /// same-session predecessor sweep (key publish, bonfire device claim).
     ///
     /// Never writes an [`E2EERemovedDevice`] tombstone: only the removal
     /// route does, so a device revoked with its session can re-enroll.
@@ -772,7 +796,92 @@ impl E2EEIdentity {
         db: &Database,
         user_id: &str,
         device_id: &str,
+        evict: bool,
+    ) -> Result<bool> {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+
+        Self::revoke_device_publishing(db, user_id, device_id, formats_v2, evict, |topic, event| {
+            event.p(topic)
+        })
+        .await
+    }
+
+    /// [`Self::revoke_device`] with the flag and the publish of the
+    /// `ProtectedChannelChanged` events passed in (`publish(topic, event)`;
+    /// the topic is the channel id: viewers only, 7.5). The channels the
+    /// passes wrote are announced even when a later step fails: a repeat
+    /// pass returns only new writes, so a retry would never announce them.
+    pub(crate) async fn revoke_device_publishing<F, Fut>(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        formats_v2: bool,
+        evict: bool,
+        mut publish: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(String, EventV1) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let mut changed = BTreeSet::new();
+        let result = async {
+            if formats_v2 {
+                // (1) Before the delete: a failure leaves the device intact
+                Self::pending_device_pass(db, user_id, device_id, &mut changed).await?;
+            }
+            Self::delete_revoked_device(db, user_id, device_id, formats_v2, evict, &mut changed)
+                .await
+        }
+        .await;
+
+        for channel_id in changed {
+            publish(
+                channel_id.clone(),
+                EventV1::ProtectedChannelChanged {
+                    id: channel_id,
+                    scope: vec![PROTECTED_SCOPE_TEXT_GROUP.to_string()],
+                },
+            )
+            .await;
+        }
+
+        result
+    }
+
+    /// One pending pass of a revocation: `add_pending_device_removal`
+    /// (both drivers, one claimed transaction), collecting the channels it
+    /// wrote into `changed`
+    pub(crate) async fn pending_device_pass(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        changed: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        changed.extend(
+            db.add_pending_device_removal(user_id, device_id, Timestamp::now_utc())
+                .await?,
+        );
+        Ok(())
+    }
+
+    /// The S1 revocation (delete, KeyPackages, `E2EEDeviceDelete`) with,
+    /// while `formats_v2` is on, the second pending pass between the
+    /// KeyPackage delete and the broadcast: it catches a Text commit that
+    /// added the device after the first pass. If that pass fails the device
+    /// is already gone; the broadcast still runs (a retry finds nothing to
+    /// delete and would never send it) and the error is returned. A device
+    /// this call removed then leaves any call it is in when `evict`.
+    pub(crate) async fn delete_revoked_device(
+        db: &Database,
+        user_id: &str,
+        device_id: &str,
+        formats_v2: bool,
         #[cfg_attr(not(feature = "voice"), allow(unused_variables))] evict: bool,
+        changed: &mut BTreeSet<String>,
     ) -> Result<bool> {
         let existed = db.delete_e2ee_device(user_id, device_id).await?;
 
@@ -780,6 +889,12 @@ impl E2EEIdentity {
         // it — a claim against a dead device would brick the joiner's
         // Welcome (media E2EE, slice 6)
         db.delete_mls_key_packages(user_id, device_id).await?;
+
+        let second_pass = if formats_v2 {
+            Self::pending_device_pass(db, user_id, device_id, changed).await
+        } else {
+            Ok(())
+        };
 
         if existed {
             Self::broadcast_device_change(
@@ -801,7 +916,7 @@ impl E2EEIdentity {
             crate::voice::evict_revoked_device(&voice_client, user_id, device_id).await;
         }
 
-        Ok(existed)
+        second_pass.map(|()| existed)
     }
 
     /// Revoke every device bound to a given session (session revoked, token
@@ -966,6 +1081,8 @@ mod envelope_shape_tests {
             key_package_ref: "a3ByZWY".to_string(),
             signature: "c2ln".to_string(),
             created_at: Timestamp::UNIX_EPOCH,
+            generation: None,
+            issued_at: None,
         }
     }
 
@@ -1345,9 +1462,14 @@ mod revoke_eviction_wiring_tests {
     /// needles below do not depend on line breaks or a trailing comma
     fn fn_body(fn_name: &str) -> String {
         const SOURCE: &str = include_str!("model.rs");
-        let header = format!("async fn {fn_name}(");
-        assert_eq!(SOURCE.matches(&header).count(), 1, "{header}");
-        let at = SOURCE.find(&header).expect("the fn is defined");
+        // A generic fn (`revoke_device_publishing<F, Fut>(`) is found too
+        let headers = [format!("async fn {fn_name}("), format!("async fn {fn_name}<")];
+        let found: Vec<usize> = headers
+            .iter()
+            .flat_map(|header| SOURCE.match_indices(header.as_str()).map(|(at, _)| at))
+            .collect();
+        assert_eq!(found.len(), 1, "exactly one `async fn {fn_name}`");
+        let at = found[0];
         let open = at + SOURCE[at..].find('{').expect("a body");
         let mut depth = 0usize;
         let mut close = None;
@@ -1418,12 +1540,28 @@ mod revoke_eviction_wiring_tests {
         assert_eq!(sweep.matches("revoke_device(").count(), 0, "{sweep}");
     }
 
-    /// In the inner revocation the eviction follows the broadcast, runs
-    /// only for a device this call removed and only when asked, and sits
-    /// behind the `voice` feature
+    /// In the revocation body (`delete_revoked_device`, which the inner
+    /// revocation reaches through `revoke_device_publishing` since protected
+    /// channels S2) the eviction follows the broadcast, runs only for a
+    /// device this call removed and only when asked, and sits behind the
+    /// `voice` feature; the inner revocation threads `evict` through
     #[test]
     fn eviction_follows_the_broadcast_and_is_gated() {
-        let inner = fn_body("revoke_device_inner");
+        assert!(
+            fn_body("revoke_device_inner").contains(
+                "Self::revoke_device_publishing(db,user_id,device_id,formats_v2,evict,"
+            ),
+            "{}",
+            fn_body("revoke_device_inner")
+        );
+        assert!(
+            fn_body("revoke_device_publishing").contains(
+                "Self::delete_revoked_device(db,user_id,device_id,formats_v2,evict,&mut changed).await"
+            ),
+            "{}",
+            fn_body("revoke_device_publishing")
+        );
+        let inner = fn_body("delete_revoked_device");
         let evict = "#[cfg(feature=\"voice\")]if existed&&evict{\
                      let voice_client=crate::voice::VoiceClient::from_revolt_config().await;\
                      crate::voice::evict_revoked_device(&voice_client,user_id,device_id).await;}";
@@ -1434,7 +1572,7 @@ mod revoke_eviction_wiring_tests {
             .find("if existed{Self::broadcast_device_change(")
             .expect("the broadcast");
         let eviction = inner.find(evict).expect("the eviction");
-        let done = inner.find("Ok(existed)").expect("the result");
+        let done = inner.find("second_pass.map(|()|existed)").expect("the result");
         assert!(broadcast < eviction && eviction < done, "{inner}");
     }
 }

@@ -109,6 +109,18 @@ auto_derived!(
         RoleRanksUpdate,
         ServerUpdate,
         ServerOwnerTransfer,
+        /// A protected channel's seat PUT released or seated users.
+        /// `channel` = the channel; `changes` = `[{key: "released", new:
+        /// StringList(user ids)}, {key: "seated", new: StringList(user
+        /// ids)}]`; `reason` = the moderator's reason. Only returned to
+        /// readers who can view `channel`
+        ProtectedSeatsUpdate,
+        /// One seat of a protected channel was released. `target` = the
+        /// released user; `channel` = the channel; `changes` = `[{key:
+        /// "cause", new: String(owner_unseat | server_removal | access_lost
+        /// | device_never_joined)}]`. Only returned to readers who can view
+        /// `channel`
+        ProtectedSeatRelease,
         /// An action this build does not know
         #[cfg_attr(feature = "serde", serde(other))]
         Unknown,

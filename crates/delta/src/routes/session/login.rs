@@ -6,7 +6,7 @@ use tokio::time::sleep;
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
     util::{email::normalise_email, password::assert_safe},
-    Account, Database, EmailVerification, MFATicket,
+    Account, Database, DeletionInfo, EmailVerification, MFATicket,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
@@ -152,6 +152,22 @@ pub async fn login(
     // Generate a session name
     let name = name.unwrap_or_else(|| "Unknown".to_string());
 
+    // A confirmed (or finished) deletion refuses the login exactly as a
+    // disabled account does. This runs BEFORE the `disabled` check: a stale
+    // whole-document save can write `disabled` back to false while the
+    // deletion stays Scheduled, and the suspension branch below could lift
+    // `disabled` itself. Only a pending (WaitingForVerification) request is
+    // cancelled by signing in, in `create_session`
+    if matches!(
+        account.deletion,
+        Some(DeletionInfo::Scheduled { .. } | DeletionInfo::Deleted)
+    ) {
+        return Ok(Json(v0::ResponseLogin::Disabled {
+            user_id: account.id,
+            suspended_until: None,
+        }));
+    }
+
     // Prevent disabled accounts from logging in;
     // timed suspensions that have expired are lifted here
     if account.disabled {
@@ -195,9 +211,12 @@ async fn assert_login_allowed(account: &Account, password: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use iso8601_timestamp::Timestamp;
-    use revolt_database::{Account, EmailVerification, Lockout, MFATicket, Totp, events::client::EventV1};
-    use crate::{rocket, util::test::TestHarness};
+    use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_database::{
+        Account, DeletionInfo, EmailVerification, Lockout, MFATicket, Totp,
+        events::client::EventV1,
+    };
+    use crate::{rocket, util::test::{Mail, TestHarness}};
     use rocket::http::{ContentType, Status};
     use revolt_models::v0;
     use revolt_result::{Error, ErrorType};
@@ -814,6 +833,270 @@ mod tests {
                 serde_json::from_str::<Error>(&body).unwrap().error_type,
                 ErrorType::ShortPassword,
             ));
+        })
+    }
+
+    /// The variant only: MongoDB keeps timestamps to the millisecond, so a
+    /// seeded value does not compare equal to what is read back
+    fn deletion_kind(deletion: &Option<DeletionInfo>) -> &'static str {
+        match deletion {
+            None => "none",
+            Some(DeletionInfo::WaitingForVerification { .. }) => "pending",
+            Some(DeletionInfo::Scheduled { .. }) => "scheduled",
+            Some(DeletionInfo::Deleted) => "deleted",
+        }
+    }
+
+    /// A fresh account under its own mailbox, not disabled, with `deletion`
+    /// seeded through `set_account_deletion` (`save_account` never writes it)
+    ///
+    /// Returns the account as stored.
+    async fn deletion_account(harness: &TestHarness, deletion: Option<DeletionInfo>) -> Account {
+        let account = sec009_account(harness, "password_insecure", false, false).await;
+        harness
+            .db
+            .set_account_deletion(&account.id, deletion.clone())
+            .await
+            .unwrap();
+
+        let stored = harness.db.fetch_account(&account.id).await.unwrap();
+        assert_eq!(
+            deletion_kind(&stored.deletion),
+            deletion_kind(&deletion),
+            "the seed must be stored"
+        );
+        assert!(!stored.disabled);
+        stored
+    }
+
+    fn pending(expiry: Timestamp) -> Option<DeletionInfo> {
+        Some(DeletionInfo::WaitingForVerification {
+            token: TestHarness::rand_string(),
+            expiry,
+        })
+    }
+
+    fn soon() -> Timestamp {
+        Timestamp::now_utc() + Duration::seconds(3600)
+    }
+
+    fn long_ago() -> Timestamp {
+        Timestamp::now_utc() - Duration::seconds(3600)
+    }
+
+    /// Log in with the password and return the session it created
+    async fn deletion_login_succeeds(harness: &TestHarness, account: &Account) -> v0::Session {
+        let (status, body) = sec009_login(harness, &account.email, "password_insecure").await;
+        assert_eq!(status, Status::Ok, "login refused: {}", body);
+
+        match serde_json::from_str::<v0::ResponseLogin>(&body).expect("`ResponseLogin`") {
+            v0::ResponseLogin::Success(session) => {
+                assert_eq!(session.user_id, account.id);
+                session
+            }
+            other => panic!("expected `ResponseLogin::Success`, got {:?}", other),
+        }
+    }
+
+    /// Every mail maildev holds for `mailbox`, left in place (unlike
+    /// `TestHarness::assert_email`, which deletes them), so it can be counted
+    async fn mail_to(mailbox: &str) -> Vec<Mail> {
+        reqwest::Client::new()
+            .get("http://localhost:14080/api/email")
+            .send()
+            .await
+            .expect("maildev unreachable on :14080; is `stoatchat-maildev-1` running?")
+            .json::<Vec<Mail>>()
+            .await
+            .expect("maildev did not return `Vec<Mail>`")
+            .into_iter()
+            .filter(|mail| mail.envelope.to.iter().any(|to| to.address == mailbox))
+            .collect()
+    }
+
+    async fn stored_deletion(harness: &TestHarness, account_id: &str) -> Option<DeletionInfo> {
+        harness.db.fetch_account(account_id).await.unwrap().deletion
+    }
+
+    async fn session_ids(harness: &TestHarness, account_id: &str) -> Vec<String> {
+        let sessions = harness.db.fetch_sessions(account_id).await.unwrap();
+        sessions.into_iter().map(|session| session.id).collect()
+    }
+
+    /// Signing in cancels a live deletion request and emails the user
+    #[test]
+    fn deletion_pending_is_cancelled_by_login() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = deletion_account(&harness, pending(soon())).await;
+
+            let session = deletion_login_succeeds(&harness, &account).await;
+
+            assert_eq!(
+                stored_deletion(&harness, &account.id).await,
+                None,
+                "signing in must cancel the pending deletion"
+            );
+            assert_eq!(session_ids(&harness, &account.id).await, vec![session.id]);
+
+            let (mail, url) = harness.assert_email(&account.email).await;
+            assert_eq!(mail.subject, "deletion_cancelled");
+            assert_eq!(url, "", "the TEST_DB cancel template has an empty url");
+        })
+    }
+
+    /// An expired request is cleared too, but it was dead already, so no
+    /// cancel email is sent for it
+    ///
+    /// Absence is proven against a marker: a second login, after a live
+    /// request is seeded, sends exactly one cancel email. Once that has
+    /// arrived (plus a grace period for the earlier send, which would have
+    /// been started first), the mailbox must hold that one mail only.
+    #[test]
+    fn deletion_expired_is_cleared_without_email() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account = deletion_account(&harness, pending(long_ago())).await;
+
+            deletion_login_succeeds(&harness, &account).await;
+            assert_eq!(
+                stored_deletion(&harness, &account.id).await,
+                None,
+                "signing in must clear an expired pending deletion"
+            );
+
+            // The marker: a live request, cancelled by a second login
+            harness
+                .db
+                .set_account_deletion(&account.id, pending(soon()))
+                .await
+                .unwrap();
+            deletion_login_succeeds(&harness, &account).await;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while mail_to(&account.email).await.is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the marker cancel email never reached {}",
+                    account.email
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let mails = mail_to(&account.email).await;
+            let subjects: Vec<&str> = mails.iter().map(|mail| mail.subject.as_str()).collect();
+            assert_eq!(
+                subjects,
+                vec!["deletion_cancelled"],
+                "only the live request may send a cancel email"
+            );
+
+            // Clean the mailbox up
+            harness.assert_email(&account.email).await;
+        })
+    }
+
+    /// A confirmed or finished deletion refuses the login as a disabled
+    /// account does, even with `disabled` false (a stale whole-document save
+    /// can write it back), and stores no session
+    #[test]
+    fn deletion_scheduled_or_deleted_is_refused() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+
+            for deletion in [
+                DeletionInfo::Scheduled { after: soon() },
+                DeletionInfo::Deleted,
+            ] {
+                let account = deletion_account(&harness, Some(deletion.clone())).await;
+
+                let (status, body) =
+                    sec009_login(&harness, &account.email, "password_insecure").await;
+                assert_eq!(status, Status::Ok, "{:?}: {}", deletion, body);
+                match serde_json::from_str::<v0::ResponseLogin>(&body).expect("`ResponseLogin`") {
+                    v0::ResponseLogin::Disabled {
+                        user_id,
+                        suspended_until,
+                    } => {
+                        assert_eq!(user_id, account.id);
+                        assert_eq!(suspended_until, None);
+                    }
+                    other => panic!("{:?}: expected `Disabled`, got {:?}", deletion, other),
+                }
+
+                assert!(
+                    session_ids(&harness, &account.id).await.is_empty(),
+                    "{:?}: a refused login must store no session",
+                    deletion
+                );
+                // `account` is the stored copy, so this compares like with like
+                let stored = harness.db.fetch_account(&account.id).await.unwrap();
+                assert_eq!(
+                    stored.deletion, account.deletion,
+                    "{:?}: a refused login changes nothing",
+                    deletion
+                );
+                assert!(!stored.disabled);
+            }
+        })
+    }
+
+    /// The refusal sits after both login paths, so an authorised MFA ticket
+    /// for a Scheduled account gets no session either
+    #[test]
+    fn deletion_scheduled_is_refused_after_mfa() {
+        crate::util::test::rt().block_on(async {
+            let harness = TestHarness::new().await;
+            let account =
+                deletion_account(&harness, Some(DeletionInfo::Scheduled { after: soon() })).await;
+
+            let mut ticket = MFATicket::new(account.id.clone(), false);
+            ticket.authorised = true;
+            ticket.save(&harness.db).await.unwrap();
+
+            let res = harness
+                .client
+                .post("/auth/session/login")
+                .header(ContentType::JSON)
+                .body(json!({ "mfa_ticket": ticket.token }).to_string())
+                .dispatch()
+                .await;
+
+            assert_eq!(res.status(), Status::Ok);
+            let response =
+                serde_json::from_str::<v0::ResponseLogin>(&res.into_string().await.unwrap())
+                    .expect("`ResponseLogin`");
+            match response {
+                v0::ResponseLogin::Disabled { user_id, .. } => assert_eq!(user_id, account.id),
+                other => panic!("expected `Disabled`, got {:?}", other),
+            }
+            assert!(session_ids(&harness, &account.id).await.is_empty());
+        })
+    }
+
+    /// Login never waits on, or fails with, the cancel email: SMTP points at
+    /// a closed port here
+    ///
+    /// `overwrite_config` is process-wide and works once per process, so
+    /// this relies on nextest's one-process-per-test (as `change_email`'s
+    /// tests do). It runs before anything reads the config, because
+    /// `config()` caches for 30 s.
+    #[test]
+    fn deletion_cancel_login_succeeds_with_smtp_down() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|config| config.api.smtp.port = Some(1)).await;
+
+            let harness = TestHarness::new().await;
+            let account = deletion_account(&harness, pending(soon())).await;
+
+            let session = deletion_login_succeeds(&harness, &account).await;
+            assert_eq!(
+                stored_deletion(&harness, &account.id).await,
+                None,
+                "the cancel must not depend on the email"
+            );
+            assert_eq!(session_ids(&harness, &account.id).await, vec![session.id]);
         })
     }
 }

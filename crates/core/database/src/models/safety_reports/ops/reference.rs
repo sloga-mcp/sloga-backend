@@ -1,10 +1,12 @@
+use std::collections::HashSet;
+
 use revolt_models::v0::{ReportStatus, ReportStatusString};
 use revolt_result::Result;
 
 use crate::ReferenceDb;
 use crate::Report;
 
-use super::AbstractReport;
+use super::{collect_file_ids, AbstractReport};
 
 #[async_trait]
 impl AbstractReport for ReferenceDb {
@@ -61,5 +63,35 @@ impl AbstractReport for ReferenceDb {
         } else {
             Err(create_error!(NotFound))
         }
+    }
+
+    /// Ids of every file embedded in a snapshot of an open report
+    async fn fetch_open_report_file_ids(&self) -> Result<HashSet<String>> {
+        // One lock at a time: reports first, released before snapshots
+        let open: HashSet<String> = {
+            let reports = self.safety_reports.lock().await;
+            reports
+                .values()
+                .filter(|report| matches!(report.status, ReportStatus::Created { .. }))
+                .map(|report| report.id.clone())
+                .collect()
+        };
+
+        let mut file_ids = HashSet::new();
+        if open.is_empty() {
+            return Ok(file_ids);
+        }
+
+        // Serialized to the same JSON shape the MongoDB driver walks
+        let snapshots = self.safety_snapshots.lock().await;
+        for snapshot in snapshots
+            .values()
+            .filter(|snapshot| open.contains(&snapshot.report_id))
+        {
+            let value = serde_json::to_value(snapshot).map_err(|_| create_error!(InternalError))?;
+            collect_file_ids(&value, &mut file_ids);
+        }
+
+        Ok(file_ids)
     }
 }

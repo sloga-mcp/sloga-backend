@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+
+use bson::{Bson, Document};
+use futures::StreamExt;
 use mongodb::options::FindOptions;
 use revolt_models::v0::ReportStatusString;
 use revolt_result::Result;
@@ -5,9 +9,10 @@ use revolt_result::Result;
 use crate::MongoDb;
 use crate::Report;
 
-use super::AbstractReport;
+use super::{collect_file_ids, AbstractReport};
 
 static COL: &str = "safety_reports";
+static COL_SNAPSHOTS: &str = "safety_snapshots";
 
 #[async_trait]
 impl AbstractReport for MongoDb {
@@ -46,5 +51,48 @@ impl AbstractReport for MongoDb {
             .await
             .map(|_| ())
             .map_err(|_| create_database_error!("replace_one", COL))
+    }
+
+    /// Ids of every file embedded in a snapshot of an open report
+    async fn fetch_open_report_file_ids(&self) -> Result<HashSet<String>> {
+        let mut reports = self
+            .col::<Document>(COL)
+            .find(doc! { "status": "Created" })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        let mut report_ids = Vec::new();
+        while let Some(row) = reports.next().await {
+            let row = row.map_err(|_| create_database_error!("find", COL))?;
+            let id = row
+                .get_str("_id")
+                .map_err(|_| create_database_error!("find", COL))?;
+            report_ids.push(id.to_string());
+        }
+
+        let mut file_ids = HashSet::new();
+        if report_ids.is_empty() {
+            return Ok(file_ids);
+        }
+
+        // Walked as raw documents, never decoded into `Snapshot`, so an old
+        // snapshot shape cannot hide its files
+        let mut snapshots = self
+            .col::<Document>(COL_SNAPSHOTS)
+            .find(doc! {
+                "report_id": {
+                    "$in": report_ids
+                }
+            })
+            .await
+            .map_err(|_| create_database_error!("find", COL_SNAPSHOTS))?;
+
+        while let Some(row) = snapshots.next().await {
+            let row = row.map_err(|_| create_database_error!("find", COL_SNAPSHOTS))?;
+            collect_file_ids(&Bson::Document(row).into_relaxed_extjson(), &mut file_ids);
+        }
+
+        Ok(file_ids)
     }
 }

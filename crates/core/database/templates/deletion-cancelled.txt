@@ -1,0 +1,12 @@
+Your account has been restored.
+
+You signed in to Sloga, so your account deletion request was cancelled. Nothing was deleted.
+
+If this wasn't you, sign in and change your password right away.
+
+Open Sloga: {{url}}
+
+This email is intended for {{email}}
+Sent by Sloga
+
+Sloga Technologies LLC

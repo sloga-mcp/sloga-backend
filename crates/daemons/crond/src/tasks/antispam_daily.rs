@@ -12,8 +12,10 @@
 //!
 //! Only server-readable messages are read, fingerprinted exactly as the live
 //! detector does. End-to-end encrypted DMs never reach the messages
-//! collection, so an account that only sends E2EE DMs is invisible here (a
-//! known gap, listed in the followups).
+//! collection, so an account that only sends encrypted DMs is invisible
+//! here. The live fan-out signal (`antispam::observe_e2ee_fanout`, off unless
+//! `e2ee_fanout_enabled`) covers those instead, from recipient ids and time
+//! alone; this scan does not read its Redis keys.
 //!
 //! crond has no leader election. The day's run is claimed with
 //! `SET antispam_daily:{day} 1 NX EX 129600`, and every report with
@@ -825,10 +827,11 @@ mod tests {
         });
     }
 
-    /// E2EE DMs leave no messages behind: many stranger DMs with nothing
-    /// readable in them are not reported (and never read)
+    /// Encrypted DMs leave no messages behind: many stranger DMs with nothing
+    /// readable in them are not reported (and never read). Named so it does
+    /// not read as the Encrypted-only chats setting.
     #[test]
-    fn e2ee_only_account_is_not_reported() {
+    fn account_with_only_encrypted_dms_is_not_reported() {
         rt().block_on(async {
             let db = reference_db();
             let user = account(&db, 1, &[]).await;

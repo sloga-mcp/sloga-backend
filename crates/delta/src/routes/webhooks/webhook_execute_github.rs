@@ -1,4 +1,8 @@
-use revolt_database::{util::reference::Reference, Database, Message, AMQP};
+use revolt_config::config;
+use revolt_database::{
+    util::{e2ee_only, reference::Reference},
+    Database, Message, AMQP,
+};
 use revolt_models::v0::{MessageAuthor, SendableEmbed, Webhook};
 use revolt_result::{create_error, Error, Result};
 use revolt_rocket_okapi::{
@@ -781,6 +785,9 @@ pub async fn webhook_execute_github(
         return Err(create_error!(ChannelProtected));
     }
 
+    // Nor does a group marked encrypted-only, refused at the same point
+    e2ee_only::plain_write_allowed_unauthored(&config().await.features.e2ee, &channel)?;
+
     let event = convert_event(&data, &event)?;
 
     let sendable_embed = match event.event {
@@ -1119,7 +1126,8 @@ pub async fn webhook_execute_github(
 mod test {
     use crate::util::test::{TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_SLOT_CAP, OWNER_DEVICE_SEED};
     use revolt_database::{
-        events::client::EventV1, Channel, MessageFilter, MessageQuery, MessageTimePeriod, Webhook,
+        events::client::EventV1, Channel, Database, MessageFilter, MessageQuery,
+        MessageTimePeriod, Webhook,
     };
     use rocket::http::{ContentType, Header, Status};
     use serde_json::{json, Map, Value};
@@ -1420,6 +1428,111 @@ mod test {
 
             assert_eq!(stored_messages(h, &f.protected).await, 0);
             assert_eq!(stored_messages(h, &f.ordinary).await, 0);
+        }))
+    }
+
+    /// A group of a new owner, stored directly and unmarked, with a webhook
+    async fn group_fixture(harness: &TestHarness) -> (Channel, Webhook) {
+        let (_, _, owner) = harness.new_user().await;
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        let hook = webhook(&group, &owner.id);
+        harness.db.insert_webhook(&hook).await.expect("`Webhook`");
+        (group, hook)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// A group marked encrypted-only refuses the github webhook (`group`)
+    /// for an event that would send and for one that would not (`ping`),
+    /// with no message row. With the mark lifted the same event sends (the
+    /// control).
+    ///
+    /// Control: the `plain_write_allowed_unauthored` line removed → the
+    /// `create` event sends into the marked group.
+    #[test]
+    fn github_execute_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(
+            github_execute_in_an_encrypted_only_group_is_refused_case(),
+        ))
+    }
+
+    async fn github_execute_in_an_encrypted_only_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (group, hook) = group_fixture(&harness).await;
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        for (event, body) in [("create", create_event()), ("ping", ping_event())] {
+            let refused = execute(&harness, &hook.id, token(&hook), event, &body).await;
+            assert_refused(&refused, Status::Forbidden, "EncryptionRequired", event);
+            let error: Value = serde_json::from_str(&refused.1).expect("a JSON error body");
+            assert_eq!(error["side"], "group", "{event}: {}", refused.1);
+        }
+        assert_eq!(stored_messages(&harness, &group).await, 0);
+
+        mark_group_raw(&harness.db, group.id(), false).await;
+        let (status, sent) =
+            execute(&harness, &hook.id, token(&hook), "create", &create_event()).await;
+        assert_eq!(status, Status::Ok, "an unmarked group: {sent}");
+        assert_eq!(stored_messages(&harness, &group).await, 1);
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn github_execute_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            // Must run before the harness primes the config cache
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+
+            let harness = TestHarness::new().await;
+            let (group, hook) = group_fixture(&harness).await;
+            mark_group_raw(&harness.db, group.id(), true).await;
+
+            let (status, sent) =
+                execute(&harness, &hook.id, token(&hook), "create", &create_event()).await;
+            assert_eq!(status, Status::Ok, "{sent}");
+            assert_eq!(stored_messages(&harness, &group).await, 1);
         }))
     }
 }

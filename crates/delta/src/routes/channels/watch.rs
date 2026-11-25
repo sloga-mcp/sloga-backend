@@ -18,9 +18,10 @@
 //! Every route requires the caller to be IN the call right now — you cannot
 //! drive, or read, a call you are not in.
 
+use revolt_config::config;
 use revolt_database::{
     events::client::EventV1,
-    util::{permissions::perms, reference::Reference},
+    util::{e2ee_only, permissions::perms, reference::Reference},
     voice::{
         get_voice_state, is_in_voice_channel, update_voice_state,
         watch::{
@@ -71,6 +72,15 @@ fn require_start_permission(channel: &Channel, permissions: &PermissionValue) ->
     }
 }
 
+/// A media reference (a video id, a server URL, a title) is readable text
+/// fanned through the server, so a direct message or group that takes
+/// encrypted messages only takes none. Only the writes that carry media
+/// call this; host handoff, the watching flag, end and fetch carry none.
+async fn require_plain_media_allowed(db: &Database, user: &User, channel: &Channel) -> Result<()> {
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, user, channel, None).await
+}
+
 /// Host, or a channel manager (the moderation override).
 fn require_control(
     user: &User,
@@ -111,6 +121,7 @@ pub async fn watch_create(
     let channel = target.as_channel(db).await?;
     let (voice_channel, permissions) = require_call_participant(db, &user, &channel).await?;
     require_start_permission(&channel, &permissions)?;
+    require_plain_media_allowed(db, &user, &channel).await?;
     validate_media(&data.media)?;
 
     let session = create_watch_session(channel.id(), &user.id, data.media)
@@ -154,6 +165,12 @@ pub async fn watch_update(
         .await?
         .ok_or_else(|| create_error!(NotFound))?;
     require_control(&user, &existing, &permissions)?;
+
+    // Only a write that names new media is refused; a heartbeat carries
+    // control state alone and stays allowed.
+    if data.media.is_some() {
+        require_plain_media_allowed(db, &user, &channel).await?;
+    }
 
     let session = update_watch_session(channel.id(), |session| {
         session.playing = data.playing;
@@ -438,7 +455,7 @@ mod test {
             create_voice_state, delete_channel_voice_state, delete_voice_state,
             watch::fetch_watch_session, UserVoiceChannel,
         },
-        Channel, Member, User,
+        Channel, Database, Member, PartialUser, User,
     };
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
@@ -1346,6 +1363,265 @@ mod test {
         );
 
         delete_channel_voice_state(&uvc, &[user_b.id.clone()])
+            .await
+            .expect("teardown");
+    }
+
+    /// A group of host A and viewer B, stored directly and unmarked, with
+    /// both in its call. Returns the group, its voice key, A, A's token, B
+    /// and B's token.
+    async fn group_call(
+        harness: &TestHarness,
+    ) -> (Channel, UserVoiceChannel, User, String, User, String) {
+        let (_, session_a, user_a) = harness.new_user().await;
+        let (_, session_b, user_b) = harness.new_user().await;
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "watch group".to_string(),
+            owner: user_a.id.clone(),
+            description: None,
+            recipients: vec![user_a.id.clone(), user_b.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            // Groups are call-capable by default
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        let uvc = UserVoiceChannel::from_channel(&group);
+        create_voice_state(&uvc, &user_a.id, Timestamp::now_utc())
+            .await
+            .expect("voice state a");
+        create_voice_state(&uvc, &user_b.id, Timestamp::now_utc())
+            .await
+            .expect("voice state b");
+        (group, uvc, user_a, session_a.token, user_b, session_b.token)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    async fn set_e2ee_only(db: &Database, user: &User, e2ee_only: bool) {
+        let mut user = user.clone();
+        user.update(
+            db,
+            PartialUser {
+                e2ee_only: Some(e2ee_only),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("e2ee_only");
+    }
+
+    async fn start(harness: &TestHarness, token: &str, channel_id: &str) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/channels/{channel_id}/watch"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(yt("YE7VzlLtp-4").to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    async fn update(
+        harness: &TestHarness,
+        token: &str,
+        channel_id: &str,
+        body: serde_json::Value,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .patch(format!("/channels/{channel_id}/watch"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token.to_string()))
+            .body(body.to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    fn assert_encryption_required(answer: &(Status, String), side: &str) {
+        assert_eq!(answer.0, Status::Forbidden, "{}", answer.1);
+        let error: serde_json::Value = serde_json::from_str(&answer.1).expect("error body");
+        assert_eq!(error["type"], "EncryptionRequired", "{}", answer.1);
+        assert_eq!(error["side"], side, "{}", answer.1);
+    }
+
+    fn video_id(session: &v0::WatchSession) -> &str {
+        match &session.media {
+            v0::WatchMedia::YouTube { video_id, .. } => video_id.as_str(),
+            other => panic!("expected a YouTube item, got {:?}", other),
+        }
+    }
+
+    /// Encrypted-only: a media reference is readable text fanned through the
+    /// server. Starting a session is refused in a marked group (`group`) and
+    /// for an encrypted-only host in an unmarked one (`sender`), leaving no
+    /// session; with both lifted the same start succeeds (the control).
+    /// Once running, an encrypted-only host's write that names new media is
+    /// refused and leaves the item unchanged, while a heartbeat (control
+    /// state only) and the watching flag stay allowed.
+    ///
+    /// Control: the `require_plain_media_allowed` calls removed → the first
+    /// start succeeds, and the media swap applies.
+    #[test]
+    fn watch_media_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(watch_media_in_an_encrypted_only_group_is_refused_case())
+    }
+
+    async fn watch_media_in_an_encrypted_only_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (group, uvc, user_a, token_a, user_b, token_b) = group_call(&harness).await;
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        assert_encryption_required(&start(&harness, &token_a, group.id()).await, "group");
+        mark_group_raw(&harness.db, group.id(), false).await;
+
+        set_e2ee_only(&harness.db, &user_a, true).await;
+        assert_encryption_required(&start(&harness, &token_a, group.id()).await, "sender");
+        set_e2ee_only(&harness.db, &user_a, false).await;
+
+        assert!(fetch_watch_session(group.id())
+            .await
+            .expect("session read")
+            .is_none());
+
+        let started = start(&harness, &token_a, group.id()).await;
+        assert_eq!(started.0, Status::Ok, "{}", started.1);
+
+        // Running session, host now encrypted-only
+        set_e2ee_only(&harness.db, &user_a, true).await;
+
+        let heartbeat = update(
+            &harness,
+            &token_a,
+            group.id(),
+            serde_json::json!({ "playing": true, "position_ms": 1000, "rate_permille": 1000 }),
+        )
+        .await;
+        assert_eq!(heartbeat.0, Status::Ok, "a heartbeat: {}", heartbeat.1);
+
+        let swap = update(
+            &harness,
+            &token_a,
+            group.id(),
+            serde_json::json!({
+                "playing": true,
+                "position_ms": 0,
+                "rate_permille": 1000,
+                "media": { "provider": "youtube", "video_id": "aaaaaaaaaaa" }
+            }),
+        )
+        .await;
+        assert_encryption_required(&swap, "sender");
+        let session = fetch_watch_session(group.id())
+            .await
+            .expect("session read")
+            .expect("session");
+        assert_eq!(video_id(&session), "YE7VzlLtp-4", "the refused swap applied");
+
+        let response = harness
+            .client
+            .put(format!("/channels/{}/watching", group.id()))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", token_b.clone()))
+            .body(serde_json::json!({ "watching": true }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        set_e2ee_only(&harness.db, &user_a, false).await;
+        let response = harness
+            .client
+            .delete(format!("/channels/{}/watch", group.id()))
+            .header(Header::new("x-session-token", token_a.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
+            .await
+            .expect("teardown");
+    }
+
+    /// `only_enforced = false` lifts the refusals: start and a media swap in
+    /// a marked group by an encrypted-only host both apply. Process-wide
+    /// config, so nextest only (one process per test).
+    #[test]
+    fn watch_media_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt()
+            .block_on(watch_media_in_an_encrypted_only_group_is_allowed_when_not_enforced_case())
+    }
+
+    async fn watch_media_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (group, uvc, user_a, token_a, user_b, _token_b) = group_call(&harness).await;
+        mark_group_raw(&harness.db, group.id(), true).await;
+        set_e2ee_only(&harness.db, &user_a, true).await;
+
+        let started = start(&harness, &token_a, group.id()).await;
+        assert_eq!(started.0, Status::Ok, "{}", started.1);
+        let swap = update(
+            &harness,
+            &token_a,
+            group.id(),
+            serde_json::json!({
+                "playing": true,
+                "position_ms": 0,
+                "rate_permille": 1000,
+                "media": { "provider": "youtube", "video_id": "aaaaaaaaaaa" }
+            }),
+        )
+        .await;
+        assert_eq!(swap.0, Status::Ok, "{}", swap.1);
+
+        let response = harness
+            .client
+            .delete(format!("/channels/{}/watch", group.id()))
+            .header(Header::new("x-session-token", token_a.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::NoContent);
+
+        delete_channel_voice_state(&uvc, &[user_a.id.clone(), user_b.id.clone()])
             .await
             .expect("teardown");
     }

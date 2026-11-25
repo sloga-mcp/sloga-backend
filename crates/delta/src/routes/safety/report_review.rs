@@ -416,6 +416,8 @@ mod test {
 
         let (server, channels) = harness.new_server(&author).await;
         let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+        // Reporters must be able to see the message they report
+        harness.join_server(&server, &reporter).await;
 
         // File a report as the reporter
         let response = harness

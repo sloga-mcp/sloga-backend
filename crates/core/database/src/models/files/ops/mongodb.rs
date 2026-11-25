@@ -228,6 +228,63 @@ impl AbstractAttachments for MongoDb {
     async fn delete_attachment(&self, id: &str) -> Result<()> {
         query!(self, delete_one_by_id, COL, id).map(|_| ())
     }
+
+    /// Fetch an attachment by its id, whatever its tag or state.
+    async fn fetch_attachment_by_id(&self, id: &str) -> Result<File> {
+        query!(self, find_one_by_id, COL, id)?.ok_or_else(|| create_error!(NotFound))
+    }
+
+    /// Fetch every attachment whose original hash is in `hashes`, in any state.
+    async fn fetch_attachments_by_hashes(&self, hashes: &[String]) -> Result<Vec<File>> {
+        if hashes.is_empty() {
+            return Ok(vec![]);
+        }
+
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "hash": {
+                    "$in": hashes
+                }
+            }
+        )
+    }
+
+    /// Hide attachments but keep the stored objects.
+    async fn hide_attachments(&self, ids: &[String]) -> Result<()> {
+        self.set_attachment_flags(
+            ids,
+            doc! {
+                "deleted": true,
+                "reported": true
+            },
+        )
+        .await
+    }
+
+    /// Undo a hide: `deleted` false, `reported` untouched.
+    async fn unhide_attachments(&self, ids: &[String]) -> Result<()> {
+        self.set_attachment_flags(
+            ids,
+            doc! {
+                "deleted": false
+            },
+        )
+        .await
+    }
+
+    /// End a hold: `reported` false, `deleted` untouched.
+    async fn release_attachment_hold(&self, ids: &[String]) -> Result<()> {
+        self.set_attachment_flags(
+            ids,
+            doc! {
+                "reported": false
+            },
+        )
+        .await
+    }
 }
 
 impl MongoDb {
@@ -239,6 +296,29 @@ impl MongoDb {
                     "$set": {
                         "deleted": true
                     }
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_many", COL))
+    }
+
+    /// `$set` the given flags on every attachment in `ids`. Unknown ids
+    /// match nothing; an empty slice skips the write.
+    async fn set_attachment_flags(&self, ids: &[String], flags: Document) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        self.col::<Document>(COL)
+            .update_many(
+                doc! {
+                    "_id": {
+                        "$in": ids
+                    }
+                },
+                doc! {
+                    "$set": flags
                 },
             )
             .await

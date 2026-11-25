@@ -587,7 +587,7 @@ mod test {
                 email: email.clone(),
                 email_normalised: email,
                 password: "not-a-real-hash".to_string(),
-                deletion,
+                deletion: deletion.clone(),
                 disabled,
                 lockout: None,
                 mfa: Default::default(),
@@ -598,6 +598,17 @@ mod test {
             })
             .await
             .expect("save account");
+
+        // `save_account` never writes `deletion` (so a stale whole-document
+        // save cannot clobber it). Seed it through the dedicated op, or the
+        // deletion fixtures below would silently have no deletion state.
+        if deletion.is_some() {
+            harness
+                .db
+                .set_account_deletion(&user.id, deletion)
+                .await
+                .expect("set account deletion");
+        }
     }
 
     /// Healthy account: the common case.

@@ -37,13 +37,29 @@ pub struct GenericPayload {
     pub user: User,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct DmCallPayload {
     pub initiator_id: String,
     pub channel_id: String,
     pub started_at: Option<String>,
     pub ended: bool,
+    /// Identifies one ring; every later signal about that ring repeats it
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    /// Why the ringing stopped; only ever set together with `ended = true`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether the caller started a video call
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<bool>,
 }
+
+// The values `DmCallPayload::reason` takes. They travel inside push payloads to apps that
+// are already installed, so a value that has shipped must never be renamed.
+pub const CALL_REASON_ANSWERED_ELSEWHERE: &str = "answered_elsewhere";
+pub const CALL_REASON_DECLINED: &str = "declined";
+pub const CALL_REASON_CANCELLED: &str = "cancelled";
+pub const CALL_REASON_ENDED: &str = "ended";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InternalDmCallPayload {
@@ -166,4 +182,91 @@ pub struct AckEventPayload {
     pub user_id: String,
     pub channel_id: Option<String>,
     pub server_id: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DmCallPayload, CALL_REASON_DECLINED};
+
+    /// A push daemon or an app that predates the ring fields must see the payload it has
+    /// always seen. An unset new field has to be left out, not sent as `null`: an extra
+    /// key is exactly what a strict older reader would trip over.
+    #[test]
+    fn a_call_payload_without_ring_fields_serializes_to_the_four_original_keys() {
+        let payload = DmCallPayload {
+            initiator_id: "01USER".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            started_at: Some("2026-09-23T00:00:00.000Z".to_string()),
+            ended: false,
+            call_id: None,
+            reason: None,
+            video: None,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&payload).expect("serializes"),
+            serde_json::json!({
+                "initiator_id": "01USER",
+                "channel_id": "01CHANNEL",
+                "started_at": "2026-09-23T00:00:00.000Z",
+                "ended": false
+            })
+        );
+    }
+
+    /// A call signal queued by a publisher that predates the ring fields is still waiting
+    /// in the broker when the consumer restarts on the new code, and has to decode.
+    #[test]
+    fn a_call_payload_holding_only_the_four_original_keys_still_decodes() {
+        let payload: DmCallPayload = serde_json::from_str(
+            r#"{"initiator_id":"01USER","channel_id":"01CHANNEL","started_at":null,"ended":true}"#,
+        )
+        .expect("deserializes");
+
+        assert_eq!(payload.initiator_id, "01USER");
+        assert_eq!(payload.channel_id, "01CHANNEL");
+        assert_eq!(payload.started_at, None);
+        assert!(payload.ended);
+        assert_eq!(payload.call_id, None);
+        assert_eq!(payload.reason, None);
+        assert_eq!(payload.video, None);
+    }
+
+    /// The ring fields are only useful if they survive the trip through the queue under
+    /// the names the apps read.
+    #[test]
+    fn a_call_payload_with_every_ring_field_set_round_trips() {
+        let payload = DmCallPayload {
+            initiator_id: "01USER".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            started_at: None,
+            ended: true,
+            call_id: Some("01CALL".to_string()),
+            reason: Some(CALL_REASON_DECLINED.to_string()),
+            video: Some(true),
+        };
+
+        let wire = serde_json::to_value(&payload).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "initiator_id": "01USER",
+                "channel_id": "01CHANNEL",
+                "started_at": null,
+                "ended": true,
+                "call_id": "01CALL",
+                "reason": "declined",
+                "video": true
+            })
+        );
+
+        let decoded: DmCallPayload = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(decoded.initiator_id, "01USER");
+        assert_eq!(decoded.channel_id, "01CHANNEL");
+        assert_eq!(decoded.started_at, None);
+        assert!(decoded.ended);
+        assert_eq!(decoded.call_id.as_deref(), Some("01CALL"));
+        assert_eq!(decoded.reason.as_deref(), Some(CALL_REASON_DECLINED));
+        assert_eq!(decoded.video, Some(true));
+    }
 }

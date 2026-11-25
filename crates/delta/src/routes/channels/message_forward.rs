@@ -2,6 +2,7 @@ use iso8601_timestamp::Timestamp;
 use revolt_config::config;
 use revolt_database::events::client::EventV1;
 use revolt_database::util::antispam;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::idempotency::IdempotencyKey;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
@@ -101,6 +102,13 @@ pub async fn message_forward(
     if destination.is_protected() || permission_channel.is_protected() {
         return Err(create_error!(ChannelProtected));
     }
+
+    // A forward is a plain snapshot, which an encrypted-only account or
+    // group never takes. The destination decides: that is where the
+    // snapshot is written. Refused in the same place as above, before the
+    // slowmode claim, the nonce and the attachment copies.
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &destination, None).await?;
 
     // Archived or locked threads reject forwards exactly like normal
     // messages.
@@ -336,9 +344,14 @@ mod test {
         MessageTimePeriod, Session, User, SYSTEM_USER_ID,
     };
     use revolt_models::v0;
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::{json, Value};
     use ulid::Ulid;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_marked_group, e2ee_messages_in,
+        e2ee_request, set_e2ee_only,
+    };
 
     #[test]
     fn forward_carries_snapshot_and_requires_source_read() {
@@ -1277,5 +1290,123 @@ mod test {
         .await;
         assert_eq!(answer.0, Status::Ok, "{:?}", answer);
         assert_eq!(body(&answer)["channel"], open_thread.id());
+    }
+
+    /// A message the author can forward: theirs, in a server channel of
+    /// their own. Returns the forward route's path for it.
+    async fn e2ee_forward_source(
+        harness: &TestHarness,
+        author: &User,
+        session: &Session,
+    ) -> String {
+        let (server, _) = harness.new_server(author).await;
+        let source = harness.new_channel(&server).await;
+        let answer = e2ee_request(
+            harness,
+            Method::Post,
+            &format!("/channels/{}/messages", source.id()),
+            session,
+            Some(&json!({ "content": "worth forwarding" })),
+        )
+        .await;
+        assert_accepted(&answer, "the source message");
+        let message_id = answer.1["_id"].as_str().expect("message id");
+        format!("/channels/{}/messages/{message_id}/forward", source.id())
+    }
+
+    /// A forward is judged by its destination: into a direct message or
+    /// group with an encrypted-only side it is refused, stores nothing and
+    /// spends no nonce. Control: with the flags lifted the same forward,
+    /// nonce included, is sent.
+    #[test]
+    fn e2ee_only_forward_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            e2ee_only_forward_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn e2ee_only_forward_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let path = e2ee_forward_source(&harness, &author, &author_session).await;
+        let nonce = Ulid::new().to_string();
+        let to_dm = json!({ "destination": dm.id(), "nonce": nonce });
+        let to_group = json!({ "destination": group.id(), "nonce": nonce });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer =
+            e2ee_request(&harness, Method::Post, &path, &author_session, Some(&to_dm)).await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer =
+            e2ee_request(&harness, Method::Post, &path, &author_session, Some(&to_dm)).await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &path,
+            &author_session,
+            Some(&to_group),
+        )
+        .await;
+        assert_encryption_required(&answer, "group", "a marked group");
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 0, "the DM");
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 0, "the group");
+
+        // Control: no flags, the same forward and nonce
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer =
+            e2ee_request(&harness, Method::Post, &path, &author_session, Some(&to_dm)).await;
+        assert_accepted(&answer, "no flags, the refused forwards' nonce");
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 1);
+    }
+
+    /// With `only_enforced = false` the same forwards are sent
+    #[test]
+    fn e2ee_only_forward_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_forward_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_forward_allowed_when_not_enforced_case() {
+        assert!(
+            !config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let path = e2ee_forward_source(&harness, &author, &author_session).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (destination, case) in [
+            (dm.id(), "an encrypted-only author and peer"),
+            (group.id(), "a marked group"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &path,
+                &author_session,
+                Some(&json!({ "destination": destination })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 1);
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 1);
     }
 }

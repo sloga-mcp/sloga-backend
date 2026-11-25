@@ -1,6 +1,6 @@
 use revolt_result::Result;
 
-use crate::{Account, EmailVerification, Lockout, PasswordReset};
+use crate::{Account, DeletionInfo, EmailVerification, Lockout, PasswordReset};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -30,6 +30,8 @@ pub trait AbstractAccounts: Sync + Send {
     async fn fetch_account_with_password_reset(&self, token: &str) -> Result<Account>;
 
     /// Find account with active deletion token
+    ///
+    /// The token must be pending and unexpired, else `InvalidToken`.
     async fn fetch_account_with_deletion_token(&self, token: &str) -> Result<Account>;
 
     /// Find accounts which are due to be deleted
@@ -37,9 +39,55 @@ pub trait AbstractAccounts: Sync + Send {
 
     // Save account
     //
-    // Never writes `lockout`: an update keeps the stored value and an insert
-    // stores none. Lockout is written only through the lockout ops below.
+    // Never writes `lockout` or `deletion`: an update keeps the stored values
+    // and an insert stores none. Lockout is written only through the lockout
+    // ops below, and deletion only through the deletion ops, so a stale
+    // whole-document save can neither reset a lockout nor cancel, revive or
+    // un-schedule a deletion. Every other field, `disabled` included, is
+    // still written.
     async fn save_account(&self, account: &Account) -> Result<()>;
+
+    /// Overwrite the deletion state, and nothing else
+    ///
+    /// `None` removes it. `UnknownUser` if there is no such account.
+    async fn set_account_deletion(&self, id: &str, deletion: Option<DeletionInfo>) -> Result<()>;
+
+    /// Atomically store a new deletion request
+    ///
+    /// Writes `deletion` only if the account is not disabled and has no
+    /// deletion or a `WaitingForVerification` one (which it replaces). A
+    /// `Scheduled` or `Deleted` account, a disabled one, or no such account
+    /// is `InvalidOperation` and changes nothing, so a request racing a
+    /// confirm can never turn a claimed deletion back into a pending one
+    /// that could then be neither confirmed nor purged.
+    async fn request_account_deletion(&self, id: &str, deletion: DeletionInfo) -> Result<()>;
+
+    /// Atomically confirm a pending deletion
+    ///
+    /// Matches only an account that is not disabled and whose deletion is
+    /// `WaitingForVerification` with this token and an expiry not yet
+    /// passed. It becomes `Scheduled { after: now }` and disabled in the same
+    /// write, and the updated account is returned. Anything else is
+    /// `InvalidToken` and changes nothing, so of any number of racing claims
+    /// (or a claim racing `cancel_account_deletion`) exactly one wins.
+    async fn claim_account_deletion(&self, token: &str) -> Result<Account>;
+
+    /// Atomically cancel a pending deletion
+    ///
+    /// If the account's deletion is `WaitingForVerification`, expired or
+    /// not, it is removed and the previous value returned. Otherwise
+    /// (`Scheduled`, `Deleted`, none, or no such account) nothing changes
+    /// and the result is `None`.
+    async fn cancel_account_deletion(&self, account_id: &str) -> Result<Option<DeletionInfo>>;
+
+    /// Remove the linked Google and Apple ids, and nothing else
+    ///
+    /// Both are removed from storage, so neither `fetch_account_by_google_id`
+    /// nor `fetch_account_by_apple_id` finds the account afterwards.
+    /// `save_account` cannot do this: it leaves a `None` id out of its
+    /// write. An account with neither id is `Ok`. `UnknownUser` if there is
+    /// no such account.
+    async fn unlink_account_oauth(&self, id: &str) -> Result<()>;
 
     /// Atomically count one failed attempt, with no lock check
     ///
@@ -79,7 +127,7 @@ pub trait AbstractAccounts: Sync + Send {
 #[cfg(test)]
 mod tests {
     use super::AbstractAccounts;
-    use crate::{Account, EmailVerification, Lockout, PasswordReset};
+    use crate::{Account, DeletionInfo, EmailVerification, Lockout, PasswordReset};
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_result::ErrorType;
 
@@ -491,6 +539,820 @@ mod tests {
                 )
                 .await
                 .is_err());
+        });
+    }
+
+    /// Millisecond-exact, so it survives the ISO string round trip
+    fn far_future() -> Timestamp {
+        Timestamp::parse("2099-01-01T00:00:00.000Z").expect("valid timestamp")
+    }
+
+    fn waiting(token: &str, expiry: Timestamp) -> Option<DeletionInfo> {
+        Some(DeletionInfo::WaitingForVerification {
+            token: token.to_string(),
+            expiry,
+        })
+    }
+
+    /// Insert an account and give it a pending deletion through the
+    /// targeted write, never through `save_account`
+    async fn request_deletion(
+        db: &crate::Database,
+        mut acct: Account,
+        token: &str,
+        expiry: Timestamp,
+    ) -> Account {
+        acct.deletion = None;
+        db.save_account(&acct).await.unwrap();
+        db.set_account_deletion(&acct.id, waiting(token, expiry))
+            .await
+            .unwrap();
+        db.fetch_account(&acct.id).await.unwrap()
+    }
+
+    fn assert_invalid_token(result: revolt_result::Result<Account>, why: &str) {
+        let error = result.expect_err(why);
+        assert!(
+            matches!(error.error_type, ErrorType::InvalidToken),
+            "{why}: expected InvalidToken, got {:?}",
+            error.error_type
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_claim() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELCLAIM000000000"),
+                "claim-token",
+                far_future(),
+            )
+            .await;
+            assert!(db
+                .fetch_account_with_deletion_token("claim-token")
+                .await
+                .is_ok());
+
+            let claimed = db.claim_account_deletion("claim-token").await.unwrap();
+            assert_eq!(claimed.id, acct.id);
+            assert!(claimed.disabled, "a claim must disable the account");
+            assert!(
+                matches!(claimed.deletion, Some(DeletionInfo::Scheduled { .. })),
+                "a claim must schedule the deletion, got {:?}",
+                claimed.deletion
+            );
+
+            // The returned document is the stored one
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert!(fetched.disabled);
+            assert_eq!(fetched.deletion, claimed.deletion);
+
+            // A token is spent once
+            assert_invalid_token(
+                db.claim_account_deletion("claim-token").await,
+                "a second claim must be refused",
+            );
+            assert_invalid_token(
+                db.fetch_account_with_deletion_token("claim-token").await,
+                "a claimed token no longer finds the account",
+            );
+
+            // A claimed deletion cannot be cancelled
+            assert_eq!(db.cancel_account_deletion(&acct.id).await.unwrap(), None);
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, claimed.deletion);
+            assert!(fetched.disabled);
+
+            // `after` is now, so the purge picks it up at once
+            let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+            assert_eq!(
+                due.iter().map(|due| due.id.as_str()).collect::<Vec<_>>(),
+                vec![acct.id.as_str()]
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_claim_expired() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELEXPIRED0000000"),
+                "expired-token",
+                Timestamp::now_utc() - Duration::minutes(1),
+            )
+            .await;
+
+            assert_invalid_token(
+                db.claim_account_deletion("expired-token").await,
+                "an expired token must be refused",
+            );
+            assert_invalid_token(
+                db.fetch_account_with_deletion_token("expired-token").await,
+                "an expired token must not find the account",
+            );
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, acct.deletion, "a refused claim changes nothing");
+            assert!(!fetched.disabled);
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_claim_wrong_token() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELWRONG000000000"),
+                "right-token",
+                far_future(),
+            )
+            .await;
+
+            assert_invalid_token(
+                db.claim_account_deletion("wrong-token").await,
+                "a wrong token must be refused",
+            );
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, waiting("right-token", far_future()));
+            assert!(!fetched.disabled);
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_claim_disabled() {
+        database_test!(|db| async move {
+            let mut acct = account("01ACCOUNTDELDISABLED000000");
+            acct.disabled = true;
+            let acct = request_deletion(&db, acct, "disabled-token", far_future()).await;
+            assert!(acct.disabled, "the control: the account is stored disabled");
+
+            assert_invalid_token(
+                db.claim_account_deletion("disabled-token").await,
+                "a disabled account must be refused",
+            );
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, waiting("disabled-token", far_future()));
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_cancel() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELCANCEL00000000"),
+                "cancel-token",
+                far_future(),
+            )
+            .await;
+
+            let previous = db.cancel_account_deletion(&acct.id).await.unwrap();
+            assert_eq!(previous, waiting("cancel-token", far_future()));
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, None);
+            assert!(!fetched.disabled);
+
+            assert_invalid_token(
+                db.claim_account_deletion("cancel-token").await,
+                "a cancelled token must be refused",
+            );
+            assert_eq!(db.cancel_account_deletion(&acct.id).await.unwrap(), None);
+            assert_eq!(
+                db.cancel_account_deletion("01ACCOUNTMISSING0000000000")
+                    .await
+                    .unwrap(),
+                None
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_cancel_expired() {
+        database_test!(|db| async move {
+            let expiry = Timestamp::parse("2000-01-01T00:00:00.000Z").expect("valid timestamp");
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELCANCELEXP00000"),
+                "old-token",
+                expiry,
+            )
+            .await;
+
+            // An expired request is still cleared, and the caller sees it
+            // was expired
+            let previous = db.cancel_account_deletion(&acct.id).await.unwrap();
+            assert_eq!(previous, waiting("old-token", expiry));
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().deletion, None);
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_cancel_scheduled() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTDELSCHEDULED00000");
+            db.save_account(&acct).await.unwrap();
+
+            let scheduled = Some(DeletionInfo::Scheduled {
+                after: far_future(),
+            });
+            db.set_account_deletion(&acct.id, scheduled.clone())
+                .await
+                .unwrap();
+            assert_eq!(db.cancel_account_deletion(&acct.id).await.unwrap(), None);
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().deletion, scheduled);
+
+            db.set_account_deletion(&acct.id, Some(DeletionInfo::Deleted))
+                .await
+                .unwrap();
+            assert_eq!(db.cancel_account_deletion(&acct.id).await.unwrap(), None);
+            assert_eq!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                Some(DeletionInfo::Deleted)
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_race() {
+        database_test!(|db| async move {
+            // Racing claims: exactly one wins
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELRACE0000000000"),
+                "race-token",
+                far_future(),
+            )
+            .await;
+            let claims = (0..5).map(|_| db.claim_account_deletion("race-token"));
+            let results = futures::future::join_all(claims).await;
+            assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+            for result in results.into_iter().filter(|result| result.is_err()) {
+                assert_invalid_token(result, "a losing claim");
+            }
+            assert!(matches!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                Some(DeletionInfo::Scheduled { .. })
+            ));
+
+            // A claim racing a cancel: exactly one of them takes effect
+            let other = request_deletion(
+                &db,
+                account("01ACCOUNTDELRACE2000000000"),
+                "race-token-2",
+                far_future(),
+            )
+            .await;
+            let (claim, cancel) = futures::join!(
+                db.claim_account_deletion("race-token-2"),
+                db.cancel_account_deletion(&other.id)
+            );
+            let cancel = cancel.unwrap();
+            let fetched = db.fetch_account(&other.id).await.unwrap();
+            match claim {
+                Ok(_) => {
+                    assert_eq!(cancel, None, "both the claim and the cancel won");
+                    assert!(matches!(
+                        fetched.deletion,
+                        Some(DeletionInfo::Scheduled { .. })
+                    ));
+                    assert!(fetched.disabled);
+                }
+                Err(error) => {
+                    assert!(matches!(error.error_type, ErrorType::InvalidToken));
+                    assert_eq!(cancel, waiting("race-token-2", far_future()));
+                    assert_eq!(fetched.deletion, None);
+                    assert!(!fetched.disabled);
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_stale_save() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTDELSTALE000000000");
+            db.save_account(&acct).await.unwrap();
+
+            // A copy taken before the deletion was requested and claimed
+            let mut stale = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(stale.deletion, None);
+            assert!(!stale.disabled);
+
+            db.set_account_deletion(&acct.id, waiting("stale-token", far_future()))
+                .await
+                .unwrap();
+            let claimed = db.claim_account_deletion("stale-token").await.unwrap();
+
+            stale.password = "hash-changed".to_string();
+            db.save_account(&stale).await.unwrap();
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(
+                fetched.deletion, claimed.deletion,
+                "a stale save must not clear a scheduled deletion"
+            );
+            assert_eq!(
+                fetched.password, "hash-changed",
+                "the save still writes every other field"
+            );
+            // `disabled` is NOT protected: the stale save wrote it back
+            assert!(!fetched.disabled);
+            assert_eq!(
+                db.fetch_accounts_due_for_deletion().await.unwrap().len(),
+                1,
+                "the purge still finds the account"
+            );
+
+            // A save never writes a deletion of its own either
+            stale.deletion = Some(DeletionInfo::Deleted);
+            db.save_account(&stale).await.unwrap();
+            assert_eq!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                claimed.deletion
+            );
+
+            // Nor does an insert
+            let mut fresh = account("01ACCOUNTDELINSERT00000000");
+            fresh.deletion = waiting("insert-token", far_future());
+            db.save_account(&fresh).await.unwrap();
+            assert_eq!(
+                db.fetch_account(&fresh.id).await.unwrap().deletion,
+                None,
+                "an insert must not store a deletion"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_set() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTDELSET00000000000");
+            db.save_account(&acct).await.unwrap();
+
+            let scheduled = Some(DeletionInfo::Scheduled {
+                after: far_future(),
+            });
+            db.set_account_deletion(&acct.id, scheduled.clone())
+                .await
+                .unwrap();
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, scheduled);
+            assert_eq!(fetched.password, acct.password, "nothing else changes");
+
+            db.set_account_deletion(&acct.id, None).await.unwrap();
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().deletion, None);
+
+            // MongoDB: `None` removes the key, it does not store a null
+            #[cfg(feature = "mongodb")]
+            {
+                if let crate::Database::MongoDb(mongo) = &db {
+                    let raw = mongo
+                        .col::<bson::Document>("accounts")
+                        .find_one(bson::doc! { "_id": &acct.id })
+                        .await
+                        .unwrap()
+                        .expect("account exists");
+                    assert!(raw.get("deletion").is_none(), "deletion key must be absent");
+                }
+            }
+
+            let missing = db
+                .set_account_deletion("01ACCOUNTMISSING0000000000", None)
+                .await
+                .expect_err("a missing account must fail");
+            assert!(
+                matches!(missing.error_type, ErrorType::UnknownUser),
+                "expected UnknownUser, got {:?}",
+                missing.error_type
+            );
+        });
+    }
+
+    /// The pending state a deletion request stores
+    fn pending(token: &str) -> DeletionInfo {
+        DeletionInfo::WaitingForVerification {
+            token: token.to_string(),
+            expiry: far_future(),
+        }
+    }
+
+    fn assert_invalid_operation(result: revolt_result::Result<()>, why: &str) {
+        let error = result.expect_err(why);
+        assert!(
+            matches!(error.error_type, ErrorType::InvalidOperation),
+            "{why}: expected InvalidOperation, got {:?}",
+            error.error_type
+        );
+    }
+
+    /// Store `deletion` on a fresh account, then show a request is refused
+    /// and leaves it as it was
+    async fn assert_request_refused(db: &crate::Database, id: &str, deletion: DeletionInfo) {
+        db.save_account(&account(id)).await.unwrap();
+        db.set_account_deletion(id, Some(deletion.clone()))
+            .await
+            .unwrap();
+
+        assert_invalid_operation(
+            db.request_account_deletion(id, pending("refused-token"))
+                .await,
+            &format!("{id}: a request over {deletion:?} must be refused"),
+        );
+
+        let fetched = db.fetch_account(id).await.unwrap();
+        assert_eq!(
+            fetched.deletion,
+            Some(deletion),
+            "{id}: a refused request changes nothing"
+        );
+        assert!(!fetched.disabled);
+        assert_invalid_token(
+            db.fetch_account_with_deletion_token("refused-token").await,
+            "a refused request must not store its token",
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_request_stores() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTDELREQUEST0000000");
+            db.save_account(&acct).await.unwrap();
+
+            db.request_account_deletion(&acct.id, pending("request-token"))
+                .await
+                .unwrap();
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, Some(pending("request-token")));
+            assert!(!fetched.disabled, "a request does not disable");
+            assert_eq!(fetched.password, acct.password, "nothing else changes");
+            assert_eq!(
+                db.fetch_account_with_deletion_token("request-token")
+                    .await
+                    .unwrap()
+                    .id,
+                acct.id
+            );
+
+            // A missing account is refused, never a silent no-op
+            assert_invalid_operation(
+                db.request_account_deletion("01ACCOUNTMISSING0000000000", pending("missing-token"))
+                    .await,
+                "a missing account must be refused",
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_request_replaces_pending() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELREQREPLACE0000"),
+                "first-token",
+                far_future(),
+            )
+            .await;
+
+            db.request_account_deletion(&acct.id, pending("second-token"))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                Some(pending("second-token"))
+            );
+            assert_invalid_token(
+                db.claim_account_deletion("first-token").await,
+                "a replaced token must be refused",
+            );
+
+            // An expired pending request is replaced the same way
+            let expired = Timestamp::parse("2000-01-01T00:00:00.000Z").expect("valid timestamp");
+            db.set_account_deletion(&acct.id, waiting("expired-token", expired))
+                .await
+                .unwrap();
+            db.request_account_deletion(&acct.id, pending("third-token"))
+                .await
+                .unwrap();
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, Some(pending("third-token")));
+            assert!(!fetched.disabled);
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_request_refuses_scheduled() {
+        database_test!(|db| async move {
+            assert_request_refused(
+                &db,
+                "01ACCOUNTDELREQSCHEDULED00",
+                DeletionInfo::Scheduled {
+                    after: far_future(),
+                },
+            )
+            .await;
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_request_refuses_deleted() {
+        database_test!(|db| async move {
+            assert_request_refused(&db, "01ACCOUNTDELREQDELETED0000", DeletionInfo::Deleted).await;
+        });
+    }
+
+    #[tokio::test]
+    async fn deletion_request_refuses_disabled() {
+        database_test!(|db| async move {
+            let mut acct = account("01ACCOUNTDELREQDISABLED000");
+            acct.disabled = true;
+            db.save_account(&acct).await.unwrap();
+            assert!(
+                db.fetch_account(&acct.id).await.unwrap().disabled,
+                "the control: the account is stored disabled"
+            );
+
+            assert_invalid_operation(
+                db.request_account_deletion(&acct.id, pending("disabled-token"))
+                    .await,
+                "a disabled account with no deletion must be refused",
+            );
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().deletion, None);
+
+            // Disabled with a pending deletion: still refused, still unchanged
+            db.set_account_deletion(&acct.id, waiting("old-token", far_future()))
+                .await
+                .unwrap();
+            assert_invalid_operation(
+                db.request_account_deletion(&acct.id, pending("disabled-token"))
+                    .await,
+                "a disabled account with a pending deletion must be refused",
+            );
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.deletion, waiting("old-token", far_future()));
+            assert!(fetched.disabled);
+        });
+    }
+
+    /// Wave-2 audit MINOR 1: a request landing after a confirm's claim must
+    /// not turn Scheduled back into a pending deletion on a disabled
+    /// account, which could then be neither confirmed nor purged
+    #[tokio::test]
+    async fn deletion_request_after_claim() {
+        database_test!(|db| async move {
+            let acct = request_deletion(
+                &db,
+                account("01ACCOUNTDELREQCLAIM000000"),
+                "claim-token",
+                far_future(),
+            )
+            .await;
+            let claimed = db.claim_account_deletion("claim-token").await.unwrap();
+
+            assert_invalid_operation(
+                db.request_account_deletion(&acct.id, pending("late-token"))
+                    .await,
+                "a request after a claim must be refused",
+            );
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert!(
+                matches!(fetched.deletion, Some(DeletionInfo::Scheduled { .. })),
+                "the account must stay Scheduled, got {:?}",
+                fetched.deletion
+            );
+            assert_eq!(fetched.deletion, claimed.deletion);
+            assert!(fetched.disabled, "the account must stay disabled");
+            assert_invalid_token(
+                db.fetch_account_with_deletion_token("late-token").await,
+                "the refused request must not store its token",
+            );
+
+            // The purge still finds it
+            let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+            assert_eq!(
+                due.iter().map(|due| due.id.as_str()).collect::<Vec<_>>(),
+                vec![acct.id.as_str()]
+            );
+
+            // A request racing a claim: exactly one takes effect, and the
+            // account is never left pending and disabled at once
+            let other = request_deletion(
+                &db,
+                account("01ACCOUNTDELREQCLAIM200000"),
+                "race-token",
+                far_future(),
+            )
+            .await;
+            let (claim, request) = futures::join!(
+                db.claim_account_deletion("race-token"),
+                db.request_account_deletion(&other.id, pending("racing-token"))
+            );
+            let fetched = db.fetch_account(&other.id).await.unwrap();
+            match claim {
+                Ok(_) => {
+                    assert_invalid_operation(request, "both the claim and the request won");
+                    assert!(matches!(
+                        fetched.deletion,
+                        Some(DeletionInfo::Scheduled { .. })
+                    ));
+                    assert!(fetched.disabled);
+                }
+                Err(error) => {
+                    assert!(matches!(error.error_type, ErrorType::InvalidToken));
+                    request.expect("the claim lost, so the request must have won");
+                    assert_eq!(fetched.deletion, Some(pending("racing-token")));
+                    assert!(!fetched.disabled);
+                }
+            }
+        });
+    }
+
+    /// MongoDB only: whole-document saves stored `deletion: null` before
+    /// `save_account` stopped writing it, and such an account must still be
+    /// able to ask. The reference driver has no raw document to hold a null.
+    #[cfg(feature = "mongodb")]
+    #[tokio::test]
+    async fn deletion_request_over_null() {
+        database_test!(|db| async move {
+            let crate::Database::MongoDb(mongo) = &db else {
+                return;
+            };
+
+            let acct = account("01ACCOUNTDELREQNULL0000000");
+            db.save_account(&acct).await.unwrap();
+
+            let accounts = mongo.col::<bson::Document>("accounts");
+            accounts
+                .update_one(
+                    bson::doc! { "_id": &acct.id },
+                    bson::doc! { "$set": { "deletion": bson::Bson::Null } },
+                )
+                .await
+                .unwrap();
+
+            // Prove the control: the field is stored as an explicit null
+            let raw = accounts
+                .find_one(bson::doc! { "_id": &acct.id })
+                .await
+                .unwrap()
+                .expect("account exists");
+            assert_eq!(raw.get("deletion"), Some(&bson::Bson::Null));
+
+            db.request_account_deletion(&acct.id, pending("null-token"))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                Some(pending("null-token"))
+            );
+        });
+    }
+
+    /// Amendment 9: a purged account must not keep its OAuth ids, so the
+    /// unlink removes both and leaves every other field as it was
+    #[tokio::test]
+    async fn oauth_unlink() {
+        database_test!(|db| async move {
+            let mut acct = account("01ACCOUNTOAUTHUNLINK000000");
+            acct.google_id = Some("google-sub-unlink".to_string());
+            acct.apple_id = Some("apple-sub-unlink".to_string());
+            acct.password_reset = Some(PasswordReset {
+                token: "reset-token".to_string(),
+                expiry: far_future(),
+            });
+            db.save_account(&acct).await.unwrap();
+            let scheduled = Some(DeletionInfo::Scheduled {
+                after: far_future(),
+            });
+            db.set_account_deletion(&acct.id, scheduled.clone())
+                .await
+                .unwrap();
+            let lockout = db.bump_lockout_count(&acct.id).await.unwrap().lockout;
+
+            // The control: both lookups find the account before the unlink
+            assert_eq!(
+                db.fetch_account_by_google_id("google-sub-unlink")
+                    .await
+                    .unwrap()
+                    .expect("the control: the Google id is stored")
+                    .id,
+                acct.id
+            );
+            assert_eq!(
+                db.fetch_account_by_apple_id("apple-sub-unlink")
+                    .await
+                    .unwrap()
+                    .expect("the control: the Apple id is stored")
+                    .id,
+                acct.id
+            );
+
+            db.unlink_account_oauth(&acct.id).await.unwrap();
+
+            assert!(db
+                .fetch_account_by_google_id("google-sub-unlink")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(db
+                .fetch_account_by_apple_id("apple-sub-unlink")
+                .await
+                .unwrap()
+                .is_none());
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.google_id, None);
+            assert_eq!(fetched.apple_id, None);
+
+            // Nothing else changes
+            assert_eq!(fetched.email, acct.email);
+            assert_eq!(fetched.email_normalised, acct.email_normalised);
+            assert_eq!(fetched.password, acct.password);
+            assert_eq!(fetched.disabled, acct.disabled);
+            assert_eq!(fetched.verification, acct.verification);
+            assert_eq!(fetched.password_reset, acct.password_reset);
+            assert_eq!(fetched.mfa, acct.mfa);
+            assert_eq!(fetched.deletion, scheduled);
+            assert_eq!(fetched.lockout, lockout);
+
+            // MongoDB: both keys are removed, not stored as nulls
+            #[cfg(feature = "mongodb")]
+            {
+                if let crate::Database::MongoDb(mongo) = &db {
+                    let raw = mongo
+                        .col::<bson::Document>("accounts")
+                        .find_one(bson::doc! { "_id": &acct.id })
+                        .await
+                        .unwrap()
+                        .expect("account exists");
+                    assert!(
+                        raw.get("google_id").is_none(),
+                        "google_id key must be absent"
+                    );
+                    assert!(raw.get("apple_id").is_none(), "apple_id key must be absent");
+                }
+            }
+        });
+    }
+
+    /// Only one id linked: the unlink still clears it
+    #[tokio::test]
+    async fn oauth_unlink_one_id() {
+        database_test!(|db| async move {
+            let mut acct = account("01ACCOUNTOAUTHUNLINKONE000");
+            acct.apple_id = Some("apple-sub-only".to_string());
+            db.save_account(&acct).await.unwrap();
+
+            db.unlink_account_oauth(&acct.id).await.unwrap();
+
+            assert!(db
+                .fetch_account_by_apple_id("apple-sub-only")
+                .await
+                .unwrap()
+                .is_none());
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().apple_id, None);
+        });
+    }
+
+    /// An account with no ids (and a second unlink, as a retried purge
+    /// runs) is `Ok` and changes nothing
+    #[tokio::test]
+    async fn oauth_unlink_none() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTOAUTHUNLINKNONE00");
+            db.save_account(&acct).await.unwrap();
+
+            db.unlink_account_oauth(&acct.id).await.unwrap();
+            db.unlink_account_oauth(&acct.id).await.unwrap();
+
+            let fetched = db.fetch_account(&acct.id).await.unwrap();
+            assert_eq!(fetched.google_id, None);
+            assert_eq!(fetched.apple_id, None);
+            assert_eq!(fetched.email, acct.email);
+            assert_eq!(fetched.password, acct.password);
+        });
+    }
+
+    #[tokio::test]
+    async fn oauth_unlink_missing() {
+        database_test!(|db| async move {
+            let missing = db
+                .unlink_account_oauth("01ACCOUNTMISSING0000000000")
+                .await
+                .expect_err("a missing account must fail");
+            assert!(
+                matches!(missing.error_type, ErrorType::UnknownUser),
+                "expected UnknownUser, got {:?}",
+                missing.error_type
+            );
         });
     }
 }

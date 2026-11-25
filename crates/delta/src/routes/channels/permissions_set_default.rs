@@ -1,6 +1,9 @@
 use revolt_database::util::audit_reason::AuditLogReason;
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{
+        permissions::DatabasePermissionQuery, protected_access::reconcile_channel,
+        reference::Reference,
+    },
     voice::{sync_voice_permissions, VoiceClient},
     AuditLogAction, AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database,
     PartialChannel, User,
@@ -9,6 +12,8 @@ use revolt_models::v0::{self, DataDefaultChannelPermissions};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, OverrideField};
 use revolt_result::{create_error, Result};
 use rocket::{serde::json::Json, State};
+
+use super::permissions_set::log_reconcile_failure;
 
 /// # Set Default Permission
 ///
@@ -126,12 +131,29 @@ pub async fn set_default_channel_permissions(
         _ => return Err(create_error!(InvalidOperation)),
     }
 
+    // Protected channels (6.3 "Hooks", S2-D11): a default overwrite can take
+    // ViewChannel away, so a server channel is reconciled after the write and
+    // its entry and BEFORE the voice sync, on every PUT (retrying the same
+    // PUT repairs a failed reconcile). The result is kept: the sync always
+    // runs, then a failed reconcile answers 500 with the overwrite in place
+    // (the `Member::remove` kept-second-release shape), its error unchanged.
+    // A failed sync is answered instead, so the reconcile error is logged
+    // here. A group is never protected, and a channel without a seat list is
+    // a no-op.
+    let reconciled = if channel.server().is_some() {
+        log_reconcile_failure(channel.id(), reconcile_channel(db, channel.id()).await)
+    } else {
+        Ok(Vec::new())
+    };
+
     let server = match channel.server() {
         Some(server_id) => Some(Reference::from_unchecked(server_id).as_server(db).await?),
         None => None
     };
 
     sync_voice_permissions(db, voice_client, &channel, server.as_ref(), None).await?;
+
+    reconciled?;
 
     Ok(Json(channel.into()))
 }
@@ -599,5 +621,291 @@ mod test {
         );
         let entries = server_entries(&harness, &f.server.id).await;
         assert!(entries.is_empty(), "{:?}", entries);
+    }
+}
+
+#[cfg(test)]
+mod reconcile_hook {
+    //! Protected channels, 6.3 "Hooks" (S2-D11): a default overwrite runs
+    //! `reconcile_channel` after the write and its entry and BEFORE the voice
+    //! sync; a failed reconcile is answered (500) once the sync ran, with the
+    //! overwrite in place. Owner O and target T are seated. Compile-only
+    //! without RabbitMQ and Redis, like every other route test.
+
+    use crate::util::test::TestHarness;
+    use iso8601_timestamp::Timestamp;
+    use revolt_database::{
+        events::client::EventV1,
+        mongodb::bson::{doc, Document},
+        voice::{delete_channel_node, set_channel_node},
+        AuditLogAction, AuditLogEntry, Channel, ChannelSeat, Database, Session, User,
+        PROTECTED_SCOPE_SEATS,
+    };
+    use revolt_permissions::{ChannelPermission, OverrideField};
+    use rocket::http::{ContentType, Header, Status};
+    use serde_json::json;
+
+    const VIEW: i64 = ChannelPermission::ViewChannel as i64;
+
+    /// A node name absent from `Revolt.toml`: the voice sync of a channel
+    /// pinned to it fails with `UnknownNode` before any network.
+    const ABSENT_NODE: &str = "test-node-with-no-sfu";
+
+    /// PUT the channel's default overwrite (allow nothing, deny `deny`) as
+    /// `session`: the status and the raw body.
+    async fn put_default(
+        harness: &TestHarness,
+        session: &Session,
+        channel_id: &str,
+        deny: i64,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .put(format!("/channels/{channel_id}/permissions/default"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.clone()))
+            .body(json!({ "permissions": { "allow": 0, "deny": deny } }).to_string())
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    async fn stored_default(harness: &TestHarness, channel_id: &str) -> Option<OverrideField> {
+        match harness.db.fetch_channel(channel_id).await.expect("channel") {
+            Channel::TextChannel {
+                default_permissions,
+                ..
+            } => default_permissions,
+            other => panic!("expected a text channel, got {:?}", other),
+        }
+    }
+
+    async fn seat_active(harness: &TestHarness, channel_id: &str, user_id: &str) -> bool {
+        harness
+            .db
+            .fetch_channel_seats(channel_id)
+            .await
+            .expect("the seats read")
+            .into_iter()
+            .find(|seat| seat.user_id == user_id)
+            .expect("a seat row")
+            .is_active()
+    }
+
+    async fn entries(
+        harness: &TestHarness,
+        server_id: &str,
+        action: AuditLogAction,
+    ) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(server_id, None, 50, Some(action), None)
+            .await
+            .expect("the audit log")
+    }
+
+    /// Arm (`{ "released_at": null }`) or lift (`{}`) a validator that
+    /// refuses every `channel_seats` row with `released_at` set, so every
+    /// seat release fails with a DatabaseError. MONGODB only.
+    async fn seat_validator(harness: &TestHarness, validator: Document) {
+        let Database::MongoDb(mongo) = &harness.db else {
+            panic!("MONGODB only");
+        };
+        mongo
+            .db()
+            .run_command(doc! {
+                "collMod": "channel_seats",
+                "validator": validator,
+                "validationLevel": "strict",
+                "validationAction": "error",
+            })
+            .await
+            .expect("the seat validator");
+    }
+
+    /// An ACTIVE seat row of `user_id` in `channel_id`, written straight to
+    /// the store with no seat list
+    async fn seat_raw(harness: &TestHarness, channel_id: &str, user_id: &str) {
+        let seat = ChannelSeat {
+            id: ChannelSeat::composite_id(channel_id, user_id),
+            channel_id: channel_id.to_string(),
+            user_id: user_id.to_string(),
+            seated_at: Timestamp::now_utc(),
+            released_at: None,
+            cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
+        };
+        match &harness.db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .insert(seat.id.clone(), seat);
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<ChannelSeat>("channel_seats")
+                    .insert_one(&seat)
+                    .await
+                    .expect("raw seat");
+            }
+        }
+    }
+
+    #[test]
+    fn a_default_overwrite_that_hides_the_channel_releases_the_seat() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_default_overwrite_that_hides_the_channel_releases_the_seat_case(),
+        ))
+    }
+
+    /// The default overwrite denies ViewChannel, so T loses it: the PUT
+    /// releases T's seat with its `ProtectedSeatRelease` entry and the seat
+    /// event, and O (the owner and list signer) keeps theirs. Control: the
+    /// hook deleted.
+    async fn a_default_overwrite_that_hides_the_channel_releases_the_seat_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&target])
+            .await;
+        let channel_id = protected.channel.id().to_string();
+        let server_id = protected.server.id.clone();
+        assert!(
+            seat_active(&harness, &channel_id, &target.id).await,
+            "precondition: T is seated"
+        );
+
+        let (status, body) = put_default(&harness, &owner_session, &channel_id, VIEW).await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert_eq!(
+            stored_default(&harness, &channel_id).await,
+            Some(OverrideField { a: 0, d: VIEW })
+        );
+        assert!(
+            !seat_active(&harness, &channel_id, &target.id).await,
+            "T's seat is released"
+        );
+        assert!(
+            seat_active(&harness, &channel_id, &owner.id).await,
+            "O keeps their seat"
+        );
+
+        let releases = entries(&harness, &server_id, AuditLogAction::ProtectedSeatRelease).await;
+        assert_eq!(releases.len(), 1, "{releases:?}");
+        assert_eq!(releases[0].target.as_deref(), Some(target.id.as_str()));
+        assert_eq!(releases[0].channel.as_deref(), Some(channel_id.as_str()));
+        harness
+            .wait_for_event(&channel_id, |event| {
+                matches!(event, EventV1::ProtectedChannelChanged { id, scope }
+                    if id == &channel_id && *scope == vec![PROTECTED_SCOPE_SEATS.to_string()])
+            })
+            .await;
+    }
+
+    #[test]
+    fn a_failed_reconcile_still_syncs_voice_then_answers_500() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_failed_reconcile_still_syncs_voice_then_answers_500_case(),
+        ))
+    }
+
+    /// Every seat release refused (MONGODB only: the reference store cannot
+    /// fail a write). (1) With the voice sync failing too (the channel is
+    /// pinned to a node with no SFU), the SYNC's error is answered: it ran
+    /// after the failed reconcile. (2) With the sync clean, the kept
+    /// reconcile error is answered (500) after the overwrite landed and was
+    /// recorded; the identical retry reconciles again. (3) Fault lifted, the
+    /// same PUT releases the seat. Controls: `reconcile_channel(..).await?`
+    /// ((1) answers DatabaseError, the sync skipped); the kept result
+    /// dropped ((2) answers 200).
+    async fn a_failed_reconcile_still_syncs_voice_then_answers_500_case() {
+        let harness = TestHarness::new().await;
+        let Database::MongoDb(_) = &harness.db else {
+            return;
+        };
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, target) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&target])
+            .await;
+        let channel_id = protected.channel.id().to_string();
+        let server_id = protected.server.id.clone();
+        seat_validator(&harness, doc! { "released_at": null }).await;
+
+        set_channel_node(&channel_id, ABSENT_NODE)
+            .await
+            .expect("node");
+        let synced = put_default(&harness, &owner_session, &channel_id, VIEW).await;
+        delete_channel_node(&channel_id).await.expect("cleanup");
+        let failed = put_default(&harness, &owner_session, &channel_id, VIEW).await;
+        let kept_seat = seat_active(&harness, &channel_id, &target.id).await;
+        seat_validator(&harness, doc! {}).await;
+
+        assert!(
+            synced.1.contains("UnknownNode") && !synced.1.contains("DatabaseError"),
+            "the voice sync runs after the failed reconcile: {:?}",
+            synced
+        );
+        assert_eq!(failed.0, Status::InternalServerError, "{:?}", failed);
+        assert!(failed.1.contains("DatabaseError"), "{:?}", failed);
+        assert!(kept_seat, "the refused release leaves the seat active");
+        assert_eq!(
+            stored_default(&harness, &channel_id).await,
+            Some(OverrideField { a: 0, d: VIEW }),
+            "the write is never undone"
+        );
+        let overwrites =
+            entries(&harness, &server_id, AuditLogAction::ChannelOverwriteUpdate).await;
+        assert_eq!(overwrites.len(), 1, "recorded once: {overwrites:?}");
+
+        let repaired = put_default(&harness, &owner_session, &channel_id, VIEW).await;
+        assert_eq!(repaired.0, Status::Ok, "{:?}", repaired);
+        assert!(
+            !seat_active(&harness, &channel_id, &target.id).await,
+            "the retry releases the seat"
+        );
+        assert_eq!(
+            entries(&harness, &server_id, AuditLogAction::ProtectedSeatRelease)
+                .await
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_unprotected_channel_is_left_alone() {
+        crate::util::test::rt().block_on(Box::pin(an_unprotected_channel_is_left_alone_case()))
+    }
+
+    /// A channel without a seat list: the default overwrite hides it from a
+    /// member who has a stray active seat row there, and the PUT answers 200
+    /// with only its own entry. The row is untouched: the reconcile of a
+    /// channel that is not protected releases nothing.
+    async fn an_unprotected_channel_is_left_alone_case() {
+        let harness = TestHarness::new().await;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, _, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        harness.join_server(&server, &member).await;
+        seat_raw(&harness, channel.id(), &member.id).await;
+
+        let (status, body) = put_default(&harness, &owner_session, channel.id(), VIEW).await;
+        assert_eq!(status, Status::Ok, "{body}");
+        assert!(
+            seat_active(&harness, channel.id(), &member.id).await,
+            "a channel without a seat list is not reconciled"
+        );
+        let all = harness
+            .db
+            .fetch_audit_log(&server.id, None, 50, None, None)
+            .await
+            .expect("the audit log");
+        assert_eq!(all.len(), 1, "only the overwrite is recorded: {all:?}");
+        assert_eq!(all[0].action, AuditLogAction::ChannelOverwriteUpdate);
     }
 }

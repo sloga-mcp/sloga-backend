@@ -147,12 +147,14 @@ mod tests {
                 signer_user_id: OWNER.to_string(),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 seats: vec![OWNER.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: signature(issued_at),
             signer_device_id: OWNER_DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 
@@ -441,7 +443,13 @@ mod tests {
                 .await
                 .map(|tank| tank.is_some()),
             Racer::PutSeatList => db
-                .put_seat_list(CHANNEL, &seat_list(2, NOW + 1 + i), true, timestamp(NOW))
+                .put_seat_list(
+                    CHANNEL,
+                    &seat_list(2, NOW + 1 + i),
+                    true,
+                    timestamp(NOW),
+                    None,
+                )
                 .await
                 .map(|outcome| !outcome.unchanged),
             Racer::Pledge => db

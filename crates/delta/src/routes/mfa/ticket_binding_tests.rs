@@ -50,10 +50,18 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
         "admin/prot_terminate.rs",
         "foreign_ticket_admin_prot_terminate",
     ),
+    (
+        "admin/takedown_common.rs",
+        "takedown_ticket_is_spent_by_one_action",
+    ),
+    ("admin/takedown_holds.rs", "foreign_ticket_takedown_holds"),
+    ("admin/takedown_remove.rs", "foreign_ticket_takedown_remove"),
+    ("admin/takedown_review.rs", "foreign_ticket_takedown_review"),
     ("e2ee/delete_backup.rs", "foreign_ticket_delete_backup"),
     ("e2ee/get_backup.rs", "foreign_ticket_get_backup"),
     ("e2ee/publish_keys.rs", "foreign_ticket_publish_keys"),
     ("e2ee/revoke_device.rs", "foreign_ticket_revoke_device"),
+    ("e2ee/set_only.rs", "foreign_ticket_set_e2ee_only"),
     ("mfa/fetch_recovery.rs", "foreign_ticket_fetch_recovery"),
     (
         "mfa/generate_recovery.rs",
@@ -121,9 +129,23 @@ fn with_ticket<'c>(
 }
 
 async fn pair() -> Pair {
+    pair_as(None).await
+}
+
+/// `pair()`, with the victim's user id fixed when `victim_id` is set.
+async fn pair_as(victim_id: Option<String>) -> Pair {
     let harness = TestHarness::new().await;
 
-    let (mut victim, victim_session, victim_user) = harness.new_user().await;
+    let (mut victim, victim_session, victim_user) = match victim_id {
+        None => harness.new_user().await,
+        Some(id) => {
+            let user = User::create(&harness.db, TestHarness::rand_string(), Some(id), None)
+                .await
+                .expect("victim `User`");
+            let (account, session) = harness.account_from_user(user.id.clone()).await;
+            (account, session, user)
+        }
+    };
     victim.mfa.totp_token = Totp::Enabled {
         secret: "secret".to_string(),
     };
@@ -746,6 +768,55 @@ async fn foreign_ticket_delete_backup_case() {
 }
 
 #[test]
+fn foreign_ticket_set_e2ee_only() {
+    rt().block_on(foreign_ticket_set_e2ee_only_case())
+}
+
+/// PUT /e2ee/only with `enabled: false` would turn the victim's
+/// Encrypted-only setting off. Turning it off needs nothing but the ticket,
+/// so the refusal can only come from the binding.
+async fn foreign_ticket_set_e2ee_only_case() {
+    let mut pair = pair().await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                e2ee_only: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the victim is Encrypted-only");
+    let before = victim_state(&pair).await;
+
+    let status = pair
+        .forged(
+            pair.harness
+                .client
+                .put("/e2ee/only")
+                .header(ContentType::JSON)
+                .body(json!({ "enabled": false }).to_string()),
+        )
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "set_e2ee_only");
+    assert!(
+        pair.harness
+            .db
+            .fetch_user(&pair.victim_user.id)
+            .await
+            .expect("victim `User`")
+            .e2ee_only,
+        "set_e2ee_only: the victim's setting was turned off"
+    );
+    pair.assert_unchanged("set_e2ee_only", &before).await;
+    pair.assert_ticket_kept("set_e2ee_only").await;
+}
+
+#[test]
 fn foreign_ticket_server_edit() {
     rt().block_on(foreign_ticket_server_edit_case())
 }
@@ -920,6 +991,189 @@ async fn foreign_ticket_admin_prot_terminate_case() {
     assert_eq!(status, Status::Forbidden, "admin_prot_terminate");
     pair.assert_unchanged("admin_prot_terminate", &before).await;
     pair.assert_ticket_kept("admin_prot_terminate").await;
+}
+
+// ------------------------------------------------------------------------
+// Take It Down staff actions
+// ------------------------------------------------------------------------
+
+/// Every Take It Down staff action that takes a ticket: its route file, its
+/// path segment and a body. A refusal never reads the body.
+const TAKEDOWN_ACTIONS: &[(&str, &str, &str)] = &[
+    ("takedown_review.rs", "decline", r#"{"reason":"other"}"#),
+    ("takedown_review.rs", "needs-info", ""),
+    ("takedown_review.rs", "close", ""),
+    ("takedown_holds.rs", "child-safety", ""),
+    ("takedown_holds.rs", "unhide", r#"{"files":[]}"#),
+    ("takedown_holds.rs", "restore", ""),
+    ("takedown_remove.rs", "remove", r#"{"files":[]}"#),
+];
+
+/// `pair()`, with the victim a reviewer who passes every other gate:
+/// privileged, on `[features.takedown] reviewers`, TOTP on. The config is
+/// set before the harness is built, as `config()` is cached for 30 s from
+/// the harness's first read, so the reviewer's id is chosen first. Once per
+/// process: these tests need nextest, like `takedown_tests.rs`.
+async fn takedown_pair() -> Pair {
+    let reviewer = ulid::Ulid::new().to_string();
+    let listed = reviewer.clone();
+    revolt_config::overwrite_config(move |settings| {
+        settings.features.takedown.enabled = true;
+        settings.features.takedown.data_key =
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff".to_string();
+        settings.features.takedown.reviewers = vec![listed];
+        settings.features.takedown.restore_enabled = true;
+    })
+    .await;
+
+    let mut pair = pair_as(Some(reviewer)).await;
+    pair.victim_user
+        .update(
+            &pair.harness.db,
+            PartialUser {
+                privileged: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("promote the victim");
+
+    // Every other gate passes, so a refusal is the ticket's doing
+    let settings = revolt_config::config().await;
+    assert_eq!(
+        settings.features.takedown.reviewers,
+        vec![pair.victim_user.id.clone()],
+        "setup: the victim is the listed reviewer"
+    );
+    let stored = pair
+        .harness
+        .db
+        .fetch_user(&pair.victim_user.id)
+        .await
+        .expect("victim `User`");
+    assert!(stored.privileged, "setup: the victim is privileged");
+    assert!(
+        pair.victim_account().await.mfa.is_active(),
+        "setup: the victim's TOTP is on"
+    );
+
+    pair
+}
+
+/// A Take It Down action request on request `id`, with a reason and a body.
+fn takedown_action<'c>(
+    harness: &'c TestHarness,
+    id: &str,
+    action: &str,
+    body: &str,
+) -> LocalRequest<'c> {
+    let request = harness
+        .client
+        .post(format!("/admin/takedown/requests/{}/{}", id, action))
+        .header(ContentType::JSON)
+        .header(Header::new("X-Audit-Log-Reason", "takedown review"));
+    if body.is_empty() {
+        request
+    } else {
+        request.body(body.to_string())
+    }
+}
+
+/// The attacker's ticket on every action of one route file: each must be
+/// refused by the guard, so the ticket survives every attempt. With the
+/// binding gone the shared gate's own account check would still answer 403,
+/// but only after the ticket was spent.
+async fn foreign_ticket_takedown_file(file: &str) {
+    let pair = takedown_pair().await;
+    let before = victim_state(&pair).await;
+    let id = ulid::Ulid::new().to_string();
+
+    let actions: Vec<_> = TAKEDOWN_ACTIONS
+        .iter()
+        .filter(|(action_file, _, _)| *action_file == file)
+        .collect();
+    assert!(!actions.is_empty(), "{}: no actions listed", file);
+
+    for (_, action, body) in actions {
+        let route = format!("takedown {}", action);
+        let status = pair
+            .forged(takedown_action(&pair.harness, &id, action, body))
+            .dispatch()
+            .await
+            .status();
+
+        assert_eq!(status, Status::Forbidden, "{}", route);
+        pair.assert_unchanged(&route, &before).await;
+        pair.assert_ticket_kept(&route).await;
+    }
+}
+
+#[test]
+fn foreign_ticket_takedown_review() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_review.rs"))
+}
+
+#[test]
+fn foreign_ticket_takedown_holds() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_holds.rs"))
+}
+
+#[test]
+fn foreign_ticket_takedown_remove() {
+    rt().block_on(foreign_ticket_takedown_file("takedown_remove.rs"))
+}
+
+#[test]
+fn takedown_ticket_is_spent_by_one_action() {
+    rt().block_on(takedown_ticket_is_spent_by_one_action_case())
+}
+
+/// `takedown_common.rs` holds the gate every action shares. The victim's own
+/// ticket passes it once: the first action claims the ticket (this unknown
+/// request then answers 404), and the same ticket is refused on every other
+/// action, so one MFA check never authorizes a second action.
+async fn takedown_ticket_is_spent_by_one_action_case() {
+    let pair = takedown_pair().await;
+    let id = ulid::Ulid::new().to_string();
+    let own = saved_ticket(&pair.harness, &pair.victim.id, true).await;
+
+    let response = with_ticket(
+        takedown_action(&pair.harness, &id, "needs-info", ""),
+        &pair.victim_session,
+        &own,
+    )
+    .dispatch()
+    .await;
+    let status = response.status();
+    let text = response.into_string().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        Status::NotFound,
+        "the victim's own ticket passes the gate: {}",
+        text
+    );
+    assert!(
+        !ticket_exists(&pair.harness, &own).await,
+        "the first action claims the ticket"
+    );
+
+    for (_, action, body) in TAKEDOWN_ACTIONS {
+        let status = with_ticket(
+            takedown_action(&pair.harness, &id, action, body),
+            &pair.victim_session,
+            &own,
+        )
+        .dispatch()
+        .await
+        .status();
+        assert_eq!(
+            status,
+            Status::Unauthorized,
+            "takedown {}: a spent ticket authorized it",
+            action
+        );
+    }
 }
 
 // ------------------------------------------------------------------------

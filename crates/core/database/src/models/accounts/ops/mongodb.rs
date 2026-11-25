@@ -1,4 +1,6 @@
-use crate::{AbstractAccounts, Account, EmailVerification, Lockout, MongoDb, PasswordReset};
+use crate::{
+    AbstractAccounts, Account, DeletionInfo, EmailVerification, Lockout, MongoDb, PasswordReset,
+};
 use bson::{to_bson, to_document, Bson, Document};
 use iso8601_timestamp::{Duration, Timestamp};
 use mongodb::options::{
@@ -69,9 +71,14 @@ fn return_after() -> FindOneAndUpdateOptions {
 
 /// `$set` the given fields of one account, and nothing else
 async fn set_account_fields(db: &MongoDb, id: &str, fields: Document) -> Result<()> {
+    update_account(db, id, doc! { "$set": fields }).await
+}
+
+/// Apply one update to one account; `UnknownUser` if it does not exist
+async fn update_account(db: &MongoDb, id: &str, update: Document) -> Result<()> {
     let result = db
         .col::<Account>(COL)
-        .update_one(doc! { "_id": id }, doc! { "$set": fields })
+        .update_one(doc! { "_id": id }, update)
         .await
         .map_err(|_| create_database_error!("update_one", COL))?;
 
@@ -208,6 +215,11 @@ impl AbstractAccounts for MongoDb {
         // whole-document save cannot reset the counter
         document.remove("lockout");
 
+        // Deletion is written only through the deletion ops, so a stale
+        // whole-document save cannot cancel or revive a deletion. An insert
+        // stores none.
+        document.remove("deletion");
+
         self.col::<Account>(COL)
             .update_one(
                 doc! {
@@ -221,6 +233,141 @@ impl AbstractAccounts for MongoDb {
             .await
             .map_err(|_| create_database_error!("find_one", COL))
             .map(|_| ())
+    }
+
+    /// Overwrite the deletion state, and nothing else
+    async fn set_account_deletion(&self, id: &str, deletion: Option<DeletionInfo>) -> Result<()> {
+        let update = match deletion {
+            Some(deletion) => {
+                let deletion =
+                    to_bson(&deletion).map_err(|_| create_database_error!("to_bson", COL))?;
+                doc! { "$set": { "deletion": deletion } }
+            }
+            None => doc! { "$unset": { "deletion": "" } },
+        };
+
+        update_account(self, id, update).await
+    }
+
+    /// Atomically store a new deletion request
+    async fn request_account_deletion(&self, id: &str, deletion: DeletionInfo) -> Result<()> {
+        let deletion = to_bson(&deletion).map_err(|_| create_database_error!("to_bson", COL))?;
+
+        // Every condition is in the filter, so a request landing after a
+        // confirm's claim (Scheduled and disabled in one write) matches
+        // nothing. The null arm also matches a key stored as an explicit
+        // null, which whole-document saves wrote before `save_account`
+        // stopped writing `deletion`.
+        let result = self
+            .col::<Account>(COL)
+            .update_one(
+                doc! {
+                    "_id": id,
+                    "disabled": {
+                        "$ne": true
+                    },
+                    "$or": [
+                        { "deletion": { "$exists": false } },
+                        { "deletion": null },
+                        { "deletion.status": "WaitingForVerification" }
+                    ]
+                },
+                doc! {
+                    "$set": {
+                        "deletion": deletion
+                    }
+                },
+            )
+            .await
+            .map_err(|_| create_database_error!("update_one", COL))?;
+
+        // A missing account cannot be told apart from a refused one here
+        if result.matched_count == 0 {
+            Err(create_error!(InvalidOperation))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Atomically confirm a pending deletion
+    async fn claim_account_deletion(&self, token: &str) -> Result<Account> {
+        let now = Timestamp::now_utc();
+        let scheduled = to_bson(&DeletionInfo::Scheduled { after: now })
+            .map_err(|_| create_database_error!("to_bson", COL))?;
+
+        // Every condition is in the filter, so a second claim, a racing
+        // cancel or an expired token matches nothing. The expiry compares
+        // ISO strings, as `fetch_account_with_deletion_token` does.
+        self.col::<Account>(COL)
+            .find_one_and_update(
+                doc! {
+                    "deletion.status": "WaitingForVerification",
+                    "deletion.token": token,
+                    "deletion.expiry": {
+                        "$gte": timestamp_bson(now)?
+                    },
+                    "disabled": {
+                        "$ne": true
+                    }
+                },
+                doc! {
+                    "$set": {
+                        "deletion": scheduled,
+                        "disabled": true
+                    }
+                },
+            )
+            .with_options(return_after())
+            .await
+            .map_err(|_| create_database_error!("find_one_and_update", COL))?
+            .ok_or_else(|| create_error!(InvalidToken))
+    }
+
+    /// Atomically cancel a pending deletion
+    async fn cancel_account_deletion(&self, account_id: &str) -> Result<Option<DeletionInfo>> {
+        // Conditional on the status, so a claimed (Scheduled) or Deleted
+        // account is never touched
+        let previous = self
+            .col::<Account>(COL)
+            .find_one_and_update(
+                doc! {
+                    "_id": account_id,
+                    "deletion.status": "WaitingForVerification"
+                },
+                doc! {
+                    "$unset": {
+                        "deletion": ""
+                    }
+                },
+            )
+            .with_options(
+                FindOneAndUpdateOptions::builder()
+                    .return_document(ReturnDocument::Before)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find_one_and_update", COL))?;
+
+        Ok(previous.and_then(|account| account.deletion))
+    }
+
+    /// Remove the linked Google and Apple ids, and nothing else
+    async fn unlink_account_oauth(&self, id: &str) -> Result<()> {
+        // `$unset`: `save_account` leaves a `None` id out of its `$set`
+        // (`skip_serializing_if`), so it can never clear one. Matching (not
+        // modifying) is the success test, so an account with neither id is
+        // `Ok` and a retry is harmless.
+        update_account(
+            self,
+            id,
+            doc! {
+                "$unset": {
+                    "google_id": "",
+                    "apple_id": ""
+                }
+            },
+        )
+        .await
     }
 
     /// Atomically count one failed attempt, with no lock check

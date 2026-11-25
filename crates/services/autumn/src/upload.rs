@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use utoipa::ToSchema;
 
-use crate::api::{Tag, UploadResponse};
+use crate::api::{upload_blocked, Tag, UploadResponse};
 
 /// Per-user cap on concurrently open (`Pending`/`Completing`) sessions — a
 /// resource guard against parking unbounded un-completed parts in S3
@@ -464,6 +464,14 @@ pub async fn complete_upload(
 
     let composite = composite_hash(&session)?;
 
+    // Take It Down re-upload block, while the session is still Pending: it
+    // ends Aborted and the session sweep drops its parts
+    if chunked_upload_blocked(&db, &composite).await? {
+        db.set_upload_session_aborted(&session.id).await?;
+        tracing::info!("chunked upload refused by the re-upload block");
+        return Err(create_error!(FileTypeNotAllowed));
+    }
+
     let Some(session) = db.begin_upload_session_complete(&session.id, &composite).await? else {
         // CAS refused: in-flight PUTs, or someone else's complete won. Look
         // again and either join the winner or report the conflict.
@@ -499,6 +507,21 @@ fn composite_hash(session: &UploadSession) -> Result<String> {
     Ok(format!("{:02x}", hasher.finalize()))
 }
 
+/// Whether a chunked upload's composite hash is on the re-upload block list.
+/// The minted file's `hash` and its hash row's `processed_hash` are both the
+/// composite, so a block recorded under any of the three kinds applies.
+async fn chunked_upload_blocked(db: &Database, composite: &str) -> Result<bool> {
+    upload_blocked(
+        db,
+        &[
+            ("chunk", composite),
+            ("orig", composite),
+            ("proc", composite),
+        ],
+    )
+    .await
+}
+
 /// Drive a `Completing` session to `Completed`, from any starting point:
 /// a fresh CAS, an owner retry after a crash, or a retry after a lost
 /// response. Every step is safe to repeat.
@@ -512,6 +535,14 @@ async fn resolve_completing(
         .composite_hash
         .clone()
         .ok_or_else(|| create_error!(InternalError))?;
+
+    // Checked again on every re-entry (a crash retry, or the loser of a
+    // racing complete), before the dedupe reuse or any mint. The session
+    // stays Completing; the sweep resolves it at expiry.
+    if chunked_upload_blocked(db, &composite).await? {
+        tracing::info!("chunked upload refused by the re-upload block");
+        return Err(create_error!(FileTypeNotAllowed));
+    }
 
     // Plain hit/miss dedupe — deliberately NOT the single-POST path's
     // stale-video reprocessing branch: every v2 chunked video legitimately
@@ -1169,6 +1200,155 @@ mod tests {
             error.error_type,
             revolt_result::ErrorType::InternalError
         ));
+    }
+
+    /// A session with both parts recorded (fake etags and part hashes,
+    /// distinct per `seed`), as `complete` sees it. Nothing is in S3.
+    fn recorded_session(user: &User, seed: u64) -> UploadSession {
+        let chunk_size = revolt_files::CHUNK_SIZE as i64;
+        let tail = 1000i64;
+        let mut session = UploadSession::new(
+            user.id.clone(),
+            "attachments".into(),
+            "blocked.bin".into(),
+            "application/octet-stream".into(),
+            chunk_size + tail,
+            chunk_size,
+            "autumn-upload-tests".into(),
+            "fake-upload-id".into(),
+            "bm9uY2U3Nzc=".into(),
+        );
+        for (part_number, size) in [(1, chunk_size), (2, tail)] {
+            session.parts.insert(
+                UploadSession::part_key(part_number),
+                UploadPartRecord {
+                    size,
+                    etag: format!("etag-{part_number}"),
+                    sha256: sha256_hex(format!("{seed}-{part_number}").as_bytes()),
+                },
+            );
+        }
+        assert!(session.is_part_set_complete(), "setup: every part recorded");
+        session
+    }
+
+    async fn block(db: &Database, kind: &str, hash: &str) {
+        db.insert_upload_hash_block(&revolt_database::UploadHashBlock {
+            id: revolt_database::upload_hash_block_key(kind, hash),
+            request_id: "01TD0000000000000000000008".to_string(),
+            created_at: Timestamp::now_utc(),
+            also_request_ids: vec![],
+        })
+        .await
+        .unwrap();
+    }
+
+    fn assert_refused(result: Result<Json<UploadResponse>>, case: &str) {
+        match result {
+            Err(error) => assert!(
+                matches!(
+                    error.error_type,
+                    revolt_result::ErrorType::FileTypeNotAllowed
+                ),
+                "{case}: expected FileTypeNotAllowed, got {error:?}"
+            ),
+            Ok(response) => panic!("{case}: a blocked upload minted {}", response.0.id),
+        }
+    }
+
+    /// Take It Down re-upload block on chunked uploads: a Pending session
+    /// whose composite is blocked (under any of the three kinds) is refused
+    /// before the complete CAS, ends Aborted, and mints nothing. Its retry is
+    /// a NotFound, never a file. No S3 work happens before the refusal.
+    #[tokio::test]
+    async fn a_blocked_composite_is_refused_and_the_session_aborted() {
+        test_env().await;
+        let db = db();
+        let user = test_user();
+
+        for (seed, kind) in [(41, "chunk"), (42, "orig"), (43, "proc")] {
+            let session = recorded_session(&user, seed);
+            let composite = composite_hash(&session).unwrap();
+            db.insert_upload_session(&session).await.unwrap();
+            block(&db, kind, &composite).await;
+
+            let result = complete_upload(
+                State(db.clone()),
+                user.clone(),
+                Path((Tag::attachments, session.id.clone())),
+            )
+            .await;
+            assert_refused(result, kind);
+
+            let stored = db.fetch_upload_session(&session.id).await.unwrap();
+            assert_eq!(stored.state, UploadSessionState::Aborted, "{kind}");
+            assert!(stored.file_id.is_none(), "{kind}");
+            assert!(
+                db.fetch_attachment_hash(&composite).await.is_err(),
+                "{kind}: no hash row"
+            );
+
+            let retry = complete_upload(
+                State(db.clone()),
+                user.clone(),
+                Path((Tag::attachments, session.id.clone())),
+            )
+            .await;
+            assert!(retry.is_err(), "{kind}: an aborted session never mints");
+        }
+    }
+
+    /// The same block on re-entry: a session already `Completing` (a crash
+    /// retry) is refused before the dedupe reuse or a mint, even when a live
+    /// hash row for the composite exists to be reused.
+    #[tokio::test]
+    async fn a_blocked_composite_is_refused_on_completing_reentry() {
+        test_env().await;
+        let db = db();
+        let user = test_user();
+
+        let mut session = recorded_session(&user, 44);
+        let composite = composite_hash(&session).unwrap();
+        session.state = UploadSessionState::Completing;
+        session.composite_hash = Some(composite.clone());
+        db.insert_upload_session(&session).await.unwrap();
+
+        // A live row the dedupe branch would otherwise mint onto
+        db.insert_attachment_hash(&FileHash {
+            id: composite.clone(),
+            processed_hash: composite.clone(),
+            created_at: Timestamp::now_utc(),
+            bucket_id: "autumn-upload-tests".to_string(),
+            path: "chunked/someone-else".to_string(),
+            iv: "bm9uY2U3Nzc=".to_string(),
+            format_version: Some(2),
+            key_id: None,
+            metadata: Metadata::File,
+            content_type: "application/octet-stream".to_string(),
+            size: session.total_size as isize,
+        })
+        .await
+        .unwrap();
+        block(&db, "chunk", &composite).await;
+
+        let result = complete_upload(
+            State(db.clone()),
+            user.clone(),
+            Path((Tag::attachments, session.id.clone())),
+        )
+        .await;
+        assert_refused(result, "completing re-entry");
+
+        let stored = db.fetch_upload_session(&session.id).await.unwrap();
+        assert_eq!(stored.state, UploadSessionState::Completing);
+        assert!(stored.file_id.is_none());
+        assert!(
+            db.fetch_attachments_by_hashes(&[composite])
+                .await
+                .unwrap()
+                .is_empty(),
+            "no file was minted onto the stored row"
+        );
     }
 
     /// A session created under a rotated primary is stored with key id "k1";

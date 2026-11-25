@@ -2795,12 +2795,14 @@ mod tests {
                 signer_user_id: owner.to_string(),
                 signer_device_id: DEVICE.to_string(),
                 seats: vec![owner.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: format!("B{}", "A".repeat(85)),
             signer_device_id: DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 

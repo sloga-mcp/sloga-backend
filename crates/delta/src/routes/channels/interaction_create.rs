@@ -57,8 +57,15 @@ pub async fn interaction_create(
     // there. Refused after the permission check (a caller who cannot send
     // here learns nothing about the flag) and before slowmode, the
     // interaction insert and the event to the bot. A thread is judged by
-    // its parent too (W2 audit B1).
-    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+    // its parent too (W2 audit B1). An encrypted-only group, or an
+    // encrypted-only invoker in a group, is refused at the same point.
+    crate::util::interactions::ensure_interactions_allowed_in(
+        db,
+        &user,
+        &channel,
+        &permission_channel,
+    )
+    .await?;
 
     // Archived or locked threads reject invocations exactly like messages.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
@@ -174,7 +181,7 @@ pub async fn interaction_create(
 mod test {
     use crate::{rocket, util::test::TestHarness};
     use revolt_database::events::client::EventV1;
-    use revolt_database::{Bot, Channel, Member};
+    use revolt_database::{Bot, Channel, Database, Member, PartialUser, User};
     use revolt_models::v0;
     use rocket::http::{ContentType, Header, Status};
     use serde_json::json;
@@ -668,5 +675,199 @@ mod test {
             EventV1::InteractionCreate { interaction } => interaction.channel_id == orphan_id,
             _ => false,
         });
+    }
+
+    /// A group of `owner` and `member_id`, stored directly and unmarked
+    async fn group_with(harness: &TestHarness, owner: &User, member_id: &str) -> Channel {
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone(), member_id.to_string()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        group
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    async fn set_e2ee_only(db: &Database, user: &User, e2ee_only: bool) {
+        let mut user = user.clone();
+        user.update(
+            db,
+            PartialUser {
+                e2ee_only: Some(e2ee_only),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("e2ee_only");
+    }
+
+    /// How many interaction rows are stored for `channel_id`
+    async fn interactions_in(db: &Database, channel_id: &str) -> u64 {
+        match db {
+            Database::Reference(reference) => reference
+                .interactions
+                .lock()
+                .await
+                .values()
+                .filter(|interaction| interaction.channel_id == channel_id)
+                .count() as u64,
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                mongo
+                    .col::<Document>("interactions")
+                    .count_documents(doc! { "channel_id": channel_id })
+                    .await
+                    .expect("count interactions")
+            }
+        }
+    }
+
+    fn assert_encryption_required(answer: &(Status, serde_json::Value), side: &str) {
+        assert_eq!(answer.0, Status::Forbidden, "body: {}", answer.1);
+        assert_eq!(answer.1["type"], "EncryptionRequired", "body: {}", answer.1);
+        assert_eq!(answer.1["side"], side, "body: {}", answer.1);
+    }
+
+    /// Encrypted-only: a marked group refuses the invocation (`group`) and
+    /// an unmarked one refuses an encrypted-only invoker (`sender`), with
+    /// no interaction row and nothing sent to the bot. With the mark and
+    /// the flag lifted the identical invocation goes through (the control),
+    /// so the refusals consumed nothing.
+    ///
+    /// Control: the helper's `plain_write_allowed` call removed → the first
+    /// invocation is accepted.
+    #[test]
+    fn invoke_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(invoke_in_an_encrypted_only_group_is_refused_case())
+    }
+
+    async fn invoke_in_an_encrypted_only_group_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        let group = group_with(&harness, &user, &bot.id).await;
+        let command = register_command(
+            &harness,
+            &session.token,
+            &bot.id,
+            json!({ "name": "ping", "description": "Ping" }),
+        )
+        .await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let marked = invoke(&harness, &session.token, group.id(), &command.id).await;
+        mark_group_raw(&harness.db, group.id(), false).await;
+
+        set_e2ee_only(&harness.db, &user, true).await;
+        let sender = invoke(&harness, &session.token, group.id(), &command.id).await;
+        set_e2ee_only(&harness.db, &user, false).await;
+
+        let allowed = invoke(&harness, &session.token, group.id(), &command.id).await;
+
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_encryption_required(&marked, "group");
+        assert_encryption_required(&sender, "sender");
+
+        assert_eq!(allowed.0, Status::Ok, "body: {}", allowed.1);
+        let allowed_id = allowed.1["interaction_id"]
+            .as_str()
+            .expect("interaction id")
+            .to_string();
+        assert_eq!(interactions_in(&harness.db, group.id()).await, 1);
+
+        let bot_topic = format!("{}!", bot.id);
+        harness
+            .wait_for_event(&bot_topic, |event| match event {
+                EventV1::InteractionCreate { interaction } => interaction.id == allowed_id,
+                _ => false,
+            })
+            .await;
+        harness.assert_no_buffered_event(&bot_topic, |event| match event {
+            EventV1::InteractionCreate { interaction } => interaction.id != allowed_id,
+            _ => false,
+        });
+    }
+
+    /// `only_enforced = false` lifts both refusals: the marked group and the
+    /// encrypted-only invoker are each let through. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn invoke_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(
+            invoke_in_an_encrypted_only_group_is_allowed_when_not_enforced_case(),
+        )
+    }
+
+    async fn invoke_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), &user, None)
+            .await
+            .expect("`Bot`");
+        let group = group_with(&harness, &user, &bot.id).await;
+        let command = register_command(
+            &harness,
+            &session.token,
+            &bot.id,
+            json!({ "name": "ping", "description": "Ping" }),
+        )
+        .await;
+        mark_group_raw(&harness.db, group.id(), true).await;
+        set_e2ee_only(&harness.db, &user, true).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+        let allowed = invoke(&harness, &session.token, group.id(), &command.id).await;
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(allowed.0, Status::Ok, "body: {}", allowed.1);
+        assert_eq!(interactions_in(&harness.db, group.id()).await, 1);
     }
 }

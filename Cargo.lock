@@ -7120,6 +7120,7 @@ dependencies = [
 name = "revolt-database"
 version = "0.13.7"
 dependencies = [
+ "aes-gcm",
  "async-lock 2.8.0",
  "async-recursion",
  "async-trait",

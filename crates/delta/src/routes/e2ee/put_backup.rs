@@ -4,9 +4,63 @@ use revolt_database::{
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Result};
-use rocket::{serde::json::Json, State};
+use revolt_rocket_okapi::{gen::OpenApiGenerator, request::OpenApiFromData};
+use rocket::{
+    data::{self, Data, FromData, ToByteUnit},
+    http::Status,
+    serde::json::Json,
+    Request, State,
+};
 
 use super::MAX_BACKUP_HEADER_LENGTH;
+
+/// Body limit for this route only. Delta's global JSON limit is Rocket's
+/// 1 MiB default, far below `E2EE_MAX_BACKUP_SIZE` (8 MiB decoded, about
+/// 10.7 MiB as base64), so a plain `Json<..>` guard refused every backup
+/// above roughly 750 KiB with a 413 before the route's own cap was reached.
+/// 12 MiB covers the cap plus the header and JSON framing; anything larger
+/// is still refused (413) before it is parsed. No other route changes.
+pub const BACKUP_BODY_LIMIT_MIB: u64 = 12;
+
+/// `Json<DataPutE2EEBackup>` read with [`BACKUP_BODY_LIMIT_MIB`] instead of
+/// the global JSON limit. Status mapping matches Rocket's `Json`: too large
+/// is 413; an unreadable body or malformed JSON is 400; well-formed JSON
+/// that does not fit the type is 422.
+pub struct BackupBody(pub v0::DataPutE2EEBackup);
+
+#[rocket::async_trait]
+impl<'r> FromData<'r> for BackupBody {
+    type Error = ();
+
+    async fn from_data(_req: &'r Request<'_>, data: Data<'r>) -> data::Outcome<'r, Self> {
+        let body = match data
+            .open(BACKUP_BODY_LIMIT_MIB.mebibytes())
+            .into_string()
+            .await
+        {
+            Ok(body) => body,
+            Err(_) => return data::Outcome::Error((Status::BadRequest, ())),
+        };
+        if !body.is_complete() {
+            return data::Outcome::Error((Status::PayloadTooLarge, ()));
+        }
+        match serde_json::from_str::<v0::DataPutE2EEBackup>(&body.into_inner()) {
+            Ok(parsed) => data::Outcome::Success(BackupBody(parsed)),
+            Err(e) if e.is_syntax() || e.is_eof() => {
+                data::Outcome::Error((Status::BadRequest, ()))
+            }
+            Err(_) => data::Outcome::Error((Status::UnprocessableEntity, ())),
+        }
+    }
+}
+
+impl<'r> OpenApiFromData<'r> for BackupBody {
+    fn request_body(
+        gen: &mut OpenApiGenerator,
+    ) -> revolt_rocket_okapi::Result<revolt_rocket_okapi::revolt_okapi::openapi3::RequestBody> {
+        <Json<v0::DataPutE2EEBackup> as OpenApiFromData<'r>>::request_body(gen)
+    }
+}
 
 /// # Upload E2EE Key Backup
 ///
@@ -28,7 +82,7 @@ pub async fn put_backup(
     db: &State<Database>,
     user: User,
     session: Session,
-    data: Json<v0::DataPutE2EEBackup>,
+    data: BackupBody,
 ) -> Result<Json<v0::ResponsePutE2EEBackup>> {
     super::require_e2ee_enabled().await?;
 
@@ -36,7 +90,7 @@ pub async fn put_backup(
         return Err(create_error!(IsBot));
     }
 
-    let data = data.into_inner();
+    let data = data.0;
 
     if !is_valid_device_id(&data.device_id) {
         return Err(create_error!(FailedValidation {

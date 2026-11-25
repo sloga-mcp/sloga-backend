@@ -127,6 +127,7 @@ impl IntoResponse for Error {
             ErrorType::NotInVoiceChannel => StatusCode::BAD_REQUEST,
             ErrorType::AlreadyConnected => StatusCode::BAD_REQUEST,
             ErrorType::UnknownNode => StatusCode::BAD_REQUEST,
+            ErrorType::CallEnded => StatusCode::BAD_REQUEST,
             ErrorType::RemoteControlOfferPending => StatusCode::CONFLICT,
             ErrorType::RemoteControlGrantActive => StatusCode::CONFLICT,
             ErrorType::WatchSessionExists => StatusCode::CONFLICT,
@@ -170,6 +171,7 @@ impl IntoResponse for Error {
             ErrorType::VideoCallFull { .. } => StatusCode::CONFLICT,
             ErrorType::E2EEDeviceRemoved => StatusCode::FORBIDDEN,
             ErrorType::E2EEDeviceHeldElsewhere => StatusCode::FORBIDDEN,
+            ErrorType::EncryptionRequired { .. } => StatusCode::FORBIDDEN,
 
             ErrorType::PaymentsDisabled => StatusCode::BAD_REQUEST,
             ErrorType::CipherSalesClosed => StatusCode::FORBIDDEN,
@@ -186,6 +188,9 @@ impl IntoResponse for Error {
             ErrorType::ChannelProtected => StatusCode::BAD_REQUEST,
             ErrorType::ProtectedFieldRefused { .. } => StatusCode::BAD_REQUEST,
             ErrorType::SeatListNamesRemovedUsers { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::RemovalReasonRequired => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectedHandoverRequired { .. } => StatusCode::BAD_REQUEST,
+
             ErrorType::InsufficientProt { .. } => StatusCode::CONFLICT,
             ErrorType::ProtDisabled => StatusCode::BAD_REQUEST,
             ErrorType::ProtSalesClosed => StatusCode::FORBIDDEN,
@@ -292,6 +297,32 @@ mod tests {
         }
     }
 
+    /// A refused unencrypted write is a 403 with the side in the body and
+    /// nothing else; `rocket.rs` pins the same answer
+    #[test]
+    fn encryption_required_is_forbidden_with_side_in_body() {
+        let response = crate::create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
+    }
+
     #[test]
     fn device_cap_reached_is_bad_request_with_max_in_body() {
         let response = crate::create_error!(DeviceCapReached { max: 5 }).into_response();
@@ -379,5 +410,54 @@ mod tests {
             let name = format!("{:?}", error.error_type);
             assert_eq!(error.into_response().status().as_u16(), code, "{name}");
         }
+    }
+
+    /// S2-D20: 400 and a body that is the type alone; `rocket.rs` pins the
+    /// same answer
+    #[test]
+    fn removal_reason_required_is_bad_request_with_type_only_body() {
+        let response = crate::create_error!(RemovalReasonRequired).into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "RemovalReasonRequired" }));
+    }
+
+    /// S2-D25 [S2b]: 400, the channels in `channel_ids`, nothing else in the
+    /// body; `rocket.rs` pins the same answer
+    #[test]
+    fn protected_handover_required_is_bad_request_with_channel_ids_in_body() {
+        let response = crate::create_error!(ProtectedHandoverRequired {
+            channel_ids: vec!["01HZXDDDDDDDDDDDDDDDDDDDDD".to_string()],
+        })
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "ProtectedHandoverRequired",
+                "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD"],
+            })
+        );
     }
 }

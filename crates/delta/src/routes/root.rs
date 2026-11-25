@@ -45,6 +45,10 @@ pub struct VoiceFeature {
     pub enabled: bool,
     /// All livekit nodes
     pub nodes: Vec<VoiceNode>,
+    /// How long a call rings before it gives up, in seconds. This is the
+    /// length the server itself applies, so a client that rings for it
+    /// stops at the moment the server stops letting the ring live
+    pub call_ring_duration: usize,
 }
 
 /// # Server Boost Configuration
@@ -298,6 +302,9 @@ pub struct ProtectedChannelsFeature {
     pub enabled: bool,
     /// Device cap used when a channel's entitlement sets none (0 = unlimited)
     pub default_device_cap: u32,
+    /// Whether channels may enter the S2 (v2) formats (design 7.2 "Root
+    /// advert"); the bridge passes it to native when signing a list
+    pub formats_v2: bool,
 }
 
 /// # E2EE Capabilities
@@ -308,6 +315,19 @@ pub struct E2EEFeature {
     /// device). Clients offer the split only when this is true: an older
     /// server would revoke the shared device instead
     pub split_from: bool,
+    /// Encrypted-only chats. Always sent by a server that has the setting
+    pub only: E2EEOnlyFeature,
+}
+
+/// # Encrypted-only Chats
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct E2EEOnlyFeature {
+    /// Whether accounts can turn the setting on (needs E2EE on this node as
+    /// well). Turning it off works either way
+    pub available: bool,
+    /// Whether the server refuses unencrypted messages for accounts and
+    /// groups that have it
+    pub enforced: bool,
 }
 
 /// # Feature Configuration
@@ -338,6 +358,10 @@ pub struct RevoltFeatures {
     pub import_sources: ImportSourcesFeature,
     /// Whether remote desktop control during screen share is enabled
     pub remote_control: bool,
+    /// Whether encrypted calls are allowed on iOS (kill switch). Always
+    /// sent; a reader that finds it missing must treat it as true
+    #[serde(default = "revolt_config::default_ios_call_e2ee")]
+    pub ios_call_e2ee: bool,
     /// Whether this server is invite only
     pub invite_only: bool,
     /// File server service configuration
@@ -383,6 +407,9 @@ pub struct LegalLinks {
     pub privacy_policy: String,
     /// Guidelines URL
     pub guidelines: String,
+    /// Take It Down page URL; left out when the node has none
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub take_it_down: String,
 }
 
 /// # Global limits
@@ -493,8 +520,12 @@ pub struct RevoltConfig {
 #[openapi(tag = "Core")]
 #[get("/")]
 pub async fn root() -> Result<Json<RevoltConfig>> {
-    let config = config().await;
+    Ok(Json(root_config(config().await)))
+}
 
+/// The body of `GET /` for a config. Kept apart from the route so tests can
+/// check the wire shape without a database
+pub fn root_config(config: Settings) -> RevoltConfig {
     // Same overlay as `User::limits()`, so the advertised perk limits always
     // match the enforced ones.
     let perk = config.features.limits.perk.as_ref().map(|p| {
@@ -509,7 +540,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
     // Built before the literal below, which moves fields out of `config`
     let prot = prot_feature(&config);
 
-    Ok(Json(RevoltConfig {
+    RevoltConfig {
         revolt: env!("CARGO_PKG_VERSION").to_string(),
         features: RevoltFeatures {
             captcha: CaptchaFeature {
@@ -537,6 +568,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             // surfaced in RevoltFeatures at all, so this is net-new
             // plumbing, not a mirror of an existing pattern.
             remote_control: config.features.remote_control,
+            ios_call_e2ee: config.features.ios_call_e2ee,
             invite_only: config.api.registration.invite_only,
             autumn: Feature {
                 enabled: !config.hosts.autumn.is_empty(),
@@ -566,6 +598,11 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                             .clone(),
                     })
                     .collect(),
+                // The length after the shared rule, never the raw setting: a
+                // zero there would tell every client to stop ringing at once
+                call_ring_duration: revolt_config::effective_call_ring_secs(
+                    config.api.livekit.call_ring_duration,
+                ),
             },
             limits: LimitsConfig {
                 global: GlobalLimits {
@@ -592,6 +629,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 terms_of_service: config.features.legal_links.terms_of_service,
                 privacy_policy: config.features.legal_links.privacy_policy,
                 guidelines: config.features.legal_links.guidelines,
+                take_it_down: config.features.legal_links.take_it_down,
             },
             boosts: BoostsFeature {
                 enabled: config.features.boosts.enabled,
@@ -603,9 +641,19 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
             protected_channels: ProtectedChannelsFeature {
                 enabled: config.features.e2ee_enabled && config.features.protected_channels.enabled,
                 default_device_cap: config.features.protected_channels.default_device_cap,
+                // As configured: protect and the seat PUT read the same key
+                formats_v2: config.features.protected_channels.formats_v2,
             },
-            // A capability of this build, not a setting
-            e2ee: E2EEFeature { split_from: true },
+            e2ee: E2EEFeature {
+                // A capability of this build, not a setting
+                split_from: true,
+                // The effective switch, like protected channels above: the
+                // route refuses turning it on while E2EE is off
+                only: E2EEOnlyFeature {
+                    available: config.features.e2ee_enabled && config.features.e2ee.only_available,
+                    enforced: config.features.e2ee.only_enforced,
+                },
+            },
             prot,
         },
         ws: config.hosts.events,
@@ -628,7 +676,7 @@ pub async fn root() -> Result<Json<RevoltConfig>> {
                 .unwrap_or_else(|| "<failed to generate>")
                 .to_string(),
         },
-    }))
+    }
 }
 
 #[cfg(test)]
@@ -882,14 +930,21 @@ mod test {
     /// the test proves the configured value is the one advertised
     const ADVERT_DEVICE_CAP: u32 = 7;
 
-    /// Sets both flags (and the device cap) explicitly, then fetches the root
-    /// and checks the protected channels advert. Every case is its own
-    /// `#[test]`: `overwrite_config` runs once per process (nextest)
-    async fn protected_channels_advert_case(e2ee: bool, enabled: bool, advertised: bool) {
+    /// Sets both flags, `formats_v2` (and the device cap) explicitly, then
+    /// fetches the root and checks the protected channels advert. Every case
+    /// is its own `#[test]`: `overwrite_config` runs once per process
+    /// (nextest)
+    async fn protected_channels_advert_case(
+        e2ee: bool,
+        enabled: bool,
+        advertised: bool,
+        formats_v2: bool,
+    ) {
         revolt_config::overwrite_config(|settings| {
             settings.features.e2ee_enabled = e2ee;
             settings.features.protected_channels.enabled = enabled;
             settings.features.protected_channels.default_device_cap = ADVERT_DEVICE_CAP;
+            settings.features.protected_channels.formats_v2 = formats_v2;
         })
         .await;
 
@@ -904,7 +959,13 @@ mod test {
             .as_object()
             .expect("protected_channels object");
 
-        assert_eq!(advert.len(), 2, "advert fields: {advert:?}");
+        assert_eq!(advert.len(), 3, "advert fields: {advert:?}");
+        assert_eq!(
+            advert["formats_v2"].as_bool(),
+            Some(formats_v2),
+            "advert: {:?}",
+            advert
+        );
         assert_eq!(advert["enabled"].as_bool(), Some(advertised));
         assert_eq!(
             advert["default_device_cap"].as_u64(),
@@ -914,22 +975,35 @@ mod test {
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false, false))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, false))
+    }
+
+    /// 7.2 "Root advert" (#206): `formats_v2` is the configured flag
+    #[test]
+    fn protected_channels_advert_carries_formats_v2() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, true))
+    }
+
+    /// `formats_v2` is advertised as configured even with growth off: it
+    /// also governs the revocation hook, which runs with growth off (#219)
+    #[test]
+    fn protected_channels_advert_carries_formats_v2_with_growth_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, true))
     }
 
     /// The node's own config with every Prot switch on and a valid sale
@@ -1266,5 +1340,217 @@ mod test {
                 .map(serde_json::Map::len),
             Some(4)
         );
+    }
+
+    fn ios_call_e2ee_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["ios_call_e2ee"]
+            .clone()
+    }
+
+    /// The iOS call switch (D14) is always on the wire as a bool under
+    /// `features.ios_call_e2ee`, carries the configured value, and the
+    /// node's own config leaves it ON
+    #[test]
+    fn root_advertises_ios_call_e2ee() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+        assert!(config.features.ios_call_e2ee, "the node's default is ON");
+        assert_eq!(ios_call_e2ee_json(config.clone()), serde_json::json!(true));
+
+        let mut off = config;
+        off.features.ios_call_e2ee = false;
+        assert_eq!(ios_call_e2ee_json(off), serde_json::json!(false));
+    }
+
+    /// The published schema tells a generated client that a missing value
+    /// means ON
+    #[test]
+    fn schema_reads_a_missing_ios_call_e2ee_as_on() {
+        let schema = serde_json::to_value(schemars::schema_for!(super::RevoltFeatures)).unwrap();
+        let field = &schema["properties"]["ios_call_e2ee"];
+        assert_eq!(field["type"], "boolean");
+        assert_eq!(field["default"], true);
+        let required = schema["required"].as_array().expect("required list");
+        assert!(required.contains(&serde_json::json!("remote_control")));
+        assert!(!required.contains(&serde_json::json!("ios_call_e2ee")));
+    }
+
+    fn livekit_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["livekit"].clone()
+    }
+
+    /// The ring length is on the wire under
+    /// `features.livekit.call_ring_duration`, in seconds, as the length the
+    /// server itself applies: a zero reads as 45 and anything else is
+    /// brought into 5 to 120. A client that rang for the raw setting would
+    /// keep ringing after the server had given the ring up, or never ring
+    #[test]
+    fn root_advertises_the_effective_call_ring_duration() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+
+        // (configured, advertised)
+        let table: [(usize, u64); 7] = [
+            (0, 45),
+            (1, 5),
+            (5, 5),
+            (30, 30),
+            (45, 45),
+            (120, 120),
+            (usize::MAX, 120),
+        ];
+        for (configured, advertised) in table {
+            let mut config = config.clone();
+            config.api.livekit.call_ring_duration = configured;
+            assert_eq!(
+                livekit_json(config)["call_ring_duration"],
+                serde_json::json!(advertised),
+                "configured {configured}"
+            );
+        }
+    }
+
+    /// `GET /` carries the ring length of the node's own config, and the
+    /// voice advert holds nothing besides it and the two older fields
+    #[test]
+    fn root_serves_call_ring_duration() {
+        crate::util::test::rt().block_on(root_serves_call_ring_duration_case())
+    }
+
+    async fn root_serves_call_ring_duration_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let advert = body["features"]["livekit"]
+            .as_object()
+            .expect("livekit object");
+
+        let mut keys: Vec<&str> = advert.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["call_ring_duration", "enabled", "nodes"]);
+
+        let config = revolt_config::config().await;
+        let advertised = advert["call_ring_duration"]
+            .as_u64()
+            .expect("call_ring_duration is a number");
+        assert_eq!(
+            advertised,
+            revolt_config::effective_call_ring_secs(config.api.livekit.call_ring_duration) as u64
+        );
+        assert!(
+            (5..=120).contains(&advertised),
+            "a ring of {advertised} seconds is outside what any service honors"
+        );
+    }
+
+    /// The legal links object of `GET /`
+    async fn legal_links() -> serde_json::Value {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        body["features"]["legal_links"].clone()
+    }
+
+    #[test]
+    fn root_serves_the_take_it_down_link_when_set() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.legal_links.take_it_down =
+                    "https://sloga.gg/legal/take-it-down.html".to_string();
+            })
+            .await;
+
+            assert_eq!(
+                legal_links().await["take_it_down"],
+                "https://sloga.gg/legal/take-it-down.html"
+            );
+        })
+    }
+
+    #[test]
+    fn root_leaves_out_an_unset_take_it_down_link() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.legal_links.take_it_down = String::new();
+            })
+            .await;
+
+            let links = legal_links().await;
+            assert!(links.get("take_it_down").is_none(), "{links}");
+            assert!(links.get("terms_of_service").is_some(), "{links}");
+        })
+    }
+
+    fn e2ee_only_json(config: revolt_config::Settings) -> serde_json::Value {
+        serde_json::to_value(super::root_config(config)).unwrap()["features"]["e2ee"]["only"]
+            .clone()
+    }
+
+    /// `features.e2ee.only` carries the effective availability (the setting
+    /// and E2EE both on) and the enforcement switch as configured
+    #[test]
+    fn root_advertises_e2ee_only() {
+        let config = crate::util::test::rt().block_on(revolt_config::config());
+
+        // (e2ee_enabled, only_available, only_enforced, advertised available)
+        let table: [(bool, bool, bool, bool); 8] = [
+            (true, true, true, true),
+            (true, true, false, true),
+            (true, false, true, false),
+            (true, false, false, false),
+            (false, true, true, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+        ];
+        for (e2ee, available, enforced, advertised) in table {
+            let mut config = config.clone();
+            config.features.e2ee_enabled = e2ee;
+            config.features.e2ee.only_available = available;
+            config.features.e2ee.only_enforced = enforced;
+            assert_eq!(
+                e2ee_only_json(config),
+                serde_json::json!({ "available": advertised, "enforced": enforced }),
+                "e2ee {e2ee}, available {available}, enforced {enforced}"
+            );
+        }
+    }
+
+    /// `GET /` carries the advert for the node's own config, next to
+    /// `split_from`, and nothing else under `features.e2ee`
+    #[test]
+    fn root_serves_e2ee_only() {
+        crate::util::test::rt().block_on(root_serves_e2ee_only_case())
+    }
+
+    async fn root_serves_e2ee_only_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        // Raw JSON so the assertions cover the wire shape, not the typed struct
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        let e2ee = body["features"]["e2ee"].as_object().expect("e2ee object");
+        let mut keys: Vec<&str> = e2ee.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["only", "split_from"]);
+
+        let config = revolt_config::config().await;
+        assert_eq!(
+            body["features"]["e2ee"]["only"],
+            serde_json::json!({
+                "available": config.features.e2ee_enabled && config.features.e2ee.only_available,
+                "enforced": config.features.e2ee.only_enforced,
+            })
+        );
+
+        // The shipped defaults: nobody can turn it on, and marks are enforced
+        assert_eq!(body["features"]["e2ee"]["only"]["available"], false);
+        assert_eq!(body["features"]["e2ee"]["only"]["enforced"], true);
     }
 }

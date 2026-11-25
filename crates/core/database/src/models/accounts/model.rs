@@ -418,8 +418,24 @@ impl Account {
     }
 
     /// Create a new session
+    ///
+    /// Signing in cancels a pending account deletion. If the account's
+    /// deletion has been confirmed (or the account deleted) by the time the
+    /// session is stored, the session is removed again and the login fails
+    /// with `InvalidSession`.
     pub async fn create_session(&self, db: &Database, name: String) -> Result<Session> {
         let config = config().await;
+
+        // Cancel before any session exists; if this fails, so does the login.
+        // An expired request was dead already, so only a live one is worth
+        // telling the user about. The email waits until the login is known
+        // to succeed.
+        let cancelled = db.cancel_account_deletion(&self.id).await?;
+        let notify_cancelled = matches!(
+            &cancelled,
+            Some(DeletionInfo::WaitingForVerification { expiry, .. })
+                if *expiry >= Timestamp::now_utc()
+        );
 
         let session = Session {
             id: ulid::Ulid::new().to_string(),
@@ -437,6 +453,33 @@ impl Account {
         // Save to database
         db.save_session(&session).await?;
 
+        // A confirm that claimed the deletion before the cancel above leaves
+        // the account Scheduled (and disabled in the same write). Read it
+        // again now that the session exists, so a login racing a confirm
+        // can never keep a session. `disabled` alone is not checked here:
+        // suspension is handled by the callers
+        let deletion = match db.fetch_account(&self.id).await {
+            Ok(account) => account.deletion,
+            Err(error) => {
+                Account::discard_session(db, &session.id).await;
+                return Err(error);
+            }
+        };
+
+        if matches!(
+            deletion,
+            Some(DeletionInfo::Scheduled { .. } | DeletionInfo::Deleted)
+        ) {
+            Account::discard_session(db, &session.id).await;
+            return Err(create_error!(InvalidSession));
+        }
+
+        // Only now, with the session stored and the re-check passed, so a
+        // refused login never tells the user their account was restored
+        if notify_cancelled {
+            self.send_deletion_cancelled_email().await;
+        }
+
         // Create and push event
         EventV1::CreateSession {
             session: session.clone(),
@@ -445,6 +488,55 @@ impl Account {
         .await;
 
         Ok(session)
+    }
+
+    /// Remove a session a refused login stored, best-effort
+    ///
+    /// Its token was never handed out and no event announced it.
+    async fn discard_session(db: &Database, session_id: &str) {
+        if let Err(error) = db.delete_session(session_id).await {
+            error!("Failed to remove session {session_id} after a refused login: {error:?}");
+        }
+    }
+
+    /// Email the user that signing in cancelled their deletion request
+    ///
+    /// Best-effort and detached: the caller never waits on SMTP, and a
+    /// failure is only logged. `send_email` blocks and can panic, so it runs
+    /// on the blocking pool and its handle is awaited in a spawned task.
+    async fn send_deletion_cancelled_email(&self) {
+        let config = config().await;
+        if config.api.smtp.host.is_empty() {
+            return;
+        }
+
+        let template = email_templates().await.deletion_cancelled;
+        let smtp = config.api.smtp;
+        let email = self.email.clone();
+        let account_id = self.id.clone();
+
+        tokio::spawn(async move {
+            let variables = json!({
+                "email": email.clone(),
+                "url": template.url.clone()
+            });
+
+            let sent =
+                tokio::task::spawn_blocking(move || send_email(&smtp, email, &template, variables))
+                    .await;
+
+            match sent {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    error!(
+                        "Failed to send the deletion cancelled email for {account_id}: {error:?}"
+                    )
+                }
+                Err(error) => {
+                    error!("The deletion cancelled email for {account_id} did not finish: {error}")
+                }
+            }
+        });
     }
 
     /// Send account verification email
@@ -598,6 +690,26 @@ impl Account {
             let token = nanoid!(32);
             let url = format!("{}{}", templates.deletion.url, token);
 
+            let deletion = DeletionInfo::WaitingForVerification {
+                token,
+                expiry: Timestamp::now_utc()
+                    .checked_add(Duration::seconds(
+                        config.api.smtp.expiry.expire_account_deletion,
+                    ))
+                    .unwrap(),
+            };
+
+            // Store the pending state before mailing the link, so a failed
+            // write never leaves the user holding a link that cannot work.
+            // The write is conditional: if a confirm claimed the deletion
+            // since this copy was read (Scheduled and disabled), it is
+            // refused with `InvalidOperation` and no email goes out, rather
+            // than reviving a pending state that could never be confirmed
+            // or purged.
+            db.request_account_deletion(&self.id, deletion.clone())
+                .await?;
+            self.deletion = Some(deletion);
+
             send_email(
                 &config.api.smtp,
                 self.email.clone(),
@@ -606,18 +718,7 @@ impl Account {
                     "email": self.email.clone(),
                     "url": url
                 }),
-            )?;
-
-            self.deletion = Some(DeletionInfo::WaitingForVerification {
-                token,
-                expiry: Timestamp::now_utc()
-                    .checked_add(Duration::seconds(
-                        config.api.smtp.expiry.expire_password_reset,
-                    ))
-                    .unwrap(),
-            });
-
-            self.save(db).await
+            )
         } else {
             self.schedule_deletion(db).await
         }
@@ -756,6 +857,11 @@ impl Account {
     }
 
     /// Delete all sessions for an account
+    ///
+    /// Every device is tried even after one fails to revoke (a failed
+    /// pending pass leaves that device intact, 6.3 "Device revocation"):
+    /// one failure must not keep the others alive. The sessions are gone
+    /// either way, so the event is sent; then the first error is returned.
     pub async fn delete_all_sessions(
         &self,
         db: &Database,
@@ -766,9 +872,30 @@ impl Account {
 
         // E2EE devices die with their sessions: revoke every device except
         // those bound to the surviving session
-        for identity in db.fetch_e2ee_identities(&self.id).await? {
-            if exclude_session_id.as_deref() != Some(identity.last_session_id.as_str()) {
-                crate::E2EEIdentity::revoke_device(db, &self.id, &identity.device_id).await?;
+        let mut first_error = None;
+        match db.fetch_e2ee_identities(&self.id).await {
+            Ok(identities) => {
+                for identity in identities {
+                    if exclude_session_id.as_deref() == Some(identity.last_session_id.as_str()) {
+                        continue;
+                    }
+                    if let Err(error) =
+                        crate::E2EEIdentity::revoke_device(db, &self.id, &identity.device_id).await
+                    {
+                        error!(
+                            "device revocation failed: user={} device={}: {error:?}",
+                            self.id, identity.device_id
+                        );
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            Err(error) => {
+                error!(
+                    "device revocation failed: user={}: listing: {error:?}",
+                    self.id
+                );
+                first_error = Some(error);
             }
         }
 
@@ -780,23 +907,35 @@ impl Account {
         .private(self.id.clone())
         .await;
 
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Disable an account
+    ///
+    /// `disabled` is stored BEFORE the sessions and devices go: a failed
+    /// revocation then answers its error with the account already disabled,
+    /// never a user logged out who can sign straight back in
     pub async fn disable(&mut self, db: &Database) -> Result<()> {
         self.disabled = true;
-        self.delete_all_sessions(db, None).await?;
-        self.save(db).await
+        self.save(db).await?;
+        self.delete_all_sessions(db, None).await
     }
 
     /// Schedule an account for deletion
     pub async fn schedule_deletion(&mut self, db: &Database) -> Result<()> {
-        self.deletion = Some(DeletionInfo::Scheduled {
+        let deletion = Some(DeletionInfo::Scheduled {
             after: Timestamp::now_utc()
                 .checked_add(Duration::weeks(1))
                 .unwrap(),
         });
+
+        // `save_account` never writes `deletion`, so it goes through the
+        // targeted op; `disable` then saves the rest
+        db.set_account_deletion(&self.id, deletion.clone()).await?;
+        self.deletion = deletion;
 
         self.disable(db).await
     }
@@ -805,9 +944,22 @@ impl Account {
     pub async fn mark_deleted(&mut self, db: &Database) -> Result<()> {
         self.email = format!("Deleted User {}", &self.id);
         self.email_normalised = format!("Deleted User {}", &self.id);
-        self.deletion = Some(DeletionInfo::Deleted);
 
         self.save(db).await?;
+
+        // The Google and Apple ids go too, or a returning user's OAuth
+        // sign-in finds this dead account forever. `save_account` cannot
+        // clear them (it leaves a `None` id out), so this is a targeted
+        // write. Before `Deleted` is stored: if it fails, the account stays
+        // due and the next sweep runs all of this again.
+        db.unlink_account_oauth(&self.id).await?;
+        self.google_id = None;
+        self.apple_id = None;
+
+        // `save_account` never writes `deletion`
+        db.set_account_deletion(&self.id, Some(DeletionInfo::Deleted))
+            .await?;
+        self.deletion = Some(DeletionInfo::Deleted);
 
         Ok(())
     }
@@ -815,9 +967,10 @@ impl Account {
 
 #[cfg(test)]
 mod tests {
-    use iso8601_timestamp::Timestamp;
+    use iso8601_timestamp::{Duration, Timestamp};
+    use revolt_result::ErrorType;
 
-    use crate::{Account, E2EEIdentity, E2EESignedKey, EmailVerification};
+    use crate::{Account, DeletionInfo, E2EEIdentity, E2EESignedKey, EmailVerification};
 
     /// An identity row for the session bookkeeping below; the keys are never
     /// verified on this path
@@ -897,6 +1050,400 @@ mod tests {
                 left,
                 vec![kept.device_id.clone()],
                 "only the device bound to the surviving session may remain"
+            );
+        });
+    }
+
+    fn account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            email: format!("{id}@example.test"),
+            email_normalised: format!("{id}@example.test"),
+            password: "hash-original".to_string(),
+            disabled: false,
+            verification: EmailVerification::Verified,
+            password_reset: None,
+            deletion: None,
+            lockout: None,
+            mfa: Default::default(),
+            google_id: None,
+            apple_id: None,
+        }
+    }
+
+    /// Millisecond-exact, so it survives the ISO string round trip
+    fn far_future() -> Timestamp {
+        Timestamp::parse("2099-01-01T00:00:00.000Z").expect("valid timestamp")
+    }
+
+    fn long_ago() -> Timestamp {
+        Timestamp::parse("2000-01-01T00:00:00.000Z").expect("valid timestamp")
+    }
+
+    fn waiting(expiry: Timestamp) -> Option<DeletionInfo> {
+        Some(DeletionInfo::WaitingForVerification {
+            token: "pending-token".to_string(),
+            expiry,
+        })
+    }
+
+    /// Store an account with no deletion, then give it `deletion` through
+    /// the targeted write, never through `save_account`
+    async fn seed(db: &crate::Database, id: &str, deletion: Option<DeletionInfo>) -> Account {
+        db.save_account(&account(id)).await.unwrap();
+        db.set_account_deletion(id, deletion.clone()).await.unwrap();
+
+        let stored = db.fetch_account(id).await.unwrap();
+        assert_eq!(stored.deletion, deletion, "the control: the seed is stored");
+        stored
+    }
+
+    async fn session_ids(db: &crate::Database, account_id: &str) -> Vec<String> {
+        db.fetch_sessions(account_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect()
+    }
+
+    /// Assert `actual` is `offset` after a moment between `before` and
+    /// `after`. The slack covers the millisecond truncation of the stored
+    /// ISO string.
+    fn assert_offset_near(
+        actual: Timestamp,
+        before: Timestamp,
+        after: Timestamp,
+        offset: Duration,
+    ) {
+        let slack = Duration::seconds(1);
+        assert!(
+            actual >= before + offset - slack && actual <= after + offset + slack,
+            "{actual:?} is not {offset:?} after [{before:?}, {after:?}]"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_cancels_a_pending_deletion() {
+        database_test!(|db| async move {
+            let acct = seed(&db, "01ACCOUNTSIGNINPENDING0000", waiting(far_future())).await;
+
+            let session = acct.create_session(&db, "web".to_string()).await.unwrap();
+
+            assert_eq!(
+                db.fetch_account(&acct.id).await.unwrap().deletion,
+                None,
+                "signing in must cancel a pending deletion"
+            );
+            assert_eq!(session.user_id, acct.id);
+            assert_eq!(session_ids(&db, &acct.id).await, vec![session.id.clone()]);
+            assert!(
+                db.claim_account_deletion("pending-token").await.is_err(),
+                "the emailed link must stop working"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn create_session_clears_an_expired_pending_deletion() {
+        database_test!(|db| async move {
+            let acct = seed(&db, "01ACCOUNTSIGNINEXPIRED0000", waiting(long_ago())).await;
+
+            let session = acct.create_session(&db, "web".to_string()).await.unwrap();
+
+            assert_eq!(db.fetch_account(&acct.id).await.unwrap().deletion, None);
+            assert_eq!(session_ids(&db, &acct.id).await, vec![session.id.clone()]);
+        });
+    }
+
+    /// A confirm that claimed the deletion first wins: the login is refused
+    /// and the session it stored is gone again
+    #[tokio::test]
+    async fn create_session_refuses_a_confirmed_deletion() {
+        database_test!(|db| async move {
+            for (id, deletion) in [
+                (
+                    "01ACCOUNTSIGNINSCHEDULED00",
+                    DeletionInfo::Scheduled {
+                        after: far_future(),
+                    },
+                ),
+                ("01ACCOUNTSIGNINDELETED0000", DeletionInfo::Deleted),
+            ] {
+                let acct = seed(&db, id, Some(deletion.clone())).await;
+
+                let error = acct
+                    .create_session(&db, "web".to_string())
+                    .await
+                    .expect_err("a confirmed deletion must refuse the login");
+                assert!(
+                    matches!(error.error_type, ErrorType::InvalidSession),
+                    "{id}: expected InvalidSession, got {:?}",
+                    error.error_type
+                );
+                assert!(
+                    session_ids(&db, id).await.is_empty(),
+                    "{id}: a refused login must leave no session"
+                );
+                assert_eq!(
+                    db.fetch_account(id).await.unwrap().deletion,
+                    Some(deletion),
+                    "{id}: a refused login changes nothing"
+                );
+            }
+        });
+    }
+
+    /// The re-check looks at the deletion only; refusing suspended accounts
+    /// is the callers' job
+    #[tokio::test]
+    async fn create_session_does_not_check_disabled() {
+        database_test!(|db| async move {
+            let mut acct = account("01ACCOUNTSIGNINDISABLED000");
+            acct.disabled = true;
+            db.save_account(&acct).await.unwrap();
+
+            let session = acct.create_session(&db, "web".to_string()).await.unwrap();
+            assert_eq!(session_ids(&db, &acct.id).await, vec![session.id]);
+        });
+    }
+
+    /// The re-read fails for an account that is not stored, and the session
+    /// is removed rather than left behind
+    #[tokio::test]
+    async fn create_session_for_a_missing_account_leaves_no_session() {
+        database_test!(|db| async move {
+            let acct = account("01ACCOUNTSIGNINMISSING0000");
+
+            let error = acct
+                .create_session(&db, "web".to_string())
+                .await
+                .expect_err("a missing account must refuse the login");
+            assert!(
+                matches!(error.error_type, ErrorType::UnknownUser),
+                "expected UnknownUser, got {:?}",
+                error.error_type
+            );
+            assert!(session_ids(&db, &acct.id).await.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn start_account_deletion_stores_the_pending_state() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTSTARTDELETION0000";
+            let mut stale = seed(&db, id, None).await;
+
+            // Another write lands after this copy was read
+            let mut newer = stale.clone();
+            newer.password = "hash-newer".to_string();
+            db.save_account(&newer).await.unwrap();
+
+            let before = Timestamp::now_utc();
+            let sent = stale.start_account_deletion(&db).await;
+            let after = Timestamp::now_utc();
+
+            let stored = db.fetch_account(id).await.unwrap();
+            let Some(DeletionInfo::WaitingForVerification { token, expiry }) =
+                stored.deletion.clone()
+            else {
+                panic!("expected a pending deletion, got {:?}", stored.deletion);
+            };
+            // MongoDB keeps milliseconds only, so compare the token
+            let Some(DeletionInfo::WaitingForVerification {
+                token: memory_token,
+                ..
+            }) = &stale.deletion
+            else {
+                panic!(
+                    "expected a pending deletion in memory, got {:?}",
+                    stale.deletion
+                );
+            };
+            assert_eq!(memory_token, &token, "memory and storage must agree");
+
+            let lifetime = revolt_config::config()
+                .await
+                .api
+                .smtp
+                .expiry
+                .expire_account_deletion;
+            assert_offset_near(expiry, before, after, Duration::seconds(lifetime));
+
+            assert_eq!(
+                db.fetch_account_with_deletion_token(&token)
+                    .await
+                    .unwrap()
+                    .id,
+                id
+            );
+            assert_eq!(
+                stored.password, "hash-newer",
+                "a deletion request must not revert other fields"
+            );
+            assert!(!stored.disabled);
+
+            sent.expect("maildev on localhost:14025 must accept the deletion email");
+        });
+    }
+
+    #[tokio::test]
+    async fn schedule_deletion_stores_the_schedule() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTSCHEDULEDELETION0";
+            let mut acct = seed(&db, id, None).await;
+            acct.create_session(&db, "web".to_string()).await.unwrap();
+
+            let before = Timestamp::now_utc();
+            acct.schedule_deletion(&db).await.unwrap();
+            let after = Timestamp::now_utc();
+
+            let stored = db.fetch_account(id).await.unwrap();
+            let Some(DeletionInfo::Scheduled { after: due }) = stored.deletion.clone() else {
+                panic!("expected a scheduled deletion, got {:?}", stored.deletion);
+            };
+            assert_offset_near(due, before, after, Duration::weeks(1));
+            assert!(
+                matches!(acct.deletion, Some(DeletionInfo::Scheduled { .. })),
+                "memory and storage must agree, got {:?}",
+                acct.deletion
+            );
+            assert!(stored.disabled, "a scheduled account is disabled");
+            assert!(session_ids(&db, id).await.is_empty());
+        });
+    }
+
+    #[tokio::test]
+    async fn mark_deleted_stores_deleted() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMARKDELETED000000";
+            let mut acct = seed(&db, id, Some(DeletionInfo::Scheduled { after: long_ago() })).await;
+
+            acct.mark_deleted(&db).await.unwrap();
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert_eq!(stored.deletion, Some(DeletionInfo::Deleted));
+            assert_eq!(stored.email, format!("Deleted User {id}"));
+            assert_eq!(stored.email_normalised, format!("Deleted User {id}"));
+            assert_eq!(acct.deletion, Some(DeletionInfo::Deleted));
+        });
+    }
+
+    /// Final audit MAJOR (Amendment 9): a purged account must not keep its
+    /// Google and Apple ids, or a returning user's OAuth sign-in finds the
+    /// dead account (`disabled_account`) forever
+    #[tokio::test]
+    async fn mark_deleted_unlinks_oauth() {
+        database_test!(|db| async move {
+            let id = "01ACCOUNTMARKDELETEDOAUTH0";
+            let google_id = "google-sub-mark-deleted";
+            let apple_id = "apple-sub-mark-deleted";
+
+            let mut linked = account(id);
+            linked.google_id = Some(google_id.to_string());
+            linked.apple_id = Some(apple_id.to_string());
+            db.save_account(&linked).await.unwrap();
+            db.set_account_deletion(id, Some(DeletionInfo::Scheduled { after: long_ago() }))
+                .await
+                .unwrap();
+
+            // The control: both lookups find the account before the purge
+            let mut acct = db
+                .fetch_account_by_google_id(google_id)
+                .await
+                .unwrap()
+                .expect("the control: the Google id is stored");
+            assert_eq!(acct.id, id);
+            assert_eq!(
+                db.fetch_account_by_apple_id(apple_id)
+                    .await
+                    .unwrap()
+                    .expect("the control: the Apple id is stored")
+                    .id,
+                id
+            );
+
+            acct.mark_deleted(&db).await.unwrap();
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert_eq!(stored.deletion, Some(DeletionInfo::Deleted));
+            assert_eq!(stored.email, format!("Deleted User {id}"));
+            assert_eq!(stored.email_normalised, format!("Deleted User {id}"));
+            assert_eq!(stored.google_id, None);
+            assert_eq!(stored.apple_id, None);
+            assert!(
+                db.fetch_account_by_google_id(google_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the Google sign-in must not find the deleted account"
+            );
+            assert!(
+                db.fetch_account_by_apple_id(apple_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the Apple sign-in must not find the deleted account"
+            );
+
+            // Memory agrees, so a later save of this copy cannot relink them
+            assert_eq!(acct.google_id, None);
+            assert_eq!(acct.apple_id, None);
+            assert_eq!(acct.deletion, Some(DeletionInfo::Deleted));
+        });
+    }
+
+    /// Wave-2 audit MINOR 1: the request route loaded its copy before a
+    /// confirm claimed the deletion. The request must be refused and must
+    /// not turn Scheduled back into a pending deletion on a disabled
+    /// account, which could then be neither confirmed nor purged.
+    #[tokio::test]
+    async fn start_account_deletion_refuses_a_claimed_deletion() {
+        database_test!(|db| async move {
+            assert!(
+                !revolt_config::config().await.api.smtp.host.is_empty(),
+                "the control: SMTP is configured, so the request takes the email branch"
+            );
+
+            let id = "01ACCOUNTSTARTCLAIMED00000";
+            let mut stale = seed(&db, id, waiting(far_future())).await;
+
+            // The confirm lands after the request route read its copy
+            let claimed = db.claim_account_deletion("pending-token").await.unwrap();
+            assert!(
+                claimed.disabled,
+                "the control: the claim disabled the account"
+            );
+            assert!(!stale.disabled, "the control: the copy predates the claim");
+
+            let error = stale
+                .start_account_deletion(&db)
+                .await
+                .expect_err("a request after a claim must be refused");
+            assert!(
+                matches!(error.error_type, ErrorType::InvalidOperation),
+                "expected InvalidOperation, got {:?}",
+                error.error_type
+            );
+
+            let stored = db.fetch_account(id).await.unwrap();
+            assert!(
+                matches!(stored.deletion, Some(DeletionInfo::Scheduled { .. })),
+                "the account must stay Scheduled, got {:?}",
+                stored.deletion
+            );
+            assert_eq!(stored.deletion, claimed.deletion);
+            assert!(stored.disabled, "the account must stay disabled");
+            assert_eq!(
+                stale.deletion,
+                waiting(far_future()),
+                "a refused request must not change the copy in memory"
+            );
+
+            let due = db.fetch_accounts_due_for_deletion().await.unwrap();
+            assert!(
+                due.iter().any(|due| due.id == id),
+                "the purge must still find the account"
             );
         });
     }
