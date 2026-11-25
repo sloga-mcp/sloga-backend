@@ -52,6 +52,7 @@ const TICKET_ROUTES: &[(&str, &str)] = &[
         "account/disable_account.rs",
         "foreign_ticket_disable_account",
     ),
+    ("account/email_add.rs", "foreign_ticket_email_add_start"),
     ("admin/prot_adjust.rs", "foreign_ticket_admin_prot_adjust"),
     ("admin/prot_orders.rs", "foreign_ticket_admin_prot_orders"),
     (
@@ -1196,6 +1197,103 @@ async fn foreign_ticket_passkey_remove_case() {
         "passkey remove: the victim's own ticket"
     );
     assert_eq!(db.count_passkeys(&pair.victim.id).await.expect("count"), 0);
+}
+
+#[test]
+fn foreign_ticket_email_add_start() {
+    rt().block_on(foreign_ticket_email_add_start_case())
+}
+
+/// Mails maildev holds for `mailbox`
+async fn mails_to(mailbox: &str) -> usize {
+    reqwest::Client::new()
+        .get("http://localhost:14080/api/email")
+        .send()
+        .await
+        .expect("maildev unreachable on :14080")
+        .json::<Vec<crate::util::test::Mail>>()
+        .await
+        .expect("`Vec<Mail>`")
+        .into_iter()
+        .filter(|mail| mail.envelope.to.iter().any(|to| to.address == mailbox))
+        .count()
+}
+
+/// POST /auth/account/email/add/start would mail a code that puts the
+/// attacker's address on the victim's account (an account with no email,
+/// as only those may add one).
+///
+/// Fails if: the route loses its `ValidatedTicket` guard, or the guard
+/// accepts a ticket of another account.
+async fn foreign_ticket_email_add_start_case() {
+    revolt_config::overwrite_config(|settings| {
+        let passkeys = &mut settings.features.passkeys;
+        passkeys.available = true;
+        passkeys.signup = true;
+    })
+    .await;
+
+    let harness = TestHarness::new().await;
+    passkey::assert_available()
+        .await
+        .expect("setup: passkeys are on");
+    crate::util::passkey_signup::assert_signup_on()
+        .await
+        .expect("setup: passkey sign-up is on");
+
+    let (victim, victim_session, _) = harness.new_no_email_user().await;
+    let (attacker, _, _) = harness.new_user().await;
+    let attacker_ticket = saved_ticket(&harness, &attacker.id, true).await;
+
+    let start = |email: &str| {
+        harness
+            .client
+            .post("/auth/account/email/add/start")
+            .header(ContentType::JSON)
+            .body(json!({ "email": email }).to_string())
+    };
+
+    let forged_address = format!("{}@validemail.com", TestHarness::rand_string());
+    let status = with_ticket(start(&forged_address), &victim_session, &attacker_ticket)
+        .dispatch()
+        .await
+        .status();
+
+    assert_eq!(status, Status::Forbidden, "email add start");
+    assert!(
+        ticket_exists(&harness, &attacker_ticket).await,
+        "email add start: the attacker's ticket was consumed by a request it could not authorize"
+    );
+
+    // The control: the victim's own ticket mails a code. It also marks the
+    // moment: a mail for the forged request would be in maildev by now.
+    let own = saved_ticket(&harness, &victim.id, true).await;
+    let own_address = format!("{}@validemail.com", TestHarness::rand_string());
+    let status = with_ticket(start(&own_address), &victim_session, &own)
+        .dispatch()
+        .await
+        .status();
+    assert_eq!(
+        status,
+        Status::NoContent,
+        "email add start: the victim's own ticket"
+    );
+    harness.assert_email(&own_address).await;
+
+    assert_eq!(
+        mails_to(&forged_address).await,
+        0,
+        "email add start: a code was mailed for the forged request"
+    );
+    let stored = harness
+        .db
+        .fetch_account(&victim.id)
+        .await
+        .expect("victim `Account`");
+    assert!(
+        stored.email_absent,
+        "email add start: the victim's account gained an email"
+    );
 }
 
 // ------------------------------------------------------------------------
