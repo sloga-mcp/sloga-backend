@@ -272,6 +272,8 @@ async fn full_flow_create_join_commit_fanout_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -543,6 +545,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -601,6 +605,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -618,6 +624,8 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -650,6 +658,8 @@ fn rejoin_outstanding_policy_requires_every_member_fresh() {
             key_package_ref: "ref0".to_string(),
             signature: "c2ln".to_string(),
             created_at: now.checked_sub(Duration::seconds(age_seconds)).unwrap(),
+            generation: None,
+            issued_at: None,
         }
     }
 
@@ -748,6 +758,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -790,6 +802,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -813,6 +827,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_b.device.device_id.clone(),
                 key_package_ref: "b0".to_string(),
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -833,6 +849,8 @@ async fn dual_reload_rejoin_closes_group_case() {
                 device_id: device_a.device.device_id.clone(),
                 key_package_ref: "a0".to_string(),
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
+                generation: None,
+                issued_at: None,
             })
             .unwrap(),
         )
@@ -1266,6 +1284,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             device_id: device_b.device.device_id.clone(),
             key_package_ref: "b0".to_string(),
             signature: STANDARD_NO_PAD.encode([0u8; 64]),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1273,24 +1293,31 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
     assert_eq!(response.status(), Status::BadRequest);
 
     // A member's OWN device signalling intent is refused (one-device rule:
-    // the creator's user already has a live leaf)
+    // the creator's user already has a live leaf). The second device is on
+    // its own session so the first stays registered.
+    let session_a2 = account_a
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("second session");
     let second_device = enroll_mls_device(
         &harness,
         &account_a.id,
         &user_a.id,
-        &session_a.token,
+        &session_a2.token,
         &["a20"],
         None,
     )
     .await;
     let response = post_json(
         &harness,
-        &session_a,
+        &session_a2,
         format!("/mls/groups/{gid}/join_intent"),
         serde_json::to_string(&v0::DataMlsJoinIntent {
             device_id: second_device.device.device_id.clone(),
             key_package_ref: "a20".to_string(),
             signature: second_device.join_signature(&user_a.id, &gid, "a20"),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1302,6 +1329,8 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
         device_id: device_b.device.device_id.clone(),
         key_package_ref: "b0".to_string(),
         signature: device_b.join_signature(&user_b.id, &gid, "b0"),
+        generation: None,
+        issued_at: None,
     })
     .unwrap();
 
@@ -1931,6 +1960,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-c"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -1960,6 +1991,8 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
                 &gid,
                 &STANDARD_NO_PAD.encode(b"ref-b2"),
             ),
+            generation: None,
+            issued_at: None,
         })
         .unwrap(),
     )
@@ -2021,11 +2054,13 @@ fn framed_text_commit(group_id: &str, epoch: i64, ad: &[u8]) -> String {
 
 /// Media E2EE AND protected-channel growth off, E2EE on. Every Call route
 /// and every unknown group id answers `FeatureDisabled { media_e2ee }`.
-/// Every Text growth route (Text create, join intent, KeyPackage claim, an
-/// Add commit) answers `FeatureDisabled { protected_channels }` to a seated,
-/// session-bound viewer; the Text maintenance routes (text group read,
-/// Update commit, commit fetch) still work, and the Text send refusal is
-/// unchanged (decisions 3 and 5 (W2)). Each answer is compared whole.
+/// Every Text growth route (Text create, a new device's join intent,
+/// KeyPackage claim, an Add commit) answers `FeatureDisabled
+/// { protected_channels }` to a seated, session-bound viewer; the Text
+/// maintenance routes (text group read, a rejoin intent, which is recovery
+/// (S2-D32), Update commit, commit fetch) still work, and the Text send
+/// refusal is unchanged (decisions 3 and 5 (W2)). Each answer is compared
+/// whole.
 async fn flag_off_rejects_every_route_case() {
     // overwrite_config is once-per-process and must run BEFORE the harness
     // primes the config cache (the create_account.rs test convention) —
@@ -2128,7 +2163,7 @@ async fn flag_off_rejects_every_route_case() {
 
     // --- The Text plane: a seated owner, its device bound to its session ---
 
-    let (_account_owner, session_owner, owner) = harness.new_user().await;
+    let (account_owner, session_owner, owner) = harness.new_user().await;
     let protected = harness
         .new_protected_channel(&owner, &session_owner, &[])
         .await;
@@ -2166,16 +2201,6 @@ async fn flag_off_rejects_every_route_case() {
             .unwrap(),
         ),
         (
-            "text join intent",
-            format!("/mls/groups/{}/join_intent", text.id),
-            serde_json::to_string(&v0::DataMlsJoinIntent {
-                device_id: owner_device.device_id.clone(),
-                key_package_ref: "a".to_string(),
-                signature: "a".to_string(),
-            })
-            .unwrap(),
-        ),
-        (
             "text key package claim",
             "/mls/key_packages/claim".to_string(),
             serde_json::to_string(&v0::DataClaimMlsKeyPackages {
@@ -2207,6 +2232,36 @@ async fn flag_off_rejects_every_route_case() {
         );
     }
 
+    // A join intent is growth only for a NEW device (S2-D32): a second
+    // device of the owner, bound to a second session of the owner and in
+    // no group, gets the gate's answer
+    let session_owner_new = account_owner
+        .create_session(&harness.db, String::new())
+        .await
+        .expect("a second owner session");
+    let new_owner_device = harness
+        .new_e2ee_device(&owner, &session_owner_new.id, 0x80)
+        .await;
+    let response = post_json(
+        &harness,
+        &session_owner_new,
+        format!("/mls/groups/{}/join_intent", text.id),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: new_owner_device.device_id.clone(),
+            key_package_ref: "a".to_string(),
+            signature: "a".to_string(),
+            generation: None,
+            issued_at: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        feature_disabled("protected_channels"),
+        "text join intent (new device)"
+    );
+
     // Maintenance: the growth flag never stops these (decision 5 (W2))
     let response = harness
         .client
@@ -2217,6 +2272,35 @@ async fn flag_off_rejects_every_route_case() {
     let (status, body) = whole_answer(response).await;
     assert_eq!(status, Status::Ok, "text group read: {body}");
     assert_eq!(body["group_id"], text.id.as_str(), "text group read");
+
+    // A rejoin (the owner's member device) is recovery (S2-D32, doc #220):
+    // it passes the gate with growth off and reaches the signature check,
+    // which refuses the dummy signature
+    let response = post_json(
+        &harness,
+        &session_owner,
+        format!("/mls/groups/{}/join_intent", text.id),
+        serde_json::to_string(&v0::DataMlsJoinIntent {
+            device_id: owner_device.device_id.clone(),
+            key_package_ref: "a".to_string(),
+            signature: "a".to_string(),
+            generation: None,
+            issued_at: None,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        whole_answer(response).await,
+        (
+            Status::BadRequest,
+            serde_json::json!({
+                "type": "FailedValidation",
+                "error": "invalid join intent signature"
+            })
+        ),
+        "text rejoin intent"
+    );
 
     // An Update commit (no Adds) wins with growth off; the refused Add
     // above stored nothing, so epoch 1 is still free
@@ -2274,5 +2358,147 @@ async fn flag_off_rejects_every_route_case() {
             serde_json::json!({ "type": "InvalidOperation" })
         ),
         "text send"
+    );
+}
+
+// Sibling-device close (mls-call-sibling-device-wedge plan §3, §4): the pure
+// verdict the join-intent route reads before closing a call group whose sole
+// leaf is the joiner's own stale sibling device, and the live set it reads.
+// `join_intent_signature_one_device_and_rate_limit` above keeps asserting the
+// sibling 400 on purpose: the harness pins no channel node, so the route gets
+// no SFU listing (`live == None` → Refuse) and that test doubles as the
+// listing-absent control for the route. It must not be "fixed" to expect the
+// close.
+
+#[test]
+fn sibling_verdict_closes_only_when_an_answered_listing_lacks_the_sibling() {
+    use std::collections::HashSet;
+
+    use super::join_intent::{sibling_verdict, SiblingVerdict};
+
+    fn live(pairs: &[(&str, &str)]) -> HashSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(user, device)| (user.to_string(), device.to_string()))
+            .collect()
+    }
+
+    // No listing (no node pinned, no room, or a listing error) → never close
+    // on an SFU that did not answer
+    assert_eq!(sibling_verdict("a", "d1", None), SiblingVerdict::Refuse);
+
+    // The sibling still holds a live seat (e.g. a failed eviction) → refuse
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("a", "d1")]))),
+        SiblingVerdict::Refuse
+    );
+
+    // An answered listing without the sibling → the sole leaf is unservable
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[]))),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // The joiner's own seat (same user, another device) is not the sibling
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("a", "d2")]))),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // Another user's device with the same id string is not the sibling: the
+    // (user, device) pair must match, not the device alone
+    assert_eq!(
+        sibling_verdict("a", "d1", Some(&live(&[("b", "d1")]))),
+        SiblingVerdict::CloseUnservable
+    );
+}
+
+#[test]
+fn live_member_devices_keeps_only_device_qualified_primaries() {
+    use std::collections::HashSet;
+
+    use revolt_database::voice::screen_leg_identity;
+
+    use super::join_intent::live_member_devices;
+
+    fn listed(identities: &[&str]) -> HashSet<(String, String)> {
+        live_member_devices(identities.iter().map(|identity| identity.to_string()))
+    }
+
+    fn pair(user: &str, device: &str) -> (String, String) {
+        (user.to_string(), device.to_string())
+    }
+
+    let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+    let device = "4208aa7e9ff58761b2d7a5d6c45f7383";
+    let primary = format!("{user}:{device}");
+    // The real leg grammar, never a hand-written literal:
+    // `{user}:{device}:screen`, and `{user}::screen` for a bare primary
+    let leg = screen_leg_identity(&primary);
+    let bare_leg = screen_leg_identity(user);
+
+    // A device-qualified primary is a live seat
+    assert_eq!(
+        listed(&[primary.as_str()]),
+        HashSet::from([pair(user, device)])
+    );
+
+    // A screen leg is a helper of its owner, never a seat
+    assert!(listed(&[leg.as_str()]).is_empty(), "{:?} kept", leg);
+    assert!(
+        listed(&[bare_leg.as_str()]).is_empty(),
+        "{:?} kept",
+        bare_leg
+    );
+
+    // A bare (non-device-qualified) identity names no device
+    assert!(listed(&[user]).is_empty(), "{:?} kept", user);
+
+    // Malformed: an empty segment, or anything but exactly two segments
+    for malformed in ["", ":", "a:", ":d", "a:b:c", "a:b:c:d"] {
+        assert!(listed(&[malformed]).is_empty(), "{:?} kept", malformed);
+    }
+
+    // Duplicates collapse, and a mixed listing yields exactly its seats
+    assert_eq!(
+        listed(&[
+            primary.as_str(),
+            leg.as_str(),
+            user,
+            bare_leg.as_str(),
+            "b:d9",
+            "b:",
+            ":d9",
+            "a:b:c:d",
+            primary.as_str(),
+            "b:d9",
+        ]),
+        HashSet::from([pair(user, device), pair("b", "d9")])
+    );
+}
+
+#[test]
+fn sibling_screen_leg_alone_is_not_a_live_seat() {
+    use revolt_database::voice::screen_leg_identity;
+
+    use super::join_intent::{live_member_devices, sibling_verdict, SiblingVerdict};
+
+    let user = "01KX7HASD9FHBYA3XGKA5YACYX";
+    let sibling = "4208aa7e9ff58761b2d7a5d6c45f7383";
+    let primary = format!("{user}:{sibling}");
+
+    // Only the sibling's screen leg is listed: a leg holds no leaf and no
+    // roster slot, so it cannot serve the join → close
+    let leg_only = live_member_devices(vec![screen_leg_identity(&primary)]);
+    assert_eq!(
+        sibling_verdict(user, sibling, Some(&leg_only)),
+        SiblingVerdict::CloseUnservable
+    );
+
+    // Control: the same listing plus the sibling's primary → refuse
+    let with_primary = live_member_devices(vec![screen_leg_identity(&primary), primary]);
+    assert_eq!(
+        sibling_verdict(user, sibling, Some(&with_primary)),
+        SiblingVerdict::Refuse
     );
 }

@@ -599,9 +599,18 @@ mod tests {
     #[tokio::test]
     async fn owner_email_is_skipped_without_smtp_a_deletion_promise_or_an_account() {
         database_test!(|db| async move {
-            let mut deleted = account("01PROTEMAIL000000000000003", "gone@example.test");
-            deleted.deletion = Some(DeletionInfo::Deleted);
+            // `save_account` never writes `deletion`, so the state goes
+            // through the targeted op
+            let deleted = account("01PROTEMAIL000000000000003", "gone@example.test");
             db.save_account(&deleted).await.unwrap();
+            db.set_account_deletion(&deleted.id, Some(DeletionInfo::Deleted))
+                .await
+                .unwrap();
+            assert_eq!(
+                db.fetch_account(&deleted.id).await.unwrap().deletion,
+                Some(DeletionInfo::Deleted),
+                "the control: the account is stored as deleted"
+            );
 
             // SMTP not configured: Ok(false) before any account lookup
             let mut no_smtp = settings().await;

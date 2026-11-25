@@ -2,12 +2,12 @@ use iso8601_timestamp::Timestamp;
 use revolt_config::config;
 use revolt_database::{
     tasks,
-    util::{antispam, permissions::DatabasePermissionQuery, reference::Reference},
+    util::{antispam, e2ee_only, permissions::DatabasePermissionQuery, reference::Reference},
     Channel, Database, Message, PartialMessage, User,
 };
 use revolt_models::v0::{self, Embed};
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use validator::Validate;
 
@@ -62,6 +62,30 @@ pub async fn edit(
         || (matches!(channel, Channel::Thread { .. }) && permission_channel.is_protected())
     {
         return Err(create_error!(ChannelProtected));
+    }
+
+    // An encrypted-only account or group takes no plain content, and an edit
+    // that brings content or embeds writes some. Refused after the
+    // permission and author checks and before any embed claim, write or
+    // event; the embed media the request named is released at once. An edit
+    // with neither only drops generated embeds, so it stays allowed.
+    if edit.content.is_some() || edit.embeds.is_some() {
+        let e2ee_config = config().await.features.e2ee.clone();
+        if let Err(error) =
+            e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await
+        {
+            if matches!(error.error_type, ErrorType::EncryptionRequired { .. }) {
+                let named: Vec<String> = edit
+                    .embeds
+                    .iter()
+                    .flatten()
+                    .filter_map(|embed| embed.media.clone())
+                    .collect();
+                e2ee_only::release_refused_attachments(db, &user.id, &named).await;
+            }
+
+            return Err(error);
+        }
     }
 
     // Anti-spam: an edit puts new text in front of the DM peer just like a
@@ -163,9 +187,14 @@ mod test {
     };
     use revolt_models::v0::{self, ReportedContent};
     use revolt_permissions::{ChannelPermission, OverrideField};
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::{json, Value};
     use ulid::Ulid;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_released, e2ee_request,
+        set_e2ee_only,
+    };
 
     /// Exempt from the detector: far below the minimum length once normalized
     const GREETING: &str = "hi";
@@ -873,5 +902,134 @@ mod test {
             let row = stored(&harness, message_id).await;
             assert!(row["edited"].is_null(), "{}: {}", case, row);
         }
+    }
+
+    /// An edit that brings content or embeds into a direct message with an
+    /// encrypted-only side is refused and changes nothing, and the embed
+    /// media it named is released. An edit with neither stays allowed.
+    /// Control: with the flags lifted the same edit is applied.
+    #[test]
+    fn e2ee_only_edit_refused_without_side_effects() {
+        crate::util::test::rt()
+            .block_on(Box::pin(e2ee_only_edit_refused_without_side_effects_case()))
+    }
+
+    async fn e2ee_only_edit_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = send(&harness, &author_session, dm.id(), GREETING).await;
+        let path = format!("/channels/{}/messages/{}", dm.id(), message.id);
+        let new_content = json!({ "content": "edited" });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        for (body, case) in [
+            (&new_content, "new content"),
+            (
+                &json!({ "embeds": [{ "description": "edited" }] }),
+                "new embeds",
+            ),
+        ] {
+            let answer =
+                e2ee_request(&harness, Method::Patch, &path, &author_session, Some(body)).await;
+            assert_encryption_required(&answer, "sender", case);
+        }
+
+        let media = upload_attachment(&harness, &author).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &path,
+            &author_session,
+            Some(&edit_with_embed(&media)),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "embed media");
+        assert!(
+            e2ee_released(&harness, &media).await,
+            "the embed media was not released"
+        );
+
+        let row = stored(&harness, &message.id).await;
+        assert_eq!(
+            row["content"], GREETING,
+            "a refused edit changed the content"
+        );
+        assert!(
+            row["edited"].is_null(),
+            "a refused edit marked the row edited"
+        );
+
+        // Neither content nor embeds: nothing plain is written
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &path,
+            &author_session,
+            Some(&json!({})),
+        )
+        .await;
+        assert_accepted(&answer, "an edit with neither content nor embeds");
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &path,
+            &author_session,
+            Some(&new_content),
+        )
+        .await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        assert_eq!(stored(&harness, &message.id).await["content"], GREETING);
+
+        // Control: no flags, the same edit
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &path,
+            &author_session,
+            Some(&new_content),
+        )
+        .await;
+        assert_accepted(&answer, "no flags");
+        assert_eq!(stored(&harness, &message.id).await["content"], "edited");
+    }
+
+    /// With `only_enforced = false` the same edit is applied
+    #[test]
+    fn e2ee_only_edit_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_edit_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_edit_allowed_when_not_enforced_case() {
+        assert!(
+            !config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = send(&harness, &author_session, dm.id(), GREETING).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &format!("/channels/{}/messages/{}", dm.id(), message.id),
+            &author_session,
+            Some(&json!({ "content": "edited" })),
+        )
+        .await;
+        assert_accepted(&answer, "an encrypted-only author and peer");
+        assert_eq!(stored(&harness, &message.id).await["content"], "edited");
     }
 }

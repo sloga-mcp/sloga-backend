@@ -47,3 +47,7 @@ revolt-presence = { workspace = true, features = ["redis-is-patched"] }
 
 # redis
 fred = { workspace = true, features = ["subscriber-client"] }
+
+[dev-dependencies]
+# signed E2EE device claims in the worker tests
+ed25519-dalek = { workspace = true }

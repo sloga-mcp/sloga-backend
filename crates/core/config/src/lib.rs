@@ -1500,6 +1500,9 @@ pub struct LegalLinks {
     pub privacy_policy: String,
     /// Guidelines URL
     pub guidelines: String,
+    /// Take It Down page URL; empty = not linked
+    #[serde(default)]
+    pub take_it_down: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1754,12 +1757,15 @@ impl BoostFeatures {
 }
 
 /// Anti-spam: the copy-paste DM detector (with its pause on DMs to
-/// strangers) and the daily staff alert.
+/// strangers), the fan-out signal for end-to-end encrypted DMs and the daily
+/// staff alert.
 ///
 /// Ships OFF. Prod turns it on in Revolt.overrides.toml under an explicit
 /// `[features.antispam]` header (env form `REVOLT__FEATURES__ANTISPAM__...`,
 /// double underscores), then RESTARTS delta AND crond: config sources are
-/// frozen into each process at first access.
+/// frozen into each process at first access. The fan-out signal has its own
+/// switch, `e2ee_fanout_enabled`, and also needs `dm_dupe_enabled` (the kill
+/// switch for every pause); read both through `e2ee_fanout_active()`.
 ///
 /// `Default` is hand-written on purpose: a derived one would give
 /// `dm_dupe_pause = false` and `dm_dupe_threshold = 0`. Read the threshold
@@ -1780,6 +1786,21 @@ pub struct AntispamFeatures {
     pub dm_dupe_min_chars: usize,
     /// Days after staff clear a flag before the detector may flag again
     pub dm_dupe_rearm_days: u64,
+    /// Switch for the encrypted DM fan-out signal (also needs
+    /// `dm_dupe_enabled`)
+    pub e2ee_fanout_enabled: bool,
+    /// Pause the account flagged by the fan-out signal until staff review the
+    /// report (false = report only, the default: no DM guard is taken)
+    pub e2ee_fanout_pause: bool,
+    /// Distinct strangers written to without a reply, within the window,
+    /// that flag an account (2 to 50)
+    pub e2ee_fanout_threshold: usize,
+    /// The same for accounts younger than 14 days (never above the other)
+    pub e2ee_fanout_new_account_threshold: usize,
+    /// How long a stranger stays counted per author (1 to 48)
+    pub e2ee_fanout_window_hours: u64,
+    /// How long the signal remembers who wrote to whom, a reply (1 to 90)
+    pub e2ee_fanout_reply_memory_days: u64,
     /// Master switch for the daily staff alert (crond)
     pub daily_enabled: bool,
     /// UTC hour at or after which the daily scan runs
@@ -1807,6 +1828,12 @@ impl Default for AntispamFeatures {
             dm_dupe_window_hours: 24,
             dm_dupe_min_chars: 30,
             dm_dupe_rearm_days: 30,
+            e2ee_fanout_enabled: false,
+            e2ee_fanout_pause: false,
+            e2ee_fanout_threshold: 10,
+            e2ee_fanout_new_account_threshold: 5,
+            e2ee_fanout_window_hours: 24,
+            e2ee_fanout_reply_memory_days: 30,
             daily_enabled: false,
             daily_run_hour_utc: 14,
             daily_account_age_days: 14,
@@ -1828,6 +1855,24 @@ impl AntispamFeatures {
     /// Minimum normalized length, never below 10
     pub fn min_chars(&self) -> usize {
         self.dm_dupe_min_chars.max(10)
+    }
+
+    /// Whether the encrypted DM fan-out signal runs: its own switch and the
+    /// detector's kill switch
+    pub fn e2ee_fanout_active(&self) -> bool {
+        self.dm_dupe_enabled && self.e2ee_fanout_enabled
+    }
+
+    /// Fan-out threshold, from 2 to 50 (the cap bounds the re-check at the
+    /// threshold). A new account is never held to a higher bar than an older
+    /// one.
+    pub fn e2ee_fanout_threshold_for(&self, new_account: bool) -> usize {
+        let threshold = self.e2ee_fanout_threshold.clamp(2, 50);
+        if new_account {
+            self.e2ee_fanout_new_account_threshold.max(2).min(threshold)
+        } else {
+            threshold
+        }
     }
 }
 
@@ -2063,6 +2108,31 @@ pub struct ProtectedChannelFeatures {
     /// `enabled` and `e2ee_enabled`: it keeps running with either one off
     #[serde(default = "ProtectedChannelFeatures::default_commit_retention_days")]
     pub commit_retention_days: u32,
+    /// Rollout gate for the S2 formats (#218): a channel ENTERS v2 (a v2
+    /// genesis, or a v1-to-v2 upgrade list) only while this is on, because
+    /// an S1 build parses a v2 list in a commit AD as malformed. It governs
+    /// nothing else about formats: a channel already on v2 keeps v2 bodies,
+    /// v2 ids, the AD v2, the Text join payload, seat PUTs and commits and
+    /// successors whatever this says, so turning it off never strands a v2
+    /// channel. On, protect accepts a v2 genesis only; off, a v1 genesis
+    /// only. It also gates the S2 device-revocation hook (#219). Flip it
+    /// once every protected device runs S2. Carried in the root advert
+    #[serde(default)]
+    pub formats_v2: bool,
+    /// Period, in seconds, of the crond protected-access sweep that runs
+    /// `reconcile_channel` over every channel with active seats (S2-D14).
+    /// The sweep runs with either feature flag in any state
+    #[serde(default = "ProtectedChannelFeatures::default_reconcile_sweep_secs")]
+    pub reconcile_sweep_secs: u64,
+    /// How long, in seconds, a Text join or rejoin intent stays
+    /// outstanding (S2-D28): the route's window and the driver's rule-6
+    /// window. The Call window stays 30 s
+    #[serde(default = "ProtectedChannelFeatures::default_text_rejoin_window_secs")]
+    pub text_rejoin_window_secs: u64,
+    /// Successor Text group creates allowed per channel per 24 h (S2-D33);
+    /// one more is refused with `InSlowmode`
+    #[serde(default = "ProtectedChannelFeatures::default_successor_rate_per_day")]
+    pub successor_rate_per_day: u32,
 }
 
 impl Default for ProtectedChannelFeatures {
@@ -2071,6 +2141,10 @@ impl Default for ProtectedChannelFeatures {
             enabled: false,
             default_device_cap: Self::default_device_cap(),
             commit_retention_days: Self::default_commit_retention_days(),
+            formats_v2: false,
+            reconcile_sweep_secs: Self::default_reconcile_sweep_secs(),
+            text_rejoin_window_secs: Self::default_text_rejoin_window_secs(),
+            successor_rate_per_day: Self::default_successor_rate_per_day(),
         }
     }
 }
@@ -2083,6 +2157,266 @@ impl ProtectedChannelFeatures {
     fn default_commit_retention_days() -> u32 {
         30
     }
+
+    fn default_reconcile_sweep_secs() -> u64 {
+        300
+    }
+
+    fn default_text_rejoin_window_secs() -> u64 {
+        86400
+    }
+
+    fn default_successor_rate_per_day() -> u32 {
+        10
+    }
+}
+
+/// Serde default for `Features::ios_call_e2ee` and its advert on `GET /`: a
+/// missing value reads ON
+pub fn default_ios_call_e2ee() -> bool {
+    true
+}
+
+/// Serde default for `Features::call_signals`: a missing value reads ON
+pub fn default_call_signals() -> bool {
+    true
+}
+
+/// Serde default for `Features::push_session_scope`: a missing value reads ON
+pub fn default_push_session_scope() -> bool {
+    true
+}
+
+/// Ring length used when none is configured
+const CALL_RING_DEFAULT_SECS: usize = 45;
+
+/// Shortest ring a configuration can ask for: anything less is over before a
+/// phone has had the time to show it
+const CALL_RING_MIN_SECS: usize = 5;
+
+/// Longest ring a configuration can ask for
+const CALL_RING_MAX_SECS: usize = 120;
+
+/// How long a call rings, in seconds, given the configured
+/// `api.livekit.call_ring_duration`. Every service and every app must agree
+/// on how long a call rings, so each of them reads the setting through this
+/// one rule: a missing or zero setting means 45 seconds, and any other value
+/// is brought into the range of 5 to 120 seconds.
+pub fn effective_call_ring_secs(configured: usize) -> usize {
+    if configured == 0 {
+        CALL_RING_DEFAULT_SECS
+    } else {
+        configured.clamp(CALL_RING_MIN_SECS, CALL_RING_MAX_SECS)
+    }
+}
+
+/// `[features.e2ee]`: E2EE switches read at process start. Flipping one
+/// needs a RESTART of delta AND bonfire (config is frozen into each process
+/// at first access).
+#[derive(Deserialize, Debug, Clone)]
+pub struct E2EEFeatures {
+    /// The live-claim lock per device (multi-device plan D4). ON unless set
+    /// false: a config without the key, or without the table, keeps the
+    /// lock. Off, bonfire neither writes nor reads locks (acks and drains
+    /// follow the device row's binding alone) and delta's device removal
+    /// decides from the database alone
+    #[serde(default = "E2EEFeatures::default_claim_lock")]
+    pub claim_lock: bool,
+
+    /// Whether accounts and groups may turn on "encrypted only". OFF unless
+    /// set true: a config without the key, or without the table, keeps it
+    /// off. Off, nobody can turn the setting on; turning it off still works
+    /// and marks that already exist are still enforced (see `only_enforced`)
+    #[serde(default = "E2EEFeatures::default_only_available")]
+    pub only_available: bool,
+
+    /// Whether "encrypted only" marks refuse unencrypted writes. ON unless
+    /// set false: a config without the key, or without the table, keeps
+    /// enforcing. Emergency switch only (restart delta AND crond): off,
+    /// every mark stays stored but refuses nothing
+    #[serde(default = "E2EEFeatures::default_only_enforced")]
+    pub only_enforced: bool,
+}
+
+impl Default for E2EEFeatures {
+    fn default() -> Self {
+        Self {
+            claim_lock: Self::default_claim_lock(),
+            only_available: Self::default_only_available(),
+            only_enforced: Self::default_only_enforced(),
+        }
+    }
+}
+
+impl E2EEFeatures {
+    fn default_claim_lock() -> bool {
+        true
+    }
+
+    fn default_only_available() -> bool {
+        false
+    }
+
+    fn default_only_enforced() -> bool {
+        true
+    }
+}
+
+/// `[features.takedown]`: Take It Down Act requests (public form, reviewer
+/// queue, crond alerts and clean-up).
+///
+/// Ships OFF. Prod sets it in Revolt.overrides.toml under an explicit
+/// `[features.takedown]` header (env form `REVOLT__FEATURES__TAKEDOWN__...`,
+/// double underscores; `data_key` belongs there or in the environment, never
+/// in a committed file), then RESTARTS delta AND crond: config sources are
+/// frozen into each process at first access. Without a valid `data_key` the
+/// feature stays off (`active()`), and the site falls back to email.
+///
+/// `Default` is hand-written for the numbers and the status URL, and `Debug`
+/// is hand-written so `init()`'s config dump never prints the key, the
+/// webhook URL or the staff addresses.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct FeaturesTakedown {
+    /// Master switch; also needs a valid `data_key`
+    pub enabled: bool,
+    /// AES-256 key sealing requester details: 64 hex characters. Empty = off
+    pub data_key: String,
+    /// User ids allowed to review requests (each also needs `privileged`
+    /// and active MFA). A TOML list, or one comma-separated string (the
+    /// environment form)
+    #[serde(deserialize_with = "takedown_list")]
+    pub reviewers: Vec<String>,
+    /// Addresses that get staff alert emails; same forms as `reviewers`
+    #[serde(deserialize_with = "takedown_list")]
+    pub staff_alert_emails: Vec<String>,
+    /// Webhook that gets each staff alert as a plain-text POST body (ntfy
+    /// style); empty = none
+    pub alert_webhook_url: String,
+    /// Status page the received email links to (`#<reference>.<token>` is
+    /// appended)
+    pub status_url_base: String,
+    /// Hour after receipt at which an unreviewed request auto-hides the
+    /// attachment it linked directly (restorable); 0 = never
+    pub auto_hide_hour: u64,
+    /// Most auto-hides per requester address per day
+    pub auto_hide_daily_cap: u64,
+    /// Copy count above which a removal needs `confirm_copies`
+    pub copy_confirm_threshold: u64,
+    /// Requests per contact address per day before new ones are throttled
+    /// (queued slower, never refused)
+    pub per_address_daily_soft_limit: u64,
+    /// Days after closing that removed adult images are held before deletion
+    pub retention_adult_days: u64,
+    /// Days after closing before requester details are purged (only the
+    /// contact fingerprint stays)
+    pub retention_requester_days: u64,
+    /// Whether reviewers may restore removed content
+    pub restore_enabled: bool,
+}
+
+impl Default for FeaturesTakedown {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            data_key: String::new(),
+            reviewers: Vec::new(),
+            staff_alert_emails: Vec::new(),
+            alert_webhook_url: String::new(),
+            status_url_base: "https://sloga.gg/legal/take-it-down-status.html".to_string(),
+            auto_hide_hour: 44,
+            auto_hide_daily_cap: 3,
+            copy_confirm_threshold: 25,
+            per_address_daily_soft_limit: 5,
+            retention_adult_days: 30,
+            retention_requester_days: 365,
+            restore_enabled: false,
+        }
+    }
+}
+
+impl FeaturesTakedown {
+    /// On, with a key that is 64 hex characters
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self.data_key.len() == 64
+            && self.data_key.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
+impl std::fmt::Debug for FeaturesTakedown {
+    /// Same output as the derive, except `data_key` and `alert_webhook_url`
+    /// print as `"<redacted>"` (or `"<unset>"` when empty) and
+    /// `staff_alert_emails` as a count
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(secret: &str) -> &'static str {
+            if secret.is_empty() {
+                "<unset>"
+            } else {
+                "<redacted>"
+            }
+        }
+
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let FeaturesTakedown {
+            enabled,
+            data_key,
+            reviewers,
+            staff_alert_emails,
+            alert_webhook_url,
+            status_url_base,
+            auto_hide_hour,
+            auto_hide_daily_cap,
+            copy_confirm_threshold,
+            per_address_daily_soft_limit,
+            retention_adult_days,
+            retention_requester_days,
+            restore_enabled,
+        } = self;
+
+        f.debug_struct("FeaturesTakedown")
+            .field("enabled", enabled)
+            .field("data_key", &redact(data_key))
+            .field("reviewers", reviewers)
+            .field("staff_alert_emails", &staff_alert_emails.len())
+            .field("alert_webhook_url", &redact(alert_webhook_url))
+            .field("status_url_base", status_url_base)
+            .field("auto_hide_hour", auto_hide_hour)
+            .field("auto_hide_daily_cap", auto_hide_daily_cap)
+            .field("copy_confirm_threshold", copy_confirm_threshold)
+            .field("per_address_daily_soft_limit", per_address_daily_soft_limit)
+            .field("retention_adult_days", retention_adult_days)
+            .field("retention_requester_days", retention_requester_days)
+            .field("restore_enabled", restore_enabled)
+            .finish()
+    }
+}
+
+/// `reviewers` and `staff_alert_emails` from a list, or from one
+/// comma-separated string (an environment variable cannot carry a list).
+/// Entries are trimmed and empty ones dropped, so an empty string is an empty
+/// list.
+fn takedown_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum List {
+        List(Vec<String>),
+        Joined(String),
+    }
+
+    let entries = match List::deserialize(deserializer)? {
+        List::List(entries) => entries,
+        List::Joined(joined) => joined.split(',').map(str::to_string).collect(),
+    };
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.trim().to_string())
+        .filter(|entry| !entry.is_empty())
+        .collect())
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -2101,6 +2435,16 @@ pub struct Features {
     /// backing media E2EE (calls). Requires `e2ee_enabled`.
     #[serde(default)]
     pub media_e2ee_enabled: bool,
+
+    /// Kill switch for the media-E2EE call path (mls-call-sibling-device-wedge
+    /// plan). When a user's other device is the ONLY member of a call's MLS
+    /// group and is no longer in the call, delta closes the group so the
+    /// joining device re-creates it; false restores the plain 400. ON by
+    /// default, and the default lives in the embedded `Revolt.toml`:
+    /// `#[serde(default)]` alone would make it `false`. Read once per
+    /// process, so flipping it needs a delta restart.
+    #[serde(default)]
+    pub mls_sibling_close: bool,
 
     /// Operator flag for the server calendar/events routes
     #[serde(default)]
@@ -2144,6 +2488,45 @@ pub struct Features {
     #[serde(default)]
     pub afk_auto_move: bool,
 
+    /// Kill switch for encrypted calls on iOS (ios-call-e2ee phase 2, D14),
+    /// advertised on `GET /` as `features.ios_call_e2ee`. ON by default, and
+    /// the default holds twice: the embedded `Revolt.toml` sets it, and the
+    /// serde default is `true`, so a config that never mentions the key
+    /// still reads ON (an unreadable switch must never turn encryption off).
+    /// Global for iOS, never per user or per channel. Turn it off with
+    /// `REVOLT__FEATURES__IOS_CALL_E2EE=false` (double underscores) or under
+    /// `[features]` in `Revolt.overrides.toml`, then RESTART delta: config
+    /// sources are frozen into the process at first access.
+    #[serde(default = "default_ios_call_e2ee")]
+    pub ios_call_e2ee: bool,
+
+    /// Kill switch for call ring signals: the call id each ring carries and
+    /// the signals that stop the other devices ringing. ON by default, and
+    /// the default holds twice: the embedded `Revolt.toml` sets it, and the
+    /// serde default is `true`, so a config that never mentions the key
+    /// still reads ON. Off, calls ring the way they did before: a ring
+    /// carries no call id, nothing tells a device that the call was answered
+    /// on another one, the decline route does nothing, and the `answer` flag
+    /// on a join is ignored. Turn it off with
+    /// `REVOLT__FEATURES__CALL_SIGNALS=false` (double underscores) or under
+    /// `[features]` in `Revolt.overrides.toml`, then RESTART voice-ingress
+    /// AND delta: config sources are frozen into each process at first
+    /// access.
+    #[serde(default = "default_call_signals")]
+    pub call_signals: bool,
+
+    /// Kill switch for the per-session push preferences ("chats only" and
+    /// "do not ring"). ON by default, and the default holds twice: the
+    /// embedded `Revolt.toml` sets it, and the serde default is `true`, so a
+    /// config that never mentions the key still reads ON. Off, the push
+    /// daemon ignores both preferences on every session and delivers
+    /// everything as before. Turn it off with
+    /// `REVOLT__FEATURES__PUSH_SESSION_SCOPE=false` (double underscores) or
+    /// under `[features]` in `Revolt.overrides.toml`, then RESTART pushd:
+    /// config sources are frozen into the process at first access.
+    #[serde(default = "default_push_session_scope")]
+    pub push_session_scope: bool,
+
     /// Optional server id that every newly-onboarded user is automatically
     /// added to (a "Welcome" / landing-spot server). Empty/unset disables the
     /// behaviour. Existing users are unaffected (backfill separately).
@@ -2171,6 +2554,17 @@ pub struct Features {
     /// the flip-requires-restart caveat and flag-off semantics)
     #[serde(default)]
     pub protected_channels: ProtectedChannelFeatures,
+
+    /// E2EE switches (see E2EEFeatures docs); a missing table keeps every
+    /// default
+    #[serde(default)]
+    pub e2ee: E2EEFeatures,
+
+    /// Take It Down requests (ships off; see FeaturesTakedown docs); a
+    /// missing table keeps every default. Boxed for the same stack reason
+    /// as `payments`
+    #[serde(default)]
+    pub takedown: Box<FeaturesTakedown>,
 
     #[serde(default)]
     pub advanced: FeaturesAdvanced,
@@ -2390,6 +2784,7 @@ mod antispam_config_tests {
                 let line = line.trim_start();
                 line != "[features.antispam]"
                     && !line.starts_with("dm_dupe_")
+                    && !line.starts_with("e2ee_fanout_")
                     && !line.starts_with("daily_")
             })
             .collect::<Vec<_>>()
@@ -2403,6 +2798,12 @@ mod antispam_config_tests {
         assert_eq!(antispam.dm_dupe_window_hours, 24);
         assert_eq!(antispam.dm_dupe_min_chars, 30);
         assert_eq!(antispam.dm_dupe_rearm_days, 30);
+        assert!(!antispam.e2ee_fanout_enabled);
+        assert!(!antispam.e2ee_fanout_pause);
+        assert_eq!(antispam.e2ee_fanout_threshold, 10);
+        assert_eq!(antispam.e2ee_fanout_new_account_threshold, 5);
+        assert_eq!(antispam.e2ee_fanout_window_hours, 24);
+        assert_eq!(antispam.e2ee_fanout_reply_memory_days, 30);
         assert!(!antispam.daily_enabled);
         assert_eq!(antispam.daily_run_hour_utc, 14);
         assert_eq!(antispam.daily_account_age_days, 14);
@@ -2549,6 +2950,100 @@ mod antispam_config_tests {
         assert_eq!(antispam.threshold(), 3);
         assert_eq!(antispam.min_chars(), 30);
     }
+
+    #[test]
+    fn e2ee_fanout_thresholds_follow_account_age_and_clamp() {
+        let antispam = AntispamFeatures::default();
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 10);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 5);
+
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 0,
+            e2ee_fanout_new_account_threshold: 1,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 2);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 2);
+
+        // A new account is never held to a higher bar than an older one
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 4,
+            e2ee_fanout_new_account_threshold: 8,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 4);
+
+        // The cap bounds the re-check at the threshold
+        let antispam = AntispamFeatures {
+            e2ee_fanout_threshold: 1000,
+            e2ee_fanout_new_account_threshold: 1000,
+            ..Default::default()
+        };
+        assert_eq!(antispam.e2ee_fanout_threshold_for(false), 50);
+        assert_eq!(antispam.e2ee_fanout_threshold_for(true), 50);
+    }
+
+    /// The signal runs only with its own switch AND the detector's kill
+    /// switch on
+    #[test]
+    fn e2ee_fanout_needs_both_switches() {
+        for (dm_dupe_enabled, e2ee_fanout_enabled, active) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let antispam = AntispamFeatures {
+                dm_dupe_enabled,
+                e2ee_fanout_enabled,
+                ..Default::default()
+            };
+            assert_eq!(
+                antispam.e2ee_fanout_active(),
+                active,
+                "dm_dupe_enabled={dm_dupe_enabled} e2ee_fanout_enabled={e2ee_fanout_enabled}"
+            );
+        }
+    }
+
+    /// The env form reaches the fan-out keys too
+    #[test]
+    fn environment_override_reaches_the_fanout_keys() {
+        let vars = HashMap::from([
+            (
+                "REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_ENABLED".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "REVOLT__FEATURES__ANTISPAM__E2EE_FANOUT_PAUSE".to_owned(),
+                "true".to_owned(),
+            ),
+        ]);
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let antispam = &settings.features.antispam;
+        assert!(antispam.e2ee_fanout_enabled);
+        assert!(antispam.e2ee_fanout_pause);
+        assert_eq!(antispam.e2ee_fanout_threshold, 10);
+        assert!(
+            !antispam.e2ee_fanout_active(),
+            "dm_dupe_enabled is still off"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2601,6 +3096,569 @@ mod afk_auto_move_tests {
             .expect("the config deserializes");
 
         assert!(!settings.features.afk_auto_move);
+    }
+}
+
+// The iOS call switch (D14). Built from in-process sources only, the way
+// CONFIG_BUILDER layers them, so no local override file or environment
+// variable can skew the result.
+#[cfg(test)]
+mod ios_call_e2ee_tests {
+    use config::{Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    fn settings(builder: ConfigBuilder<config::builder::DefaultState>) -> Settings {
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    fn with_env(name: &str, value: &str) -> Settings {
+        settings(
+            Config::builder().add_source(embedded()).add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(name.to_string(), value.to_string())].into())),
+            ),
+        )
+    }
+
+    #[test]
+    fn the_embedded_default_is_on() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .ios_call_e2ee
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default),
+    /// so losing the line can never turn encryption off
+    #[test]
+    fn a_missing_key_reads_on() {
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("ios_call_e2ee"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+
+        // The key must really be gone, or this test proves nothing
+        assert!(config.get_bool("features.ios_call_e2ee").is_err());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without ios_call_e2ee deserializes");
+        assert!(settings.features.ios_call_e2ee);
+    }
+
+    #[test]
+    fn the_overrides_file_turns_it_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\nios_call_e2ee = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.ios_call_e2ee);
+    }
+
+    #[test]
+    fn the_environment_override_turns_it_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__IOS_CALL_E2EE", "false")
+                .features
+                .ios_call_e2ee
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_is_ignored() {
+        assert!(
+            with_env("REVOLT_FEATURES__IOS_CALL_E2EE", "false")
+                .features
+                .ios_call_e2ee
+        );
+    }
+}
+
+// The two call switches (ring signals, per-session push preferences) and the
+// ring length. Built from in-process sources only, the way CONFIG_BUILDER
+// layers them, so no local override file or environment variable can skew
+// the result.
+#[cfg(test)]
+mod call_ring_switch_tests {
+    use config::{Config, ConfigBuilder, Environment, File, FileFormat};
+
+    use super::{effective_call_ring_secs, Settings};
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    fn settings(builder: ConfigBuilder<config::builder::DefaultState>) -> Settings {
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    fn with_env(name: &str, value: &str) -> Settings {
+        settings(
+            Config::builder().add_source(embedded()).add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(name.to_string(), value.to_string())].into())),
+            ),
+        )
+    }
+
+    /// The embedded Revolt.toml with the line that sets `key` under
+    /// `[features]` removed: the table is still there, the key is not
+    fn without_feature_key(key: &str) -> Settings {
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(key))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+
+        // The key must really be gone, or the caller proves nothing
+        assert!(config.get_bool(&format!("features.{key}")).is_err());
+        // And the table it sat in must still be there
+        assert!(config.get_bool("features.webhooks_enabled").is_ok());
+
+        config
+            .try_deserialize()
+            .expect("a config without the key deserializes")
+    }
+
+    #[test]
+    fn call_signals_is_on_in_the_embedded_default() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .call_signals
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default), so
+    /// losing the line can never quietly take the stop-ringing signals away
+    #[test]
+    fn a_missing_call_signals_key_reads_on() {
+        assert!(without_feature_key("call_signals").features.call_signals);
+    }
+
+    #[test]
+    fn the_overrides_file_turns_call_signals_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\ncall_signals = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.call_signals);
+    }
+
+    #[test]
+    fn the_environment_override_turns_call_signals_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__CALL_SIGNALS", "false")
+                .features
+                .call_signals
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_leaves_call_signals_on() {
+        assert!(
+            with_env("REVOLT_FEATURES__CALL_SIGNALS", "false")
+                .features
+                .call_signals
+        );
+    }
+
+    #[test]
+    fn push_session_scope_is_on_in_the_embedded_default() {
+        assert!(
+            settings(Config::builder().add_source(embedded()))
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// A config that never mentions the key reads ON (the serde default), so
+    /// losing the line can never quietly drop what a session asked for
+    #[test]
+    fn a_missing_push_session_scope_key_reads_on() {
+        assert!(
+            without_feature_key("push_session_scope")
+                .features
+                .push_session_scope
+        );
+    }
+
+    #[test]
+    fn the_overrides_file_turns_push_session_scope_off() {
+        let settings = settings(Config::builder().add_source(embedded()).add_source(
+            File::from_str("[features]\npush_session_scope = false\n", FileFormat::Toml),
+        ));
+        assert!(!settings.features.push_session_scope);
+    }
+
+    #[test]
+    fn the_environment_override_turns_push_session_scope_off() {
+        assert!(
+            !with_env("REVOLT__FEATURES__PUSH_SESSION_SCOPE", "false")
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// The single-underscore form is dropped without a warning, so it
+    /// leaves the switch ON
+    #[test]
+    fn a_single_underscore_prefix_leaves_push_session_scope_on() {
+        assert!(
+            with_env("REVOLT_FEATURES__PUSH_SESSION_SCOPE", "false")
+                .features
+                .push_session_scope
+        );
+    }
+
+    /// Every client rings for this long, and the push that rings a phone
+    /// expires after it
+    #[test]
+    fn the_embedded_ring_lasts_45_seconds() {
+        assert_eq!(
+            settings(Config::builder().add_source(embedded()))
+                .api
+                .livekit
+                .call_ring_duration,
+            45
+        );
+    }
+
+    /// The one rule every service applies to the configured ring length. A
+    /// zero would end every ring the moment it starts, so it reads as the
+    /// default; a value outside the range is brought to its nearest end.
+    #[test]
+    fn the_effective_ring_length_defaults_a_zero_and_clamps_the_rest() {
+        // (configured, effective)
+        let table = [
+            (0, 45),
+            (1, 5),
+            (5, 5),
+            (45, 45),
+            (120, 120),
+            (121, 120),
+            (usize::MAX, 120),
+        ];
+        for (configured, effective) in table {
+            assert_eq!(
+                effective_call_ring_secs(configured),
+                effective,
+                "configured {configured}"
+            );
+        }
+    }
+
+    /// The length the embedded default asks for is one the rule leaves alone
+    #[test]
+    fn the_embedded_ring_length_is_already_effective() {
+        let configured = settings(Config::builder().add_source(embedded()))
+            .api
+            .livekit
+            .call_ring_duration;
+        assert_eq!(effective_call_ring_secs(configured), configured);
+    }
+}
+
+#[cfg(test)]
+mod e2ee_claim_lock_switch_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.e2ee]\n";
+
+    fn build(toml: &str, env: Option<(&str, &str)>) -> Settings {
+        let mut builder = Config::builder().add_source(File::from_str(toml, FileFormat::Toml));
+        if let Some((key, value)) = env {
+            builder = builder.add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(key.to_string(), value.to_string())].into())),
+            );
+        }
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.e2ee]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(!cut.contains("claim_lock"), "the cut left the key behind");
+        cut
+    }
+
+    #[test]
+    fn the_embedded_config_keeps_the_lock_on() {
+        assert!(build(EMBEDDED, None).features.e2ee.claim_lock);
+    }
+
+    /// A prod override file (or any config) without the key keeps the lock:
+    /// the serde default is true, not bool's false
+    #[test]
+    fn a_config_without_the_key_keeps_the_lock_on() {
+        let without_table = embedded_without_the_table();
+        assert!(build(&without_table, None).features.e2ee.claim_lock);
+
+        let empty_table = format!("{without_table}\n{TABLE}");
+        assert!(build(&empty_table, None).features.e2ee.claim_lock);
+    }
+
+    /// The documented emergency switch (double underscores)
+    #[test]
+    fn the_environment_override_turns_the_lock_off() {
+        let settings = build(
+            EMBEDDED,
+            Some(("REVOLT__FEATURES__E2EE__CLAIM_LOCK", "false")),
+        );
+        assert!(!settings.features.e2ee.claim_lock);
+        assert!(settings.features.e2ee_enabled, "the E2EE flag itself is untouched");
+
+        let settings = build(
+            &embedded_without_the_table(),
+            Some(("REVOLT__FEATURES__E2EE__CLAIM_LOCK", "false")),
+        );
+        assert!(!settings.features.e2ee.claim_lock);
+    }
+}
+
+#[cfg(test)]
+mod e2ee_only_switch_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{E2EEFeatures, Settings};
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.e2ee]\n";
+
+    fn build(toml: &str, env: Option<(&str, &str)>) -> Settings {
+        let mut builder = Config::builder().add_source(File::from_str(toml, FileFormat::Toml));
+        if let Some((key, value)) = env {
+            builder = builder.add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some([(key.to_string(), value.to_string())].into())),
+            );
+        }
+        builder
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.e2ee]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(!cut.contains("only_available"), "the cut left a key behind");
+        assert!(!cut.contains("only_enforced"), "the cut left a key behind");
+        cut
+    }
+
+    /// The embedded Revolt.toml without the line that sets `key`
+    fn embedded_without_the_key(key: &str) -> String {
+        let kept = EMBEDDED
+            .lines()
+            .filter(|line| !line.trim_start().starts_with(key))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept.len() + 1,
+            EMBEDDED.lines().count(),
+            "the embedded config sets {key} once"
+        );
+        kept.join("\n")
+    }
+
+    #[test]
+    fn the_code_default_is_unavailable_and_enforced() {
+        let features = E2EEFeatures::default();
+        assert!(!features.only_available);
+        assert!(features.only_enforced);
+    }
+
+    #[test]
+    fn the_embedded_config_is_unavailable_and_enforced() {
+        let settings = build(EMBEDDED, None);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+    }
+
+    /// A prod override file (or any config) without the table, or with an
+    /// empty one, reads the serde defaults: unavailable, and enforced (true,
+    /// not bool's false)
+    #[test]
+    fn a_config_without_the_table_is_unavailable_and_enforced() {
+        let without_table = embedded_without_the_table();
+        let settings = build(&without_table, None);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+
+        let empty_table = format!("{without_table}\n{TABLE}");
+        let settings = build(&empty_table, None);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+    }
+
+    #[test]
+    fn a_config_without_only_available_keeps_it_off() {
+        let settings = build(&embedded_without_the_key("only_available"), None);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+        assert!(settings.features.e2ee.claim_lock, "the lock is untouched");
+    }
+
+    #[test]
+    fn a_config_without_only_enforced_keeps_enforcing() {
+        let settings = build(&embedded_without_the_key("only_enforced"), None);
+        assert!(settings.features.e2ee.only_enforced);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.claim_lock, "the lock is untouched");
+    }
+
+    #[test]
+    fn explicit_values_in_the_table_are_read() {
+        let toml = format!(
+            "{}\n{TABLE}only_available = true\nonly_enforced = false\n",
+            embedded_without_the_table()
+        );
+        let settings = build(&toml, None);
+        assert!(settings.features.e2ee.only_available);
+        assert!(!settings.features.e2ee.only_enforced);
+        assert!(settings.features.e2ee.claim_lock, "the lock keeps its default");
+
+        // Each key on its own leaves the other at its default
+        let toml = format!(
+            "{}\n{TABLE}only_available = true\n",
+            embedded_without_the_table()
+        );
+        let settings = build(&toml, None);
+        assert!(settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+
+        let toml = format!(
+            "{}\n{TABLE}only_enforced = false\n",
+            embedded_without_the_table()
+        );
+        let settings = build(&toml, None);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(!settings.features.e2ee.only_enforced);
+    }
+
+    /// The documented switches (double underscores)
+    #[test]
+    fn the_environment_overrides_are_read() {
+        let settings = build(
+            EMBEDDED,
+            Some(("REVOLT__FEATURES__E2EE__ONLY_AVAILABLE", "true")),
+        );
+        assert!(settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee.only_enforced);
+
+        let settings = build(
+            EMBEDDED,
+            Some(("REVOLT__FEATURES__E2EE__ONLY_ENFORCED", "false")),
+        );
+        assert!(!settings.features.e2ee.only_enforced);
+        assert!(!settings.features.e2ee.only_available);
+        assert!(settings.features.e2ee_enabled, "the E2EE flag itself is untouched");
+
+        let settings = build(
+            &embedded_without_the_table(),
+            Some(("REVOLT__FEATURES__E2EE__ONLY_ENFORCED", "false")),
+        );
+        assert!(!settings.features.e2ee.only_enforced);
+    }
+}
+
+#[cfg(test)]
+mod mls_sibling_close_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::Settings;
+
+    fn embedded() -> File<config::FileSourceString, FileFormat> {
+        File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The sole-stale-sibling close is ON unless an operator turns it off.
+    /// `#[serde(default)]` on a `bool` is `false`, so the `true` has to come
+    /// from the embedded `Revolt.toml`, the first source every process loads.
+    #[test]
+    fn the_embedded_default_turns_the_close_on() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .build()
+            .expect("the embedded Revolt.toml builds")
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+
+        assert!(settings.features.mls_sibling_close);
+    }
+
+    /// And the override turns it off (double underscores). The environment
+    /// source is configured exactly as `CONFIG_BUILDER` does, with the
+    /// variable supplied in-process rather than set on the test process.
+    #[test]
+    fn the_environment_override_turns_the_close_off() {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(
+                        [(
+                            "REVOLT__FEATURES__MLS_SIBLING_CLOSE".to_string(),
+                            "false".to_string(),
+                        )]
+                        .into(),
+                    )),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        assert!(!settings.features.mls_sibling_close);
     }
 }
 
@@ -2684,12 +3742,112 @@ legacy_private_key = "fake-legacy-private-key-placeholder"
 // environment source, so a developer machine cannot skew the result.
 #[cfg(test)]
 mod protected_channels_config_tests {
-    use config::{Config, File, FileFormat};
+    use std::collections::HashMap;
 
-    use super::Settings;
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{ProtectedChannelFeatures, Settings};
 
     fn embedded() -> File<config::FileSourceString, FileFormat> {
         File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml)
+    }
+
+    /// The embedded Revolt.toml with an overrides file on top
+    fn layered(overrides: &str) -> ProtectedChannelFeatures {
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(File::from_str(overrides, FileFormat::Toml))
+            .build()
+            .expect("the layered config builds")
+            .try_deserialize()
+            .expect("the layered config deserializes");
+        settings.features.protected_channels
+    }
+
+    /// The S2 keys at their design 7.1 values
+    fn assert_s2_defaults(protected: &ProtectedChannelFeatures) {
+        assert!(!protected.formats_v2);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
+        assert_eq!(protected.successor_rate_per_day, 10);
+    }
+
+    #[test]
+    fn hand_written_defaults_have_the_documented_values() {
+        let protected = ProtectedChannelFeatures::default();
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+        assert_s2_defaults(&protected);
+    }
+
+    /// An S1 overrides block names none of the S2 keys: it still loads, and
+    /// each S2 key takes its own default
+    #[test]
+    fn an_s1_block_takes_the_s2_defaults() {
+        let protected = layered(
+            "[features.protected_channels]\nenabled = true\ndefault_device_cap = 7\ncommit_retention_days = 14\n",
+        );
+        assert!(protected.enabled);
+        assert_eq!(protected.default_device_cap, 7);
+        assert_eq!(protected.commit_retention_days, 14);
+        assert_s2_defaults(&protected);
+    }
+
+    #[test]
+    fn a_toml_override_sets_each_s2_key() {
+        let protected = layered(
+            "[features.protected_channels]\nformats_v2 = true\nreconcile_sweep_secs = 60\ntext_rejoin_window_secs = 3600\nsuccessor_rate_per_day = 3\n",
+        );
+        assert!(protected.formats_v2);
+        assert_eq!(protected.reconcile_sweep_secs, 60);
+        assert_eq!(protected.text_rejoin_window_secs, 3600);
+        assert_eq!(protected.successor_rate_per_day, 3);
+        // The keys it does not name keep theirs: growth stays off
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+
+        // One key alone moves only that key
+        let protected = layered("[features.protected_channels]\nformats_v2 = true\n");
+        assert!(protected.formats_v2);
+        assert!(!protected.enabled);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
+        assert_eq!(protected.successor_rate_per_day, 10);
+    }
+
+    /// The documented env form (double underscores) reaches the S2 keys
+    #[test]
+    fn environment_override_reaches_the_s2_keys() {
+        let vars: HashMap<String, String> = [
+            ("REVOLT__FEATURES__PROTECTED_CHANNELS__FORMATS_V2", "true"),
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__SUCCESSOR_RATE_PER_DAY",
+                "4",
+            ),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let protected = &settings.features.protected_channels;
+        assert!(protected.formats_v2);
+        assert_eq!(protected.successor_rate_per_day, 4);
+        assert!(!protected.enabled);
+        assert_eq!(protected.reconcile_sweep_secs, 300);
+        assert_eq!(protected.text_rejoin_window_secs, 86400);
     }
 
     /// The feature ships dark: the defaults alone leave growth off and keep
@@ -2709,10 +3867,12 @@ mod protected_channels_config_tests {
             settings.features.protected_channels.commit_retention_days,
             30
         );
+        assert_s2_defaults(&settings.features.protected_channels);
     }
 
     /// The test config turns growth on, on top of the E2EE plane it needs,
-    /// so the W2 route tests run with the feature live.
+    /// so the W2 route tests run with the feature live. `formats_v2` stays
+    /// off there: the existing route tests protect with a v1 genesis.
     #[test]
     fn the_test_config_turns_growth_on() {
         let settings: Settings = Config::builder()
@@ -2733,6 +3893,7 @@ mod protected_channels_config_tests {
             settings.features.protected_channels.commit_retention_days,
             30
         );
+        assert_s2_defaults(&settings.features.protected_channels);
     }
 }
 
@@ -4815,5 +5976,174 @@ pubsub_subscription = "projects/p/subscriptions/s"
         // Both structs are in the dump, through the redacting impls
         assert!(debug.contains("ApiAppStore {"));
         assert!(debug.contains("ApiGooglePlay {"));
+    }
+}
+
+// Built from in-process sources only, never the cached `config()`, so no
+// local Revolt.overrides.toml or environment variable can skew the result.
+#[cfg(test)]
+mod takedown_config_tests {
+    use config::{Config, Environment, File, FileFormat};
+
+    use super::{FeaturesTakedown, Settings};
+
+    const EMBEDDED: &str = include_str!("../Revolt.toml");
+    const TABLE: &str = "[features.takedown]\n";
+    const HEX_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+    fn build(toml: &[&str], env: &[(&str, &str)]) -> Settings {
+        let mut builder = Config::builder();
+        for source in toml {
+            builder = builder.add_source(File::from_str(source, FileFormat::Toml));
+        }
+        builder
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(
+                        env.iter()
+                            .map(|(key, value)| (key.to_string(), value.to_string()))
+                            .collect(),
+                    )),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes")
+    }
+
+    /// The embedded Revolt.toml with its `[features.takedown]` table cut out
+    /// (up to the next table header)
+    fn embedded_without_the_table() -> String {
+        let start = EMBEDDED.find(TABLE).expect("the embedded table");
+        let end = EMBEDDED[start + TABLE.len()..]
+            .find("\n[")
+            .map_or(EMBEDDED.len(), |at| start + TABLE.len() + at + 1);
+        let cut = format!("{}{}", &EMBEDDED[..start], &EMBEDDED[end..]);
+        assert!(
+            !cut.contains("copy_confirm_threshold"),
+            "the cut left the table behind"
+        );
+        cut
+    }
+
+    fn assert_defaults(takedown: &FeaturesTakedown) {
+        assert!(!takedown.enabled);
+        assert!(takedown.data_key.is_empty());
+        assert!(takedown.reviewers.is_empty());
+        assert!(takedown.staff_alert_emails.is_empty());
+        assert!(takedown.alert_webhook_url.is_empty());
+        assert_eq!(
+            takedown.status_url_base,
+            "https://sloga.gg/legal/take-it-down-status.html"
+        );
+        assert_eq!(takedown.auto_hide_hour, 44);
+        assert_eq!(takedown.auto_hide_daily_cap, 3);
+        assert_eq!(takedown.copy_confirm_threshold, 25);
+        assert_eq!(takedown.per_address_daily_soft_limit, 5);
+        assert_eq!(takedown.retention_adult_days, 30);
+        assert_eq!(takedown.retention_requester_days, 365);
+        assert!(!takedown.restore_enabled);
+        assert!(!takedown.active());
+    }
+
+    #[test]
+    fn hand_written_default_has_the_planned_values() {
+        assert_defaults(&FeaturesTakedown::default());
+    }
+
+    /// The embedded table must not drift from the code default
+    #[test]
+    fn embedded_table_matches_the_code_default() {
+        let settings = build(&[EMBEDDED], &[]);
+        assert_defaults(&settings.features.takedown);
+        assert!(settings.features.legal_links.take_it_down.is_empty());
+    }
+
+    #[test]
+    fn missing_table_takes_the_defaults() {
+        let cut = embedded_without_the_table();
+        let without_link = cut
+            .lines()
+            .filter(|line| !line.starts_with("take_it_down"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settings = build(&[&without_link], &[]);
+        assert_defaults(&settings.features.takedown);
+        assert!(settings.features.legal_links.take_it_down.is_empty());
+    }
+
+    /// A partial table (what an overrides file holds) keeps every other default
+    #[test]
+    fn partial_table_keeps_the_other_defaults() {
+        let settings = build(
+            &[
+                &embedded_without_the_table(),
+                "[features.takedown]\nenabled = true\nreviewers = [\" 01ABC \", \"\"]\n",
+            ],
+            &[],
+        );
+        let takedown = &settings.features.takedown;
+        assert!(takedown.enabled);
+        assert_eq!(takedown.reviewers, ["01ABC"]);
+        assert_eq!(takedown.copy_confirm_threshold, 25);
+        assert_eq!(takedown.retention_requester_days, 365);
+        // No key yet, so still off
+        assert!(!takedown.active());
+    }
+
+    #[test]
+    fn environment_form_sets_the_key_and_comma_lists() {
+        let settings = build(
+            &[EMBEDDED],
+            &[
+                ("REVOLT__FEATURES__TAKEDOWN__ENABLED", "true"),
+                ("REVOLT__FEATURES__TAKEDOWN__DATA_KEY", HEX_KEY),
+                ("REVOLT__FEATURES__TAKEDOWN__REVIEWERS", "01AAA, 01BBB,,"),
+                ("REVOLT__FEATURES__TAKEDOWN__STAFF_ALERT_EMAILS", ""),
+                ("REVOLT__FEATURES__TAKEDOWN__AUTO_HIDE_HOUR", "0"),
+            ],
+        );
+        let takedown = &settings.features.takedown;
+        assert!(takedown.active());
+        assert_eq!(takedown.reviewers, ["01AAA", "01BBB"]);
+        assert!(takedown.staff_alert_emails.is_empty());
+        assert_eq!(takedown.auto_hide_hour, 0);
+    }
+
+    #[test]
+    fn active_needs_the_switch_and_a_64_hex_key() {
+        let with = |enabled: bool, key: &str| FeaturesTakedown {
+            enabled,
+            data_key: key.to_string(),
+            ..Default::default()
+        };
+
+        assert!(with(true, HEX_KEY).active());
+        assert!(with(true, &HEX_KEY.to_uppercase()).active());
+        assert!(!with(false, HEX_KEY).active());
+        assert!(!with(true, "").active());
+        assert!(!with(true, &HEX_KEY[..63]).active());
+        assert!(!with(true, &format!("{HEX_KEY}0")).active());
+        assert!(!with(true, &format!("{}zz", &HEX_KEY[..62])).active());
+    }
+
+    #[test]
+    fn debug_never_prints_the_secrets() {
+        let takedown = FeaturesTakedown {
+            enabled: true,
+            data_key: HEX_KEY.to_string(),
+            staff_alert_emails: vec!["staff-alerts@example.com".to_string()],
+            alert_webhook_url: "https://ntfy.example/secret-topic".to_string(),
+            ..Default::default()
+        };
+        let printed = format!("{takedown:?}");
+        assert!(!printed.contains(HEX_KEY));
+        assert!(!printed.contains("staff-alerts@example.com"));
+        assert!(!printed.contains("secret-topic"));
+        assert!(printed.contains("data_key: \"<redacted>\""));
+        assert!(printed.contains("staff_alert_emails: 1"));
+        assert!(printed.contains("auto_hide_hour: 44"));
+        assert!(format!("{:?}", FeaturesTakedown::default()).contains("data_key: \"<unset>\""));
     }
 }

@@ -136,6 +136,8 @@ async fn main() {
         cron_task_wrapper(prot_tank_clock::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prot_goals::task, db.clone(), amqp.clone()),
         cron_task_wrapper(prot_store_reconcile::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(protected_access_sweep::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(takedown::task, db.clone(), amqp.clone()),
     );
 }
 

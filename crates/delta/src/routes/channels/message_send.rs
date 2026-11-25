@@ -5,7 +5,8 @@ use revolt_config::config;
 use revolt_database::events::client::EventV1;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::{
-    util::antispam, util::idempotency::IdempotencyKey, util::reference::Reference, Database, User,
+    util::antispam, util::e2ee_only, util::idempotency::IdempotencyKey, util::reference::Reference,
+    Database, User,
 };
 use revolt_database::{validate_protected_send, MlsGroupKind, Session};
 use revolt_database::{Channel, Interactions, Message, Referral, ReferralActivity, AMQP};
@@ -115,6 +116,29 @@ pub async fn message_send(
             &idempotency_header,
         )
         .await?;
+    }
+
+    // An encrypted-only account or group takes no plain message, and every
+    // message this route stores in a direct message or group is plain.
+    // Refused here, after the SendMessage check and before slowmode, the
+    // nonce and every file claim. The files the request named will never be
+    // claimed, so they are released at once.
+    let e2ee_config = config().await.features.e2ee.clone();
+    if let Err(error) =
+        e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await
+    {
+        if matches!(error.error_type, ErrorType::EncryptionRequired { .. }) {
+            let mut named: Vec<String> = data.attachments.clone().unwrap_or_default();
+            named.extend(
+                data.embeds
+                    .iter()
+                    .flatten()
+                    .filter_map(|embed| embed.media.clone()),
+            );
+            e2ee_only::release_refused_attachments(db, &user.id, &named).await;
+        }
+
+        return Err(error);
     }
 
     // Archived or locked threads reject new messages unless the sender can
@@ -330,8 +354,14 @@ async fn check_protected_send(
         .filter(|group| group.id == encrypted.group_id)
         .ok_or_else(|| resecuring("stale_group"))?;
 
-    // 5. No removal is pending
-    if !group.pending_removals.is_empty() {
+    // 5. The list signer's device is not lost, then no removal is pending,
+    // user or device (S2, 6.1). `owner_device_lost` answers first, as in the
+    // commit driver: only the owner's recovery list clears it, so waiting
+    // for a pending Remove to land would not let the send through.
+    if group.signer_lost.is_some() {
+        return Err(resecuring("owner_device_lost"));
+    }
+    if !group.pending_removals.is_empty() || !group.pending_device_removals.is_empty() {
         return Err(resecuring("pending_removal"));
     }
 
@@ -349,7 +379,7 @@ async fn check_protected_send(
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
 
@@ -1811,6 +1841,357 @@ mod test {
         send_ok(&harness, &session, &dm, SCAM).await;
         assert_eq!(dm_message_count(&harness, &dm).await, 1);
     }
+
+    // Encrypted-only chats: a plain write into a direct message or group
+    // that involves an encrypted-only account, or into a group marked
+    // encrypted-only, is refused before anything is stored. The helpers
+    // below are shared with the tests of the other plain write routes.
+
+    /// Turn the Encrypted-only setting on or off for `user` by writing the
+    /// stored field directly (the setting's own route is tested elsewhere)
+    pub async fn set_e2ee_only(harness: &TestHarness, user: &mut User, value: bool) {
+        user.update(
+            &harness.db,
+            PartialUser {
+                e2ee_only: Some(value),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("Failed to set e2ee_only");
+        assert_eq!(
+            harness
+                .db
+                .fetch_user(&user.id)
+                .await
+                .expect("user")
+                .e2ee_only,
+            value,
+            "the stored flag"
+        );
+    }
+
+    /// Two accounts who share a server, so either may write to the other
+    /// without being friends, and the direct message between them: the
+    /// author's session and account, the peer's, and the DM
+    pub async fn e2ee_dm(harness: &TestHarness) -> (Session, User, Session, User, Channel) {
+        let (_, author_session, author) = harness.new_user().await;
+        let (_, peer_session, peer) = harness.new_user().await;
+        share_server(harness, &[&author, &peer]).await;
+        let dm = Channel::create_dm(&harness.db, &author, &peer)
+            .await
+            .expect("Failed to create test DM");
+        assert!(
+            matches!(dm, Channel::DirectMessage { .. }),
+            "not a DM: {dm:?}"
+        );
+        (author_session, author, peer_session, peer, dm)
+    }
+
+    /// A group owned by `owner` with `member` in it, marked encrypted-only.
+    /// Stored directly: how a group comes to be marked is tested elsewhere.
+    pub async fn e2ee_marked_group(harness: &TestHarness, owner: &User, member: &User) -> Channel {
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Encrypted".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone(), member.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: true,
+        };
+        harness
+            .db
+            .insert_channel(&group)
+            .await
+            .expect("Failed to store the test group");
+        group
+    }
+
+    /// An unclaimed file in the `attachments` bucket uploaded by `uploader`,
+    /// as Autumn leaves an upload
+    pub async fn e2ee_upload(harness: &TestHarness, uploader: &User) -> String {
+        let id = ulid::Ulid::new().to_string();
+        harness
+            .db
+            .insert_attachment(&revolt_database::File {
+                id: id.clone(),
+                tag: "attachments".to_string(),
+                filename: "plain.png".to_string(),
+                hash: None,
+                uploaded_at: Some(Timestamp::now_utc()),
+                uploader_id: Some(uploader.id.clone()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: revolt_database::Metadata::File,
+                content_type: "application/octet-stream".to_string(),
+                size: 10,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            })
+            .await
+            .expect("Failed to store the test attachment");
+        id
+    }
+
+    /// Whether a refusal released `attachment`: never claimed, and marked
+    /// deleted for the deletion sweep
+    pub async fn e2ee_released(harness: &TestHarness, attachment: &str) -> bool {
+        let file = harness
+            .db
+            .fetch_attachment("attachments", attachment)
+            .await
+            .expect("the attachment");
+        file.used_for.is_none() && file.deleted == Some(true)
+    }
+
+    /// How many messages `channel_id` holds (up to ten)
+    pub async fn e2ee_messages_in(harness: &TestHarness, channel_id: &str) -> usize {
+        dm_message_count(harness, channel_id).await
+    }
+
+    /// `method` on `path` as `session`, with `body` as JSON when there is
+    /// one. The status and the JSON body (`Null` when there is none).
+    pub async fn e2ee_request(
+        harness: &TestHarness,
+        method: rocket::http::Method,
+        path: &str,
+        session: &Session,
+        body: Option<&serde_json::Value>,
+    ) -> (Status, serde_json::Value) {
+        let mut request = harness
+            .client
+            .req(method, path.to_string())
+            .header(Header::new("x-session-token", session.token.to_string()));
+        if let Some(body) = body {
+            request = request.header(ContentType::JSON).body(body.to_string());
+        }
+        let response = request.dispatch().await;
+        let status = response.status();
+        let body = response
+            .into_json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// The refusal of a plain write, naming `side`
+    #[track_caller]
+    pub fn assert_encryption_required(
+        answer: &(Status, serde_json::Value),
+        side: &str,
+        case: &str,
+    ) {
+        assert_eq!(answer.0, Status::Forbidden, "{case}: {}", answer.1);
+        assert_eq!(
+            answer.1["type"], "EncryptionRequired",
+            "{case}: {}",
+            answer.1
+        );
+        assert_eq!(answer.1["side"], side, "{case}: {}", answer.1);
+    }
+
+    #[track_caller]
+    pub fn assert_accepted(answer: &(Status, serde_json::Value), case: &str) {
+        assert_eq!(answer.0, Status::Ok, "{case}: {}", answer.1);
+    }
+
+    /// A plain send into a direct message or group is refused for each
+    /// side, and leaves nothing behind: no message, the files it named
+    /// released, the nonce unspent. Server channels and Saved Notes still
+    /// take the encrypted-only author's messages. Control: with the flags
+    /// lifted the same request, nonce included, is sent.
+    #[test]
+    fn e2ee_only_send_refused_without_side_effects() {
+        crate::util::test::rt()
+            .block_on(Box::pin(e2ee_only_send_refused_without_side_effects_case()))
+    }
+
+    async fn e2ee_only_send_refused_without_side_effects_case() {
+        use rocket::http::Method;
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        let dm_path = format!("/channels/{}/messages", dm.id());
+        let group_path = format!("/channels/{}/messages", group.id());
+        let plain = json!({ "content": "plain", "nonce": ulid::Ulid::new().to_string() });
+
+        // The author is encrypted-only
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&plain),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        // The files a refused send named are released
+        let attachment = e2ee_upload(&harness, &author).await;
+        let media = e2ee_upload(&harness, &author).await;
+        let with_files = json!({
+            "content": "plain",
+            "attachments": [attachment],
+            "embeds": [{ "title": "embed", "media": media }]
+        });
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&with_files),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author with files");
+        assert!(
+            e2ee_released(&harness, &attachment).await,
+            "the attachment was not released"
+        );
+        assert!(
+            e2ee_released(&harness, &media).await,
+            "the embed media was not released"
+        );
+
+        // Server channels and Saved Notes are not affected
+        let (server, _) = harness.new_server(&author).await;
+        let channel = harness.new_channel(&server).await;
+        let saved = Channel::SavedMessages {
+            id: ulid::Ulid::new().to_string(),
+            user: author.id.clone(),
+        };
+        harness
+            .db
+            .insert_channel(&saved)
+            .await
+            .expect("Failed to store Saved Notes");
+        for (channel_id, case) in [
+            (channel.id(), "a server channel"),
+            (saved.id(), "Saved Notes"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &format!("/channels/{channel_id}/messages"),
+                &author_session,
+                Some(&json!({ "content": "plain" })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        // The peer is encrypted-only: the author is refused for the
+        // recipient, and the peer writing back is refused as the sender
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&plain),
+        )
+        .await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &peer_session,
+            Some(&json!({ "content": "plain" })),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "the encrypted-only peer writing back");
+
+        // A marked group refuses everyone
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &group_path,
+            &author_session,
+            Some(&plain),
+        )
+        .await;
+        assert_encryption_required(&answer, "group", "a marked group");
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 0, "the DM");
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 0, "the group");
+
+        // Control: no flags, the same request and nonce
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(
+            &harness,
+            Method::Post,
+            &dm_path,
+            &author_session,
+            Some(&plain),
+        )
+        .await;
+        assert_accepted(&answer, "no flags, the refused requests' nonce");
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 1);
+    }
+
+    /// With `only_enforced = false` the same sends go through: the flags
+    /// stay stored, the refusals are lifted
+    #[test]
+    fn e2ee_only_send_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_send_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_send_allowed_when_not_enforced_case() {
+        use rocket::http::Method;
+
+        assert!(
+            !config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let group = e2ee_marked_group(&harness, &author, &peer).await;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (session, channel_id, case) in [
+            (
+                &author_session,
+                dm.id(),
+                "an encrypted-only author and peer",
+            ),
+            (&peer_session, dm.id(), "the peer writing back"),
+            (&author_session, group.id(), "a marked group"),
+        ] {
+            let answer = e2ee_request(
+                &harness,
+                Method::Post,
+                &format!("/channels/{channel_id}/messages"),
+                session,
+                Some(&json!({ "content": "plain" })),
+            )
+            .await;
+            assert_accepted(&answer, case);
+        }
+
+        assert_eq!(e2ee_messages_in(&harness, dm.id()).await, 2);
+        assert_eq!(e2ee_messages_in(&harness, group.id()).await, 1);
+    }
 }
 
 /// The protected-channel send (design 7.3). Every flag case is its own
@@ -1927,6 +2308,7 @@ mod protected_tests {
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         };
         let outcome = db
             .insert_mls_text_commit(&commit, &hash, 0)
@@ -2328,6 +2710,266 @@ mod protected_tests {
             "NotSeated",
             "the removed member",
         );
+    }
+
+    /// The revocation pending pass, through the database primitive (6.3):
+    /// a pending device entry, or `signer_lost` for the list signer's device
+    async fn revoke_device(
+        harness: &TestHarness,
+        group: &MlsGroup,
+        device: &TestE2EEDevice,
+    ) -> MlsGroup {
+        let touched = harness
+            .db
+            .add_pending_device_removal(&device.user_id, &device.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending pass");
+        assert_eq!(touched, vec![group.channel_id.clone()]);
+        let group = harness
+            .db
+            .fetch_mls_group(&group.id)
+            .await
+            .expect("the group");
+        assert!(group.has_member(&device.user_id, &device.device_id));
+        group
+    }
+
+    /// S2 step 5: a pending device entry refuses every send with
+    /// `pending_removal`, before the epoch and membership checks
+    #[test]
+    fn protected_send_waits_for_pending_device_removals() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_waits_for_pending_device_removals_case(),
+        ))
+    }
+
+    async fn protected_send_waits_for_pending_device_removals_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let owner = session_auth(&f.owner_session);
+        let owner_send = || encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+
+        assert_sent(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "before the revocation",
+        );
+
+        let group = revoke_device(h, &f.group, &f.member_device).await;
+        assert_eq!(group.pending_device_removals.len(), 1);
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, None);
+
+        assert_resecuring(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "pending_removal",
+            "a pending device",
+        );
+        let mut stale_epoch = f.protected.owner_device.encrypted_payload(&f.group);
+        stale_epoch.epoch = 0;
+        assert_resecuring(
+            &send(h, owner, channel_id, &encrypted_send(stale_epoch), false).await,
+            "pending_removal",
+            "a pending device + a stale epoch",
+        );
+        let loner_send = encrypted_send(f.loner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.loner_session),
+                channel_id,
+                &loner_send,
+                false,
+            )
+            .await,
+            "pending_removal",
+            "a pending device + not a member",
+        );
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.member_session),
+                channel_id,
+                &member_send,
+                false,
+            )
+            .await,
+            "pending_removal",
+            "the pending device itself",
+        );
+    }
+
+    /// S2 step 5: while the list signer's device is lost every send is
+    /// refused with `owner_device_lost`, before the epoch and membership
+    /// checks
+    #[test]
+    fn protected_send_pauses_while_the_signer_is_lost() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_pauses_while_the_signer_is_lost_case(),
+        ))
+    }
+
+    async fn protected_send_pauses_while_the_signer_is_lost_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let member = session_auth(&f.member_session);
+        let member_send = || encrypted_send(f.member_device.encrypted_payload(&f.group));
+
+        assert_sent(
+            &send(h, member.clone(), channel_id, &member_send(), false).await,
+            "before the revocation",
+        );
+
+        let group = revoke_device(h, &f.group, &f.protected.owner_device).await;
+        let lost = group.signer_lost.as_ref().expect("signer_lost");
+        assert_eq!(lost.device_id, f.protected.owner_device.device_id);
+        assert!(group.pending_removals.is_empty());
+        assert!(group.pending_device_removals.is_empty());
+
+        assert_resecuring(
+            &send(h, member.clone(), channel_id, &member_send(), false).await,
+            "owner_device_lost",
+            "the signer's device lost",
+        );
+        let mut stale_epoch = f.member_device.encrypted_payload(&f.group);
+        stale_epoch.epoch = 0;
+        assert_resecuring(
+            &send(h, member, channel_id, &encrypted_send(stale_epoch), false).await,
+            "owner_device_lost",
+            "the signer's device lost + a stale epoch",
+        );
+        let loner_send = encrypted_send(f.loner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.loner_session),
+                channel_id,
+                &loner_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "the signer's device lost + not a member",
+        );
+        let owner_send = encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.owner_session),
+                channel_id,
+                &owner_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "the lost device itself",
+        );
+    }
+
+    /// S2 step 5 order: `owner_device_lost` answers before
+    /// `pending_removal`, for a pending device and a pending user alike
+    #[test]
+    fn protected_send_signer_lost_answers_before_pending_removal() {
+        crate::util::test::rt().block_on(Box::pin(
+            protected_send_signer_lost_answers_before_pending_removal_case(),
+        ))
+    }
+
+    async fn protected_send_signer_lost_answers_before_pending_removal_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        let owner = session_auth(&f.owner_session);
+        let owner_send = || encrypted_send(f.protected.owner_device.encrypted_payload(&f.group));
+
+        revoke_device(h, &f.group, &f.member_device).await;
+        let group = revoke_device(h, &f.group, &f.protected.owner_device).await;
+        assert_eq!(group.pending_device_removals.len(), 1);
+        assert!(group.signer_lost.is_some());
+
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(
+                h,
+                session_auth(&f.member_session),
+                channel_id,
+                &member_send,
+                false,
+            )
+            .await,
+            "owner_device_lost",
+            "a pending device + the signer's device lost (member)",
+        );
+        assert_resecuring(
+            &send(h, owner.clone(), channel_id, &owner_send(), false).await,
+            "owner_device_lost",
+            "a pending device + the signer's device lost (owner)",
+        );
+
+        h.db.release_channel_seats_for_user(
+            &f.member.id,
+            Some(&f.protected.server.id),
+            Timestamp::now_utc(),
+        )
+        .await
+        .expect("release the member's seat");
+        let group = h.db.fetch_mls_group(&f.group.id).await.expect("the group");
+        assert!(group.has_pending_removal(&f.member.id));
+        assert!(group.signer_lost.is_some());
+        assert_resecuring(
+            &send(h, owner, channel_id, &owner_send(), false).await,
+            "owner_device_lost",
+            "both pending lists + the signer's device lost",
+        );
+    }
+
+    /// Decision 18 (W2) under S2's step 5: a caller who cannot view the
+    /// channel still gets the ordinary channel's answer, seated or not,
+    /// while the group carries `signer_lost` and a pending device
+    #[test]
+    fn protected_send_non_viewer_while_resecuring() {
+        crate::util::test::rt()
+            .block_on(Box::pin(protected_send_non_viewer_while_resecuring_case()))
+    }
+
+    async fn protected_send_non_viewer_while_resecuring_case() {
+        let f = fixture().await;
+        let h = &f.harness;
+        let channel_id = f.protected.channel.id();
+        revoke_device(h, &f.group, &f.member_device).await;
+        revoke_device(h, &f.group, &f.protected.owner_device).await;
+
+        // Viewing, the seated member sees the S2 refusal
+        let member = session_auth(&f.member_session);
+        let member_send = encrypted_send(f.member_device.encrypted_payload(&f.group));
+        assert_resecuring(
+            &send(h, member.clone(), channel_id, &member_send, false).await,
+            "owner_device_lost",
+            "a viewer",
+        );
+
+        deny_view(h, &f.protected.channel).await;
+        deny_view(h, &f.ordinary).await;
+        let outsider = session_auth(&f.outsider_session);
+        let outsider_send = encrypted_send(f.outsider_device.encrypted_payload(&f.group));
+        for (auth, body, with_key, case) in [
+            (&member, &member_send, false, "seated, a payload"),
+            (&member, &member_send, true, "seated, a payload + a header"),
+            (&outsider, &outsider_send, false, "unseated, a payload"),
+            (
+                &outsider,
+                &json!({ "content": "x" }),
+                false,
+                "unseated, plaintext",
+            ),
+        ] {
+            let protected = send(h, auth.clone(), channel_id, body, with_key).await;
+            let ordinary = send(h, auth.clone(), f.ordinary.id(), body, with_key).await;
+            assert_refused(&ordinary, Status::Forbidden, "MissingPermission", case);
+            assert_eq!(protected, ordinary, "{case}");
+        }
     }
 
     /// 0. With E2EE off a protected send answers `FeatureDisabled { e2ee }`

@@ -171,8 +171,10 @@ key = ""
 max_concurrent_connections = 50
 
 [api.livekit]
-# How long to ring devices for when calling in dms/groups, in seconds
-call_ring_duration = 30
+# How long a call in a dm/group rings, in seconds. Every client rings for this
+# long, and the push that rings a phone expires after it, so a phone that was
+# offline does not start ringing for a call nobody is waiting on any more
+call_ring_duration = 45
 
 [api.livekit.nodes]
 
@@ -433,6 +435,8 @@ e2ee_enabled = true
 # Media E2EE (calls): MLS delivery service + KeyPackage directory (requires e2ee_enabled).
 # Production-enabled 2026-07-14; kept true here for durability across reprovisions.
 media_e2ee_enabled = true
+# Kill switch: close a call's MLS group held only by a departed sibling device; restart delta.
+mls_sibling_close = true
 # Enable push notifications for mass pings (everyone, online, roles)
 # When false this will still ping in-client but will not send notifications from pushd
 mass_mentions_send_notifications = true
@@ -468,6 +472,31 @@ screen_leg = false
 # delta refuses new idle claims (PUT /channels/{id}/afk_idle answers
 # InvalidOperation) and the crond sweep moves nobody.
 afk_auto_move = true
+# Encrypted calls on iOS (ios-call-e2ee phase 2, D14), advertised to clients
+# as features.ios_call_e2ee on GET /. ON by default (the field's serde default
+# is true as well, so a config without this line also reads ON). This is the
+# kill switch for a bad iOS build: set it false in Revolt.overrides.toml under
+# an explicit [features] header, or REVOLT__FEATURES__IOS_CALL_E2EE=false, and
+# RESTART delta. Global for iOS; never per user or per channel.
+ios_call_e2ee = true
+# Call ring signals: each ring carries a call id, and the other devices stop
+# ringing when the call is answered on another device or declined. ON by
+# default (the field's serde default is true as well, so a config without this
+# line also reads ON). This is the kill switch: set it false in
+# Revolt.overrides.toml under an explicit [features] header, or
+# REVOLT__FEATURES__CALL_SIGNALS=false, and RESTART voice-ingress AND delta.
+# Off, rings carry no call id, nothing tells a device that the call was
+# answered on another one, the decline route does nothing, and the `answer`
+# flag on a join is ignored.
+call_signals = true
+# Per-session push preferences: a session can ask for chats only (direct
+# messages, groups, friend requests and calls) or ask not to be rung for
+# incoming calls. ON by default (the field's serde default is true as well, so
+# a config without this line also reads ON). This is the kill switch: set it
+# false in Revolt.overrides.toml under an explicit [features] header, or
+# REVOLT__FEATURES__PUSH_SESSION_SCOPE=false, and RESTART pushd. Off, the push
+# daemon ignores both preferences and delivers everything as before.
+push_session_scope = true
 
 # --- Server boosts (Discord-style) ---
 # The feature ships DARK: all keys below default in code to the values shown,
@@ -533,6 +562,21 @@ dm_dupe_threshold = 3
 dm_dupe_window_hours = 24
 dm_dupe_min_chars = 30
 dm_dupe_rearm_days = 30
+# Fan-out signal for end-to-end encrypted DMs: counts distinct strangers an account writes to
+# with no reply (recipient ids and time only, never content). Needs dm_dupe_enabled too.
+# Turning it on needs the Privacy Policy update first (30-day memory of who wrote to whom).
+# Switch on with e2ee_fanout_pause = false (staff report only, no pause); set it to true only
+# after two weeks of reviewed reports.
+e2ee_fanout_enabled = false
+e2ee_fanout_pause = false
+# Distinct strangers in the window with no reply; clamped to 2..=50
+e2ee_fanout_threshold = 10
+# Accounts younger than 14 days (never above e2ee_fanout_threshold)
+e2ee_fanout_new_account_threshold = 5
+# Clamped to 1..=48
+e2ee_fanout_window_hours = 24
+# Clamped to 1..=90
+e2ee_fanout_reply_memory_days = 30
 daily_enabled = false
 daily_run_hour_utc = 14
 daily_account_age_days = 14
@@ -619,6 +663,52 @@ prot_store_us_web_link = false
 # Staff mailbox for store work items; empty = log only
 ops_alert_email = ""
 
+[features.e2ee]
+# Live-claim lock per E2EE device (multi-device plan D4). ON by default, and a
+# config without the key keeps it on. Emergency switch only: false (here under
+# an explicit [features.e2ee] header in Revolt.overrides.toml, or
+# REVOLT__FEATURES__E2EE__CLAIM_LOCK=false) and RESTART delta AND bonfire.
+# Off, bonfire takes no locks and acks follow the device row's binding alone,
+# and delta's device removal decides from the database alone; the lock's
+# protections between a user's own installs are gone while it is off.
+claim_lock = true
+# "Encrypted only" for accounts and groups. only_available lets people turn
+# the setting on; it ships OFF, and a config without the key keeps it off
+# (turning the setting off still works).
+# only_enforced makes existing marks refuse unencrypted writes; it is ON by
+# default, and a config without the key keeps it on. Emergency switch only:
+# false keeps every stored mark but refuses nothing. Set either one here under
+# an explicit [features.e2ee] header in Revolt.overrides.toml, or with
+# REVOLT__FEATURES__E2EE__ONLY_AVAILABLE / REVOLT__FEATURES__E2EE__ONLY_ENFORCED,
+# and RESTART delta AND crond.
+only_available = false
+only_enforced = true
+
+[features.takedown]
+# Take It Down Act requests. Ships OFF; prod sets it in Revolt.overrides.toml under an explicit
+# [features.takedown] header, then restarts delta AND crond. It stays off until data_key is 64 hex
+# characters (openssl rand -hex 32); keep the key in the overrides file or the environment
+# (REVOLT__FEATURES__TAKEDOWN__DATA_KEY), never in a committed file. Losing it loses every stored
+# requester's details.
+enabled = false
+data_key = ""
+# User ids that may review requests (each also needs privileged + active MFA). A list, or one
+# comma-separated string in the environment form.
+reviewers = []
+# Addresses that get staff alert emails; same forms as reviewers
+staff_alert_emails = []
+# Webhook that gets each staff alert as a plain-text POST body (ntfy style); empty = none
+alert_webhook_url = ""
+# Status page linked from the received email; "#<reference>.<token>" is appended
+status_url_base = "https://sloga.gg/legal/take-it-down-status.html"
+auto_hide_hour = 44                 # unreviewed by this hour: hide the directly linked attachment; 0 = never
+auto_hide_daily_cap = 3             # most auto-hides per requester address per day
+copy_confirm_threshold = 25         # removals with more copies need confirm_copies
+per_address_daily_soft_limit = 5    # per contact address per day before throttling (never refused)
+retention_adult_days = 30           # days after close that removed adult images are held, then deleted
+retention_requester_days = 365      # days after close before requester details are purged
+restore_enabled = false
+
 # --- Protected channels (protected-channels design §7.1) ---
 # The feature ships DARK: all keys below default in code to the values shown,
 # with enabled = false. To turn it on, put the block in Revolt.overrides.toml
@@ -632,11 +722,18 @@ ops_alert_email = ""
 # plane's kill switch is e2ee_enabled, not this flag. Commit pruning is
 # unaffected by both flags: crond keeps pruning with enabled or e2ee_enabled
 # off. commit_retention_days = 0 is the only way to stop it.
+# formats_v2 (S2) governs only a channel ENTERING the v2 formats; a channel
+# already on v2 keeps working with it off. Flip it once every protected
+# device runs S2. The reconcile sweep runs with either flag in any state.
 #
 # [features.protected_channels]
 # enabled = false              # master switch for growth (grants, protect, seating, adds)
 # default_device_cap = 5       # 0 = unlimited (still bounded by 100 leaves)
 # commit_retention_days = 30   # crond prunes Text commits older than this; 0 = never prune
+# formats_v2 = false              # entry into v2 (genesis, upgrade) and the revocation hook; flip once every protected device runs S2
+# reconcile_sweep_secs = 300      # S2-D14 sweep period
+# text_rejoin_window_secs = 86400 # S2-D28 Text join and rejoin intent window (route and driver)
+# successor_rate_per_day = 10     # S2-D33 successor creates per channel per 24 h
 
 [features.limits]
 
@@ -789,6 +886,7 @@ process_message_delay_limit = 5
 terms_of_service = ""
 privacy_policy = ""
 guidelines = ""
+take_it_down = ""
 
 [sentry]
 # Configuration for Sentry error reporting

@@ -10,13 +10,15 @@ use redis_kiss::redis;
 use revolt_database::util::email::normalise_email;
 use revolt_database::util::password::hash_password;
 use revolt_database::{
-    events::client::EventV1, Channel, Database, Member, Message, PartialRole, Server, User, AMQP,
+    events::client::EventV1, Channel, Database, Member, Message, PartialRole, PartialUser, Server,
+    User, AMQP,
 };
 use revolt_database::{
     seat_list_channel_server, ChannelEntitlement, ChannelEntitlementSource,
-    ChannelEntitlementState, E2EEIdentity, E2EESignedKey, EncryptedPayload, HandoverBody, MlsGroup,
-    MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatListBody, SeatListSubmission,
-    SeatListWriteOutcome, CONTEXT_HANDOVER, E2EE_PROTOCOL_VERSION, E2EE_SIGN_CONTEXT_FALLBACK,
+    ChannelEntitlementState, ChannelSeat, E2EEIdentity, E2EESignedKey, EncryptedPayload,
+    HandoverBody, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, SeatListBody,
+    SeatListSubmission, SeatListWriteOutcome, CONTEXT_HANDOVER, E2EE_PROTOCOL_VERSION,
+    E2EE_SIGN_CONTEXT_FALLBACK,
 };
 use revolt_database::{util::idempotency::IdempotencyKey, Role};
 use revolt_database::{Account, EmailVerification, Session};
@@ -914,6 +916,7 @@ impl TestE2EEDevice {
             signer_user_id: self.user_id.clone(),
             signer_device_id: self.device_id.clone(),
             seats: seats.iter().map(|seat| seat.as_ref().to_string()).collect(),
+            v2: None,
         }
         .build()
         .expect("a canonical seat list body");
@@ -923,6 +926,7 @@ impl TestE2EEDevice {
             body,
             signer_device_id: self.device_id.clone(),
             handover: None,
+            authority: None,
         }
     }
 
@@ -998,6 +1002,17 @@ pub struct ProtectedChannel {
     pub seat_list: v0::DataSeatList,
 }
 
+/// What [`TestHarness::new_encrypted_user`] built
+pub struct EncryptedUser {
+    pub account: Account,
+    /// The session its device is bound to
+    pub session: Session,
+    /// Re-read after its flags were set
+    pub user: User,
+    /// Its published device, bound to `session`
+    pub device: TestE2EEDevice,
+}
+
 impl TestHarness {
     /// A server owned by `owner`, the owner's membership (as `server_create`
     /// leaves it) and a fresh unprotected TextChannel; the server is re-read,
@@ -1068,6 +1083,38 @@ impl TestHarness {
         device
     }
 
+    /// A new account with encryption turned on (`e2ee_enabled`) and one
+    /// published device bound to its session, through the database
+    /// primitives. With `e2ee_only` the account is Encrypted-only as well,
+    /// set directly on the user (no ticket, no route), for the tests of the
+    /// routes that must refuse it
+    pub async fn new_encrypted_user(&self, e2ee_only: bool) -> EncryptedUser {
+        let (account, session, mut user) = self.new_user().await;
+        let device = self
+            .new_e2ee_device(&user, &session.id, rand::thread_rng().gen())
+            .await;
+
+        user.update(
+            &self.db,
+            PartialUser {
+                e2ee_enabled: Some(true),
+                e2ee_only: e2ee_only.then_some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("the encryption flags");
+        let user = self.db.fetch_user(&user.id).await.expect("`User`");
+
+        EncryptedUser {
+            account,
+            session,
+            user,
+            device,
+        }
+    }
+
     /// Protect `channel` with `data`'s genesis list through the database
     /// primitive (no signature or route check)
     pub async fn protect_with_db(
@@ -1086,7 +1133,8 @@ impl TestHarness {
     }
 
     /// Store `data` as `channel`'s next seat list through the database
-    /// primitive, claims allowed (no signature or route check)
+    /// primitive, claims allowed, with a removal reason (no signature or
+    /// route check)
     pub async fn put_seats_with_db(
         &self,
         channel: &Channel,
@@ -1098,6 +1146,7 @@ impl TestHarness {
                 &SeatListSubmission::from(data.clone()),
                 true,
                 Timestamp::now_utc(),
+                Some("test fixture"),
             )
             .await
             .expect("Failed to store test seat list")
@@ -1145,6 +1194,43 @@ impl TestHarness {
         }
     }
 
+    /// Stamp `user_id`'s seat in `channel_id` with `keys_received_at`, as
+    /// the Text commit adding the user's first device does (design 2.3),
+    /// written straight to the store. Any later release of the seat then
+    /// cools 14 days; without the stamp (or a Text-group device) it frees at
+    /// once as `DeviceNeverJoined` (S2-D21).
+    pub async fn mark_keys_received(&self, channel_id: &str, user_id: &str) {
+        let id = ChannelSeat::composite_id(channel_id, user_id);
+        let now = Timestamp::now_utc();
+        match &self.db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("the seat row")
+                    .keys_received_at = Some(now);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::doc;
+
+                let collection = mongo.col::<ChannelSeat>("channel_seats");
+                let mut seat = collection
+                    .find_one(doc! { "_id": &id })
+                    .await
+                    .expect("the seat read")
+                    .expect("the seat row");
+                seat.keys_received_at = Some(now);
+                let result = collection
+                    .replace_one(doc! { "_id": &id }, &seat)
+                    .await
+                    .expect("the seat write");
+                assert_eq!(result.matched_count, 1, "the seat row");
+            }
+        }
+    }
+
     /// `channel`'s Text group `text_group_id(channel, generation)`, created
     /// by `creator` (the current list signer's device) through the database
     /// primitive; `supersedes` names the group it succeeds (generation - 1).
@@ -1175,6 +1261,9 @@ impl TestHarness {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         };
 
         match self

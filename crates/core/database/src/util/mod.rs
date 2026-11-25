@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod bulk_permissions;
 pub mod captcha;
 pub mod chunked;
+pub mod e2ee_only;
 pub mod email;
 pub mod event_visibility;
 mod funcs;
@@ -16,8 +17,10 @@ pub mod password;
 pub mod permissions;
 pub mod prot_email;
 pub mod prot_store_alert;
+pub mod protected_access;
 pub mod reference;
 pub mod shield;
+pub mod takedown_crypto;
 pub mod test_fixtures;
 pub mod unreads;
 

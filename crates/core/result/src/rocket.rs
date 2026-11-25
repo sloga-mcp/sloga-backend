@@ -129,6 +129,7 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::AlreadyConnected => Status::BadRequest,
             ErrorType::NotConnected => Status::BadRequest,
             ErrorType::UnknownNode => Status::BadRequest,
+            ErrorType::CallEnded => Status::BadRequest,
             ErrorType::RemoteControlOfferPending => Status::Conflict,
             ErrorType::RemoteControlGrantActive => Status::Conflict,
             ErrorType::WatchSessionExists => Status::Conflict,
@@ -173,6 +174,9 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::IncorrectData { .. } => Status::BadRequest,
             ErrorType::MlsCallFull { .. } => Status::Conflict,
             ErrorType::VideoCallFull { .. } => Status::Conflict,
+            ErrorType::E2EEDeviceRemoved => Status::Forbidden,
+            ErrorType::E2EEDeviceHeldElsewhere => Status::Forbidden,
+            ErrorType::EncryptionRequired { .. } => Status::Forbidden,
 
             ErrorType::PaymentsDisabled => Status::BadRequest,
             ErrorType::CipherSalesClosed => Status::Forbidden,
@@ -189,6 +193,9 @@ impl<'r> Responder<'r, 'static> for Error {
             ErrorType::ChannelProtected => Status::BadRequest,
             ErrorType::ProtectedFieldRefused { .. } => Status::BadRequest,
             ErrorType::SeatListNamesRemovedUsers { .. } => Status::BadRequest,
+            ErrorType::RemovalReasonRequired => Status::BadRequest,
+            ErrorType::ProtectedHandoverRequired { .. } => Status::BadRequest,
+
             ErrorType::InsufficientProt { .. } => Status::Conflict,
             ErrorType::ProtDisabled => Status::BadRequest,
             ErrorType::ProtSalesClosed => Status::Forbidden,
@@ -278,6 +285,54 @@ mod tests {
             let response = error.respond_to(request.inner()).unwrap();
             assert_eq!(response.status().code, code, "{name}");
         }
+    }
+
+    /// A removed E2EE device is a 403 refusal of an authenticated caller,
+    /// not a 401; `axum.rs` pins the same answer
+    #[test]
+    fn e2ee_device_removed_is_forbidden() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+        let response = create_error!(E2EEDeviceRemoved)
+            .respond_to(request.inner())
+            .unwrap();
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    /// A refused device removal is a 403 as well; `axum.rs` pins the same
+    #[test]
+    fn e2ee_device_held_elsewhere_is_forbidden() {
+        let client = Client::untracked(rocket::build()).unwrap();
+        let request = client.get("/");
+        let response = create_error!(E2EEDeviceHeldElsewhere)
+            .respond_to(request.inner())
+            .unwrap();
+        assert_eq!(response.status(), Status::Forbidden);
+    }
+
+    /// A refused unencrypted write is a 403 with the side in the body and
+    /// nothing else; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn encryption_required_is_forbidden_with_side_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        })
+        .respond_to(request.inner())
+        .expect("error responder");
+
+        assert_eq!(response.status(), Status::Forbidden);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
     }
 
     #[rocket::async_test]
@@ -390,5 +445,53 @@ mod tests {
             let response = error.respond_to(request.inner()).unwrap();
             assert_eq!(response.status().code, code, "{name}");
         }
+    }
+
+    /// S2-D20: 400 and a body that is the type alone; `axum.rs` pins the
+    /// same answer
+    #[rocket::async_test]
+    async fn removal_reason_required_is_bad_request_with_type_only_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(RemovalReasonRequired)
+            .respond_to(request.inner())
+            .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "RemovalReasonRequired" }));
+    }
+
+    /// S2-D25 [S2b]: 400, the channels in `channel_ids`, nothing else in the
+    /// body; `axum.rs` pins the same answer
+    #[rocket::async_test]
+    async fn protected_handover_required_is_bad_request_with_channel_ids_in_body() {
+        let client = AsyncClient::untracked(rocket::build())
+            .await
+            .expect("local rocket client");
+        let request = client.get("/");
+        let mut response = crate::create_error!(ProtectedHandoverRequired {
+            channel_ids: vec!["01HZXDDDDDDDDDDDDDDDDDDDDD".to_string()],
+        })
+        .respond_to(request.inner())
+        .expect("error responder");
+
+        assert_eq!(response.status(), Status::BadRequest);
+        assert_eq!(response.content_type(), Some(ContentType::JSON));
+
+        let body = response.body_mut().to_string().await.expect("body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "type": "ProtectedHandoverRequired",
+                "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD"],
+            })
+        );
     }
 }

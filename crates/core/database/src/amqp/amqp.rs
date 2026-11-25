@@ -30,6 +30,46 @@ pub struct AMQP {
     connection: Arc<Connection>,
 }
 
+/// One signal about a ringing DM or group call, as handed to the push daemon.
+/// `recipients` narrows who is told; `None` tells everyone in the conversation.
+/// `ended` refers to the ringing period, not necessarily the call itself.
+#[derive(Debug, Clone, Default)]
+pub struct DmCallSignal {
+    pub initiator_id: String,
+    pub channel_id: String,
+    pub started_at: Option<String>,
+    pub ended: bool,
+    pub recipients: Option<Vec<String>>,
+    /// Identifies one ring; every later signal about that ring repeats it
+    pub call_id: Option<String>,
+    /// Why the ringing stopped; only ever set together with `ended = true`
+    pub reason: Option<String>,
+    /// Whether the caller started a video call
+    pub video: Option<bool>,
+}
+
+/// How long a stop-ringing signal stays worth delivering. It only matters while a phone
+/// may still be ringing, so it outlives a ring by a little and no more.
+const DM_CALL_ENDED_EXPIRATION_MS: usize = 60_000;
+
+/// The per-message expiration for a DM call signal, in milliseconds, as the decimal
+/// string AMQP carries it in. A ring is worth delivering only for as long as the caller
+/// is still ringing; a stop-ringing signal gets a fixed minute.
+///
+/// `ring_secs` is the configured ring length as it stands. It is read through
+/// `revolt_config::effective_call_ring_secs`, the rule every service shares, so a zero
+/// (which would expire every ring the instant it is queued) rings for the default 45
+/// seconds, and no setting can keep a ring queued for longer than a call may ring.
+pub fn dm_call_expiration_ms(ended: bool, ring_secs: usize) -> String {
+    if ended {
+        return DM_CALL_ENDED_EXPIRATION_MS.to_string();
+    }
+
+    revolt_config::effective_call_ring_secs(ring_secs)
+        .saturating_mul(1000)
+        .to_string()
+}
+
 impl AMQP {
     pub async fn new(connection: Arc<Connection>) -> Self {
         Self {
@@ -312,14 +352,47 @@ impl AMQP {
         ended: bool,
         recipients: Option<Vec<String>>,
     ) -> Result<(), AMQPError> {
+        self.dm_call_signal(DmCallSignal {
+            initiator_id: initiator_id.to_string(),
+            channel_id: channel_id.to_string(),
+            started_at: started_at.map(|f| f.to_string()),
+            ended,
+            recipients,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// # DM Call Signal
+    /// Sends one signal about a ringing DM or group call to the push daemon.
+    /// Every signal is published with an expiration: one that sat in the queue while the
+    /// push daemon was down is dropped by the broker instead of ringing a phone, or
+    /// silencing a newer ring, long after the moment it was about.
+    pub async fn dm_call_signal(&self, signal: DmCallSignal) -> Result<(), AMQPError> {
         let config = revolt_config::config().await;
+
+        let DmCallSignal {
+            initiator_id,
+            channel_id,
+            started_at,
+            ended,
+            recipients,
+            call_id,
+            reason,
+            video,
+        } = signal;
+
+        let expiration = dm_call_expiration_ms(ended, config.api.livekit.call_ring_duration);
 
         let payload = InternalDmCallPayload {
             payload: DmCallPayload {
-                initiator_id: initiator_id.to_string(),
-                channel_id: channel_id.to_string(),
-                started_at: started_at.map(|f| f.to_string()),
+                initiator_id,
+                channel_id,
+                started_at,
                 ended,
+                call_id,
+                reason,
+                video,
             },
             recipients,
         };
@@ -339,7 +412,8 @@ impl AMQP {
                 payload.as_bytes(),
                 AMQPProperties::default()
                     .with_content_type("application/json".into())
-                    .with_delivery_mode(2),
+                    .with_delivery_mode(2)
+                    .with_expiration(expiration.into()),
             )
             .await?;
 
@@ -413,5 +487,127 @@ impl AMQP {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dm_call_tests {
+    use super::dm_call_expiration_ms;
+
+    const SOURCE: &str = include_str!("amqp.rs");
+
+    /// Everything above this test module: the shipping source.
+    fn shipping() -> &'static str {
+        let end = SOURCE
+            .find("#[cfg(test)]")
+            .expect("the test module marker is in this file");
+        &SOURCE[..end]
+    }
+
+    /// One method of `AMQP`, from its signature to the start of the next method.
+    fn method_source(name: &str) -> &'static str {
+        let shipping = shipping();
+        let start = shipping
+            .find(&format!("pub async fn {}(", name))
+            .unwrap_or_else(|| panic!("AMQP::{} is gone", name));
+        let rest = &shipping[start..];
+        let end = rest[1..]
+            .find("pub async fn ")
+            .map(|at| at + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn dm_call_expiration_truth_table() {
+        let cases = [
+            // a ring lives as long as the caller rings
+            (false, 45, "45000"),
+            (false, 30, "30000"),
+            // a zero ring length falls back instead of expiring the ring at once
+            (false, 0, "45000"),
+            // a ring length outside what a call may ring for is brought to the nearest end
+            (false, 1, "5000"),
+            (false, 5, "5000"),
+            (false, 120, "120000"),
+            (false, 121, "120000"),
+            (false, 100_000, "120000"),
+            (false, usize::MAX, "120000"),
+            // a stop-ringing signal gets a fixed minute, whatever the ring length
+            (true, 45, "60000"),
+            (true, 30, "60000"),
+            (true, 0, "60000"),
+            (true, 300, "60000"),
+            (true, usize::MAX, "60000"),
+        ];
+
+        for (ended, ring_secs, expected) in cases {
+            let expiration = dm_call_expiration_ms(ended, ring_secs);
+            assert_eq!(
+                expiration, expected,
+                "ended = {}, ring_secs = {}",
+                ended, ring_secs
+            );
+            // The broker refuses a publish whose expiration is not a plain whole number.
+            assert!(
+                !expiration.is_empty() && expiration.bytes().all(|b| b.is_ascii_digit()),
+                "expiration {:?} is not a plain whole number",
+                expiration
+            );
+        }
+    }
+
+    /// A ring must leave the queue exactly when the apps stop ringing, so its expiration
+    /// is the ring length every service reads, not a rule of this file's own.
+    #[test]
+    fn a_ring_expires_after_the_ring_length_every_service_reads() {
+        for ring_secs in [0, 1, 4, 5, 6, 44, 45, 46, 119, 120, 121, 3600, usize::MAX] {
+            let shared = revolt_config::effective_call_ring_secs(ring_secs);
+            assert_eq!(
+                dm_call_expiration_ms(false, ring_secs),
+                (shared * 1000).to_string(),
+                "ring_secs = {}",
+                ring_secs
+            );
+        }
+    }
+
+    /// The expiration only helps if the publish carries it, and nothing here can publish to
+    /// a broker, so the source is pinned instead: the one publish of a DM call signal sets
+    /// an expiration computed from the configured ring length.
+    #[test]
+    fn dm_call_signal_publishes_with_the_expiration() {
+        let signal = method_source("dm_call_signal");
+
+        assert!(
+            signal
+                .contains("dm_call_expiration_ms(ended, config.api.livekit.call_ring_duration)"),
+            "dm_call_signal must take its expiration from the configured ring length"
+        );
+        assert!(
+            signal.contains(".with_expiration(expiration.into())"),
+            "dm_call_signal must publish with the expiration"
+        );
+        assert_eq!(
+            signal.matches(".basic_publish(").count(),
+            1,
+            "dm_call_signal must publish exactly once"
+        );
+    }
+
+    /// The older entry point must not grow a publish of its own again, or its signals
+    /// would go out without the expiration.
+    #[test]
+    fn dm_call_updated_goes_through_dm_call_signal() {
+        let updated = method_source("dm_call_updated");
+
+        assert!(
+            updated.contains("self.dm_call_signal(DmCallSignal"),
+            "dm_call_updated must hand its signal to dm_call_signal"
+        );
+        assert!(
+            !updated.contains(".basic_publish("),
+            "dm_call_updated must not publish on its own"
+        );
     }
 }

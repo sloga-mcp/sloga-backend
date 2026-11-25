@@ -1601,6 +1601,7 @@ mod protected_delete_tests {
                     signer_user_id: owner.id.clone(),
                     signer_device_id: DEVICE.to_string(),
                     seats: vec![owner.id.clone()],
+                    v2: None,
                 }
                 .build()
                 .expect("body"),
@@ -1609,6 +1610,7 @@ mod protected_delete_tests {
                 signature: format!("B{}", "A".repeat(85)),
                 signer_device_id: DEVICE.to_string(),
                 handover: None,
+                authority: None,
             };
             db.protect_channel(&protected, &submission, now())
                 .await
@@ -1633,6 +1635,9 @@ mod protected_delete_tests {
                 seat_list_ad_sha256: None,
                 pending_removals: vec![],
                 member_added: vec![],
+                pending_device_removals: vec![],
+                signer_lost: None,
+                rejoin_readd: vec![],
             };
             db.create_text_mls_group(&group, None)
                 .await
@@ -1733,12 +1738,14 @@ mod protected_delete_tests {
                     signer_user_id: owner.id.clone(),
                     signer_device_id: DEVICE.to_string(),
                     seats: vec![owner.id.clone()],
+                    v2: None,
                 }
                 .build()
                 .expect("body"),
                 signature: format!("B{}", "A".repeat(85)),
                 signer_device_id: DEVICE.to_string(),
                 handover: None,
+                authority: None,
             };
             db.protect_channel(&protected, &submission, now())
                 .await

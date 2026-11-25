@@ -86,8 +86,9 @@ pub async fn send_messages(
 
     // Anti-spam DM pause. Metadata only: decided from each envelope's
     // `recipient_user_id` plus the server's own relationship and channel
-    // data. No other envelope field is read for it, and E2EE sends are
-    // never observed by the detector.
+    // data. No other envelope field is read for it. The copy-paste detector
+    // never sees E2EE sends; only the fan-out signal below does, and it gets
+    // the recipient ids alone.
     let dm_pause_enforced =
         antispam::dm_pause_enforced(&revolt_config::config().await.features.antispam, &user);
 
@@ -223,6 +224,35 @@ pub async fn send_messages(
     let reached_other_user = accepted
         .iter()
         .any(|envelope| envelope.recipient_user_id != user.id);
+
+    // Other users with at least one envelope queued in this request
+    let delivered_recipient_ids: HashSet<String> = accepted
+        .iter()
+        .map(|envelope| envelope.recipient_user_id.clone())
+        .filter(|id| id != &user.id)
+        .collect();
+
+    // Fan-out signal for encrypted DMs, off the request path: it never fails
+    // or delays the send. It gets the sender and the delivered recipient ids
+    // only (the sender's own devices are not in the set), never an envelope,
+    // its ciphertext or its size. Off unless `e2ee_fanout_enabled` (and
+    // `dm_dupe_enabled`): then nothing is cloned or spawned.
+    if reached_other_user {
+        let antispam_config = revolt_config::config().await.features.antispam;
+        if antispam_config.e2ee_fanout_active() {
+            let db = db.inner().clone();
+            let user = user.clone();
+            tokio::spawn(async move {
+                antispam::observe_e2ee_fanout(
+                    &db,
+                    &antispam_config,
+                    &user,
+                    &delivered_recipient_ids,
+                )
+                .await;
+            });
+        }
+    }
 
     let mut notified = HashSet::new();
     for envelope in accepted {

@@ -104,6 +104,19 @@ auto_derived!(
         RoleRanksUpdate,
         ServerUpdate,
         ServerOwnerTransfer,
+        /// A protected channel's seat PUT released or seated users
+        /// (protected channels design §7.5). `channel` = the channel;
+        /// `changes` = `[{key: "released", new: StringList(user ids)},
+        /// {key: "seated", new: StringList(user ids)}]`; `reason` = the
+        /// `X-Audit-Log-Reason`. Served only to readers with ViewChannel on
+        /// `channel` (#221).
+        ProtectedSeatsUpdate,
+        /// One seat of a protected channel was released (design §7.5).
+        /// `target` = the released user; `channel` = the channel;
+        /// `changes` = `[{key: "cause", new: String(<snake_case
+        /// SeatReleaseCause>)}]`. Served only to readers with ViewChannel
+        /// on `channel` (#221).
+        ProtectedSeatRelease,
         /// An action this build does not know. A rolled-back binary reading
         /// entries written by a newer one decodes them to this instead of
         /// failing the whole fetch.
@@ -224,6 +237,69 @@ mod tests {
                 .unwrap(),
             AuditLogAction::ServerOwnerTransfer
         );
+    }
+
+    /// S2 (design §7.5): the protected-seat actions round-trip under their
+    /// snake_case names on both the stored and the v0 enum, convert both
+    /// ways, and an unknown action still decodes to `Unknown` on both
+    #[test]
+    fn protected_seat_actions_round_trip() {
+        for (action, v0_action, wire) in [
+            (
+                AuditLogAction::ProtectedSeatsUpdate,
+                v0::AuditLogAction::ProtectedSeatsUpdate,
+                "protected_seats_update",
+            ),
+            (
+                AuditLogAction::ProtectedSeatRelease,
+                v0::AuditLogAction::ProtectedSeatRelease,
+                "protected_seat_release",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(action).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<AuditLogAction>(serde_json::json!(wire)).unwrap(),
+                action
+            );
+            assert_eq!(serde_json::to_value(v0_action).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<v0::AuditLogAction>(serde_json::json!(wire)).unwrap(),
+                v0_action
+            );
+            assert_eq!(v0::AuditLogAction::from(action), v0_action);
+            assert_eq!(AuditLogAction::from(v0_action), action);
+
+            let document = bson::to_document(&AuditLogEntry {
+                id: "01J00000000000000000000001".to_string(),
+                server: "01SERVER000000000000000001".to_string(),
+                actor: None,
+                action,
+                target: None,
+                channel: None,
+                changes: vec![],
+                count: None,
+                reason: None,
+            })
+            .unwrap();
+            assert_eq!(document.get_str("action").unwrap(), wire);
+            assert_eq!(
+                bson::from_document::<AuditLogEntry>(document)
+                    .unwrap()
+                    .action,
+                action
+            );
+        }
+
+        for unknown in ["protected_seat_moved", "ProtectedSeatsUpdate"] {
+            assert_eq!(
+                serde_json::from_value::<AuditLogAction>(serde_json::json!(unknown)).unwrap(),
+                AuditLogAction::Unknown
+            );
+            assert_eq!(
+                serde_json::from_value::<v0::AuditLogAction>(serde_json::json!(unknown)).unwrap(),
+                v0::AuditLogAction::Unknown
+            );
+        }
     }
 
     /// The v0 wire model must serialize exactly like the stored document.

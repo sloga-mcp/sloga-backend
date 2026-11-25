@@ -330,6 +330,16 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 ("swagger", _, _) => ("swagger", None),
                 ("safety", Some("report"), _) => ("safety_report", Some("report")),
                 ("safety", _, _) => ("safety", None),
+                // The public Take It Down form, status lookup and add-info
+                // box. Sessionless, so keyed by address; one counter for all
+                // three, so a script cannot spread a burst across them. It
+                // only slows one address: the route itself never refuses a
+                // request for volume.
+                ("takedown", _, _) => ("takedown", None),
+                // The Take It Down reviewer routes get their own counter, so
+                // a reviewer working the queue neither spends nor is starved
+                // by the shared "any" bucket. Other /admin routes stay there.
+                ("admin", Some("takedown"), _) => ("admin_takedown", None),
                 // Bundle fetches are keyed by target user: probing one
                 // user's keys can't be amortised across targets
                 ("e2ee", Some("keys"), Method::Get) => ("e2ee_fetch_keys", extra),
@@ -646,6 +656,12 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // One delivery per App Store notification plus Apple's retries
             // after a failed one, as the Stripe webhook
             "payments_apple_webhook" => 60,
+            // Take It Down, per address: a person files once and checks the
+            // status now and then. 10 leaves room for a retry or two.
+            "takedown" => 10,
+            // Take It Down reviewers: the queue, a request's detail and an
+            // action or two per request
+            "admin_takedown" => 30,
             _ => 20,
         }
     }
@@ -1973,5 +1989,116 @@ mod tests {
             Some("28"),
             "the events bucket has spent exactly its own two requests"
         );
+    }
+
+    #[rocket::post("/requests")]
+    fn takedown_requests() {}
+
+    #[rocket::post("/status")]
+    fn takedown_status() {}
+
+    #[rocket::post("/info")]
+    fn takedown_info() {}
+
+    #[rocket::get("/takedown/requests")]
+    fn admin_takedown_list() {}
+
+    #[rocket::post("/takedown/requests/<_id>/remove")]
+    fn admin_takedown_remove(_id: &str) {}
+
+    /// The Take It Down routes, public and staff, on the same database-free
+    /// Rocket as `client()`
+    fn takedown_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount(
+                "/takedown",
+                rocket::routes![takedown_requests, takedown_status, takedown_info],
+            )
+            .mount(
+                "/admin",
+                rocket::routes![admin_takedown_list, admin_takedown_remove, admin_prot_order],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    #[test]
+    fn takedown_routes_have_their_own_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = takedown_client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/takedown/requests", "takedown"),
+            ("POST", "/0.8/takedown/requests", "takedown"),
+            ("POST", "/takedown/status", "takedown"),
+            ("POST", "/takedown/info", "takedown"),
+            ("GET", "/takedown/config", "takedown"),
+            ("GET", "/admin/takedown/requests", "admin_takedown"),
+            ("GET", "/0.8/admin/takedown/requests", "admin_takedown"),
+            ("GET", "/admin/takedown/requests/01ABC", "admin_takedown"),
+            (
+                "POST",
+                "/admin/takedown/requests/01ABC/remove",
+                "admin_takedown",
+            ),
+            // Other admin routes keep the shared bucket
+            ("GET", "/admin/prot/orders/x", "any"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("takedown"), 10);
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("admin_takedown"), 30);
+
+        // Through the fairing: the form, the status lookup and add-info
+        // share one counter of 10
+        let form = client.post("/takedown/requests").dispatch();
+        assert_eq!(form.status(), Status::Ok);
+        assert_eq!(limit(&form), 10);
+        let status = client.post("/takedown/status").dispatch();
+        assert_eq!(bucket(&status), bucket(&form));
+        let info = client.post("/takedown/info").dispatch();
+        assert_eq!(bucket(&info), bucket(&form));
+
+        let staff = client.get("/admin/takedown/requests").dispatch();
+        assert_eq!(staff.status(), Status::Ok);
+        assert_eq!(limit(&staff), 30);
+        let any = client.get("/sync/settings").dispatch();
+        let other_admin = client.get("/admin/prot/orders/x").dispatch();
+        assert_eq!(bucket(&other_admin), bucket(&any));
+        assert_ne!(bucket(&staff), bucket(&form));
+        assert_ne!(bucket(&staff), bucket(&any));
+        assert_ne!(bucket(&form), bucket(&any));
+
+        // Three spent; seven more fit the window and the next is refused
+        for _ in 0..7 {
+            assert_eq!(
+                client.post("/takedown/status").dispatch().status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client.post("/takedown/requests").dispatch().status(),
+            Status::TooManyRequests
+        );
+
+        // The staff and shared buckets are untouched
+        assert_eq!(
+            client.get("/admin/takedown/requests").dispatch().status(),
+            Status::Ok
+        );
+        assert_eq!(client.get("/sync/settings").dispatch().status(), Status::Ok);
     }
 }

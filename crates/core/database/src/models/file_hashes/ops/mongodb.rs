@@ -143,4 +143,19 @@ impl AbstractAttachmentHashes for MongoDb {
     async fn delete_attachment_hash(&self, id: &str) -> Result<()> {
         query!(self, delete_one_by_id, COL, id).map(|_| ())
     }
+
+    /// Fetch every hash entry with the given processed hash.
+    async fn fetch_attachment_hashes_by_processed(
+        &self,
+        processed_hash: &str,
+    ) -> Result<Vec<FileHash>> {
+        query!(
+            self,
+            find,
+            COL,
+            doc! {
+                "processed_hash": processed_hash
+            }
+        )
+    }
 }

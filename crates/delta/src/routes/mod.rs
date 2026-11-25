@@ -28,6 +28,7 @@ mod safety;
 mod servers;
 mod softres;
 mod sync;
+mod takedown;
 mod users;
 mod webhooks;
 mod account;
@@ -35,6 +36,8 @@ mod session;
 mod mfa;
 mod oauth;
 mod import;
+#[cfg(test)]
+mod e2ee_only_scan_tests;
 
 pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
     let settings = OpenApiSettings::default();
@@ -53,6 +56,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
+            "/takedown" => takedown::routes(),
             "/e2ee" => e2ee::routes(),
             "/mls" => mls::routes(),
             "/events" => events::routes(),
@@ -89,6 +93,7 @@ pub fn mount(config: Settings, mut rocket: Rocket<Build>) -> Rocket<Build> {
             "/interactions" => interactions::routes(),
             "/custom" => customisation::routes(),
             "/safety" => safety::routes(),
+            "/takedown" => takedown::routes(),
             "/e2ee" => e2ee::routes(),
             "/mls" => mls::routes(),
             "/events" => events::routes(),

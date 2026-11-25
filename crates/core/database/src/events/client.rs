@@ -464,6 +464,18 @@ pub enum EventV1 {
         message_id: String,
     },
 
+    /// A protected channel's seats or Text group changed (protected
+    /// channels 7.5). Published on the CHANNEL topic, so only viewers
+    /// receive it, and it carries no user ids. `scope` names what to
+    /// refetch: `"seats"` (`GET .../seats`) or `"text_group"`
+    /// (`GET .../text_group`). Clients refetch (debounced) and run the
+    /// removal duty; the periodic refresh stays as the backstop. No push
+    /// notification in S2.
+    ProtectedChannelChanged {
+        id: String,
+        scope: Vec<String>,
+    },
+
     /// New webhook
     WebhookCreate(Webhook),
 
@@ -809,6 +821,12 @@ pub enum EventV1 {
     E2EEDeviceCreate {
         user_id: String,
         device_id: String,
+        /// The device this one was split from (multi-device D5): an install
+        /// that shared `split_from` with another install became a separate
+        /// device. The other install re-claims `split_from` on seeing it.
+        /// Absent on an ordinary new device
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split_from: Option<String>,
     },
 
     /// A user's E2EE device was revoked
@@ -836,6 +854,13 @@ pub enum EventV1 {
         /// relay events from an older delta during rollout.
         #[serde(default)]
         rejoin: bool,
+        /// Text join payload only (protected channels design §3.13): the
+        /// signed generation. Absent on Call intents and S1 intents.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u32>,
+        /// Text join payload only (design §3.13): the signed issue time (ms)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issued_at: Option<i64>,
     },
 
     /// Live push of an MLS commit envelope (media E2EE).
@@ -865,6 +890,12 @@ pub enum EventV1 {
     E2EEClaimResult {
         device_id: String,
         accepted: bool,
+        /// Why a claim was refused (multi-device D4, D8): `held_elsewhere`
+        /// (another session holds the device's live claim) or `removed`
+        /// (the device was removed from the account). Absent otherwise;
+        /// older clients ignore it
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// A poll's aggregate counts changed (vote cast, replaced or retracted).
@@ -1056,6 +1087,16 @@ pub enum EventV1 {
         #[serde(skip_serializing_if = "Option::is_none", default)]
         tank: Option<v0::ProtTankSummary>,
     },
+
+    /// A callee declined a ringing DM or group call. Always published on the
+    /// decliner's private topic (their other open apps stop ringing); in a DM
+    /// also on the channel topic, so the caller learns of it. Never published
+    /// for a call that was already answered.
+    VoiceCallDeclined {
+        channel_id: String,
+        call_id: String,
+        user_id: String,
+    },
 }
 
 /// Redis topic that reaches exactly one session's bonfire connection
@@ -1246,6 +1287,195 @@ mod tests {
     fn session_topic_prefixes_the_session_id() {
         assert_eq!(session_topic("abc"), "session:abc");
     }
+
+    /// Protected channels 7.5: the event is exactly `type`, `id` and
+    /// `scope` on the wire, in that shape, and nothing else (it goes to
+    /// every viewer of the channel, so a field added here would reach
+    /// them too). A `rename` on the variant or a field compiles and
+    /// moves it to a key stoat.js does not read.
+    #[test]
+    fn protected_channel_changed_has_the_exact_wire_shape() {
+        let event = EventV1::ProtectedChannelChanged {
+            id: "01J9Z3K4M5N6P7Q8R9S0T1V2W3".to_string(),
+            scope: vec!["seats".to_string()],
+        };
+        let json = serde_json::to_string(&event).expect("serializes");
+        assert_eq!(
+            json,
+            r#"{"type":"ProtectedChannelChanged","id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","scope":["seats"]}"#
+        );
+
+        match serde_json::from_str::<EventV1>(&json).expect("deserializes") {
+            EventV1::ProtectedChannelChanged { id, scope } => {
+                assert_eq!(id, "01J9Z3K4M5N6P7Q8R9S0T1V2W3");
+                assert_eq!(scope, vec!["seats".to_string()]);
+            }
+            other => panic!("round-tripped to another event: {other:?}"),
+        }
+    }
+
+    /// Both scope items survive a round trip, in order, from the JSON a
+    /// publisher sends for a change that touched seats and the Text group.
+    #[test]
+    fn protected_channel_changed_round_trips_both_scopes() {
+        let wire = r#"{"type":"ProtectedChannelChanged","id":"C","scope":["seats","text_group"]}"#;
+        let event = serde_json::from_str::<EventV1>(wire).expect("deserializes");
+        match &event {
+            EventV1::ProtectedChannelChanged { id, scope } => {
+                assert_eq!(id, "C");
+                assert_eq!(scope, &["seats", "text_group"]);
+            }
+            other => panic!("decoded to another event: {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&event).expect("serializes"), wire);
+    }
+
+    /// The join request exactly as an S1 build (dafb3433) sends it
+    const JOIN_REQUESTED_S1: &str = r#"{"type":"MlsJoinRequested","group_id":"G","channel_id":"C","user_id":"U","device_id":"D","key_package_ref":"a3ByZWY","signature":"c2ln","rejoin":false}"#;
+
+    /// S2 (design §3.13): `generation` and `issued_at` are absent when
+    /// `None`, so an S1-shaped event is byte-identical on the wire and an
+    /// S1 payload decodes with both `None`; set values travel under their
+    /// exact keys
+    #[test]
+    fn mls_join_requested_text_fields_are_absent_when_empty() {
+        let event = serde_json::from_str::<EventV1>(JOIN_REQUESTED_S1).expect("deserializes");
+        match &event {
+            EventV1::MlsJoinRequested {
+                generation,
+                issued_at,
+                rejoin,
+                ..
+            } => {
+                assert_eq!((*generation, *issued_at, *rejoin), (None, None, false));
+            }
+            other => panic!("decoded to another event: {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_string(&event).expect("serializes"),
+            JOIN_REQUESTED_S1
+        );
+
+        let text = EventV1::MlsJoinRequested {
+            group_id: "G".to_string(),
+            channel_id: "C".to_string(),
+            user_id: "U".to_string(),
+            device_id: "D".to_string(),
+            key_package_ref: "a3ByZWY".to_string(),
+            signature: "c2ln".to_string(),
+            rejoin: true,
+            generation: Some(3),
+            issued_at: Some(1_790_812_800_000),
+        };
+        let wire = serde_json::to_value(&text).expect("serializes");
+        assert_eq!(wire["generation"], 3);
+        assert_eq!(wire["issued_at"], 1_790_812_800_000i64);
+        match serde_json::from_value::<EventV1>(wire).expect("deserializes") {
+            EventV1::MlsJoinRequested {
+                generation,
+                issued_at,
+                ..
+            } => assert_eq!((generation, issued_at), (Some(3), Some(1_790_812_800_000))),
+            other => panic!("round-tripped to another event: {other:?}"),
+        }
+    }
+
+    /// Multi-device D4: a claim result carries `reason` only when set. An
+    /// accepted (or old-style refused) result keeps its earlier wire shape,
+    /// and a result relayed without the key still deserializes
+    #[test]
+    fn the_claim_result_carries_reason_only_when_set() {
+        let plain = EventV1::E2EEClaimResult {
+            device_id: "a".repeat(32),
+            accepted: true,
+            reason: None,
+        };
+        let wire = serde_json::to_value(&plain).expect("serializes");
+        assert!(wire.get("reason").is_none(), "an unset reason is absent: {wire}");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "E2EEClaimResult",
+                "device_id": "a".repeat(32),
+                "accepted": true,
+            })
+        );
+
+        let refused = EventV1::E2EEClaimResult {
+            device_id: "a".repeat(32),
+            accepted: false,
+            reason: Some("held_elsewhere".to_string()),
+        };
+        let wire = serde_json::to_value(&refused).expect("serializes");
+        assert_eq!(
+            wire.get("reason").and_then(|value| value.as_str()),
+            Some("held_elsewhere"),
+            "{wire}"
+        );
+
+        for (value, expected) in [
+            (wire, Some("held_elsewhere")),
+            (
+                serde_json::json!({ "type": "E2EEClaimResult", "device_id": "d", "accepted": false }),
+                None,
+            ),
+        ] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::E2EEClaimResult { reason, .. } => {
+                    assert_eq!(reason.as_deref(), expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
+
+    /// Multi-device D5 (audit M3): a device-create event carries
+    /// `split_from` only for a split, so an ordinary new device keeps its
+    /// earlier wire shape, and an event without the key still deserializes
+    #[test]
+    fn the_device_create_event_carries_split_from_only_when_set() {
+        let added = EventV1::E2EEDeviceCreate {
+            user_id: "U".to_string(),
+            device_id: "b".repeat(32),
+            split_from: None,
+        };
+        let wire = serde_json::to_value(&added).expect("serializes");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "type": "E2EEDeviceCreate",
+                "user_id": "U",
+                "device_id": "b".repeat(32),
+            })
+        );
+
+        let split = EventV1::E2EEDeviceCreate {
+            user_id: "U".to_string(),
+            device_id: "b".repeat(32),
+            split_from: Some("a".repeat(32)),
+        };
+        let wire = serde_json::to_value(&split).expect("serializes");
+        assert_eq!(
+            wire.get("split_from").and_then(|value| value.as_str()),
+            Some("a".repeat(32).as_str()),
+            "{wire}"
+        );
+
+        for (value, expected) in [
+            (wire, Some("a".repeat(32))),
+            (
+                serde_json::json!({ "type": "E2EEDeviceCreate", "user_id": "U", "device_id": "d" }),
+                None,
+            ),
+        ] {
+            match serde_json::from_value::<EventV1>(value).expect("deserializes") {
+                EventV1::E2EEDeviceCreate { split_from, .. } => {
+                    assert_eq!(split_from, expected)
+                }
+                other => panic!("round-tripped to another event: {other:?}"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1348,5 +1578,115 @@ mod prot_tests {
             }
             other => panic!("deserialized to another event: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::EventV1;
+
+    /// Clients read exactly `{ type, channel_id, call_id, user_id }`. A rename
+    /// still compiles here and silently leaves the decliner's other apps, and
+    /// in a DM the caller, ringing. Each field carries a different value so
+    /// two ids swapped on the way through are caught as well.
+    #[test]
+    fn the_voice_call_declined_wire_shape_is_type_channel_call_user() {
+        let event = EventV1::VoiceCallDeclined {
+            channel_id: "channel".to_string(),
+            call_id: "call".to_string(),
+            user_id: "user".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).expect("serializes"),
+            serde_json::json!({
+                "type": "VoiceCallDeclined",
+                "channel_id": "channel",
+                "call_id": "call",
+                "user_id": "user"
+            })
+        );
+
+        match serde_json::from_str::<EventV1>(
+            r#"{"type":"VoiceCallDeclined","channel_id":"c1","call_id":"k1","user_id":"u1"}"#,
+        )
+        .expect("deserializes")
+        {
+            EventV1::VoiceCallDeclined {
+                channel_id,
+                call_id,
+                user_id,
+            } => {
+                assert_eq!(
+                    (channel_id.as_str(), call_id.as_str(), user_id.as_str()),
+                    ("c1", "k1", "u1")
+                )
+            }
+            other => panic!("deserialized to another event: {other:?}"),
+        }
+    }
+
+    /// The names of the `EventV1` variants in the order this file declares
+    /// them. Inside the enum a variant is the only line that starts with a
+    /// capital letter one indent deep (fields sit deeper, comments and
+    /// attributes start otherwise), and the enum ends at the first line that
+    /// is neither blank nor indented.
+    fn event_variants_in_source_order() -> Vec<&'static str> {
+        const SOURCE: &str = include_str!("client.rs");
+
+        let mut lines = SOURCE
+            .lines()
+            .skip_while(|line| !line.starts_with("pub enum EventV1 "));
+        assert!(lines.next().is_some(), "the EventV1 enum was not found");
+
+        lines
+            .take_while(|line| line.is_empty() || line.starts_with(' '))
+            .filter_map(|line| line.strip_prefix("    "))
+            .filter(|line| line.starts_with(|ch: char| ch.is_ascii_uppercase()))
+            .map(|line| {
+                line.split(|ch: char| !ch.is_ascii_alphanumeric())
+                    .next()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// New events are appended to `EventV1`, never inserted. Bonfire chooses
+    /// how to decode what it reads from Redis by `REDIS_PAYLOAD_TYPE`, and one
+    /// of the choices, bincode, is a positional encoding. While the enum
+    /// carries its `type` tag every encoding names the variant, so the order
+    /// does not reach the wire; encoded by position, an insertion in the
+    /// middle would renumber every later variant, and a daemon still on the
+    /// older build would read each of them as a different event. Appending is
+    /// the one change that is safe either way, so this event has to stay
+    /// where it was added.
+    ///
+    /// Appending a newer event after this one is fine: move this pin to it.
+    #[test]
+    fn voice_call_declined_is_the_last_event_variant() {
+        let variants = event_variants_in_source_order();
+
+        // The scan has to be reading the real enum, or "last" proves nothing.
+        assert!(
+            variants.len() >= 100,
+            "suspiciously small scan of EventV1 ({} variants): {variants:?}",
+            variants.len()
+        );
+        assert_eq!(variants.first(), Some(&"Bulk"), "{variants:?}");
+        assert!(variants.contains(&"ProtBalanceUpdate"), "{variants:?}");
+        assert_eq!(
+            variants
+                .iter()
+                .filter(|name| **name == "VoiceCallDeclined")
+                .count(),
+            1,
+            "{variants:?}"
+        );
+
+        assert_eq!(
+            variants.last(),
+            Some(&"VoiceCallDeclined"),
+            "an EventV1 variant is declared after VoiceCallDeclined, or it was moved up: \
+             {variants:?}"
+        );
     }
 }

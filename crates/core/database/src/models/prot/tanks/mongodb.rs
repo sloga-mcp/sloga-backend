@@ -4024,12 +4024,14 @@ mod tests {
                 signer_user_id: owner_id.to_string(),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 seats: vec![owner_id.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: signature(),
             signer_device_id: OWNER_DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 

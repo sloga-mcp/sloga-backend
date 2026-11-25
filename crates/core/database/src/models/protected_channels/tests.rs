@@ -7,20 +7,31 @@
 //! `TEST_DB=REFERENCE` and `TEST_DB=MONGODB` (never run without `TEST_DB`:
 //! that is production).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
 use std::time::Instant;
 
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_result::ErrorType;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    channel_seats_used, seat_list_removed_users, Channel, ChannelEntitlement,
-    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, Database, E2EEContentType,
-    E2EEEnvelope, HandoverBody, Member, MemberCompositeKey, MlsGroup, MlsGroupCreateOutcome,
-    MlsGroupKind, MlsMemberDevice, SeatList, SeatListBody, SeatListSubmission, Server,
-    SignedHandover, E2EE_PROTOCOL_VERSION, MAX_SEAT_LIST_HANDOVERS, SEAT_COOLDOWN_DAYS,
+    channel_seats_used, check_removal_reason, check_seat_list_authority, check_seat_list_v2_lines,
+    plan_seat_list_write, prepare_text_group, resolve_signer_lost,
+    retain_member_pending_device_removals, seat_list_removed_users, text_group_id_v2,
+    text_group_id_v2_input, AuthorityOwnerDevice, AuthorityUserDevice, Channel, ChannelAuthority,
+    ChannelAuthorityBody, ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState,
+    ChannelSeat, Database, E2EEContentType, E2EEEnvelope, HandoverBody, Member, MemberCompositeKey,
+    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberAdded, MlsMemberDevice,
+    MlsPendingDeviceRemoval, MlsPendingRemoval, MlsRejoinReadd, MlsSignerLost, MlsSignerLostCause,
+    SeatList, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListSubmission,
+    SeatListV2Lines, SeatListWriteDecision, SeatListWriteInput, SeatListWriteKind,
+    SeatListWritePlan, SeatReleaseCause, Server, SignedAuthority, SignedHandover,
+    SignerLostResolution, SuccessionStatement, TextGroupCreator, TextJoinPayload,
+    E2EE_PROTOCOL_VERSION, MAX_COMMIT_AD_LEN, MAX_SEAT_LIST_HANDOVERS, MAX_TEXT_GROUP_GENERATION,
+    MAX_TEXT_GROUP_GENERATION_V2, PROTECTED_SCOPE_SEATS, PROTECTED_SCOPE_TEXT_GROUP,
+    SEAT_COOLDOWN_DAYS,
 };
 
 // Section 5.1 inputs
@@ -32,6 +43,10 @@ const DEVICE_A: &str = "00112233445566778899aabbccddeeff";
 const DEVICE_A2: &str = "0123456789abcdef0123456789abcdef";
 const DEVICE_B: &str = "ffeeddccbbaa99887766554433221100";
 const SERVER: &str = "01HZXSERVERSERVERSERVERSER";
+
+/// The `X-Audit-Log-Reason` every seat PUT here carries unless a test is
+/// about step 4d (a list that releases anyone needs one)
+const SEAT_PUT_REASON: &str = "seat list test";
 
 // Section 5.3 / 5.4 / 5.7 vectors
 const VECTOR_BODY: &str = "sloga-seat-list-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:3\ndevice_cap:5\nissued_at:1790812800000\nsigner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nseats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC";
@@ -93,6 +108,7 @@ fn body_with(version: i64, issued_at: i64, seats: &[&str]) -> String {
         signer_user_id: USER_A.to_string(),
         signer_device_id: DEVICE_A.to_string(),
         seats: seats.iter().map(|seat| seat.to_string()).collect(),
+        v2: None,
     }
     .build()
     .unwrap()
@@ -104,6 +120,7 @@ fn submit(version: i64, seats: &[&str]) -> SeatListSubmission {
         signature: signature(version),
         signer_device_id: DEVICE_A.to_string(),
         handover: None,
+        authority: None,
     }
 }
 
@@ -131,6 +148,9 @@ fn text_group(id_byte: u8, creator: &MlsMemberDevice, generation: u32) -> MlsGro
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     }
 }
 
@@ -226,12 +246,14 @@ fn submit_in(channel_id: &str, version: i64, seats: &[&str]) -> SeatListSubmissi
             signer_user_id: USER_A.to_string(),
             signer_device_id: DEVICE_A.to_string(),
             seats: seats.iter().map(|seat| seat.to_string()).collect(),
+            v2: None,
         }
         .build()
         .unwrap(),
         signature: signature(version),
         signer_device_id: DEVICE_A.to_string(),
         handover: None,
+        authority: None,
     }
 }
 
@@ -406,6 +428,7 @@ fn seat_list_body_matches_the_5_3_vector() {
         signer_device_id: DEVICE_A.to_string(),
         // the builder sorts (5.3 is built from `seats_unsorted`)
         seats: vec![USER_C.to_string(), USER_A.to_string(), USER_B.to_string()],
+        v2: None,
     }
     .build()
     .unwrap();
@@ -490,6 +513,7 @@ fn commit_ad_matches_the_5_7_vector() {
             signature: VECTOR_HANDOVER_SIGNATURE.to_string(),
         }],
         updated_at: at(0),
+        authority: None,
     };
 
     let ad = row.commit_ad().unwrap();
@@ -661,7 +685,13 @@ async fn protect_and_put_follow_the_version_rule() {
         // Strictly stored + 1
         for version in [3, 4, 1_000] {
             let error = db
-                .put_seat_list(CHANNEL, &submit(version, &[USER_A, USER_B]), true, at(0))
+                .put_seat_list(
+                    CHANNEL,
+                    &submit(version, &[USER_A, USER_B]),
+                    true,
+                    at(0),
+                    Some(SEAT_PUT_REASON),
+                )
                 .await
                 .unwrap_err();
             assert!(is_failed_validation(&error), "version {version}");
@@ -671,7 +701,7 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut other_v1 = submit(1, &[USER_A]);
         other_v1.body = body_with(1, 1_790_812_800_001, &[USER_A]);
         let error = db
-            .put_seat_list(CHANNEL, &other_v1, true, at(0))
+            .put_seat_list(CHANNEL, &other_v1, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -680,13 +710,19 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut resigned_v1 = submit(1, &[USER_A]);
         resigned_v1.signature = signature(40);
         let error = db
-            .put_seat_list(CHANNEL, &resigned_v1, true, at(0))
+            .put_seat_list(CHANNEL, &resigned_v1, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(!outcome.unchanged);
@@ -696,7 +732,13 @@ async fn protect_and_put_follow_the_version_rule() {
         // Byte-identical re-PUT: stored success, no side effects
         let seats_before = db.fetch_channel_seats(CHANNEL).await.unwrap();
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -706,7 +748,13 @@ async fn protect_and_put_follow_the_version_rule() {
 
         // A different list at version 2 is refused
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -715,7 +763,7 @@ async fn protect_and_put_follow_the_version_rule() {
         let mut wrong_device = submit(3, &[USER_A]);
         wrong_device.signer_device_id = DEVICE_A2.to_string();
         let error = db
-            .put_seat_list(CHANNEL, &wrong_device, true, at(0))
+            .put_seat_list(CHANNEL, &wrong_device, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
@@ -725,6 +773,7 @@ async fn protect_and_put_follow_the_version_rule() {
                 &submit(3, &[USER_A]),
                 true,
                 at(0),
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -779,12 +828,35 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         db.protect_channel(CHANNEL, &submit(1, &[USER_A]), at(0))
             .await
             .unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        // S2 (2.3, S2-D21): B holds a device in the Text group, so its
+        // releases cool; a seat whose user never received the keys frees at
+        // once (`an_unused_seat_frees_its_slot_at_once_on_every_release_path`)
+        let group = text_group(0xcc, &device(USER_A, DEVICE_A), 0);
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(
+            &db,
+            &group.id,
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
 
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -797,14 +869,26 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
 
         // A new user does not fit while B cools
         let error = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // Re-seating the cooling user reactivates the row, no new slot
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -815,26 +899,50 @@ async fn released_seats_count_against_the_cap_until_the_cooldown_ends() {
         assert_eq!(seats.len(), 2);
 
         // Release again at day 1: cooling until day 15
-        db.put_seat_list(CHANNEL, &submit(5, &[USER_A]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(5, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // Day 14 is still inside the cooldown
         let error = db
-            .put_seat_list(CHANNEL, &submit(6, &[USER_A, USER_C]), true, at(14))
+            .put_seat_list(
+                CHANNEL,
+                &submit(6, &[USER_A, USER_C]),
+                true,
+                at(14),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_seat_cap(&error, 2));
 
         // A removal-only list is never refused by the cap (7.1)
         // (here: the same seats, so nothing is claimed)
-        db.put_seat_list(CHANNEL, &submit(6, &[USER_A]), true, at(14))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(6, &[USER_A]),
+            true,
+            at(14),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // Day 16: B's cooldown is over and its slot is free
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(7, &[USER_A, USER_C]), true, at(16))
+            .put_seat_list(
+                CHANNEL,
+                &submit(7, &[USER_A, USER_C]),
+                true,
+                at(16),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_C]);
@@ -900,6 +1008,7 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     &submit(2, &[USER_A, winner.as_str(), new.as_str()]),
                     true,
                     at(0),
+                    Some(SEAT_PUT_REASON),
                 )
                 .await
             }));
@@ -955,8 +1064,10 @@ async fn racing_seat_claims_never_exceed_the_cap() {
                     signature: signature(task),
                     signer_device_id: DEVICE_A.to_string(),
                     handover: None,
+                    authority: None,
                 };
-                db.put_seat_list(CHANNEL, &submission, true, at(0)).await
+                db.put_seat_list(CHANNEL, &submission, true, at(0), Some(SEAT_PUT_REASON))
+                    .await
             }));
         }
         let mut landed = Vec::new();
@@ -1015,7 +1126,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // Unseat B: released, pending removal, and the new hash, together
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -1040,7 +1157,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // An identical re-PUT adds nothing
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -1054,7 +1177,13 @@ async fn seat_put_writes_the_group_hash_and_pending_removals_with_the_list() {
 
         // A later list never duplicates the pending entry, but moves the hash
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(outcome.pending_removals_added.is_empty());
@@ -1079,23 +1208,41 @@ async fn byte_identical_reput_succeeds_after_the_signer_lost_its_leaf() {
             .unwrap();
         let group = text_group(0xbb, &owner, 0);
         db.create_text_mls_group(&group, None).await.unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
 
         // The signer device's leaf is gone (rejoin case)
         set_group_members(&db, &group.id, vec![device(USER_B, DEVICE_B)]).await;
 
         // 5b refuses a NEW list from a signer without a leaf
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // ... but the lost-response retry of the stored list still succeeds
         let again = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged);
@@ -1204,7 +1351,7 @@ async fn handover_chain_is_append_only_and_capped() {
                 signature: signature(version),
             });
             let outcome = db
-                .put_seat_list(CHANNEL, &submission, true, at(0))
+                .put_seat_list(CHANNEL, &submission, true, at(0), Some(SEAT_PUT_REASON))
                 .await
                 .unwrap();
             assert_eq!(outcome.list.handovers.len() as i64, version - 1);
@@ -1221,14 +1368,20 @@ async fn handover_chain_is_append_only_and_capped() {
             signature: signature(next),
         });
         let error = db
-            .put_seat_list(CHANNEL, &over, true, at(0))
+            .put_seat_list(CHANNEL, &over, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error));
 
         // Without a handover the list still advances; the chain is kept
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(next, &[USER_A]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(next, &[USER_A]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.list.handovers.len(), MAX_SEAT_LIST_HANDOVERS);
@@ -1306,7 +1459,13 @@ async fn forced_release_releases_the_seat_and_adds_one_pending_removal() {
 
         // The owner's later unseat neither re-releases nor duplicates
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A]), true, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(outcome.released.is_empty());
@@ -1388,6 +1547,8 @@ async fn delete_cascade_removes_the_protected_channel_data() {
             key_package_ref: "cmVm".to_string(),
             signature: signature(1),
             created_at: at(0),
+            generation: None,
+            issued_at: None,
         })
         .await
         .unwrap();
@@ -1477,7 +1638,7 @@ async fn text_group_create_never_binds_a_stale_seat_list() {
             let next = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (created, put) = tokio::join!(
                 db.create_text_mls_group(&group, None),
-                db.put_seat_list(&channel_id, &next, true, at(0))
+                db.put_seat_list(&channel_id, &next, true, at(0), Some(SEAT_PUT_REASON))
             );
             assert_eq!(
                 created.expect("create must not error"),
@@ -1512,7 +1673,7 @@ async fn lowering_the_slot_cap_never_skews_against_a_seat_claim() {
             let claim = submit_in(&channel_id, 2, &[USER_A, USER_B]);
             let (granted, put) = tokio::join!(
                 db.upsert_channel_entitlement(&lowered, at(0)),
-                db.put_seat_list(&channel_id, &claim, true, at(0))
+                db.put_seat_list(&channel_id, &claim, true, at(0), Some(SEAT_PUT_REASON))
             );
 
             // Exactly one lands; the other sees it and hits the cap
@@ -1587,6 +1748,7 @@ async fn text_commit_stream(
             created_at: Timestamp::now_utc(),
             rejoin_intents: vec![],
             removed_reasons: vec![],
+            welcome: None,
         };
         match db.insert_mls_text_commit(&commit, &hash, 0).await {
             Ok(crate::MlsCommitOutcome::Won) => {
@@ -1653,8 +1815,14 @@ async fn seat_put_lands_while_text_commits_stream_in() {
                     };
                     let submission = submit_in(&channel_id, version, seats);
                     results.push(
-                        db.put_seat_list(&channel_id, &submission, true, at(0))
-                            .await,
+                        db.put_seat_list(
+                            &channel_id,
+                            &submission,
+                            true,
+                            at(0),
+                            Some(SEAT_PUT_REASON),
+                        )
+                        .await,
                     );
                 }
                 // Keep streaming until a commit lands on the newest hash
@@ -1758,9 +1926,15 @@ async fn genesis_reprotect_is_the_stored_success_and_writes_nothing() {
         assert!(is_invalid_operation(&error), "{error:?}");
 
         // Once the stored list is past version 1, the genesis retry is refused
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), true, at(1))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
         let error = db
             .protect_channel(CHANNEL, &genesis, at(5))
             .await
@@ -1795,7 +1969,13 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
 
         // Flag off: a new claim is refused and nothing is written
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B]), false, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B]),
+                false,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
@@ -1808,7 +1988,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag on: B and C are seated
         let seated = submit(2, &[USER_A, USER_B, USER_C]);
         let outcome = db
-            .put_seat_list(CHANNEL, &seated, true, at(0))
+            .put_seat_list(CHANNEL, &seated, true, at(0), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B, USER_C]);
@@ -1821,7 +2001,7 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag off: the byte-identical retry of the list that landed still
         // succeeds, although applying it again would reactivate C's seat
         let again = db
-            .put_seat_list(CHANNEL, &seated, false, at(1))
+            .put_seat_list(CHANNEL, &seated, false, at(1), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert!(again.unchanged, "{again:?}");
@@ -1829,14 +2009,26 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // C1 (W2 audit): a list that still names C, whom the server removed
         // since v2, is refused before the flag is even looked at
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                false,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_removed_users(&error, &[USER_C]), "{error:?}");
 
         // Flag off: a removal-only list lands
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A]), false, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A]),
+                false,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
@@ -1845,7 +2037,13 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
         // Flag off: reactivating a cooling seat is a claim (B's, which the
         // owner's v3 released)
         let error = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), false, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                false,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
@@ -1860,15 +2058,17 @@ async fn seat_claims_need_the_growth_flag_but_retries_and_removals_do_not() {
                 signer_user_id: USER_A.to_string(),
                 signer_device_id: DEVICE_A.to_string(),
                 seats: vec![USER_A.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: signature(4),
             signer_device_id: DEVICE_A.to_string(),
             handover: None,
+            authority: None,
         };
         let outcome = db
-            .put_seat_list(CHANNEL, &capped, false, at(2))
+            .put_seat_list(CHANNEL, &capped, false, at(2), Some(SEAT_PUT_REASON))
             .await
             .unwrap();
         assert!(!outcome.unchanged);
@@ -1930,12 +2130,14 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
                 signer_user_id: USER_B.to_string(),
                 signer_device_id: DEVICE_B.to_string(),
                 seats: vec![USER_B.to_string()],
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: signature(1),
             signer_device_id: DEVICE_B.to_string(),
             handover: None,
+            authority: None,
         };
         let error = db
             .protect_channel(CHANNEL, &by_member, at(0))
@@ -1964,6 +2166,7 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
                 &submit(2, &[USER_A, USER_C, stranger.as_str()]),
                 true,
                 at(0),
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -1975,7 +2178,13 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
         .await
         .unwrap();
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(0))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B, USER_C]),
+                true,
+                at(0),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_failed_validation(&error), "{error:?}");
@@ -1992,9 +2201,15 @@ async fn protect_needs_the_owner_and_every_claim_needs_a_member() {
         })
         .await
         .unwrap();
-        db.put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(0))
-            .await
-            .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_C]),
+            true,
+            at(0),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
     });
 }
 
@@ -2027,7 +2242,13 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
 
         // The stored list's retry is still the stored success
         let again = db
-            .put_seat_list(CHANNEL, &submit(1, &[USER_A, USER_B]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(1, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert!(again.unchanged, "{again:?}");
@@ -2039,6 +2260,7 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
                     &submit(2, &[USER_A, USER_B, USER_C]),
                     allow_claims,
                     at(1),
+                    Some(SEAT_PUT_REASON),
                 )
                 .await
                 .unwrap_err();
@@ -2066,7 +2288,13 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
 
         // The list without B lands
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_C]);
@@ -2075,12 +2303,24 @@ async fn a_list_still_naming_a_removed_user_is_refused_until_one_without_them_la
         // Only now is B's re-seat an ordinary claim: refused with the
         // growth flag off, landed with it on
         let error = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), false, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                false,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_growth_disabled(&error), "{error:?}");
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(3))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -2118,12 +2358,24 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
 
         // The owner unseats B, then seats B again
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.released, vec![USER_B]);
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(3, &[USER_A, USER_B, USER_C]), true, at(2))
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B, USER_C]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_B]);
@@ -2140,6 +2392,7 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
                 &submit(4, &[USER_A, USER_B, USER_C]),
                 true,
                 expired,
+                Some(SEAT_PUT_REASON),
             )
             .await
             .unwrap_err();
@@ -2150,7 +2403,13 @@ async fn only_a_server_removal_refuses_a_list_naming_the_user_again() {
             .await
             .unwrap();
         let outcome = db
-            .put_seat_list(CHANNEL, &submit(4, &[USER_A, USER_B]), true, expired)
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A, USER_B]),
+                true,
+                expired,
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.claimed, vec![USER_A]);
@@ -2173,6 +2432,8 @@ fn removed_users_are_read_from_the_rows_not_from_release_times() {
         seated_at: at(0),
         released_at: released.map(at),
         cooldown_until: released.map(|days| at(days + SEAT_COOLDOWN_DAYS)),
+        release_cause: None,
+        keys_received_at: None,
     };
     let unseated = numbered_user(901);
     let stored = SeatList {
@@ -2184,6 +2445,7 @@ fn removed_users_are_read_from_the_rows_not_from_release_times() {
         signature: signature(2),
         handovers: vec![],
         updated_at: at(5),
+        authority: None,
     };
     let seats = vec![
         row(USER_A, Some(1)),
@@ -2227,6 +2489,7 @@ fn a_listed_user_with_no_seat_row_is_reported_as_removed() {
         signature: signature(2),
         handovers: vec![],
         updated_at: at(5),
+        authority: None,
     };
     let active = |user_id: &str| ChannelSeat {
         id: ChannelSeat::composite_id(CHANNEL, user_id),
@@ -2235,6 +2498,8 @@ fn a_listed_user_with_no_seat_row_is_reported_as_removed() {
         seated_at: at(0),
         released_at: None,
         cooldown_until: None,
+        release_cause: None,
+        keys_received_at: None,
     };
     // The signer has no row either: still never reported
     let seats = vec![active(USER_B)];
@@ -2294,7 +2559,13 @@ async fn a_removed_user_whose_seat_row_is_gone_is_still_refused() {
             .all(|seat| seat.user_id != USER_B));
 
         let error = db
-            .put_seat_list(CHANNEL, &submit(2, &[USER_A, USER_B, USER_C]), true, at(1))
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A, USER_B, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
             .await
             .unwrap_err();
         assert!(is_removed_users(&error, &[USER_B]), "{error:?}");
@@ -2452,7 +2723,9 @@ async fn seat_puts_racing_a_kick_never_seat_a_non_member() {
                     };
                     let list = submit_in(&channel_id, version, seats);
                     let started = Instant::now();
-                    let put = db.put_seat_list(&channel_id, &list, true, at(0)).await;
+                    let put = db
+                        .put_seat_list(&channel_id, &list, true, at(0), Some(SEAT_PUT_REASON))
+                        .await;
                     if step % 2 == 0 {
                         tally.claims.push((started, Instant::now()));
                     }
@@ -3029,6 +3302,9 @@ fn call_group(group_id: &str, call_channel: &str) -> MlsGroup {
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
+        pending_device_removals: vec![],
+        signer_lost: None,
+        rejoin_readd: vec![],
     }
 }
 
@@ -3045,6 +3321,7 @@ fn call_commit(group_id: &str, epoch: i64) -> crate::MlsCommit {
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
         removed_reasons: vec![],
+        welcome: None,
     }
 }
 
@@ -3086,6 +3363,8 @@ async fn squat(db: &Database, group_id: &str, call_channel: &str) {
         key_package_ref: "cmVm".to_string(),
         signature: signature(1),
         created_at: at(0),
+        generation: None,
+        issued_at: None,
     })
     .await
     .unwrap();
@@ -3204,6 +3483,7 @@ async fn assert_text_commit_wins(db: &Database, channel_id: &str, committer: &Ml
         created_at: Timestamp::now_utc(),
         rejoin_intents: vec![],
         removed_reasons: vec![],
+        welcome: None,
     };
     let outcome = db
         .insert_mls_text_commit(&commit, &group.seat_list_ad_sha256.unwrap(), 0)
@@ -3667,5 +3947,3733 @@ async fn a_text_create_claims_the_squat_row_before_the_squatter_can_starve_it() 
             "the squatter's write landed while the create's transaction was open"
         );
         assert_text_group_replaced_the_squat(&db, &group_id, &channel_id, 0, &owner).await;
+    });
+}
+
+/// A cooling seat row exactly as an S1 build (dafb3433) stores it
+const SEAT_S1: &str = r#"{"_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3:01HZXBBBBBBBBBBBBBBBBBBBBB","channel_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","seated_at":"2026-10-04T12:00:00.000Z","released_at":"2026-10-05T12:00:00.000Z","cooldown_until":"2026-10-19T12:00:00.000Z"}"#;
+
+/// A seat list row exactly as an S1 build (dafb3433) stores it
+const SEAT_LIST_S1: &str = r#"{"_id":"01J9Z3K4M5N6P7Q8R9S0T1V2W3","version":3,"body":"body","signer_user_id":"01HZXAAAAAAAAAAAAAAAAAAAAA","signer_device_id":"00112233445566778899aabbccddeeff","signature":"c2ln","handovers":[{"body":"handover","signature":"aG8"}],"updated_at":"2026-10-04T12:00:00.000Z"}"#;
+
+/// Decodes `s1`, checks it is byte-identical on re-encode (JSON) and has
+/// the same keys as a BSON document, and returns it
+fn s1_round_trip<T>(s1: &str) -> T
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let parsed: T = serde_json::from_str(s1).expect("an S1 row decodes");
+    assert_eq!(serde_json::to_string(&parsed).unwrap(), s1);
+
+    let expected: serde_json::Map<String, serde_json::Value> = serde_json::from_str(s1).unwrap();
+    let document = bson::to_document(&parsed).unwrap();
+    assert_eq!(
+        document.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>(),
+        "the stored BSON keys are the S1 keys"
+    );
+    assert_eq!(bson::from_document::<T>(document).unwrap(), parsed);
+    parsed
+}
+
+/// S2 (2.3): `release_cause` and `keys_received_at` are absent when `None`,
+/// so an S1 seat row decodes and re-encodes byte-identical; set values are
+/// stored snake_case under their exact keys
+#[test]
+fn seat_s2_fields_are_absent_when_empty() {
+    let seat: ChannelSeat = s1_round_trip(SEAT_S1);
+    assert_eq!(seat.release_cause, None);
+    assert_eq!(seat.keys_received_at, None);
+
+    for (cause, wire) in [
+        (SeatReleaseCause::OwnerUnseat, "owner_unseat"),
+        (SeatReleaseCause::ServerRemoval, "server_removal"),
+        (SeatReleaseCause::AccessLost, "access_lost"),
+        (SeatReleaseCause::DeviceNeverJoined, "device_never_joined"),
+    ] {
+        let s2 = ChannelSeat {
+            release_cause: Some(cause),
+            keys_received_at: Some(seat.seated_at),
+            ..seat.clone()
+        };
+        let value = serde_json::to_value(&s2).unwrap();
+        assert_eq!(value["release_cause"], wire);
+        assert_eq!(value["keys_received_at"], value["seated_at"]);
+        assert_eq!(serde_json::from_value::<ChannelSeat>(value).unwrap(), s2);
+        let document = bson::to_document(&s2).unwrap();
+        assert_eq!(document.get_str("release_cause").unwrap(), wire);
+        assert_eq!(bson::from_document::<ChannelSeat>(document).unwrap(), s2);
+    }
+}
+
+/// S2 (2.4): `authority` is absent when `None`, so an S1 seat list row
+/// decodes and re-encodes byte-identical; a set authority round-trips
+#[test]
+fn seat_list_authority_is_absent_when_empty() {
+    let list: SeatList = s1_round_trip(SEAT_LIST_S1);
+    assert_eq!(list.authority, None);
+
+    let s2 = SeatList {
+        authority: Some(SignedAuthority {
+            body: "authority".to_string(),
+            signature: "YXV0aA".to_string(),
+        }),
+        ..list
+    };
+    let value = serde_json::to_value(&s2).unwrap();
+    assert_eq!(value["authority"]["body"], "authority");
+    assert_eq!(value["authority"]["signature"], "YXV0aA");
+    let document = bson::to_document(&s2).unwrap();
+    assert!(document.contains_key("authority"));
+    assert_eq!(bson::from_document::<SeatList>(document).unwrap(), s2);
+}
+
+/// `ProtectedChannelChanged.scope` items (7.5): the exact wire strings
+#[test]
+fn protected_scopes_are_the_wire_strings() {
+    assert_eq!(PROTECTED_SCOPE_SEATS, "seats");
+    assert_eq!(PROTECTED_SCOPE_TEXT_GROUP, "text_group");
+}
+
+// ---------------------------------------------------------------------------
+// S2 (W1-1b): the 5.8 `tv2:` vectors and the 4.3 "S2 additions" rules
+// ---------------------------------------------------------------------------
+
+// `tv:inputs` seeds (5.1) and `tv2:inputs` (5.8)
+const OWNER_SEED: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+const MEMBER_SEED: &str = "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f";
+const NEW_OWNER_SEED: &str = "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f";
+const CID: &str = "01JA0000000000000000000MSG";
+const GROUP_SALT: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+const SEAT_V2_VERSION: i64 = 4;
+const SEAT_V2_DEVICE_CAP: u32 = 5;
+const SEAT_V2_ISSUED_AT: i64 = 1_790_812_860_000;
+const AUTHORITY_VERSION: i64 = 1;
+const AUTHORITY_ISSUED_AT: i64 = 1_790_812_860_000;
+const AUTHORITY_DELEGATE_MAX_DEVICE_CAP: u32 = 5;
+const JOIN_GENERATION: u32 = 0;
+const JOIN_KEY_PACKAGE_REF: &str = "S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789";
+const JOIN_ISSUED_AT: i64 = 1_790_812_870_000;
+const SUCCESSION_RANK: u8 = 1;
+const SUCCESSION_ISSUED_AT: i64 = 1_790_812_880_000;
+const EXTRA1_SEED: &str = "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf";
+const EXTRA2_SEED: &str = "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+
+// Section 5.2 member key; `MAX` of the 5.8 worst case
+const MEMBER_IDENTITY_KEY: &str = "Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc";
+const MAX_INT: i64 = 9_007_199_254_740_991;
+
+// The `tv2:` expected values, copied verbatim from 5.8. Each test rebuilds
+// the value from the inputs above and compares.
+const TV2_AUTHORITY_BODY: &str = "sloga-channel-authority-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:1\nowner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nissued_at:1790812860000\nowner_devices:00112233445566778899aabbccddeeff.A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg,0123456789abcdef0123456789abcdef.zRSzf5VulTGU/3+3Oz2B3MVh1hp1OAlLfD4aZD7l86o\ndelegates:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\ndelegate_scope:seat\ndelegate_max_device_cap:5\nsuccessors:01HZXBBBBBBBBBBBBBBBBBBBBB.ffeeddccbbaa99887766554433221100.Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\nprev:";
+const TV2_AUTHORITY_BODY_SHA256: &str =
+    "0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71";
+const TV2_AUTHORITY_SIGNATURE: &str =
+    "xRMnLtvVVtb5tra2OK01NOd+gCbkWfTqnQSYJThQ1Wlc5Cv2XObDdLXviQH/kji2qjWDRj7PMWDTfqkQusupAA";
+const TV2_SEAT_LIST_V2_BODY: &str = "sloga-seat-list-v2\nv:2\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nversion:4\ndevice_cap:5\nissued_at:1790812860000\nsigner_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nsigner_device_id:00112233445566778899aabbccddeeff\nseats:01HZXAAAAAAAAAAAAAAAAAAAAA,01HZXBBBBBBBBBBBBBBBBBBBBB,01HZXCCCCCCCCCCCCCCCCCCCCC\nauthority:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71\nhistory:visible\nhistory_boundary:\npre_history:kept\ngroup_salt:a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+const TV2_SEAT_LIST_V2_BODY_SHA256: &str =
+    "6822d2c987006383581ee0cf0c5fd758dd3785bb2c214d514332dd7eed336806";
+const TV2_SEAT_LIST_V2_SIGNATURE: &str =
+    "2fpKyQ7i80lUPxe8a4K8CjJAeoRR1xH4s3owXpN4L92AeR2ot0pcaRD/qLR8bbH97vLzYNNQ/5jP+M6GXybwAg";
+const TV2_GROUP_ID_V2_INPUT_G0_HEX: [&str; 4] = [
+    "0013736c6f67612d746578742d67726f75702d7632",
+    "001a30314a395a334b344d354e365037513852395330543156325733",
+    "0000000000000000",
+    "0020a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+];
+const TV2_GROUP_ID_V2_G0: &str = "6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3";
+const TV2_GROUP_ID_V2_G1: &str = "f5d67f0df1e16b362c46ede8a927a8cb63b95ddca63822da6d691475b56fe81f";
+const TV2_GROUP_ID_V2_G64: &str =
+    "787025fd12b11b64a85630a1fa261c420d919691633a6ab349a51173c671eb95";
+const TV2_GROUP_ID_V2_G65535: &str =
+    "c6e859ede61183b2d91d57c50484667f004a96e931dc5cbc38d614674ae5e4c3";
+const TV2_COMMIT_AD_V2_HEX: [&str; 8] = [
+    "0017736c6f67612d746578742d636f6d6d69742d61642d7632",
+    "01e8736c6f67612d736561742d6c6973742d76320a763a320a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a340a6465766963655f6361703a350a6973737565645f61743a313739303831323836303030300a7369676e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a73656174733a3031485a584141414141414141414141414141414141414141412c3031485a584242424242424242424242424242424242424242422c3031485a584343434343434343434343434343434343434343430a617574686f726974793a303237376238643530653633323235363833383065316665646530656531613761303361653730343434343230343435653836643130653939646337636437310a686973746f72793a76697369626c650a686973746f72795f626f756e646172793a0a7072655f686973746f72793a6b6570740a67726f75705f73616c743a61306131613261336134613561366137613861396161616261636164616561666230623162326233623462356236623762386239626162626263626462656266",
+    "0040d9fa4ac90ee2f349543f17bc6b82bc0a32407a8451d711f8b37a305e93782fdd80791da8b74a5c6910ffa8b47c6db1fdeef2f360d350ff98cff8ce865f26f002",
+    "0001",
+    "017f736c6f67612d6f776e65722d68616e646f7665722d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a66726f6d5f757365725f69643a3031485a584141414141414141414141414141414141414141410a66726f6d5f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a66726f6d5f6964656e746974795f6b65793a41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62670a746f5f757365725f69643a3031485a584141414141414141414141414141414141414141410a746f5f6465766963655f69643a30313233343536373839616263646566303132333435363738396162636465660a746f5f6964656e746974795f6b65793a7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a6973737565645f61743a31373930383132383030303030",
+    "004024a9d8b5a88afe2ded612c55ef55e85f2cfd9745da0ec588873a02bbcb3d22e4dd9859965f904db68121a6dfaff604af844fa7a92dbf919100d025fa82247a04",
+    "0282736c6f67612d6368616e6e656c2d617574686f726974792d76310a763a310a6368616e6e656c5f69643a30314a395a334b344d354e3650375138523953305431563257330a76657273696f6e3a310a6f776e65725f757365725f69643a3031485a584141414141414141414141414141414141414141410a7369676e65725f6465766963655f69643a30303131323233333434353536363737383839396161626263636464656566660a6973737565645f61743a313739303831323836303030300a6f776e65725f646576696365733a30303131323233333434353536363737383839396161626263636464656566662e41364548762f504f454c3464634e3059353076416d57666b316a436270513166486479475a424a564d62672c30313233343536373839616263646566303132333435363738396162636465662e7a52537a663556756c5447552f332b334f7a3242334d5668316870314f416c4c664434615a44376c38366f0a64656c6567617465733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a64656c65676174655f73636f70653a736561740a64656c65676174655f6d61785f6465766963655f6361703a350a737563636573736f72733a3031485a584242424242424242424242424242424242424242422e66666565646463636262616139393838373736363535343433333232313130302e4b61793634554738797643794c6871553030304c787a5965556d304c2f684c496c3553386b794b576264630a707265763a",
+    "0040c513272edbd556d6f9b6b6b638ad3534e77e8026e459f4ea9d0498253850d5695ce42bf65ce6c374b5ef8901ff9238b6aa3583463ecf3160d37ea910bacba900",
+];
+const TV2_COMMIT_AD_V2_SHA256: &str =
+    "38495363a9d10a817ed464523a1d17852f6c634008124118d6ff814397299d46";
+const TV2_TEXT_JOIN_BODY: &str = "sloga-text-join-v1\nv:1\nuser_id:01HZXBBBBBBBBBBBBBBBBBBBBB\ndevice_id:ffeeddccbbaa99887766554433221100\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\ngeneration:0\ngroup_id:6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3\nkey_package_ref:S2JvaW5LZXlQYWNrYWdlUmVmVjE+/0123456789\nissued_at:1790812870000";
+const TV2_TEXT_JOIN_SIGNATURE: &str =
+    "l6DoK5goYia40tveyilADPFzJ46y8uVz/IUGtdn3DuybteG/t0xU1Hfur8G0siBGCbEVQNxzNiGKayHnCjKABw";
+const TV2_SUCCESSION_BODY: &str = "sloga-owner-succession-v1\nv:1\nchannel_id:01J9Z3K4M5N6P7Q8R9S0T1V2W3\nfrom_user_id:01HZXAAAAAAAAAAAAAAAAAAAAA\nfrom_identity_key:A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg\nto_user_id:01HZXBBBBBBBBBBBBBBBBBBBBB\nto_device_id:ffeeddccbbaa99887766554433221100\nto_identity_key:Kay64UG8yvCyLhqU000LxzYeUm0L/hLIl5S8kyKWbdc\nauthority_sha256:0277b8d50e6322568380e1fede0ee1a7a03ae70444420445e86d10e99dc7cd71\nrank:1\nissued_at:1790812880000";
+const TV2_SUCCESSION_SIGNATURE: &str =
+    "FTQqMwVpolS3sn+iveaRPZwuthYIbGn1P99OBmLp1OpCrcOYSG8C3o90XFn1LsqMt3yxRBiJqtHkW+6mOEZhCw";
+const TV2_WORST_COMMIT_AD_V2_LEN: &str = "14112";
+const TV2_WORST_COMMIT_AD_V2_SHA256: &str =
+    "745d6adff648976eb588bab96cb005001819f66858b6556bba5f59bf3dcd68c1";
+
+fn unhex(value: &str) -> Vec<u8> {
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).unwrap())
+        .collect()
+}
+
+fn signing_key(seed_hex: &str) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&unhex(seed_hex).try_into().unwrap())
+}
+
+/// b64 of the Ed25519 public key of a seed (5.2)
+fn identity_key_of(seed_hex: &str) -> String {
+    STANDARD_NO_PAD.encode(signing_key(seed_hex).verifying_key().as_bytes())
+}
+
+/// b64 Ed25519 signature by a seed (deterministic, so the 5.8 signatures
+/// are reproducible)
+fn sign_b64(seed_hex: &str, message: &str) -> String {
+    use ed25519_dalek::Signer;
+    STANDARD_NO_PAD.encode(signing_key(seed_hex).sign(message.as_bytes()).to_bytes())
+}
+
+fn hex32(n: u32) -> String {
+    format!("{n:032x}")
+}
+
+/// Refused with `FailedValidation` by the rule whose message contains
+/// `needle`, so a rule's test fails when that rule is gone even if another
+/// rule refuses the input. Every failure names `case`.
+fn assert_refused<T: std::fmt::Debug>(result: revolt_result::Result<T>, needle: &str, case: &str) {
+    match result {
+        Err(error) => match error.error_type {
+            ErrorType::FailedValidation { error } => assert!(
+                error.contains(needle),
+                "{case}: refused with {error:?}, expected {needle:?}"
+            ),
+            other => panic!("{case}: expected FailedValidation, got {other:?}"),
+        },
+        Ok(value) => panic!("{case}: expected a refusal, got {value:?}"),
+    }
+}
+
+fn is_resecuring(error: &revolt_result::Error) -> bool {
+    matches!(&error.error_type, ErrorType::ProtectedChannelResecuring { reason } if reason == "owner_device_lost")
+}
+
+/// `body` with the value of its one `label:` line replaced
+fn with_line(body: &str, label: &str, value: &str) -> String {
+    let prefix = format!("{label}:");
+    let mut found = 0;
+    let lines: Vec<String> = body
+        .split('\n')
+        .map(|line| {
+            if line.starts_with(&prefix) {
+                found += 1;
+                format!("{prefix}{value}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    assert_eq!(found, 1, "{label}");
+    lines.join("\n")
+}
+
+fn owner_device(device_id: &str, identity_key: &str) -> AuthorityOwnerDevice {
+    AuthorityOwnerDevice {
+        device_id: device_id.to_string(),
+        identity_key: identity_key.to_string(),
+    }
+}
+
+fn user_device(user_id: &str, device_id: &str, identity_key: &str) -> AuthorityUserDevice {
+    AuthorityUserDevice {
+        user_id: user_id.to_string(),
+        device_id: device_id.to_string(),
+        identity_key: identity_key.to_string(),
+    }
+}
+
+/// The 5.8 authority from its inputs; the owner devices are given out of
+/// order (the builder sorts)
+fn vector_authority() -> ChannelAuthorityBody {
+    ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version: AUTHORITY_VERSION,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        issued_at: AUTHORITY_ISSUED_AT,
+        owner_devices: vec![
+            owner_device(DEVICE_A2, &identity_key_of(NEW_OWNER_SEED)),
+            owner_device(DEVICE_A, &identity_key_of(OWNER_SEED)),
+        ],
+        delegates: vec![user_device(USER_B, DEVICE_B, &identity_key_of(MEMBER_SEED))],
+        delegate_max_device_cap: AUTHORITY_DELEGATE_MAX_DEVICE_CAP,
+        successors: vec![user_device(USER_B, DEVICE_B, &identity_key_of(MEMBER_SEED))],
+        prev: None,
+    }
+}
+
+/// The 5.8 seat list v2 (5.3's seats, unsorted: the builder sorts)
+fn vector_seat_list_v2(authority_sha256: &str) -> SeatListBody {
+    SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version: SEAT_V2_VERSION,
+        device_cap: SEAT_V2_DEVICE_CAP,
+        issued_at: SEAT_V2_ISSUED_AT,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        seats: vec![USER_C.to_string(), USER_A.to_string(), USER_B.to_string()],
+        v2: Some(SeatListV2Lines {
+            authority_sha256: Some(authority_sha256.to_string()),
+            // `seat_v2_history`, `seat_v2_pre_history`
+            history: SeatListHistory::Visible,
+            history_boundary: None,
+            pre_history: SeatListPreHistory::Kept,
+            group_salt: GROUP_SALT.to_string(),
+        }),
+    }
+}
+
+/// The 5.8 AD v2 row: the v2 list, the 5.4 handover and the 5.8 authority,
+/// every signature computed from its seed
+fn vector_v2_row() -> SeatList {
+    let authority = ChannelAuthority::build(&vector_authority()).unwrap();
+    let body = vector_seat_list_v2(&ChannelAuthority::sha256(&authority))
+        .build()
+        .unwrap();
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: SEAT_V2_VERSION,
+        signature: sign_b64(OWNER_SEED, &body),
+        body,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        handovers: vec![SignedHandover {
+            body: VECTOR_HANDOVER_BODY.to_string(),
+            signature: sign_b64(OWNER_SEED, VECTOR_HANDOVER_BODY),
+        }],
+        updated_at: at(0),
+        authority: Some(SignedAuthority {
+            signature: sign_b64(OWNER_SEED, &authority),
+            body: authority,
+        }),
+    }
+}
+
+/// Chain entries of filler bodies (the AD builder never parses chain
+/// entries, as in S1) that bring an AD of `base_len` bytes to `target`
+fn filler_chain(base_len: usize, target: usize) -> Vec<SignedHandover> {
+    let mut remaining = target - base_len;
+    let mut chain = Vec::new();
+    while remaining > 0 {
+        assert!(remaining > 68, "filler chain cannot hit {target} exactly");
+        let len = (remaining - 68).min(1024);
+        chain.push(SignedHandover {
+            body: "x".repeat(len),
+            signature: signature(chain.len() as i64),
+        });
+        remaining -= 68 + len;
+    }
+    assert!(chain.len() <= MAX_SEAT_LIST_HANDOVERS);
+    chain
+}
+
+#[test]
+fn s2_seeds_give_the_5_2_identity_keys() {
+    assert_eq!(identity_key_of(OWNER_SEED), OWNER_IDENTITY_KEY);
+    assert_eq!(identity_key_of(NEW_OWNER_SEED), NEW_OWNER_IDENTITY_KEY);
+    assert_eq!(identity_key_of(MEMBER_SEED), MEMBER_IDENTITY_KEY);
+}
+
+#[test]
+fn authority_matches_the_5_8_vector() {
+    let body = ChannelAuthority::build(&vector_authority()).unwrap();
+    assert_eq!(body, TV2_AUTHORITY_BODY);
+    assert_eq!(ChannelAuthority::sha256(&body), TV2_AUTHORITY_BODY_SHA256);
+    assert_eq!(sign_b64(OWNER_SEED, &body), TV2_AUTHORITY_SIGNATURE);
+
+    let mut sorted = vector_authority();
+    sorted.owner_devices.reverse();
+    assert_eq!(ChannelAuthority::parse(TV2_AUTHORITY_BODY).unwrap(), sorted);
+}
+
+#[test]
+fn seat_list_v2_matches_the_5_8_vector() {
+    let authority = ChannelAuthority::build(&vector_authority()).unwrap();
+    let authority_sha256 = ChannelAuthority::sha256(&authority);
+    let unsorted = vector_seat_list_v2(&authority_sha256);
+    let body = unsorted.build().unwrap();
+    assert_eq!(body, TV2_SEAT_LIST_V2_BODY);
+    assert_eq!(unsorted.build_v2().unwrap(), TV2_SEAT_LIST_V2_BODY);
+    assert_eq!(
+        hex(&Sha256::digest(body.as_bytes())),
+        TV2_SEAT_LIST_V2_BODY_SHA256
+    );
+    assert_eq!(sign_b64(OWNER_SEED, &body), TV2_SEAT_LIST_V2_SIGNATURE);
+
+    // `parse` dispatches on the context line; `parse_v1` refuses v2 bytes
+    let parsed = SeatListBody::parse(TV2_SEAT_LIST_V2_BODY).unwrap();
+    assert_eq!(
+        parsed,
+        SeatListBody {
+            seats: vec![USER_A.to_string(), USER_B.to_string(), USER_C.to_string()],
+            ..unsorted
+        }
+    );
+    assert_eq!(
+        SeatListBody::parse_v2(TV2_SEAT_LIST_V2_BODY).unwrap(),
+        parsed
+    );
+    assert_refused(
+        SeatListBody::parse_v1(TV2_SEAT_LIST_V2_BODY),
+        "exactly 9 lines",
+        "v2 bytes through parse_v1",
+    );
+}
+
+/// v1 byte identity: an S1 body still parses as v1 (no v2 lines) and builds
+/// back to the same bytes; `build_v2` refuses it
+#[test]
+fn s1_bodies_still_parse_as_v1_and_rebuild_byte_identical() {
+    let parsed = SeatListBody::parse(VECTOR_BODY).unwrap();
+    assert_eq!(parsed.v2, None);
+    assert_eq!(SeatListBody::parse_v1(VECTOR_BODY).unwrap(), parsed);
+    assert_eq!(parsed.build().unwrap(), VECTOR_BODY);
+    assert_refused(
+        SeatListBody::parse_v2(VECTOR_BODY),
+        "exactly 14 lines",
+        "v1 bytes through parse_v2",
+    );
+    assert_refused(
+        parsed.build_v2(),
+        "v2 lines missing",
+        "build_v2 of a v1 body",
+    );
+}
+
+#[test]
+fn seat_list_v2_body_refuses_every_non_canonical_form() {
+    let base = TV2_SEAT_LIST_V2_BODY;
+    let mut swapped: Vec<&str> = base.split('\n').collect();
+    swapped.swap(10, 12);
+    let swapped = swapped.join("\n");
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 14 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "13 lines",
+            base.rsplit_once('\n').unwrap().0.to_string(),
+            "exactly 14 lines",
+        ),
+        (
+            "v2 context, v:1",
+            base.replace("\nv:2\n", "\nv:1\n"),
+            "context or format version",
+        ),
+        (
+            "v1 context, v:2, 14 lines",
+            base.replace("sloga-seat-list-v2", "sloga-seat-list-v1"),
+            "exactly 9 lines",
+        ),
+        (
+            "v1 context, v:2, 9 lines",
+            VECTOR_BODY.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "authority charset",
+            with_line(base, "authority", &TV2_AUTHORITY_BODY_SHA256.to_uppercase()),
+            "seat list authority",
+        ),
+        (
+            "authority length",
+            with_line(base, "authority", &TV2_AUTHORITY_BODY_SHA256[..63]),
+            "seat list authority",
+        ),
+        (
+            "history value",
+            with_line(base, "history", "shown"),
+            "seat list history",
+        ),
+        (
+            "boundary charset",
+            with_line(base, "history_boundary", &CID.to_lowercase()),
+            "seat list history_boundary",
+        ),
+        (
+            "pre_history value",
+            with_line(base, "pre_history", "gone"),
+            "seat list pre_history",
+        ),
+        (
+            "wiped without a boundary",
+            with_line(base, "pre_history", "wiped"),
+            "wiped without a boundary",
+        ),
+        (
+            "empty salt",
+            with_line(base, "group_salt", ""),
+            "seat list group_salt",
+        ),
+        (
+            "salt charset",
+            with_line(base, "group_salt", &GROUP_SALT.to_uppercase()),
+            "seat list group_salt",
+        ),
+        ("lines out of order", swapped, "seat list label"),
+        (
+            "seats unsorted",
+            with_line(base, "seats", &format!("{USER_B},{USER_A},{USER_C}")),
+            "not sorted and unique",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(SeatListBody::parse(body), needle, case);
+    }
+
+    // Format-valid: an empty authority line, `hidden`, a boundary with `wiped`
+    for valid in [
+        with_line(base, "authority", ""),
+        with_line(base, "history", "hidden"),
+        with_line(
+            &with_line(base, "history_boundary", CID),
+            "pre_history",
+            "wiped",
+        ),
+    ] {
+        assert!(SeatListBody::parse(&valid).is_ok(), "{valid}");
+    }
+}
+
+#[test]
+fn channel_authority_refuses_every_format_violation() {
+    let base = TV2_AUTHORITY_BODY;
+    let a = format!("{DEVICE_A}.{OWNER_IDENTITY_KEY}");
+    let a2 = format!("{DEVICE_A2}.{NEW_OWNER_IDENTITY_KEY}");
+    let entry = |user: &str, n: u32| format!("{user}.{}.{MEMBER_IDENTITY_KEY}", hex32(n));
+    let joined = |entries: Vec<String>| entries.join(",");
+    let hash = "ab".repeat(32);
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 13 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "12 lines",
+            base.rsplit_once('\n').unwrap().0.to_string(),
+            "exactly 13 lines",
+        ),
+        (
+            "context",
+            base.replace("sloga-channel-authority-v1", "sloga-channel-authority-v2"),
+            "context or format version",
+        ),
+        (
+            "format version",
+            base.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "over 3072 bytes",
+            with_line(base, "delegates", &"x".repeat(3100)),
+            "too long",
+        ),
+        (
+            "label",
+            base.replace("owner_user_id:", "owner_user:"),
+            "authority label",
+        ),
+        (
+            "channel charset",
+            with_line(base, "channel_id", &CHANNEL.to_lowercase()),
+            "authority channel_id",
+        ),
+        (
+            "version 0",
+            with_line(base, "version", "0"),
+            "authority version",
+        ),
+        (
+            "version leading zero",
+            with_line(base, "version", "01"),
+            "authority version",
+        ),
+        (
+            "version above 2^53 - 1",
+            with_line(base, "version", "9007199254740992"),
+            "authority version",
+        ),
+        (
+            "owner charset",
+            with_line(base, "owner_user_id", &USER_A.to_lowercase()),
+            "authority owner_user_id",
+        ),
+        (
+            "signer device charset",
+            with_line(base, "signer_device_id", &DEVICE_A.to_uppercase()),
+            "authority signer_device_id",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            with_line(base, "issued_at", "9007199254740992"),
+            "authority issued_at",
+        ),
+        (
+            "no owner device",
+            with_line(base, "owner_devices", ""),
+            "owner_devices count",
+        ),
+        (
+            "six owner devices",
+            with_line(
+                base,
+                "owner_devices",
+                &joined(
+                    (0..6)
+                        .map(|n| format!("{}.{OWNER_IDENTITY_KEY}", hex32(n)))
+                        .collect(),
+                ),
+            ),
+            "owner_devices count",
+        ),
+        (
+            "owner devices unsorted",
+            with_line(base, "owner_devices", &format!("{a2},{a}")),
+            "owner_devices not sorted",
+        ),
+        (
+            "owner device twice",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{a},{DEVICE_A}.{NEW_OWNER_IDENTITY_KEY}"),
+            ),
+            "device id twice",
+        ),
+        (
+            "owner identity key twice",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{a},{DEVICE_A2}.{OWNER_IDENTITY_KEY}"),
+            ),
+            "owner identity key twice",
+        ),
+        (
+            "signer device not an owner device",
+            with_line(base, "signer_device_id", DEVICE_B),
+            "no owner_devices entry",
+        ),
+        (
+            "owner entry shape",
+            with_line(base, "owner_devices", &format!("{USER_A}.{a}")),
+            "entry shape",
+        ),
+        (
+            "owner entry key",
+            with_line(
+                base,
+                "owner_devices",
+                &format!("{DEVICE_A}.{}", &OWNER_IDENTITY_KEY[..42]),
+            ),
+            "entry charset",
+        ),
+        (
+            "empty entry",
+            with_line(base, "owner_devices", &format!("{a},,{a2}")),
+            "empty entry",
+        ),
+        (
+            "owner as delegate",
+            with_line(base, "delegates", &entry(USER_A, 1)),
+            "names the owner",
+        ),
+        (
+            "delegates unsorted",
+            with_line(
+                base,
+                "delegates",
+                &format!("{},{}", entry(USER_C, 2), entry(USER_B, 1)),
+            ),
+            "delegates not sorted",
+        ),
+        (
+            "delegate device twice",
+            with_line(
+                base,
+                "delegates",
+                &format!("{},{}", entry(USER_B, 1), entry(USER_C, 1)),
+            ),
+            "device id twice",
+        ),
+        (
+            "eleven delegates",
+            with_line(
+                base,
+                "delegates",
+                &joined((0..11).map(|n| entry(&numbered_user(n), n)).collect()),
+            ),
+            "too many entries",
+        ),
+        (
+            "delegate entry shape",
+            with_line(base, "delegates", &format!("{USER_B}.{DEVICE_B}")),
+            "entry shape",
+        ),
+        (
+            "delegate scope",
+            with_line(base, "delegate_scope", "all"),
+            "authority delegate_scope",
+        ),
+        (
+            "empty delegate scope",
+            with_line(base, "delegate_scope", ""),
+            "authority delegate_scope",
+        ),
+        (
+            "delegate cap above u32",
+            with_line(base, "delegate_max_device_cap", "4294967296"),
+            "delegate_max_device_cap",
+        ),
+        (
+            "owner as successor",
+            with_line(base, "successors", &entry(USER_A, 1)),
+            "names the owner",
+        ),
+        (
+            "six successor users",
+            with_line(
+                base,
+                "successors",
+                &joined((0..6).map(|n| entry(&numbered_user(n), n)).collect()),
+            ),
+            "more than 5 successor users",
+        ),
+        (
+            "successors not contiguous",
+            with_line(
+                base,
+                "successors",
+                &format!(
+                    "{},{},{}",
+                    entry(USER_B, 1),
+                    entry(USER_C, 2),
+                    entry(USER_B, 3)
+                ),
+            ),
+            "not contiguous",
+        ),
+        (
+            "successor devices unsorted",
+            with_line(
+                base,
+                "successors",
+                &format!("{},{}", entry(USER_B, 2), entry(USER_B, 1)),
+            ),
+            "successor devices not sorted",
+        ),
+        (
+            "eleven successors",
+            with_line(
+                base,
+                "successors",
+                &joined((0..11).map(|n| entry(&numbered_user(n / 3), n)).collect()),
+            ),
+            "too many entries",
+        ),
+        (
+            "prev at version 1",
+            with_line(base, "prev", &hash),
+            "exactly at version 1",
+        ),
+        (
+            "no prev at version 2",
+            with_line(base, "version", "2"),
+            "exactly at version 1",
+        ),
+        (
+            "prev charset",
+            with_line(
+                &with_line(base, "version", "2"),
+                "prev",
+                &hash.to_uppercase(),
+            ),
+            "authority prev",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(ChannelAuthority::parse(body), needle, case);
+    }
+
+    // The bounds are inclusive: 5 owner devices, 10 delegates, 5 successor
+    // users with 2 devices each, the u32 cap, empty lists
+    let five_owner_devices = joined(
+        [
+            (hex32(1), MEMBER_IDENTITY_KEY.to_string()),
+            (hex32(2), identity_key_of(EXTRA1_SEED)),
+            (hex32(3), identity_key_of(EXTRA2_SEED)),
+            (DEVICE_A.to_string(), OWNER_IDENTITY_KEY.to_string()),
+            (DEVICE_A2.to_string(), NEW_OWNER_IDENTITY_KEY.to_string()),
+        ]
+        .iter()
+        .map(|(device, key)| format!("{device}.{key}"))
+        .collect(),
+    );
+    let valid = [
+        with_line(base, "owner_devices", &five_owner_devices),
+        with_line(
+            base,
+            "delegates",
+            &joined((0..10).map(|n| entry(&numbered_user(n), n)).collect()),
+        ),
+        with_line(
+            base,
+            "successors",
+            &joined((0..10).map(|n| entry(&numbered_user(n / 2), n)).collect()),
+        ),
+        with_line(base, "delegate_max_device_cap", "4294967295"),
+        with_line(&with_line(base, "delegates", ""), "successors", ""),
+        with_line(
+            &with_line(base, "version", "9007199254740991"),
+            "prev",
+            &hash,
+        ),
+    ];
+    for body in &valid {
+        assert!(ChannelAuthority::parse(body).is_ok(), "{body}");
+    }
+}
+
+#[test]
+fn text_group_id_v2_matches_the_5_8_vectors() {
+    let input = text_group_id_v2_input(CHANNEL, 0, GROUP_SALT).unwrap();
+    assert_eq!(input.len(), 91);
+    assert_eq!(hex(&input), TV2_GROUP_ID_V2_INPUT_G0_HEX.concat());
+    for (generation, expected) in [
+        (0, TV2_GROUP_ID_V2_G0),
+        (1, TV2_GROUP_ID_V2_G1),
+        (64, TV2_GROUP_ID_V2_G64),
+        (65_535, TV2_GROUP_ID_V2_G65535),
+    ] {
+        assert_eq!(
+            text_group_id_v2(CHANNEL, generation, GROUP_SALT).unwrap(),
+            expected,
+            "g = {generation}"
+        );
+    }
+
+    // The v1 derivation never stands in for a v2 id (3.1.1 control)
+    assert_ne!(derived_group_id(CHANNEL, 0), TV2_GROUP_ID_V2_G0);
+
+    assert_refused(
+        text_group_id_v2(CHANNEL, 65_536, GROUP_SALT),
+        "text group generation",
+        "g = 65536",
+    );
+    assert_refused(
+        text_group_id_v2(CHANNEL, 0, &GROUP_SALT.to_uppercase()),
+        "text group salt",
+        "uppercase salt",
+    );
+    assert_refused(
+        text_group_id_v2(CHANNEL, 0, &GROUP_SALT[..62]),
+        "text group salt",
+        "short salt",
+    );
+    assert_refused(
+        text_group_id_v2(&CHANNEL.to_lowercase(), 0, GROUP_SALT),
+        "text group channel id",
+        "lowercase channel",
+    );
+}
+
+#[test]
+fn commit_ad_v2_matches_the_5_8_vector() {
+    let row = vector_v2_row();
+    assert_eq!(row.handovers[0].signature, VECTOR_HANDOVER_SIGNATURE);
+
+    let ad = row.commit_ad_v2().unwrap();
+    assert_eq!(ad.len(), 1744);
+    assert_eq!(hex(&ad), TV2_COMMIT_AD_V2_HEX.concat());
+    assert_eq!(hex(&Sha256::digest(&ad)), TV2_COMMIT_AD_V2_SHA256);
+
+    // `commit_ad` dispatches a v2 row to the v2 AD, and the group hash
+    // follows it (3.12.1: `seat_list_ad_sha256` hashes the v2 bytes)
+    assert!(row.is_v2());
+    assert_eq!(row.commit_ad().unwrap(), ad);
+    assert_eq!(row.commit_ad_sha256().unwrap(), TV2_COMMIT_AD_V2_SHA256);
+}
+
+/// v1 byte identity of the AD: an S1 row stays on the v1 AD (5.7), and a v1
+/// row never carries an authority
+#[test]
+fn commit_ad_v1_rows_keep_the_s1_bytes_and_carry_no_authority() {
+    let row = SeatList {
+        id: CHANNEL.to_string(),
+        version: 3,
+        body: VECTOR_BODY.to_string(),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: VECTOR_SIGNATURE.to_string(),
+        handovers: vec![SignedHandover {
+            body: VECTOR_HANDOVER_BODY.to_string(),
+            signature: VECTOR_HANDOVER_SIGNATURE.to_string(),
+        }],
+        updated_at: at(0),
+        authority: None,
+    };
+    assert!(!row.is_v2());
+    assert_eq!(
+        hex(&row.commit_ad().unwrap()),
+        VECTOR_COMMIT_AD_HEX.concat()
+    );
+    assert_refused(
+        row.commit_ad_v2(),
+        "exactly 14 lines",
+        "v1 row through the v2 AD",
+    );
+
+    let with_authority = SeatList {
+        authority: vector_v2_row().authority,
+        ..row
+    };
+    assert_refused(
+        with_authority.commit_ad(),
+        "carries no authority",
+        "v1 row with an authority",
+    );
+}
+
+#[test]
+fn commit_ad_v2_refuses_an_authority_that_does_not_match_its_line() {
+    let row = vector_v2_row();
+    let no_line = SeatListBody {
+        v2: Some(SeatListV2Lines {
+            authority_sha256: None,
+            ..vector_seat_list_v2("").v2.unwrap()
+        }),
+        ..vector_seat_list_v2("")
+    }
+    .build()
+    .unwrap();
+
+    let missing = SeatList {
+        authority: None,
+        ..row.clone()
+    };
+    assert_refused(missing.commit_ad_v2(), "disagree", "a line, no authority");
+
+    let extra = SeatList {
+        body: no_line.clone(),
+        ..row.clone()
+    };
+    assert_refused(extra.commit_ad_v2(), "disagree", "an authority, no line");
+
+    let mut other = row.clone();
+    other.authority.as_mut().unwrap().body = ChannelAuthority::build(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..vector_authority()
+    })
+    .unwrap();
+    assert_refused(
+        other.commit_ad_v2(),
+        "does not match the seat list",
+        "authority hash differs from the line",
+    );
+
+    let mut short = row.clone();
+    short.authority.as_mut().unwrap().signature = "AAAA".to_string();
+    assert_refused(short.commit_ad_v2(), "signature length", "short signature");
+
+    // Neither: two empty fields close the AD
+    let neither = SeatList {
+        body: no_line,
+        authority: None,
+        ..row
+    };
+    let ad = neither.commit_ad_v2().unwrap();
+    assert_eq!(&ad[ad.len() - 4..], &[0, 0, 0, 0]);
+}
+
+/// 3.12.1: an AD of exactly 16383 bytes passes and one of 16384 is refused
+#[test]
+fn commit_ad_v2_is_refused_above_16383_bytes() {
+    let mut row = vector_v2_row();
+    row.handovers.clear();
+    let base = row.commit_ad_v2().unwrap().len();
+
+    row.handovers = filler_chain(base, MAX_COMMIT_AD_LEN);
+    assert_eq!(row.commit_ad_v2().unwrap().len(), MAX_COMMIT_AD_LEN);
+
+    row.handovers = filler_chain(base, MAX_COMMIT_AD_LEN + 1);
+    assert_refused(row.commit_ad_v2(), "commit ad too long", "16384 bytes");
+}
+
+/// 3.12.1 / 5.8 worst case: authority 2836 bytes, list 3161, 16 succession
+/// statements of 429, AD 14112 bytes and its SHA-256
+#[test]
+fn worst_case_commit_ad_v2_matches_the_5_8_vector() {
+    let member_key = identity_key_of(MEMBER_SEED);
+    let vector_authority_sha256 =
+        ChannelAuthority::sha256(&ChannelAuthority::build(&vector_authority()).unwrap());
+
+    let authority = ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version: MAX_INT,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        issued_at: MAX_INT,
+        owner_devices: vec![
+            owner_device(DEVICE_A, &identity_key_of(OWNER_SEED)),
+            owner_device(DEVICE_A2, &identity_key_of(NEW_OWNER_SEED)),
+            owner_device(&hex32(1), &member_key),
+            owner_device(&hex32(2), &identity_key_of(EXTRA1_SEED)),
+            owner_device(&hex32(3), &identity_key_of(EXTRA2_SEED)),
+        ],
+        delegates: (0..=9)
+            .map(|i| user_device(&format!("01HZXD{i:020}"), &hex32(16 + i), &member_key))
+            .collect(),
+        delegate_max_device_cap: u32::MAX,
+        successors: (0..=4)
+            .flat_map(|u| {
+                let user = format!("01HZXW{u:020}");
+                [
+                    user_device(&user, &hex32(32 + 2 * u), &member_key),
+                    user_device(&user, &hex32(33 + 2 * u), &member_key),
+                ]
+            })
+            .collect(),
+        prev: Some(vector_authority_sha256),
+    };
+    let authority_body = ChannelAuthority::build(&authority).unwrap();
+    assert_eq!(authority_body.len(), 2836);
+    let authority_sha256 = ChannelAuthority::sha256(&authority_body);
+
+    let mut seats = vec![USER_A.to_string()];
+    seats.extend((0..=98).map(|i| format!("01HZXS{i:020}")));
+    let list = SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version: MAX_INT,
+        device_cap: u32::MAX,
+        issued_at: MAX_INT,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        seats,
+        v2: Some(SeatListV2Lines {
+            authority_sha256: Some(authority_sha256.clone()),
+            history: SeatListHistory::Visible,
+            history_boundary: Some(CID.to_string()),
+            pre_history: SeatListPreHistory::Wiped,
+            group_salt: GROUP_SALT.to_string(),
+        }),
+    };
+    let list_body = list.build().unwrap();
+    assert_eq!(list_body.len(), 3161);
+
+    let chain: Vec<SignedHandover> = (0..=15)
+        .map(|i| {
+            let body = SuccessionStatement {
+                channel_id: CHANNEL.to_string(),
+                from_user_id: USER_A.to_string(),
+                from_identity_key: identity_key_of(OWNER_SEED),
+                to_user_id: format!("01HZXT{i:020}"),
+                to_device_id: hex32(i),
+                to_identity_key: member_key.clone(),
+                authority_sha256: authority_sha256.clone(),
+                rank: 5,
+                issued_at: MAX_INT,
+            }
+            .build()
+            .unwrap();
+            assert_eq!(body.len(), 429);
+            SignedHandover {
+                signature: sign_b64(MEMBER_SEED, &body),
+                body,
+            }
+        })
+        .collect();
+
+    let row = SeatList {
+        id: CHANNEL.to_string(),
+        version: MAX_INT,
+        signature: sign_b64(OWNER_SEED, &list_body),
+        body: list_body,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        handovers: chain,
+        updated_at: at(0),
+        authority: Some(SignedAuthority {
+            signature: sign_b64(OWNER_SEED, &authority_body),
+            body: authority_body,
+        }),
+    };
+    let ad = row.commit_ad_v2().unwrap();
+    assert_eq!(ad.len().to_string(), TV2_WORST_COMMIT_AD_V2_LEN);
+    assert_eq!(hex(&Sha256::digest(&ad)), TV2_WORST_COMMIT_AD_V2_SHA256);
+
+    // Format-valid, but S2 refuses its boundary and `wiped` (4.3 step 4c)
+    assert!(check_seat_list_v2_lines(&list, None).is_err());
+}
+
+fn vector_text_join() -> TextJoinPayload {
+    TextJoinPayload {
+        user_id: USER_B.to_string(),
+        device_id: DEVICE_B.to_string(),
+        channel_id: CHANNEL.to_string(),
+        generation: JOIN_GENERATION,
+        group_id: text_group_id_v2(CHANNEL, JOIN_GENERATION, GROUP_SALT).unwrap(),
+        key_package_ref: JOIN_KEY_PACKAGE_REF.to_string(),
+        issued_at: JOIN_ISSUED_AT,
+    }
+}
+
+#[test]
+fn text_join_payload_matches_the_5_8_vector() {
+    let body = vector_text_join().build().unwrap();
+    assert_eq!(body, TV2_TEXT_JOIN_BODY);
+    assert_eq!(sign_b64(MEMBER_SEED, &body), TV2_TEXT_JOIN_SIGNATURE);
+}
+
+#[test]
+fn text_join_payload_refuses_out_of_charset_inputs() {
+    let good = vector_text_join();
+    let cases: Vec<(&str, TextJoinPayload, &str)> = vec![
+        (
+            "generation 65536",
+            TextJoinPayload {
+                generation: 65_536,
+                ..good.clone()
+            },
+            "text join generation",
+        ),
+        (
+            "user charset",
+            TextJoinPayload {
+                user_id: USER_B.to_lowercase(),
+                ..good.clone()
+            },
+            "text join user or channel id",
+        ),
+        (
+            "channel charset",
+            TextJoinPayload {
+                channel_id: CHANNEL[..25].to_string(),
+                ..good.clone()
+            },
+            "text join user or channel id",
+        ),
+        (
+            "device charset",
+            TextJoinPayload {
+                device_id: DEVICE_B.to_uppercase(),
+                ..good.clone()
+            },
+            "text join device id",
+        ),
+        (
+            "group id charset",
+            TextJoinPayload {
+                group_id: good.group_id.to_uppercase(),
+                ..good.clone()
+            },
+            "text join group id",
+        ),
+        (
+            "empty key_package_ref",
+            TextJoinPayload {
+                key_package_ref: String::new(),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "key_package_ref separator",
+            TextJoinPayload {
+                key_package_ref: "a.b".to_string(),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "key_package_ref of 65 chars",
+            TextJoinPayload {
+                key_package_ref: "A".repeat(65),
+                ..good.clone()
+            },
+            "text join key_package_ref",
+        ),
+        (
+            "negative issued_at",
+            TextJoinPayload {
+                issued_at: -1,
+                ..good.clone()
+            },
+            "text join issued_at",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            TextJoinPayload {
+                issued_at: MAX_INT + 1,
+                ..good.clone()
+            },
+            "text join issued_at",
+        ),
+    ];
+    for (case, payload, needle) in cases {
+        assert_refused(payload.build(), needle, case);
+    }
+
+    // The bounds are inclusive
+    assert!(TextJoinPayload {
+        generation: 65_535,
+        issued_at: MAX_INT,
+        key_package_ref: "A".repeat(64),
+        ..good
+    }
+    .build()
+    .is_ok());
+}
+
+fn vector_succession() -> SuccessionStatement {
+    SuccessionStatement {
+        channel_id: CHANNEL.to_string(),
+        from_user_id: USER_A.to_string(),
+        from_identity_key: identity_key_of(OWNER_SEED),
+        to_user_id: USER_B.to_string(),
+        to_device_id: DEVICE_B.to_string(),
+        to_identity_key: identity_key_of(MEMBER_SEED),
+        authority_sha256: ChannelAuthority::sha256(
+            &ChannelAuthority::build(&vector_authority()).unwrap(),
+        ),
+        rank: SUCCESSION_RANK,
+        issued_at: SUCCESSION_ISSUED_AT,
+    }
+}
+
+#[test]
+fn succession_statement_matches_the_5_8_vector() {
+    let body = vector_succession().build().unwrap();
+    assert_eq!(body, TV2_SUCCESSION_BODY);
+    assert_eq!(sign_b64(MEMBER_SEED, &body), TV2_SUCCESSION_SIGNATURE);
+    assert_eq!(
+        SuccessionStatement::parse(TV2_SUCCESSION_BODY).unwrap(),
+        vector_succession()
+    );
+}
+
+#[test]
+fn succession_statement_refuses_every_format_violation() {
+    let base = TV2_SUCCESSION_BODY;
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("trailing LF", format!("{base}\n"), "exactly 11 lines"),
+        ("CR", base.replacen('\n', "\r\n", 1), "contains CR"),
+        (
+            "context",
+            base.replace("sloga-owner-succession-v1", "sloga-owner-handover-v1"),
+            "context or format version",
+        ),
+        (
+            "format version",
+            base.replace("\nv:1\n", "\nv:2\n"),
+            "context or format version",
+        ),
+        (
+            "over 1024 bytes",
+            with_line(base, "to_identity_key", &"x".repeat(1100)),
+            "too long",
+        ),
+        (
+            "label",
+            base.replace("\nrank:", "\nrnk:"),
+            "succession label",
+        ),
+        ("rank 0", with_line(base, "rank", "0"), "succession rank"),
+        ("rank 6", with_line(base, "rank", "6"), "succession rank"),
+        (
+            "rank leading zero",
+            with_line(base, "rank", "01"),
+            "succession rank",
+        ),
+        (
+            "authority hash charset",
+            with_line(
+                base,
+                "authority_sha256",
+                &TV2_AUTHORITY_BODY_SHA256.to_uppercase(),
+            ),
+            "succession authority_sha256",
+        ),
+        (
+            "device charset",
+            with_line(base, "to_device_id", &DEVICE_B.to_uppercase()),
+            "succession device id",
+        ),
+        (
+            "key charset",
+            with_line(base, "from_identity_key", &OWNER_IDENTITY_KEY[..42]),
+            "succession identity key",
+        ),
+        (
+            "user charset",
+            with_line(base, "to_user_id", &USER_B.to_lowercase()),
+            "succession user or channel id",
+        ),
+        (
+            "issued_at above 2^53 - 1",
+            with_line(base, "issued_at", "9007199254740992"),
+            "succession issued_at",
+        ),
+    ];
+    for (case, body, needle) in &cases {
+        assert_ne!(body, base, "{case} changed nothing");
+        assert_refused(SuccessionStatement::parse(body), needle, case);
+    }
+    assert!(SuccessionStatement::parse(&with_line(base, "rank", "5")).is_ok());
+}
+
+// --- 4.3 S2 rules: helpers ---------------------------------------------------
+
+fn v2_lines(salt: &str) -> SeatListV2Lines {
+    SeatListV2Lines {
+        authority_sha256: None,
+        history: SeatListHistory::Visible,
+        history_boundary: None,
+        pre_history: SeatListPreHistory::Kept,
+        group_salt: salt.to_string(),
+    }
+}
+
+/// A v2 body (signer A on `signer_device`)
+fn v2_body_by(signer_device: &str, version: i64, seats: &[&str], lines: SeatListV2Lines) -> String {
+    SeatListBody {
+        channel_id: CHANNEL.to_string(),
+        version,
+        device_cap: 5,
+        issued_at: 1_790_812_800_000,
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: signer_device.to_string(),
+        seats: seats.iter().map(|seat| seat.to_string()).collect(),
+        v2: Some(lines),
+    }
+    .build()
+    .unwrap()
+}
+
+fn v2_body(version: i64, seats: &[&str], lines: SeatListV2Lines) -> String {
+    v2_body_by(DEVICE_A, version, seats, lines)
+}
+
+fn submit_v2(
+    version: i64,
+    seats: &[&str],
+    lines: SeatListV2Lines,
+    authority: Option<SignedAuthority>,
+) -> SeatListSubmission {
+    SeatListSubmission {
+        body: v2_body(version, seats, lines),
+        signature: signature(version),
+        signer_device_id: DEVICE_A.to_string(),
+        handover: None,
+        authority,
+    }
+}
+
+/// The stored row a submission would become (no chain)
+fn stored_row(submission: &SeatListSubmission) -> SeatList {
+    let body = SeatListBody::parse(&submission.body).unwrap();
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: body.version,
+        body: submission.body.clone(),
+        signer_user_id: body.signer_user_id,
+        signer_device_id: body.signer_device_id,
+        signature: submission.signature.clone(),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: submission.authority.clone(),
+    }
+}
+
+fn active_seats(users: &[&str]) -> Vec<ChannelSeat> {
+    users
+        .iter()
+        .map(|user| ChannelSeat {
+            id: ChannelSeat::composite_id(CHANNEL, user),
+            channel_id: CHANNEL.to_string(),
+            user_id: user.to_string(),
+            seated_at: at(0),
+            released_at: None,
+            cooldown_until: None,
+            release_cause: None,
+            keys_received_at: None,
+        })
+        .collect()
+}
+
+/// The planner as a driver calls it (no open Text group, claims allowed,
+/// a removal reason)
+fn plan(
+    kind: SeatListWriteKind,
+    submission: &SeatListSubmission,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+    formats_v2: bool,
+) -> revolt_result::Result<SeatListWriteDecision> {
+    plan_with_reason(
+        kind,
+        submission,
+        stored,
+        seats,
+        formats_v2,
+        Some(SEAT_PUT_REASON),
+    )
+}
+
+/// [`plan`] with the PUT's `removal_reason` as given (4.3 step 4d)
+fn plan_with_reason(
+    kind: SeatListWriteKind,
+    submission: &SeatListSubmission,
+    stored: Option<&SeatList>,
+    seats: &[ChannelSeat],
+    formats_v2: bool,
+    removal_reason: Option<&str>,
+) -> revolt_result::Result<SeatListWriteDecision> {
+    let entitlement = entitlement(100);
+    plan_seat_list_write(&SeatListWriteInput {
+        kind,
+        channel_id: CHANNEL,
+        submission,
+        stored,
+        entitlement: Some(&entitlement),
+        seats,
+        text_group: None,
+        allow_claims: true,
+        formats_v2,
+        text_group_users: &BTreeSet::new(),
+        removal_reason,
+        now: at(1),
+    })
+}
+
+fn applied(decision: SeatListWriteDecision) -> SeatListWritePlan {
+    match decision {
+        SeatListWriteDecision::Apply(plan) => plan,
+        other => panic!("expected a write, got {other:?}"),
+    }
+}
+
+// --- 4.3 step 1 (format; #218) -----------------------------------------------
+
+#[test]
+fn step1_protect_takes_a_v2_genesis_only_with_formats_v2_on() {
+    let genesis = submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None);
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], true).unwrap());
+    assert!(landed.row.is_v2());
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &genesis, None, &[], false),
+        "a v2 genesis list needs formats_v2",
+        "v2 genesis, flag off",
+    );
+}
+
+#[test]
+fn step1_protect_takes_a_v1_genesis_only_with_formats_v2_off() {
+    let genesis = submit(1, &[USER_A]);
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], false).unwrap());
+    assert!(!landed.row.is_v2());
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &genesis, None, &[], true),
+        "must be v2 while formats_v2 is on",
+        "v1 genesis, flag on",
+    );
+}
+
+#[test]
+fn step1_a_v1_list_never_replaces_a_v2_list() {
+    let stored = stored_row(&submit_v2(1, &[USER_A, USER_B], v2_lines(GROUP_SALT), None));
+    let seats = active_seats(&[USER_A, USER_B]);
+    for formats_v2 in [false, true] {
+        assert_refused(
+            plan(
+                SeatListWriteKind::Put,
+                &submit(2, &[USER_A, USER_B]),
+                Some(&stored),
+                &seats,
+                formats_v2,
+            ),
+            "a v1 seat list cannot replace a v2 list",
+            &format!("v1 over v2, formats_v2 = {formats_v2}"),
+        );
+    }
+}
+
+/// #218: a channel already on v2 keeps v2 with the flag off: a removal-only
+/// PUT lands and a byte-identical re-PUT answers its stored success
+#[test]
+fn step1_a_v2_channel_keeps_working_with_formats_v2_off() {
+    let genesis = submit_v2(1, &[USER_A, USER_B], v2_lines(GROUP_SALT), None);
+    let stored = stored_row(&genesis);
+    let seats = active_seats(&[USER_A, USER_B]);
+
+    let removal = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+    let landed = applied(
+        plan(
+            SeatListWriteKind::Put,
+            &removal,
+            Some(&stored),
+            &seats,
+            false,
+        )
+        .unwrap(),
+    );
+    assert_eq!(landed.released, vec![USER_B.to_string()]);
+    assert!(landed.row.is_v2());
+    assert_eq!(
+        landed.seat_list_ad_sha256,
+        hex(&Sha256::digest(landed.row.commit_ad_v2().unwrap()))
+    );
+
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &genesis,
+            Some(&stored),
+            &seats,
+            false
+        ),
+        Ok(SeatListWriteDecision::Unchanged(_))
+    ));
+}
+
+#[test]
+fn step1_a_v1_to_v2_upgrade_needs_formats_v2() {
+    let stored = stored_row(&submit(1, &[USER_A, USER_B]));
+    let seats = active_seats(&[USER_A, USER_B]);
+    let upgrade = submit_v2(2, &[USER_A, USER_B], v2_lines(GROUP_SALT), None);
+
+    assert_refused(
+        plan(
+            SeatListWriteKind::Put,
+            &upgrade,
+            Some(&stored),
+            &seats,
+            false,
+        ),
+        "a v2 seat list over a v1 list needs formats_v2",
+        "upgrade, flag off",
+    );
+    let landed = applied(
+        plan(
+            SeatListWriteKind::Put,
+            &upgrade,
+            Some(&stored),
+            &seats,
+            true,
+        )
+        .unwrap(),
+    );
+    assert!(landed.row.is_v2());
+
+    // A v1 channel may stay on v1 with the flag on (#232)
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &submit(2, &[USER_A, USER_B]),
+            Some(&stored),
+            &seats,
+            true
+        ),
+        Ok(SeatListWriteDecision::Apply(_))
+    ));
+}
+
+// --- 4.3 step 3b (authority; #215, #225) -------------------------------------
+
+/// An authority over the owner devices A and A2, signed by `signer_device_id`
+fn test_authority(
+    version: i64,
+    signer_device_id: &str,
+    prev: Option<String>,
+) -> ChannelAuthorityBody {
+    ChannelAuthorityBody {
+        channel_id: CHANNEL.to_string(),
+        version,
+        owner_user_id: USER_A.to_string(),
+        signer_device_id: signer_device_id.to_string(),
+        issued_at: AUTHORITY_ISSUED_AT,
+        owner_devices: vec![
+            owner_device(DEVICE_A, OWNER_IDENTITY_KEY),
+            owner_device(DEVICE_A2, NEW_OWNER_IDENTITY_KEY),
+        ],
+        delegates: vec![],
+        delegate_max_device_cap: 0,
+        successors: vec![],
+        prev,
+    }
+}
+
+fn signed_authority(authority: &ChannelAuthorityBody) -> SignedAuthority {
+    SignedAuthority {
+        body: ChannelAuthority::build(authority).unwrap(),
+        signature: signature(authority.version),
+    }
+}
+
+fn lines_naming(authority: &SignedAuthority) -> SeatListV2Lines {
+    SeatListV2Lines {
+        authority_sha256: Some(ChannelAuthority::sha256(&authority.body)),
+        ..v2_lines(GROUP_SALT)
+    }
+}
+
+/// A parsed v2 body signed by A's `signer_device`, naming `authority`
+fn body_naming(
+    version: i64,
+    signer_device: &str,
+    authority: Option<&SignedAuthority>,
+) -> SeatListBody {
+    let lines = authority
+        .map(lines_naming)
+        .unwrap_or_else(|| v2_lines(GROUP_SALT));
+    SeatListBody::parse(&v2_body_by(signer_device, version, &[USER_A], lines)).unwrap()
+}
+
+/// A stored v2 row (version 1, by A's first device) carrying `authority`
+fn stored_with(authority: Option<&SignedAuthority>) -> SeatList {
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: 1,
+        body: body_naming(1, DEVICE_A, authority).build().unwrap(),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(1),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: authority.cloned(),
+    }
+}
+
+#[test]
+fn step3b_a_first_authority_is_version_1_and_returns_the_signer_entry_key() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let change = check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), Some(&a1), None)
+        .unwrap()
+        .expect("a first authority is a change");
+    assert_eq!(change.authority.version, 1);
+    assert_eq!(change.signer_identity_key, OWNER_IDENTITY_KEY);
+
+    // Over a stored v1 list (no authority) too; by the other owner device,
+    // its entry's key is the one the route must check
+    let v1 = stored_row(&submit(1, &[USER_A]));
+    let by_a2 = signed_authority(&test_authority(1, DEVICE_A2, None));
+    let change = check_seat_list_authority(
+        &body_naming(2, DEVICE_A2, Some(&by_a2)),
+        Some(&by_a2),
+        Some(&v1),
+    )
+    .unwrap()
+    .expect("a change");
+    assert_eq!(change.signer_identity_key, NEW_OWNER_IDENTITY_KEY);
+
+    // No line, no authority, nothing stored: nothing to check
+    assert_eq!(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, None), None, None).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn step3b_a_non_empty_line_needs_its_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), None, None),
+        "line without an authority",
+        "line, no authority",
+    );
+}
+
+#[test]
+fn step3b_an_authority_needs_its_line() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, None), Some(&a1), None),
+        "authority without a seat list authority line",
+        "v2 body with an empty line",
+    );
+    let v1 = SeatListBody::parse(&body_with(1, 1_790_812_800_000, &[USER_A])).unwrap();
+    assert_refused(
+        check_seat_list_authority(&v1, Some(&a1), None),
+        "authority without a seat list authority line",
+        "v1 body",
+    );
+}
+
+#[test]
+fn step3b_the_line_never_empties_over_a_stored_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, None),
+            None,
+            Some(&stored_with(Some(&a1))),
+        ),
+        "drops the stored authority",
+        "empty line over a stored authority",
+    );
+}
+
+#[test]
+fn step3b_the_authority_hashes_to_the_line() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let other = signed_authority(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&a1)), Some(&other), None),
+        "does not match the seat list authority line",
+        "hash differs",
+    );
+}
+
+#[test]
+fn step3b_the_authority_names_the_route_channel() {
+    let elsewhere = signed_authority(&ChannelAuthorityBody {
+        channel_id: "01J9Z3K4M5N6P7Q8R9S0T1V2W4".to_string(),
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(1, DEVICE_A, Some(&elsewhere)),
+            Some(&elsewhere),
+            None,
+        ),
+        "channel_id does not match",
+        "another channel",
+    );
+}
+
+#[test]
+fn step3b_the_authority_owner_is_the_list_signer() {
+    let foreign = signed_authority(&ChannelAuthorityBody {
+        owner_user_id: USER_B.to_string(),
+        ..test_authority(1, DEVICE_A, None)
+    });
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(1, DEVICE_A, Some(&foreign)),
+            Some(&foreign),
+            None,
+        ),
+        "owner is not the seat list signer",
+        "another owner",
+    );
+}
+
+#[test]
+fn step3b_a_changed_authority_is_signed_by_the_list_signer_device() {
+    let by_a2 = signed_authority(&test_authority(1, DEVICE_A2, None));
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&by_a2)), Some(&by_a2), None),
+        "signed by the list's signer device",
+        "authority by A2 on a list by A",
+    );
+}
+
+/// #225: a list from another listed owner device may carry the stored
+/// authority unchanged; it is not a change and is not re-verified
+#[test]
+fn step3b_an_unchanged_authority_rides_on_another_owner_devices_list() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let stored = stored_with(Some(&a1));
+    assert_eq!(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A2, Some(&a1)),
+            Some(&a1),
+            Some(&stored)
+        )
+        .unwrap(),
+        None
+    );
+
+    // Same body, another signature: a change, refused (same version)
+    let resigned = SignedAuthority {
+        signature: signature(9),
+        ..a1.clone()
+    };
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&resigned)),
+            Some(&resigned),
+            Some(&stored),
+        ),
+        "version must be the stored version + 1",
+        "re-signed authority",
+    );
+}
+
+#[test]
+fn step3b_a_change_is_the_stored_version_plus_1() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let stored = stored_with(Some(&a1));
+    let after_a1 = Some(ChannelAuthority::sha256(&a1.body));
+
+    let skipped = signed_authority(&test_authority(3, DEVICE_A, after_a1.clone()));
+    let same_version = signed_authority(&ChannelAuthorityBody {
+        issued_at: AUTHORITY_ISSUED_AT + 1,
+        ..test_authority(1, DEVICE_A, None)
+    });
+    for (case, authority, stored) in [
+        ("a skipped version", &skipped, Some(&stored)),
+        (
+            "the same version, another body",
+            &same_version,
+            Some(&stored),
+        ),
+        (
+            "a first authority above version 1",
+            &signed_authority(&test_authority(2, DEVICE_A, after_a1.clone())),
+            None,
+        ),
+    ] {
+        assert_refused(
+            check_seat_list_authority(
+                &body_naming(2, DEVICE_A, Some(authority)),
+                Some(authority),
+                stored,
+            ),
+            "version must be the stored version + 1",
+            case,
+        );
+    }
+
+    // Never lower: a stored version 3 refuses a version 2
+    let a3 = signed_authority(&test_authority(3, DEVICE_A, Some("ab".repeat(32))));
+    let lower = signed_authority(&test_authority(
+        2,
+        DEVICE_A,
+        Some(ChannelAuthority::sha256(&a3.body)),
+    ));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&lower)),
+            Some(&lower),
+            Some(&stored_with(Some(&a3))),
+        ),
+        "version must be the stored version + 1",
+        "a lower version",
+    );
+
+    // The next version naming the stored body is accepted
+    let a2 = signed_authority(&test_authority(2, DEVICE_A, after_a1));
+    assert!(check_seat_list_authority(
+        &body_naming(2, DEVICE_A, Some(&a2)),
+        Some(&a2),
+        Some(&stored)
+    )
+    .unwrap()
+    .is_some());
+}
+
+#[test]
+fn step3b_a_change_names_the_stored_authority_as_prev() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let wrong_prev = signed_authority(&test_authority(2, DEVICE_A, Some("ab".repeat(32))));
+    assert_refused(
+        check_seat_list_authority(
+            &body_naming(2, DEVICE_A, Some(&wrong_prev)),
+            Some(&wrong_prev),
+            Some(&stored_with(Some(&a1))),
+        ),
+        "prev must name the stored authority",
+        "prev names another body",
+    );
+}
+
+#[test]
+fn step3b_the_authority_signature_is_64_bytes_of_b64() {
+    let short = SignedAuthority {
+        signature: "AAAA".to_string(),
+        ..signed_authority(&test_authority(1, DEVICE_A, None))
+    };
+    assert_refused(
+        check_seat_list_authority(&body_naming(1, DEVICE_A, Some(&short)), Some(&short), None),
+        "signature length",
+        "short signature",
+    );
+}
+
+/// Step 3b runs in the planner, and the landed row carries the authority
+/// its AD v2 binds
+#[test]
+fn step3b_runs_in_the_planner_and_the_row_carries_the_authority() {
+    let a1 = signed_authority(&test_authority(1, DEVICE_A, None));
+    let genesis = submit_v2(1, &[USER_A], lines_naming(&a1), Some(a1.clone()));
+    let landed = applied(plan(SeatListWriteKind::Protect, &genesis, None, &[], true).unwrap());
+    assert_eq!(landed.row.authority, Some(a1.clone()));
+    let ad = landed.row.commit_ad_v2().unwrap();
+    assert_eq!(landed.seat_list_ad_sha256, hex(&Sha256::digest(&ad)));
+    assert!(ad.ends_with(&crate::decode_signature_b64(&a1.signature).unwrap()));
+
+    let without = SeatListSubmission {
+        authority: None,
+        ..genesis
+    };
+    assert_refused(
+        plan(SeatListWriteKind::Protect, &without, None, &[], true),
+        "line without an authority",
+        "planner, line without an authority",
+    );
+}
+
+// --- 4.3 step 4c (immutable and one-way lines) -------------------------------
+
+/// A stored v2 row with the given lines (a boundary or `wiped` row stands
+/// for S4 data; S2 never writes one)
+fn stored_v2(lines: SeatListV2Lines) -> SeatList {
+    stored_row(&submit_v2(1, &[USER_A], lines, None))
+}
+
+fn next_v2(lines: SeatListV2Lines) -> SeatListBody {
+    SeatListBody::parse(&v2_body(2, &[USER_A], lines)).unwrap()
+}
+
+fn with_boundary(lines: SeatListV2Lines, pre_history: SeatListPreHistory) -> SeatListV2Lines {
+    SeatListV2Lines {
+        history_boundary: Some(CID.to_string()),
+        pre_history,
+        ..lines
+    }
+}
+
+#[test]
+fn step4c_group_salt_is_immutable() {
+    let stored = stored_v2(v2_lines(GROUP_SALT));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(&"5".repeat(64))), Some(&stored)),
+        "group_salt is immutable",
+        "another salt",
+    );
+    assert!(check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)).is_ok());
+}
+
+#[test]
+fn step4c_history_boundary_is_immutable() {
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)),
+        "history_boundary is immutable",
+        "boundary dropped",
+    );
+}
+
+#[test]
+fn step4c_pre_history_never_goes_from_wiped_to_kept() {
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Wiped,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&next_v2(v2_lines(GROUP_SALT)), Some(&stored)),
+        "cannot go from wiped to kept",
+        "wiped to kept",
+    );
+}
+
+/// Until S4: `wiped` is refused on every path (genesis included), so `kept`
+/// to `wiped` is refused on the PUT
+#[test]
+fn step4c_pre_history_wiped_is_refused_until_s4() {
+    let wiped = next_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Wiped,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&wiped, None),
+        "pre_history wiped is refused until S4",
+        "wiped genesis",
+    );
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&wiped, Some(&stored)),
+        "pre_history wiped is refused until S4",
+        "kept to wiped",
+    );
+}
+
+#[test]
+fn step4c_history_boundary_is_refused_until_s4() {
+    let boundary = next_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&boundary, None),
+        "history_boundary is refused until S4",
+        "boundary genesis",
+    );
+    let stored = stored_v2(with_boundary(
+        v2_lines(GROUP_SALT),
+        SeatListPreHistory::Kept,
+    ));
+    assert_refused(
+        check_seat_list_v2_lines(&boundary, Some(&stored)),
+        "history_boundary is refused until S4",
+        "same boundary as stored",
+    );
+}
+
+/// 4.1.1 / PA-18: a stored v1 list is the predecessor `{ authority: empty,
+/// history: hidden, history_boundary: empty, pre_history: kept }`: any salt
+/// and any `history` (#222), but no boundary
+#[test]
+fn step4c_a_stored_v1_list_is_the_v2_predecessor() {
+    let stored = stored_row(&submit(1, &[USER_A]));
+    for history in [SeatListHistory::Visible, SeatListHistory::Hidden] {
+        let lines = SeatListV2Lines {
+            history,
+            ..v2_lines(&"5".repeat(64))
+        };
+        assert!(check_seat_list_v2_lines(&next_v2(lines), Some(&stored)).is_ok());
+    }
+    assert_refused(
+        check_seat_list_v2_lines(
+            &next_v2(with_boundary(
+                v2_lines(GROUP_SALT),
+                SeatListPreHistory::Kept,
+            )),
+            Some(&stored),
+        ),
+        "history_boundary is refused until S4",
+        "a boundary over v1",
+    );
+}
+
+#[test]
+fn step4c_history_may_change_either_way() {
+    for (from, to) in [
+        (SeatListHistory::Visible, SeatListHistory::Hidden),
+        (SeatListHistory::Hidden, SeatListHistory::Visible),
+    ] {
+        let stored = stored_v2(SeatListV2Lines {
+            history: from,
+            ..v2_lines(GROUP_SALT)
+        });
+        let next = next_v2(SeatListV2Lines {
+            history: to,
+            ..v2_lines(GROUP_SALT)
+        });
+        assert!(check_seat_list_v2_lines(&next, Some(&stored)).is_ok());
+    }
+}
+
+/// 4c runs in the planner AFTER the byte-identical return of step 4
+#[test]
+fn step4c_runs_in_the_planner_after_the_retry_return() {
+    let stored_submission = submit_v2(
+        1,
+        &[USER_A],
+        with_boundary(v2_lines(GROUP_SALT), SeatListPreHistory::Kept),
+        None,
+    );
+    let stored = stored_row(&stored_submission);
+    let seats = active_seats(&[USER_A]);
+    assert!(matches!(
+        plan(
+            SeatListWriteKind::Put,
+            &stored_submission,
+            Some(&stored),
+            &seats,
+            true
+        ),
+        Ok(SeatListWriteDecision::Unchanged(_))
+    ));
+    assert_refused(
+        plan(
+            SeatListWriteKind::Put,
+            &submit_v2(2, &[USER_A], v2_lines(&"5".repeat(64)), None),
+            Some(&stored),
+            &seats,
+            true,
+        ),
+        "group_salt is immutable",
+        "planner, new salt",
+    );
+}
+
+// --- 4.3 step 4d (removal reason) --------------------------------------------
+
+#[test]
+fn step4d_a_release_needs_a_non_empty_reason() {
+    let released = vec![USER_B.to_string()];
+    for reason in [None, Some(""), Some("  \t")] {
+        let error = check_removal_reason(&released, reason).unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{reason:?}"
+        );
+    }
+    assert!(check_removal_reason(&released, Some("left the team")).is_ok());
+
+    // Nothing released (a retry, a growth-only list): no reason needed
+    assert!(check_removal_reason(&[], None).is_ok());
+}
+
+/// 4.3 step 4d wired into the planner: a list that releases B is refused
+/// without a reason (absent, empty, whitespace only) and lands with one;
+/// the byte-identical retry of the stored list and a list that only claims
+/// need none. Control: the `check_removal_reason` call removed from
+/// `plan_seat_list_write`.
+#[test]
+fn step4d_the_planner_refuses_a_release_without_a_reason() {
+    let stored = stored_row(&submit(1, &[USER_A, USER_B]));
+    let seats = active_seats(&[USER_A, USER_B]);
+    let unseat = submit(2, &[USER_A]);
+    let put = |submission: &SeatListSubmission, reason: Option<&str>| {
+        plan_with_reason(
+            SeatListWriteKind::Put,
+            submission,
+            Some(&stored),
+            &seats,
+            false,
+            reason,
+        )
+    };
+
+    for reason in [None, Some(""), Some("  ")] {
+        let error = put(&unseat, reason).unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{reason:?}: {error:?}"
+        );
+    }
+    let landed = applied(put(&unseat, Some("left the team")).unwrap());
+    assert_eq!(landed.released, vec![USER_B.to_string()]);
+
+    let retry = put(&submit(1, &[USER_A, USER_B]), None).unwrap();
+    assert!(
+        matches!(retry, SeatListWriteDecision::Unchanged(_)),
+        "{retry:?}"
+    );
+
+    let growth = applied(put(&submit(2, &[USER_A, USER_B, USER_C]), None).unwrap());
+    assert_eq!(growth.claimed, vec![USER_C.to_string()]);
+    assert!(growth.released.is_empty());
+}
+
+/// 4.3 step 4d through both drivers: a PUT that releases B without a
+/// reason is `RemovalReasonRequired` and writes nothing (neither the list
+/// nor B's seat); with one it lands, and its byte-identical retry without
+/// one is the stored success. Control: the reason check moved after the
+/// write (the refused PUT then leaves version 2 stored).
+#[tokio::test]
+async fn step4d_a_releasing_put_without_a_reason_writes_nothing() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let sorted_seats = |mut seats: Vec<ChannelSeat>| {
+            seats.sort_by(|a, b| a.id.cmp(&b.id));
+            seats
+        };
+        let list_before = db.fetch_seat_list(CHANNEL).await.unwrap();
+        let seats_before = sorted_seats(db.fetch_channel_seats(CHANNEL).await.unwrap());
+
+        let unseat = submit(2, &[USER_A]);
+        let error = db
+            .put_seat_list(CHANNEL, &unseat, true, at(1), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.error_type, ErrorType::RemovalReasonRequired),
+            "{error:?}"
+        );
+        assert_eq!(db.fetch_seat_list(CHANNEL).await.unwrap(), list_before);
+        assert_eq!(
+            sorted_seats(db.fetch_channel_seats(CHANNEL).await.unwrap()),
+            seats_before
+        );
+
+        let outcome = db
+            .put_seat_list(CHANNEL, &unseat, true, at(1), Some("left the team"))
+            .await
+            .unwrap();
+        assert!(!outcome.unchanged);
+        assert_eq!(outcome.released, vec![USER_B.to_string()]);
+
+        let retry = db
+            .put_seat_list(CHANNEL, &unseat, true, at(2), None)
+            .await
+            .unwrap();
+        assert!(retry.unchanged);
+        assert_eq!(retry.list.version, 2);
+    });
+}
+
+// --- 4.3 step 7 (`signer_lost`; #222, #224) ----------------------------------
+
+/// An open Text group whose `signer_lost` names A's first device
+fn signer_lost_group(members: &[&str]) -> MlsGroup {
+    let mut group = text_group(0x07, &device(USER_A, DEVICE_A2), 1);
+    group.members = members.iter().map(|id| device(USER_A, id)).collect();
+    group.signer_lost = Some(MlsSignerLost {
+        user_id: USER_A.to_string(),
+        device_id: DEVICE_A.to_string(),
+        cause: MlsSignerLostCause::DeviceRevoked,
+        at: at(0),
+    });
+    group
+}
+
+/// An authority change by A2 whose `owner_devices` drops or keeps A
+fn recovery_authority(keeps_lost: bool) -> ChannelAuthorityBody {
+    let mut authority = test_authority(2, DEVICE_A2, Some("ab".repeat(32)));
+    if !keeps_lost {
+        authority
+            .owner_devices
+            .retain(|device| device.device_id != DEVICE_A);
+    }
+    authority
+}
+
+#[test]
+fn step7_nothing_to_resolve_without_signer_lost() {
+    let list = body_naming(2, DEVICE_A2, None);
+    assert_eq!(
+        resolve_signer_lost(None, &list, None, at(1)).unwrap(),
+        SignerLostResolution::NotLost
+    );
+    let group = text_group(0x07, &device(USER_A, DEVICE_A), 1);
+    assert_eq!(
+        resolve_signer_lost(Some(&group), &list, None, at(1)).unwrap(),
+        SignerLostResolution::NotLost
+    );
+}
+
+#[test]
+fn step7_another_device_without_an_authority_change_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(Some(&group), &body_naming(2, DEVICE_A2, None), None, at(1))
+        .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_an_authority_still_listing_the_lost_device_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(
+        Some(&group),
+        &body_naming(2, DEVICE_A2, None),
+        Some(&recovery_authority(true)),
+        at(1),
+    )
+    .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_a_list_by_the_lost_device_itself_is_refused() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    let error = resolve_signer_lost(
+        Some(&group),
+        &body_naming(2, DEVICE_A, None),
+        Some(&recovery_authority(false)),
+        at(1),
+    )
+    .unwrap_err();
+    assert!(is_resecuring(&error), "{error:?}");
+}
+
+#[test]
+fn step7_a_qualifying_list_clears_and_queues_the_lost_leaf() {
+    let group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: Some(MlsPendingDeviceRemoval {
+                user_id: USER_A.to_string(),
+                device_id: DEVICE_A.to_string(),
+                created_at: at(1),
+            })
+        }
+    );
+}
+
+/// #224: a lost device that holds no leaf (a recovery successor) is only
+/// cleared; an entry nobody can remove would freeze every send
+#[test]
+fn step7_a_lost_device_without_a_leaf_is_only_cleared() {
+    let group = signer_lost_group(&[DEVICE_A2]);
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: None
+        }
+    );
+}
+
+#[test]
+fn step7_an_already_pending_lost_device_is_not_queued_twice() {
+    let mut group = signer_lost_group(&[DEVICE_A, DEVICE_A2]);
+    group.pending_device_removals = vec![MlsPendingDeviceRemoval {
+        user_id: USER_A.to_string(),
+        device_id: DEVICE_A.to_string(),
+        created_at: at(0),
+    }];
+    assert_eq!(
+        resolve_signer_lost(
+            Some(&group),
+            &body_naming(2, DEVICE_A2, None),
+            Some(&recovery_authority(false)),
+            at(1),
+        )
+        .unwrap(),
+        SignerLostResolution::Clear {
+            pending_device: None
+        }
+    );
+}
+
+// --- AD size in the planner (3.12.1) -----------------------------------------
+
+#[test]
+fn the_planner_refuses_a_row_whose_ad_v2_exceeds_16383_bytes() {
+    let mut stored = stored_row(&submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None));
+    let next = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+    let base = stored_row(&next).commit_ad_v2().unwrap().len();
+    let seats = active_seats(&[USER_A]);
+
+    stored.handovers = filler_chain(base, MAX_COMMIT_AD_LEN);
+    let landed =
+        applied(plan(SeatListWriteKind::Put, &next, Some(&stored), &seats, false).unwrap());
+    assert_eq!(landed.row.commit_ad().unwrap().len(), MAX_COMMIT_AD_LEN);
+
+    stored.handovers = filler_chain(base, MAX_COMMIT_AD_LEN + 1);
+    assert_refused(
+        plan(SeatListWriteKind::Put, &next, Some(&stored), &seats, false),
+        "commit ad too long",
+        "16384-byte AD",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2 (W1-2): release causes, release primitives, device revocation, the
+// 2.5 clearing rule and the 4.3 step-7 `signer_lost` write
+// ---------------------------------------------------------------------------
+
+const DEVICE_C: &str = "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf";
+
+/// The channel's open Text group
+async fn open_group(db: &Database, channel_id: &str) -> MlsGroup {
+    db.fetch_seat_list_snapshot(channel_id)
+        .await
+        .unwrap()
+        .text_group
+        .expect("an open Text group")
+}
+
+/// `user`'s seat row in `channel_id`
+async fn seat_of(db: &Database, channel_id: &str, user: &str) -> ChannelSeat {
+    db.fetch_channel_seats(channel_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|seat| seat.user_id == user)
+        .expect("a seat row")
+}
+
+/// Test-only edit of a stored group on both drivers (the commit paths that
+/// really write these fields belong to another lane)
+async fn edit_group(db: &Database, group_id: &str, edit: impl FnOnce(&mut MlsGroup)) {
+    match db {
+        Database::Reference(reference) => {
+            edit(
+                reference
+                    .mls_groups
+                    .lock()
+                    .await
+                    .get_mut(group_id)
+                    .expect("group"),
+            );
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let collection = mongo.col::<MlsGroup>("mls_groups");
+            let mut group = collection
+                .find_one(doc! { "_id": group_id })
+                .await
+                .unwrap()
+                .expect("group");
+            edit(&mut group);
+            let result = collection
+                .replace_one(doc! { "_id": group_id }, &group)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// Test-only edit of a seat row on both drivers (the Text commit stamps
+/// `keys_received_at`; that path belongs to another lane)
+async fn edit_seat(
+    db: &Database,
+    channel_id: &str,
+    user: &str,
+    edit: impl FnOnce(&mut ChannelSeat),
+) {
+    let id = ChannelSeat::composite_id(channel_id, user);
+    match db {
+        Database::Reference(reference) => {
+            edit(
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("seat"),
+            );
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let collection = mongo.col::<ChannelSeat>("channel_seats");
+            let mut seat = collection
+                .find_one(doc! { "_id": &id })
+                .await
+                .unwrap()
+                .expect("seat");
+            edit(&mut seat);
+            let result = collection
+                .replace_one(doc! { "_id": &id }, &seat)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// Test-only overwrite of the stored seat-list row on both drivers (the
+/// test config keeps `formats_v2` off, so no route can enter v2)
+async fn replace_seat_list(db: &Database, row: &SeatList) {
+    match db {
+        Database::Reference(reference) => {
+            reference
+                .channel_seat_lists
+                .lock()
+                .await
+                .insert(row.id.clone(), row.clone());
+        }
+        #[cfg(feature = "mongodb")]
+        Database::MongoDb(mongo) => {
+            let result = mongo
+                .col::<SeatList>("channel_seat_lists")
+                .replace_one(doc! { "_id": &row.id }, row)
+                .await
+                .unwrap();
+            assert_eq!(result.matched_count, 1);
+        }
+    }
+}
+
+/// A v1 list of CHANNEL signed by A's `signer_device`
+fn submit_by(signer_device: &str, version: i64, seats: &[&str]) -> SeatListSubmission {
+    let mut body = SeatListBody::parse(&body_with(version, 1_790_812_800_000, seats)).unwrap();
+    body.signer_device_id = signer_device.to_string();
+    SeatListSubmission {
+        body: body.build().unwrap(),
+        signature: signature(version),
+        signer_device_id: signer_device.to_string(),
+        handover: None,
+        authority: None,
+    }
+}
+
+/// `signer_lost` naming A's `device_id`, recorded on day `days`
+fn lost(device_id: &str, days: i64) -> MlsSignerLost {
+    MlsSignerLost {
+        user_id: USER_A.to_string(),
+        device_id: device_id.to_string(),
+        cause: MlsSignerLostCause::DeviceRevoked,
+        at: at(days),
+    }
+}
+
+fn pending_device(user: &str, device_id: &str, days: i64) -> MlsPendingDeviceRemoval {
+    MlsPendingDeviceRemoval {
+        user_id: user.to_string(),
+        device_id: device_id.to_string(),
+        created_at: at(days),
+    }
+}
+
+/// CHANNEL protected with `seats` (cap 10) and its generation-0 Text group,
+/// created by A's first device, holding `members`; returns the group id
+async fn protected_with_group(
+    db: &Database,
+    seats: &[&str],
+    members: Vec<MlsMemberDevice>,
+) -> String {
+    setup(db, 10).await;
+    db.protect_channel(CHANNEL, &submit(1, seats), at(0))
+        .await
+        .unwrap();
+    let group = text_group(0xcc, &device(USER_A, DEVICE_A), 0);
+    db.create_text_mls_group(&group, None).await.unwrap();
+    set_group_members(db, &group.id, members).await;
+    group.id
+}
+
+fn pending_users(group: &MlsGroup) -> Vec<&str> {
+    group
+        .pending_removals
+        .iter()
+        .map(|pending| pending.user_id.as_str())
+        .collect()
+}
+
+/// 2.3 (S2-D21, O-4): the release terms, and a re-seat while cooling
+/// clearing the cause but keeping the stamp (F-1)
+#[test]
+fn a_release_cools_only_once_the_keys_were_received_and_a_cooling_reseat_keeps_them() {
+    let mut seat = active_seats(&[USER_B]).remove(0);
+    seat.release(at(1), SeatReleaseCause::OwnerUnseat, false)
+        .unwrap();
+    assert_eq!(
+        seat.release_cause,
+        Some(SeatReleaseCause::DeviceNeverJoined)
+    );
+    assert_eq!(seat.cooldown_until, None);
+    assert!(!seat.counts_against_cap(at(1)));
+
+    // Stamped by the commit: cools, whatever the cause
+    seat.reactivate(at(2));
+    seat.keys_received_at = Some(at(2));
+    seat.release(at(3), SeatReleaseCause::AccessLost, false)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+    assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+
+    // A re-seat while cooling overwrites the cause, keeps the stamp (F-1)
+    seat.reactivate(at(4));
+    assert_eq!(seat.release_cause, None);
+    assert_eq!(seat.keys_received_at, Some(at(2)));
+    seat.release(at(5), SeatReleaseCause::ServerRemoval, true)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+    assert!(seat.is_cooling(at(5)));
+}
+
+/// 2.5 "Clearing" (#224), pure: only entries whose (user, device) holds a
+/// leaf survive
+#[test]
+fn clearing_keeps_only_pending_device_entries_whose_device_holds_a_leaf() {
+    let mut group = text_group(0x07, &device(USER_A, DEVICE_A), 0);
+    group.members = vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)];
+    group.pending_device_removals = vec![
+        pending_device(USER_B, DEVICE_B, 0),
+        pending_device(USER_B, DEVICE_C, 0),
+        // A member's device id under another user is not that member
+        pending_device(USER_C, DEVICE_B, 0),
+    ];
+    retain_member_pending_device_removals(&mut group);
+    assert_eq!(
+        group.pending_device_removals,
+        vec![pending_device(USER_B, DEVICE_B, 0)]
+    );
+}
+
+/// 6.3 "Reconciler": `release_channel_seat` is a compare-and-set on
+/// `{ active, seated_at }`; a mismatch writes nothing, so a stale reconcile
+/// never undoes an owner re-seat. Control: drop the `seated_at` filter.
+#[tokio::test]
+async fn release_channel_seat_is_a_compare_and_set_on_seated_at() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        // A wrong `seated_at`: nothing written
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(5), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+        assert!(open_group(&db, CHANNEL).await.pending_removals.is_empty());
+
+        // The read `seated_at`: released with its cause, cooling, one entry
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.released_at, Some(at(1)));
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, None);
+
+        // Already released: false, no second entry, nothing rewritten
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        assert_eq!(open_group(&db, CHANNEL).await.pending_removals.len(), 1);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.released_at, Some(at(1)));
+
+        // The owner re-seats B (C1: a list without B lands first); a
+        // reconcile that read the old seat now matches nothing
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.seated_at, at(2));
+        assert_eq!(seat.release_cause, None, "a re-seat clears the cause");
+        assert_eq!(seat.keys_received_at, Some(at(0)), "cooling: kept");
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+
+        // No row at all
+        assert!(!db
+            .release_channel_seat(CHANNEL, USER_C, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+    });
+}
+
+/// S2-D15 through `release_channel_seat`: releasing the user who signed the
+/// stored list (the reconciler never does, #222) sets `signer_lost` naming
+/// the signer device and never queues the signer; another user's release
+/// still queues. Control: queue the signer instead.
+#[tokio::test]
+async fn a_reconciler_release_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_A, at(0), SeatReleaseCause::AccessLost, at(1))
+            .await
+            .unwrap());
+        let group = open_group(&db, CHANNEL).await;
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+        let seat = seat_of(&db, CHANNEL, USER_A).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert!(seat.is_cooling(at(2)));
+
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_B, at(0), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+    });
+}
+
+/// S2-D15 through the forced release (kick, ban, leave, deletion): the list
+/// signer gets `signer_lost`, never an entry, with `ServerRemoval`.
+/// Control: queue the signer instead.
+#[tokio::test]
+async fn a_forced_release_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_A, Some(SERVER), at(1))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let group = open_group(&db, CHANNEL).await;
+        assert!(group.pending_removals.is_empty());
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+        let seat = seat_of(&db, CHANNEL, USER_A).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+        assert!(seat.is_cooling(at(2)));
+
+        // Idempotent; another user's forced release queues as before
+        assert!(db
+            .release_channel_seats_for_user(USER_A, None, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, None, at(2))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(pending_users(&group), vec![USER_B]);
+        assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)));
+    });
+}
+
+/// 2.3 (S2-D21): a release while the user never received the keys (no
+/// stamp, never in any of the channel's Text groups) writes
+/// `DeviceNeverJoined` and frees the slot at once, on every release path.
+/// Control: always cool.
+#[tokio::test]
+async fn an_unused_seat_frees_its_slot_at_once_on_every_release_path() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let assert_freed = |seat: ChannelSeat| {
+            assert_eq!(
+                seat.release_cause,
+                Some(SeatReleaseCause::DeviceNeverJoined),
+                "{}",
+                seat.user_id
+            );
+            assert_eq!(seat.cooldown_until, None, "{}", seat.user_id);
+        };
+
+        // The owner's unseat; the slot is free at once (cap 2)
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_C]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+
+        // The reconciler's release
+        assert!(db
+            .release_channel_seat(CHANNEL, USER_C, at(1), SeatReleaseCause::AccessLost, at(2))
+            .await
+            .unwrap());
+        assert_freed(seat_of(&db, CHANNEL, USER_C).await);
+
+        // The forced release, with a Text group that never held B
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        db.put_seat_list(
+            CHANNEL,
+            &submit(5, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        db.create_text_mls_group(&text_group(0xcc, &device(USER_A, DEVICE_A), 0), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.release_channel_seats_for_user(USER_B, Some(SERVER), at(3))
+                .await
+                .unwrap(),
+            vec![CHANNEL]
+        );
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(3)),
+            1
+        );
+    });
+}
+
+/// 2.3: once the keys count as received the slot cools 14 days on every
+/// path: a member device in the open group (owner unseat), a past
+/// `member_added` in a CLOSED generation only (forced release; the pre-S2
+/// fallback), the commit's `keys_received_at` stamp (the reconciler)
+#[tokio::test]
+async fn a_used_seat_cools_on_every_release_path() {
+    database_test!(|db| async move {
+        let owner = device(USER_A, DEVICE_A);
+        let user_d = numbered_user(4);
+        setup(&db, 10).await;
+        insert_members(&db, SERVER, &[user_d.as_str()]).await;
+        db.protect_channel(
+            CHANNEL,
+            &submit(1, &[user_d.as_str(), USER_A, USER_B, USER_C]),
+            at(0),
+        )
+        .await
+        .unwrap();
+
+        // C was added in generation 0 and has not rejoined generation 1
+        let first = text_group(0xcc, &owner, 0);
+        db.create_text_mls_group(&first, None).await.unwrap();
+        edit_group(&db, &first.id, |group| {
+            group.member_added.push(MlsMemberAdded {
+                user_id: USER_C.to_string(),
+                device_id: DEVICE_C.to_string(),
+                epoch: 1,
+                at: at(0),
+            })
+        })
+        .await;
+        let successor = text_group(0xdd, &owner, 1);
+        db.create_text_mls_group(&successor, Some(&first.id))
+            .await
+            .unwrap();
+        set_group_members(
+            &db,
+            &successor.id,
+            vec![owner.clone(), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_seat(&db, CHANNEL, &user_d, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[user_d.as_str(), USER_A, USER_C]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+
+        db.release_channel_seats_for_user(USER_C, Some(SERVER), at(2))
+            .await
+            .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_C).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::ServerRemoval));
+        assert_eq!(seat.cooldown_until, Some(at(2 + SEAT_COOLDOWN_DAYS)));
+
+        assert!(db
+            .release_channel_seat(CHANNEL, &user_d, at(0), SeatReleaseCause::AccessLost, at(3))
+            .await
+            .unwrap());
+        let seat = seat_of(&db, CHANNEL, &user_d).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::AccessLost));
+        assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+    });
+}
+
+/// The `race_channel(n)` channels for `n` in `range`, each protected
+/// (genesis A) with an open Text group created by A's first device and
+/// holding `members(index)`
+async fn channels_with_groups(
+    db: &Database,
+    count: u32,
+    members: impl Fn(usize) -> Vec<MlsMemberDevice>,
+) -> Vec<String> {
+    server_ready(db).await;
+    let owner = device(USER_A, DEVICE_A);
+    let channels: Vec<String> = (1..=count).map(race_channel).collect();
+    for (index, channel_id) in channels.iter().enumerate() {
+        protected_in(db, channel_id, 10).await;
+        let mut group = text_group(0xa0 + index as u8, &owner, 0);
+        group.channel_id = channel_id.clone();
+        db.create_text_mls_group(&group, None).await.unwrap();
+        set_group_members(db, &group.id, members(index)).await;
+    }
+    channels
+}
+
+/// 6.3 "Device revocation", the pending pass: every OPEN Text group holding
+/// the device gets one entry; a repeat adds nothing and returns nothing
+#[tokio::test]
+async fn a_device_revocation_queues_the_device_in_every_open_group_holding_it() {
+    database_test!(|db| async move {
+        let channels = channels_with_groups(&db, 3, |index| {
+            let mut members = vec![device(USER_A, DEVICE_A)];
+            if index < 2 {
+                members.push(device(USER_B, DEVICE_B));
+            }
+            members
+        })
+        .await;
+
+        assert_eq!(
+            db.add_pending_device_removal(USER_B, DEVICE_B, at(1))
+                .await
+                .unwrap(),
+            channels[..2].to_vec()
+        );
+        for (index, channel_id) in channels.iter().enumerate() {
+            let group = open_group(&db, channel_id).await;
+            let expected = if index < 2 {
+                vec![pending_device(USER_B, DEVICE_B, 1)]
+            } else {
+                vec![]
+            };
+            assert_eq!(group.pending_device_removals, expected, "{channel_id}");
+            assert_eq!(group.signer_lost, None, "{channel_id}");
+            assert!(group.pending_removals.is_empty(), "{channel_id}");
+        }
+
+        assert!(db
+            .add_pending_device_removal(USER_B, DEVICE_B, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            open_group(&db, &channels[0]).await.pending_device_removals,
+            vec![pending_device(USER_B, DEVICE_B, 1)]
+        );
+        assert!(db
+            .add_pending_device_removal(USER_B, DEVICE_C, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// S2-D15 (#222) through the revocation pass: the device that signed a
+/// channel's stored list sets that open group's `signer_lost`, whether or
+/// not it still holds a leaf there, and is never queued; another owner
+/// device is queued as usual. Control: queue the signer instead.
+#[tokio::test]
+async fn a_device_revocation_of_the_list_signer_sets_signer_lost_never_an_entry() {
+    database_test!(|db| async move {
+        let channels = channels_with_groups(&db, 2, |index| {
+            // The second channel: the signer device holds no leaf any more
+            if index == 0 {
+                vec![device(USER_A, DEVICE_A), device(USER_A, DEVICE_A2)]
+            } else {
+                vec![device(USER_A, DEVICE_A2)]
+            }
+        })
+        .await;
+
+        assert_eq!(
+            db.add_pending_device_removal(USER_A, DEVICE_A, at(1))
+                .await
+                .unwrap(),
+            channels
+        );
+        for channel_id in &channels {
+            let group = open_group(&db, channel_id).await;
+            assert_eq!(group.signer_lost, Some(lost(DEVICE_A, 1)), "{channel_id}");
+            assert!(group.pending_device_removals.is_empty(), "{channel_id}");
+        }
+
+        // A repeat keeps the first `signer_lost`
+        assert!(db
+            .add_pending_device_removal(USER_A, DEVICE_A, at(2))
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            open_group(&db, &channels[0]).await.signer_lost,
+            Some(lost(DEVICE_A, 1))
+        );
+
+        // The owner's other device did not sign: an entry
+        assert_eq!(
+            db.add_pending_device_removal(USER_A, DEVICE_A2, at(2))
+                .await
+                .unwrap(),
+            channels
+        );
+        assert_eq!(
+            open_group(&db, &channels[1]).await.pending_device_removals,
+            vec![pending_device(USER_A, DEVICE_A2, 2)]
+        );
+    });
+}
+
+/// 2.5 "Clearing" (#224): every seat-list write drops the open group's
+/// `pending_device_removals` entries whose device holds no leaf, keeps the
+/// others, and leaves the field absent once empty. Control: skip it.
+#[tokio::test]
+async fn every_seat_list_write_drops_pending_device_entries_of_non_members() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![device(USER_A, DEVICE_A), device(USER_B, DEVICE_B)],
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.pending_device_removals = vec![
+                pending_device(USER_B, DEVICE_B, 0),
+                pending_device(USER_B, DEVICE_C, 0),
+                pending_device(USER_C, DEVICE_C, 0),
+            ]
+        })
+        .await;
+
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A, USER_B]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            open_group(&db, CHANNEL).await.pending_device_removals,
+            vec![pending_device(USER_B, DEVICE_B, 0)]
+        );
+
+        // B's device leaves; the next write drops the last entry
+        set_group_members(&db, &group_id, vec![device(USER_A, DEVICE_A)]).await;
+        db.put_seat_list(
+            CHANNEL,
+            &submit(3, &[USER_A, USER_B]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        assert!(open_group(&db, CHANNEL)
+            .await
+            .pending_device_removals
+            .is_empty());
+        #[cfg(feature = "mongodb")]
+        if let Database::MongoDb(mongo) = &db {
+            let row = mongo
+                .col::<bson::Document>("mls_groups")
+                .find_one(doc! { "_id": &group_id })
+                .await
+                .unwrap()
+                .expect("the group");
+            assert!(!row.contains_key("pending_device_removals"));
+        }
+    });
+}
+
+/// #213: a successor create COPIES `signer_lost` and starts with both
+/// pending lists empty; no create takes the S2 fields from the request.
+/// Control: skip the copy.
+#[tokio::test]
+async fn a_successor_copies_signer_lost_and_starts_with_empty_pending_lists() {
+    database_test!(|db| async move {
+        setup(&db, 10).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let owner = device(USER_A, DEVICE_A);
+
+        let mut first = text_group(0xcc, &owner, 0);
+        first.signer_lost = Some(lost(DEVICE_A2, 0));
+        first.pending_device_removals = vec![pending_device(USER_A, DEVICE_A, 0)];
+        first.rejoin_readd = vec![MlsRejoinReadd {
+            user_id: USER_B.to_string(),
+            device_id: DEVICE_B.to_string(),
+            at: at(0),
+        }];
+        db.create_text_mls_group(&first, None).await.unwrap();
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.signer_lost, None);
+        assert!(stored.pending_device_removals.is_empty());
+        assert!(stored.rejoin_readd.is_empty());
+
+        edit_group(&db, &first.id, |group| {
+            group.members.push(device(USER_B, DEVICE_B));
+            group.signer_lost = Some(lost(DEVICE_A, 0));
+            group.pending_removals = vec![MlsPendingRemoval {
+                user_id: USER_B.to_string(),
+                created_at: at(0),
+            }];
+            group.pending_device_removals = vec![pending_device(USER_B, DEVICE_B, 0)];
+        })
+        .await;
+
+        let successor = text_group(0xdd, &owner, 1);
+        assert!(matches!(
+            db.create_text_mls_group(&successor, Some(&first.id))
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        ));
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.id, successor.id);
+        assert_eq!(stored.signer_lost, Some(lost(DEVICE_A, 0)));
+        assert!(stored.pending_removals.is_empty());
+        assert!(stored.pending_device_removals.is_empty());
+    });
+}
+
+/// 4.3 step 7 (#222): while the open group carries `signer_lost`, a list
+/// without an authority change omitting the lost device is
+/// `ProtectedChannelResecuring { owner_device_lost }` and writes nothing,
+/// whether another device or the lost one signed it; the byte-identical
+/// retry of the stored list still answers first. Control: drop the refusal.
+#[tokio::test]
+async fn while_signer_lost_is_set_a_list_without_a_recovery_authority_is_refused() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![
+                device(USER_A, DEVICE_A),
+                device(USER_A, DEVICE_A2),
+                device(USER_B, DEVICE_B),
+            ],
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+        let before = open_group(&db, CHANNEL).await;
+
+        for signer_device in [DEVICE_A2, DEVICE_A] {
+            let error = db
+                .put_seat_list(
+                    CHANNEL,
+                    &submit_by(signer_device, 2, &[USER_A]),
+                    true,
+                    at(1),
+                    Some(SEAT_PUT_REASON),
+                )
+                .await
+                .unwrap_err();
+            assert!(is_resecuring(&error), "{signer_device}: {error:?}");
+        }
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().version,
+            1
+        );
+        assert!(seat_of(&db, CHANNEL, USER_B).await.is_active());
+        assert_eq!(open_group(&db, CHANNEL).await, before);
+
+        assert!(
+            db.put_seat_list(
+                CHANNEL,
+                &submit(1, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON)
+            )
+            .await
+            .unwrap()
+            .unchanged
+        );
+    });
+}
+
+/// 4.3 step 7 (#222, #224): a list from another owner device carrying an
+/// authority change that omits the lost device clears `signer_lost` in its
+/// own write and queues the lost device, which still holds a leaf. The
+/// stored v2 row is written directly: the test config keeps `formats_v2`
+/// off, and a stored v2 list keeps v2 whatever the flag says (step 1).
+#[tokio::test]
+async fn a_recovery_list_clears_signer_lost_and_queues_the_lost_leaf() {
+    database_test!(|db| async move {
+        let group_id = protected_with_group(
+            &db,
+            &[USER_A, USER_B],
+            vec![
+                device(USER_A, DEVICE_A),
+                device(USER_A, DEVICE_A2),
+                device(USER_B, DEVICE_B),
+            ],
+        )
+        .await;
+        let first = signed_authority(&test_authority(1, DEVICE_A, None));
+        replace_seat_list(
+            &db,
+            &SeatList {
+                id: CHANNEL.to_string(),
+                version: 1,
+                body: v2_body_by(DEVICE_A, 1, &[USER_A, USER_B], lines_naming(&first)),
+                signer_user_id: USER_A.to_string(),
+                signer_device_id: DEVICE_A.to_string(),
+                signature: signature(1),
+                handovers: vec![],
+                updated_at: at(0),
+                authority: Some(first.clone()),
+            },
+        )
+        .await;
+        edit_group(&db, &group_id, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+
+        let mut recovery =
+            test_authority(2, DEVICE_A2, Some(ChannelAuthority::sha256(&first.body)));
+        recovery
+            .owner_devices
+            .retain(|owner| owner.device_id != DEVICE_A);
+        let recovery = signed_authority(&recovery);
+        let submission = SeatListSubmission {
+            body: v2_body_by(DEVICE_A2, 2, &[USER_A, USER_B], lines_naming(&recovery)),
+            signature: signature(2),
+            signer_device_id: DEVICE_A2.to_string(),
+            handover: None,
+            authority: Some(recovery),
+        };
+        let outcome = db
+            .put_seat_list(CHANNEL, &submission, true, at(1), Some(SEAT_PUT_REASON))
+            .await
+            .unwrap();
+        assert!(outcome.signer_lost_cleared);
+        let group = open_group(&db, CHANNEL).await;
+        assert_eq!(group.signer_lost, None);
+        assert_eq!(
+            group.pending_device_removals,
+            vec![pending_device(USER_A, DEVICE_A, 1)]
+        );
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL)
+                .await
+                .unwrap()
+                .unwrap()
+                .signer_device_id,
+            DEVICE_A2
+        );
+    });
+}
+
+/// 6.3 "Sweep" (S2-D14): the channels holding an ACTIVE seat, paged in id
+/// order strictly after `after`
+#[tokio::test]
+async fn channels_with_active_seats_page_in_channel_order() {
+    database_test!(|db| async move {
+        server_ready(&db).await;
+        let channels: Vec<String> = (1..=4).map(race_channel).collect();
+        for channel_id in &channels {
+            protected_in(&db, channel_id, 10).await;
+        }
+        // The third channel's only seat is released
+        assert!(db
+            .release_channel_seat(
+                &channels[2],
+                USER_A,
+                at(0),
+                SeatReleaseCause::AccessLost,
+                at(1)
+            )
+            .await
+            .unwrap());
+        let active = [&channels[0], &channels[1], &channels[3]];
+
+        assert_eq!(
+            db.fetch_channels_with_active_seats(None, 10).await.unwrap(),
+            active.map(String::clone).to_vec()
+        );
+        assert_eq!(
+            db.fetch_channels_with_active_seats(None, 2).await.unwrap(),
+            active[..2]
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            db.fetch_channels_with_active_seats(Some(channels[1].clone()), 2)
+                .await
+                .unwrap(),
+            vec![channels[3].clone()]
+        );
+        assert!(db
+            .fetch_channels_with_active_seats(Some(channels[3].clone()), 2)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .fetch_channels_with_active_seats(None, 0)
+            .await
+            .unwrap()
+            .is_empty());
+    });
+}
+
+/// 7.1 (#218): both drivers read `formats_v2` from the config. Protect
+/// takes a v2 genesis exactly when it is on, and a seat PUT the v1-to-v2
+/// upgrade. The suite runs it with the test config (off); run it once more
+/// with `REVOLT__FEATURES__PROTECTED_CHANNELS__FORMATS_V2=true` for the on
+/// side.
+#[tokio::test]
+async fn protect_and_put_read_formats_v2_from_the_config() {
+    database_test!(|db| async move {
+        let formats_v2 = revolt_config::config()
+            .await
+            .features
+            .protected_channels
+            .formats_v2;
+        setup(&db, 10).await;
+        let v1 = submit(1, &[USER_A]);
+        let v2 = submit_v2(1, &[USER_A], v2_lines(GROUP_SALT), None);
+        let (refused, accepted) = if formats_v2 { (&v1, &v2) } else { (&v2, &v1) };
+
+        let error = db
+            .protect_channel(CHANNEL, refused, at(0))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error), "{error:?}");
+        db.protect_channel(CHANNEL, accepted, at(0)).await.unwrap();
+        assert_eq!(
+            db.fetch_seat_list(CHANNEL).await.unwrap().unwrap().is_v2(),
+            formats_v2
+        );
+
+        // The upgrade over a stored v1 list
+        replace_seat_list(&db, &stored_row(&v1)).await;
+        let upgrade = submit_v2(2, &[USER_A], v2_lines(GROUP_SALT), None);
+        let result = db
+            .put_seat_list(CHANNEL, &upgrade, true, at(1), Some(SEAT_PUT_REASON))
+            .await;
+        if formats_v2 {
+            assert!(result.unwrap().list.is_v2());
+        } else {
+            assert!(is_failed_validation(&result.unwrap_err()));
+        }
+    });
+}
+
+/// 2.3 S2-D21 / O-4 (S2-W1 wave audit F-1), the exploit sequence: B's
+/// device received the keys (the stamp), the owner unseats B (cools 14
+/// days), B is in no Text group (as once a Remove commit dropped its
+/// `member_added`), the owner re-seats B while it cools (no new slot) and
+/// unseats B again. That release cools as well, so the slot stays used and
+/// cannot rotate to C. Control: clear the stamp on every reactivation.
+#[tokio::test]
+async fn a_reseat_while_cooling_keeps_the_slot_used_so_the_next_unseat_cools() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(2, &[USER_A]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert!(seat.is_cooling(at(2)));
+
+        // The re-seat reactivates the cooling row and keeps the stamp
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                at(2),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert!(seat.is_active());
+        assert_eq!(seat.keys_received_at, Some(at(0)));
+
+        // The second unseat cools from now; it is not `DeviceNeverJoined`
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(4, &[USER_A]),
+                true,
+                at(3),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.released, vec![USER_B]);
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+        assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(4)),
+            2
+        );
+
+        // So the slot does not pass to C
+        let error = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(5, &[USER_A, USER_C]),
+                true,
+                at(4),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap_err();
+        assert!(is_seat_cap(&error, 2), "{error:?}");
+    });
+}
+
+/// F-1 counter-test: a re-seat after a release that did not cool (the user
+/// never received the keys) is a new slot use, and its next unseat still
+/// frees at once. Control: carry or set the stamp on every reactivation.
+#[tokio::test]
+async fn a_reseat_after_a_never_joined_release_still_frees_at_once() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        let assert_freed = |seat: ChannelSeat| {
+            assert_eq!(
+                seat.release_cause,
+                Some(SeatReleaseCause::DeviceNeverJoined)
+            );
+            assert_eq!(seat.cooldown_until, None);
+        };
+
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                at(1),
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
+
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            at(2),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        assert_freed(seat_of(&db, CHANNEL, USER_B).await);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), at(2)),
+            1
+        );
+    });
+}
+
+/// F-1 counter-test: a re-seat after the cooldown ended is a new slot use
+/// and starts unstamped, so with no keys received since, its next unseat
+/// frees at once. Control: keep the stamp once the cooldown has ended.
+#[tokio::test]
+async fn a_reseat_after_the_cooldown_ended_starts_unstamped() {
+    database_test!(|db| async move {
+        setup(&db, 2).await;
+        db.protect_channel(CHANNEL, &submit(1, &[USER_A, USER_B]), at(0))
+            .await
+            .unwrap();
+        edit_seat(&db, CHANNEL, USER_B, |seat| {
+            seat.keys_received_at = Some(at(0))
+        })
+        .await;
+
+        db.put_seat_list(
+            CHANNEL,
+            &submit(2, &[USER_A]),
+            true,
+            at(1),
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(seat.cooldown_until, Some(at(1 + SEAT_COOLDOWN_DAYS)));
+
+        let expired = at(1 + SEAT_COOLDOWN_DAYS + 1);
+        assert!(!seat.is_cooling(expired));
+        let outcome = db
+            .put_seat_list(
+                CHANNEL,
+                &submit(3, &[USER_A, USER_B]),
+                true,
+                expired,
+                Some(SEAT_PUT_REASON),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.claimed, vec![USER_B]);
+        assert_eq!(seat_of(&db, CHANNEL, USER_B).await.keys_received_at, None);
+
+        let later = at(1 + SEAT_COOLDOWN_DAYS + 2);
+        db.put_seat_list(
+            CHANNEL,
+            &submit(4, &[USER_A]),
+            true,
+            later,
+            Some(SEAT_PUT_REASON),
+        )
+        .await
+        .unwrap();
+        let seat = seat_of(&db, CHANNEL, USER_B).await;
+        assert_eq!(
+            seat.release_cause,
+            Some(SeatReleaseCause::DeviceNeverJoined)
+        );
+        assert_eq!(seat.cooldown_until, None);
+        assert_eq!(
+            channel_seats_used(&db.fetch_channel_seats(CHANNEL).await.unwrap(), later),
+            1
+        );
+    });
+}
+
+/// F-1, pure: a seat that cooled on the `text_group_user_ids` fallback alone
+/// (no stamp) and is re-seated while cooling gets its release time as the
+/// stamp, so its next release cools even once a Remove commit took the user
+/// out of every Text group. Control: keep the stamp without that fallback.
+#[test]
+fn a_cooling_reseat_of_a_fallback_release_stamps_the_release_time() {
+    let mut seat = active_seats(&[USER_B]).remove(0);
+    seat.release(at(1), SeatReleaseCause::OwnerUnseat, true)
+        .unwrap();
+    assert_eq!(seat.keys_received_at, None);
+    assert!(seat.is_cooling(at(2)));
+
+    seat.reactivate(at(2));
+    assert_eq!(seat.keys_received_at, Some(at(1)));
+    seat.release(at(3), SeatReleaseCause::OwnerUnseat, false)
+        .unwrap();
+    assert_eq!(seat.release_cause, Some(SeatReleaseCause::OwnerUnseat));
+    assert_eq!(seat.cooldown_until, Some(at(3 + SEAT_COOLDOWN_DAYS)));
+}
+
+// --- 6.1 Text create: the generation cap and the creator rule ---------------
+
+/// CHANNEL's stored v1 list (version 1, seats A and B), signed by A's first
+/// device
+fn stored_text_list() -> SeatList {
+    SeatList {
+        id: CHANNEL.to_string(),
+        version: 1,
+        body: body_with(1, 1_790_812_800_000, &[USER_A, USER_B]),
+        signer_user_id: USER_A.to_string(),
+        signer_device_id: DEVICE_A.to_string(),
+        signature: signature(1),
+        handovers: vec![],
+        updated_at: at(0),
+        authority: None,
+    }
+}
+
+/// `prepare_text_group` of a creator-only group by `creator` at
+/// `generation`, against [`stored_text_list`]
+fn prepare_by(
+    creator: &MlsMemberDevice,
+    generation: u32,
+    rule: &TextGroupCreator,
+) -> revolt_result::Result<MlsGroup> {
+    prepare_text_group(&text_group(0x01, creator, generation), &stored_text_list(), rule)
+}
+
+/// S2-D33 (#204): one cap, 65535, on both the S1 and the v2 names; every
+/// generation up to it is prepared, 65536 is refused. Control: cap at 63.
+#[test]
+fn prepare_text_group_caps_the_generation_at_65535() {
+    assert_eq!(MAX_TEXT_GROUP_GENERATION, 65_535);
+    assert_eq!(MAX_TEXT_GROUP_GENERATION_V2, MAX_TEXT_GROUP_GENERATION);
+
+    let owner = device(USER_A, DEVICE_A);
+    for generation in [0, 63, 64, 65_535] {
+        let prepared = prepare_by(&owner, generation, &TextGroupCreator::SignerDevice).unwrap();
+        assert_eq!(prepared.generation, Some(generation));
+        assert_eq!(prepared.kind, MlsGroupKind::Text);
+    }
+    let error = prepare_by(&owner, 65_536, &TextGroupCreator::SignerDevice).unwrap_err();
+    assert!(is_failed_validation(&error));
+}
+
+/// 6.1 (S2-D17d, #213), pure: under the rule only the list's signer device
+/// creates; under the recovery exception another device of the signer USER
+/// creates a successor, but never a first group, never from the lost device
+/// itself, never for another user, and never once the list names a signer
+/// device other than the lost one. Controls: drop each recovery condition.
+#[test]
+fn prepare_text_group_admits_another_signer_user_device_only_for_recovery() {
+    let signer = device(USER_A, DEVICE_A);
+    let other = device(USER_A, DEVICE_A2);
+    let recovery = TextGroupCreator::SignerUserRecovery {
+        lost_device_id: DEVICE_A.to_string(),
+    };
+
+    prepare_by(&signer, 0, &TextGroupCreator::SignerDevice).unwrap();
+    prepare_by(&signer, 1, &TextGroupCreator::SignerDevice).unwrap();
+    let error = prepare_by(&other, 1, &TextGroupCreator::SignerDevice).unwrap_err();
+    assert!(is_failed_validation(&error), "another device under the rule");
+
+    let prepared = prepare_by(&other, 1, &recovery).unwrap();
+    assert_eq!(prepared.created_by, other);
+    assert_eq!(prepared.members, vec![other.clone()]);
+    assert_eq!(prepared.member_added.len(), 1);
+    assert_eq!(prepared.member_added[0].device_id, DEVICE_A2);
+    assert_eq!(prepared.member_added[0].epoch, 0);
+    assert_eq!(prepared.signer_lost, None);
+
+    let stale = TextGroupCreator::SignerUserRecovery {
+        lost_device_id: DEVICE_C.to_string(),
+    };
+    for (case, creator, generation, rule) in [
+        ("a first group", &other, 0, &recovery),
+        ("the lost device itself", &signer, 1, &recovery),
+        ("another user", &device(USER_B, DEVICE_B), 1, &recovery),
+        ("the list names another signer device", &other, 1, &stale),
+    ] {
+        let error = prepare_by(creator, generation, rule).unwrap_err();
+        assert!(is_failed_validation(&error), "{case}: {error:?}");
+    }
+}
+
+/// 6.1 (S2-D17d, #213) through both drivers: a recovery successor by another
+/// device of the signer user lands and carries `signer_lost` over; the same
+/// create under the signer-device rule, and a recovery once a list naming
+/// another signer device has landed, are refused and write nothing.
+/// Control: the drivers ignore `creator` (always the signer-device rule).
+#[tokio::test]
+async fn a_recovery_successor_by_a_signer_user_device_lands_through_both_drivers() {
+    database_test!(|db| async move {
+        let first = protected_with_group(&db, &[USER_A, USER_B], vec![device(USER_A, DEVICE_A)])
+            .await;
+        edit_group(&db, &first, |group| {
+            group.signer_lost = Some(lost(DEVICE_A, 0))
+        })
+        .await;
+        let recovery = TextGroupCreator::SignerUserRecovery {
+            lost_device_id: DEVICE_A.to_string(),
+        };
+
+        // Under the rule another device of the owner is refused
+        let successor = text_group(0xdd, &device(USER_A, DEVICE_A2), 1);
+        let error = db
+            .create_text_mls_group(&successor, Some(&first))
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error));
+        assert_eq!(open_group(&db, CHANNEL).await.id, first);
+
+        assert_eq!(
+            db.create_text_mls_group_as(&successor, Some(&first), &recovery)
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
+        let stored = open_group(&db, CHANNEL).await;
+        assert_eq!(stored.id, successor.id);
+        assert_eq!(stored.created_by, device(USER_A, DEVICE_A2));
+        assert_eq!(stored.signer_lost, Some(lost(DEVICE_A, 0)));
+        assert_eq!(stored.member_added.len(), 1);
+        assert_eq!(stored.member_added[0].device_id, DEVICE_A2);
+
+        // A list naming another signer device landed after the route's
+        // reads: the recovery premise is stale
+        let mut row = db.fetch_seat_list(CHANNEL).await.unwrap().unwrap();
+        let moved = submit_by(DEVICE_A2, 2, &[USER_A, USER_B]);
+        row.version = 2;
+        row.body = moved.body;
+        row.signature = moved.signature;
+        row.signer_device_id = DEVICE_A2.to_string();
+        replace_seat_list(&db, &row).await;
+
+        let stale = text_group(0xee, &device(USER_A, DEVICE_C), 2);
+        let error = db
+            .create_text_mls_group_as(&stale, Some(&successor.id), &recovery)
+            .await
+            .unwrap_err();
+        assert!(is_failed_validation(&error));
+        assert_eq!(open_group(&db, CHANNEL).await.id, successor.id);
+
+        // The new signer device creates it under the rule
+        let next = text_group(0xee, &device(USER_A, DEVICE_A2), 2);
+        assert_eq!(
+            db.create_text_mls_group(&next, Some(&successor.id))
+                .await
+                .unwrap(),
+            MlsGroupCreateOutcome::Created
+        );
     });
 }

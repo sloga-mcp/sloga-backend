@@ -1,0 +1,9 @@
+We received your Take It Down request {{{reference}}}. A person will review it and we will act within 48 hours of receiving it. Keep this link to check the status or add information:
+
+{{{url}}}
+
+If you did not send this request, you can ignore this email.
+
+You can also contact the FTC at TakeItDown.ftc.gov.
+
+Sloga

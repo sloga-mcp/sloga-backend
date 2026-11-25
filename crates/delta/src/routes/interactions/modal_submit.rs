@@ -88,8 +88,16 @@ pub async fn interaction_modal_submit(
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
     // A thread is judged by its parent: a thread under a protected channel
-    // takes no bot traffic either
-    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+    // takes no bot traffic either. The typed values are plain text, so an
+    // encrypted-only group, or an encrypted-only submitter in a group, is
+    // refused here, before the submit slot is claimed.
+    crate::util::interactions::ensure_interactions_allowed_in(
+        db,
+        &user,
+        &channel,
+        &permission_channel,
+    )
+    .await?;
 
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
@@ -172,7 +180,8 @@ mod test {
     use crate::util::test::TestHarness;
     use revolt_database::events::client::EventV1;
     use revolt_database::{
-        Bot, Channel, Database, Interaction, InteractionKind, Member, PartialChannel, Server, User,
+        Bot, Channel, Database, Interaction, InteractionKind, Member, PartialChannel, PartialUser,
+        Server, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -435,5 +444,178 @@ mod test {
         assert_eq!(on_open.0, Status::Forbidden, "{:?}", on_open);
         assert!(on_open.1.contains("MissingPermission"), "{}", on_open.1);
         assert_eq!(on_protected, on_open);
+    }
+
+    /// A group of `owner` and a new bot, stored directly and unmarked
+    async fn group_with_bot(harness: &TestHarness, owner: &User) -> (Channel, Bot) {
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), owner, None)
+            .await
+            .expect("`Bot`");
+        let group = Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone(), bot.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        (group, bot)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    async fn set_e2ee_only(db: &Database, user: &User, e2ee_only: bool) {
+        let mut user = user.clone();
+        user.update(
+            db,
+            PartialUser {
+                e2ee_only: Some(e2ee_only),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("e2ee_only");
+    }
+
+    fn assert_encryption_required(answer: &(Status, String), side: &str) {
+        assert_eq!(answer.0, Status::Forbidden, "{:?}", answer);
+        let error: serde_json::Value = serde_json::from_str(&answer.1).expect("JSON");
+        assert_eq!(error["type"], "EncryptionRequired", "{}", answer.1);
+        assert_eq!(error["side"], side, "{}", answer.1);
+    }
+
+    /// Encrypted-only: the typed values are plain text, so a form opened in
+    /// a group is refused at submit once the group is marked (`group`) and
+    /// for a submitter who has turned encrypted-only on since (`sender`).
+    /// Neither claims the submit slot or reaches the bot. With the mark and
+    /// the flag lifted the identical submit is delivered (the control).
+    ///
+    /// Control: the helper's `plain_write_allowed` call removed → the first
+    /// submit is delivered (204).
+    #[test]
+    fn modal_submit_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(modal_submit_in_an_encrypted_only_group_is_refused_case())
+    }
+
+    async fn modal_submit_in_an_encrypted_only_group_is_refused_case() {
+        let mut harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+        let submission_id = opened_form(&harness, &bot, &user, group.id()).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let marked = submit(&harness, &session.token, &submission_id).await;
+        mark_group_raw(&harness.db, group.id(), false).await;
+
+        set_e2ee_only(&harness.db, &user, true).await;
+        let sender = submit(&harness, &session.token, &submission_id).await;
+        set_e2ee_only(&harness.db, &user, false).await;
+
+        assert_encryption_required(&marked, "group");
+        assert_encryption_required(&sender, "sender");
+
+        let stored = harness
+            .db
+            .fetch_interaction(&submission_id)
+            .await
+            .expect("submission row");
+        assert!(!stored.submitted);
+        assert!(stored.submitted_values.is_empty());
+
+        // Marker on the bot's private topic: once seen, anything the refused
+        // submits published there is buffered too
+        let marker = ulid::Ulid::new().to_string();
+        EventV1::ChannelAck {
+            id: ulid::Ulid::new().to_string(),
+            user: bot.id.clone(),
+            message_id: marker.clone(),
+        }
+        .private(bot.id.clone())
+        .await;
+        harness
+            .wait_for_event(&format!("{}!", bot.id), |event| match event {
+                EventV1::ChannelAck { message_id, .. } => message_id == &marker,
+                _ => false,
+            })
+            .await;
+        harness.assert_no_buffered_event(&format!("{}!", bot.id), |event| match event {
+            EventV1::InteractionCreate { interaction } => interaction.id == submission_id,
+            _ => false,
+        });
+
+        let delivered = submit(&harness, &session.token, &submission_id).await;
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(delivered.0, Status::NoContent, "{:?}", delivered);
+        let stored = harness
+            .db
+            .fetch_interaction(&submission_id)
+            .await
+            .expect("submission row");
+        assert!(stored.submitted);
+    }
+
+    /// `only_enforced = false` lifts both refusals. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn modal_submit_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(
+            modal_submit_in_an_encrypted_only_group_is_allowed_when_not_enforced_case(),
+        )
+    }
+
+    async fn modal_submit_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (_, session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+        let submission_id = opened_form(&harness, &bot, &user, group.id()).await;
+        mark_group_raw(&harness.db, group.id(), true).await;
+        set_e2ee_only(&harness.db, &user, true).await;
+
+        let (_, presence_session) = revolt_presence::create_session(&bot.id, 0).await;
+        let delivered = submit(&harness, &session.token, &submission_id).await;
+        revolt_presence::delete_session(&bot.id, presence_session).await;
+
+        assert_eq!(delivered.0, Status::NoContent, "{:?}", delivered);
     }
 }

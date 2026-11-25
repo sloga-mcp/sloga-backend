@@ -1,13 +1,15 @@
 use std::collections::HashSet;
 
 use iso8601_timestamp::Timestamp;
+use revolt_database::voice::{get_channel_node, is_screen_leg, VoiceClient};
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref, mls_join_intent_payload,
-    mls_text_enforced_device_cap, Database, E2EEIdentity, MlsGroup, MlsJoinIntent, MlsMemberDevice,
-    SeatListBody, Session, User, MAX_MLS_GROUP_MEMBERS,
+    mls_text_enforced_device_cap, ChannelEntitlement, Database, E2EEIdentity, MlsGroup,
+    MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody, Session, TextJoinPayload, User,
+    MAX_MLS_GROUP_MEMBERS,
 };
 use revolt_models::v0;
-use revolt_result::{create_error, Result};
+use revolt_result::{create_error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 use rocket_empty::EmptyResponse;
 
@@ -38,26 +40,106 @@ pub(crate) fn all_member_devices_rejoining(
     })
 }
 
+/// What the call path does with a join intent from a user whose OTHER
+/// device holds the group's only leaf
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SiblingVerdict {
+    /// The plain "another device" 400
+    Refuse,
+    /// Close the group: its only leaf-holder has left the call
+    CloseUnservable,
+}
+
+/// The sibling close's decision (sibling-device plan §3), pure. `live` is
+/// the call's SFU-live member devices as (user, device), `None` when the
+/// SFU gave no answer to act on: an unanswered SFU never closes. A sibling
+/// still in the call refuses too (two live seats, a failed eviction).
+pub(crate) fn sibling_verdict(
+    user_id: &str,
+    sibling_device_id: &str,
+    live: Option<&HashSet<(String, String)>>,
+) -> SiblingVerdict {
+    match live {
+        None => SiblingVerdict::Refuse,
+        Some(live) if live.contains(&(user_id.to_string(), sibling_device_id.to_string())) => {
+            SiblingVerdict::Refuse
+        }
+        Some(_) => SiblingVerdict::CloseUnservable,
+    }
+}
+
+/// Whether the sibling's registration read says its identity row is gone,
+/// by error type. A read error is no evidence either way. Pure.
+pub(crate) fn sibling_registration_gone<T>(registration: &Result<T>) -> bool {
+    matches!(registration, Err(error) if matches!(error.error_type, ErrorType::NotFound))
+}
+
+/// The member devices among SFU participant identities, as (user, device).
+/// A screen leg is a helper of its owner, never a member, and a bare
+/// identity names no device, so neither counts; only an identity of exactly
+/// two non-empty `:` segments does. Pure.
+pub(crate) fn live_member_devices(
+    identities: impl IntoIterator<Item = String>,
+) -> HashSet<(String, String)> {
+    identities
+        .into_iter()
+        .filter(|identity| !is_screen_leg(identity))
+        .filter_map(|identity| {
+            let mut segments = identity.split(':');
+            match (segments.next(), segments.next(), segments.next()) {
+                (Some(user), Some(device), None) if !user.is_empty() && !device.is_empty() => {
+                    Some((user.to_string(), device.to_string()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The call's SFU-live member devices, or `None` when there is no answer
+/// to act on: no node pinned for the channel, a Redis failure, no such room
+/// on the SFU, or a failed listing. Never an error; the caller refuses on
+/// `None`.
+async fn live_call_devices(
+    voice_client: &VoiceClient,
+    channel_id: &str,
+) -> Option<HashSet<(String, String)>> {
+    let node = get_channel_node(channel_id).await.ok().flatten()?;
+    match voice_client
+        .list_participants_if_present(&node, channel_id)
+        .await
+    {
+        Ok(Some(participants)) => Some(live_member_devices(
+            participants
+                .into_iter()
+                .map(|participant| participant.identity),
+        )),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 /// # Signal MLS Join Intent
 ///
 /// Store a signed join intent for a call group and fan out
 /// `MlsJoinRequested` to member devices (plan §1.4 step 1).
 ///
 /// The signature — Ed25519 by the device identity key over the canonical
-/// `acutest:e2ee:mls-join:v1` payload — is verified server-side as defense
-/// in depth; the REAL trust decision is each admitting member's client-side
-/// re-verification against its own pinned identity for this device. The
-/// server can never grow a roster: an Add is only ever issued by a member
-/// that verified this intent itself.
+/// `acutest:e2ee:mls-join:v1` payload (on a protected channel whose list is
+/// v2, the Text join payload, design §3.13) — is verified server-side as
+/// defense in depth; the REAL trust decision is each admitting member's
+/// client-side re-verification against its own pinned identity for this
+/// device. The server can never grow a roster: an Add is only ever issued
+/// by a member that verified this intent itself.
 ///
 /// A protected channel's Text group takes its own path (protected channels
 /// design §6.1 "Join intent"): the caller must be seated, a user may join
-/// with several devices up to the enforced device cap, and the route never
-/// closes the group.
+/// with several devices up to the enforced device cap, recovery intents
+/// pass with the growth flag off, and the route never closes the group.
 #[openapi(tag = "MLS")]
 #[post("/groups/<group_id>/join_intent", data = "<data>")]
 pub async fn join_intent(
     db: &State<Database>,
+    voice_client: &State<VoiceClient>,
     user: User,
     session: Session,
     group_id: String,
@@ -71,7 +153,7 @@ pub async fn join_intent(
             super::as_unknown_group(db, &user, Some(&session)).await
         }
         GroupDispatch::CallOrUnknown(Some(_)) => {
-            call_join_intent(db, user, session, group_id, data.into_inner()).await
+            call_join_intent(db, voice_client, user, session, group_id, data.into_inner()).await
         }
         GroupDispatch::Text(group) => {
             text_join_intent(db, &user, &session, group, data.into_inner()).await
@@ -82,6 +164,7 @@ pub async fn join_intent(
 /// The call path, unchanged by protected channels
 async fn call_join_intent(
     db: &Database,
+    voice_client: &VoiceClient,
     user: User,
     session: Session,
     group_id: String,
@@ -114,6 +197,18 @@ async fn call_join_intent(
 
     // One device per user per call (plan §1.5), enforced at the DS — two
     // native layers on two devices share no state; only the DS sees both.
+    // A user holds one seat in a call: a second device's join
+    // force-disconnects the first, so a second leaf of one user is only
+    // ever a stale one.
+    // ANOTHER device of the user as the SOLE member = a stale sibling
+    // (sibling-device plan §3): the only leaf-holder is this user's own
+    // device, evicted by this newer join, so nobody is left to admit
+    // anyone. Mirroring the solo-stale close below, close the group, on
+    // positive evidence only: the sibling's registration is gone (a removed
+    // device, checked before the SFU is asked), or the SFU answered and the
+    // sibling is not in the call. NotFound sends the joiner straight to
+    // CREATE through the client's not_found arm. Anything else, a failed
+    // registration read included, keeps the 400.
     // SAME device already a member = a REJOIN: the device wiped its local
     // group state (rejoin-fresh) but its stale leaf is still in the roster,
     // and it can never remove itself (RFC 9420 forbids self-removal). Fan
@@ -123,6 +218,32 @@ async fn call_join_intent(
     let mut rejoin = false;
     if let Some(existing) = group.member_device_of(&user.id) {
         if existing.device_id != data.device_id {
+            if revolt_config::config().await.features.mls_sibling_close && group.members.len() == 1
+            {
+                let registration = db.fetch_e2ee_identity(&user.id, &existing.device_id).await;
+                if sibling_registration_gone(&registration) {
+                    db.close_mls_group(&group.id).await?;
+                    log::info!(
+                        "mls: closed call group {} in channel {}: sole leaf was a removed sibling",
+                        group.id,
+                        group.channel_id
+                    );
+                    return Err(create_error!(NotFound));
+                }
+
+                let live = live_call_devices(voice_client, &group.channel_id).await;
+                if sibling_verdict(&user.id, &existing.device_id, live.as_ref())
+                    == SiblingVerdict::CloseUnservable
+                {
+                    db.close_mls_group(&group.id).await?;
+                    log::info!(
+                        "mls: closed call group {} in channel {}: sole leaf was a stale sibling",
+                        group.id,
+                        group.channel_id
+                    );
+                    return Err(create_error!(NotFound));
+                }
+            }
             return Err(create_error!(FailedValidation {
                 error: "another device of this user is already in the call group".to_string()
             }));
@@ -150,7 +271,7 @@ async fn call_join_intent(
         }));
     }
 
-    let intent = join_intent_row(&group, &user.id, &data);
+    let intent = join_intent_row(&group, &user.id, &data, None, None);
     store_join_intent(db, &intent).await?;
 
     // Dual-reload deadlock (rejoin plan §5): a rejoin is only ever served
@@ -169,7 +290,7 @@ async fn call_join_intent(
         }
     }
 
-    fan_out_join_requested(&group, &user.id, &data, rejoin).await;
+    fan_out_join_requested(&group, &intent, rejoin).await;
 
     Ok(EmptyResponse)
 }
@@ -178,8 +299,26 @@ async fn call_join_intent(
 /// order: the group's channel and ViewChannel, where any failure answers
 /// [`super::as_unknown_group`] so a hidden or deleted channel's group is
 /// indistinguishable from an unknown id; the shared caller checks; request
-/// validation; the growth gate (a join is growth, decision 5 (W2)); the
-/// caller's seat; then the join rules.
+/// validation; the recovery or growth gate; the caller's seat; then the
+/// join rules.
+///
+/// The gate follows the operation, never a client flag (§6.3 "Recovery
+/// gates", S2-D32, #213, #220). A rejoin (this device is already a member)
+/// and the signer user's replacement device while recovery is open
+/// ([`signer_replacement`]) are RECOVERY: the available gate and an
+/// entitlement that allows text traffic ([`allows_text_traffic`]), so they
+/// pass with the growth flag off. Any other new device is growth: the
+/// growth gate, and the same entitlement predicate at the cap check.
+///
+/// On a channel whose stored list is v2 the intent is signed over the Text
+/// join payload and its `generation` and `issued_at` are stored and fanned
+/// out (§3.13, #218); a v1 channel keeps the S1 payload and S1 rows.
+///
+/// A Text intent stays outstanding for `text_rejoin_window_secs` (24 h),
+/// measured from the row's server-stamped `created_at` by the driver's rule
+/// 6 and the routes that read intents; the signed `issued_at` is only
+/// bounds-checked (§3.13). The 30 s window of
+/// [`all_member_devices_rejoining`] is the Call plane's alone.
 ///
 /// Two call rules do not apply. A user may hold several member devices, up
 /// to the enforced device cap. And this route never closes the group (§2.5
@@ -203,7 +342,19 @@ async fn text_join_intent(
     }
     super::require_mls_caller(db, user, Some(session)).await?;
     validate_join_intent(&data)?;
-    super::require_text_gate(TextGate::Growth).await?;
+
+    // Device-aware: THIS device already a member is a rejoin (members
+    // remove its stale leaf under the rejoin case, §3.12.2, and re-Add it).
+    // Any other device is a NEW device of a user who may already have some
+    let rejoin = group.has_member(&user.id, &data.device_id);
+    let seat_list = db.fetch_seat_list(&group.channel_id).await?;
+    let recovery = rejoin || signer_replacement(db, &group, seat_list.as_ref(), &user.id).await?;
+    let gate = if recovery {
+        TextGate::Available
+    } else {
+        TextGate::Growth
+    };
+    super::require_text_gate(gate).await?;
     super::require_seated(db, &group.channel_id, &user.id).await?;
 
     // A superseded group takes no joins; its successor does
@@ -212,45 +363,124 @@ async fn text_join_intent(
     }
 
     // The session must be bound to the joining device itself, and the
-    // intent signed by it, before anything below is reachable
+    // intent signed by it, before anything below is reachable. The payload
+    // depends on the stored list's format, so a Text group without one
+    // takes no intent at all
     let identity = bound_identity(db, &user.id, session, &data.device_id).await?;
-    verify_join_signature(&identity, &user.id, &group.id, &data)?;
+    let seat_list = seat_list.ok_or_else(|| create_error!(InvalidOperation))?;
+    let (generation, issued_at) =
+        verify_text_join_signature(&identity, &user.id, &group, &seat_list, &data)?;
 
-    // Device-aware: THIS device already a member is a rejoin (members
-    // remove its stale leaf under the rejoin case, §3.12.2, and its next
-    // intent is admitted as a new device). Any other device is a NEW device
-    // of a user who may already have some, refused once the user's member
-    // devices reach the enforced cap. The Text commit transaction enforces
-    // the same cap on the Add; this refusal only spares the admit round
-    // trip and tells the joiner why.
-    let rejoin = group.has_member(&user.id, &data.device_id);
-    if !rejoin {
+    // A rejoin is exempt from the cap (it is not new), but it is recovery,
+    // which still needs an entitlement that allows text traffic. A new
+    // device is refused once the user's counted member devices reach the
+    // enforced cap. The Text commit transaction enforces the cap again on
+    // the Add, counting every post-commit leaf; this refusal only spares
+    // the admit round trip and tells the joiner why.
+    if rejoin {
+        require_text_traffic(db, &group.channel_id).await?;
+    } else {
         let max = enforced_device_cap(db, &group.channel_id).await?;
-        if max != 0 && group.member_devices_of(&user.id).count() >= max as usize {
+        if max != 0 && capped_device_count(&group, &user.id) >= max as usize {
             return Err(create_error!(DeviceCapReached { max: max as usize }));
         }
     }
 
-    let intent = join_intent_row(&group, &user.id, &data);
+    let intent = join_intent_row(&group, &user.id, &data, generation, issued_at);
     store_join_intent(db, &intent).await?;
 
-    fan_out_join_requested(&group, &user.id, &data, rejoin).await;
+    fan_out_join_requested(&group, &intent, rejoin).await;
 
     Ok(EmptyResponse)
+}
+
+/// Whether a NEW device of `user_id` is the signer user's replacement
+/// device while recovery is open (§6.1 "S2 additions", widened in #213):
+/// `user_id` is the stored list's signer user, and the open group carries
+/// `signer_lost` OR the list's signer device has no registered E2EE
+/// identity. The second is the server's own directory, so recovery never
+/// depends on `signer_lost` having been written. A read error other than
+/// an absent identity is returned, so it refuses (fails closed).
+async fn signer_replacement(
+    db: &Database,
+    group: &MlsGroup,
+    seat_list: Option<&SeatList>,
+    user_id: &str,
+) -> Result<bool> {
+    let Some(seat_list) = seat_list else {
+        return Ok(false);
+    };
+    if seat_list.signer_user_id != user_id {
+        return Ok(false);
+    }
+    if group.signer_lost.is_some() {
+        return Ok(true);
+    }
+
+    match db
+        .fetch_e2ee_identity(&seat_list.signer_user_id, &seat_list.signer_device_id)
+        .await
+    {
+        Ok(_) => Ok(false),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// The entitlement predicate every Text join needs, a new device and a
+/// recovery intent alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14,
+/// S2-D32 amended).
+fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
+    entitlement.allows_text_traffic()
+}
+
+/// The entitlement half of the recovery gate for a rejoin (§6.3 "Recovery
+/// gates"): a missing entitlement, or one that does not allow text
+/// traffic, refuses it with `InvalidOperation`, as it refuses a new device
+async fn require_text_traffic(db: &Database, channel_id: &str) -> Result<()> {
+    db.fetch_channel_entitlement(channel_id)
+        .await?
+        .filter(allows_text_traffic)
+        .ok_or_else(|| create_error!(InvalidOperation))?;
+
+    Ok(())
+}
+
+/// The user's member devices that count against the enforced cap at the
+/// join intent (§6.1 "S2 additions", #212): every member device of the
+/// user, a revoked device whose leaf is still there and a lost signer
+/// device included, EXCEPT one listed in `pending_device_removals`. The Add
+/// that follows must remove those in the same commit (Add-clears-pending),
+/// so they never coexist with the new device. That is the only exclusion:
+/// the commit transaction counts every post-commit leaf, as every receiver
+/// does.
+fn capped_device_count(group: &MlsGroup, user_id: &str) -> usize {
+    group
+        .member_devices_of(user_id)
+        .filter(|device| {
+            !group.pending_device_removals.iter().any(|pending| {
+                pending.user_id == device.user_id && pending.device_id == device.device_id
+            })
+        })
+        .count()
 }
 
 /// The enforced per-user device cap of a channel's Text group (§2.5,
 /// W0-fix3): `min(signed-list device_cap, effective entitlement cap)`, `0`
 /// meaning unlimited in either operand, so `0` here is unlimited too.
 ///
-/// A new device is an Add to come, and an Add needs an Active or Grace
-/// entitlement (§6.1 errors, S5b D14), so a missing, Frozen or Deleted one
-/// refuses the new device here rather than at the admitter's commit.
+/// A new device is an Add to come, and an Add of a seated member's new
+/// device needs an entitlement that allows text traffic
+/// ([`allows_text_traffic`]: Active or Grace, S5b D14; §6.1 errors, §6.3
+/// "Recovery gates"), so a missing, Frozen or Deleted one refuses the new
+/// device here rather than at the admitter's commit. The signer user's
+/// replacement device meets the same check under the recovery gate.
 async fn enforced_device_cap(db: &Database, channel_id: &str) -> Result<u32> {
     let entitlement = db
         .fetch_channel_entitlement(channel_id)
         .await?
-        .filter(|entitlement| entitlement.allows_text_traffic())
+        .filter(allows_text_traffic)
         .ok_or_else(|| create_error!(InvalidOperation))?;
     let seat_list = db
         .fetch_seat_list(channel_id)
@@ -326,8 +556,73 @@ fn verify_join_signature(
     Ok(())
 }
 
-/// The stored intent row, stamped now
-fn join_intent_row(group: &MlsGroup, user_id: &str, data: &v0::DataMlsJoinIntent) -> MlsJoinIntent {
+/// Verify a Text intent's signature by the joining device and return the
+/// signed `(generation, issued_at)` to store and fan out (design §3.13).
+///
+/// On a channel whose stored list is v2 (#218, whatever `formats_v2` says)
+/// both fields are required, `generation` must be the stored group's, and
+/// the signature must verify over the Text join payload built from the
+/// server's own group id and channel; `issued_at` is only bounds-checked.
+/// Every refusal is `FailedValidation`.
+///
+/// On a v1 channel the S1 payload is verified and the two fields are
+/// IGNORED, never stored or fanned out, so the channel behaves exactly as
+/// in S1 (§3.13: "on a v1 channel the S1 payload is used and the two
+/// fields are ignored"). Relaying them would be wrong, not just redundant:
+/// admitters choose the payload by the carrier (both fields present means
+/// the Text payload), so they would refuse an intent the server accepted
+/// over the S1 payload.
+fn verify_text_join_signature(
+    identity: &E2EEIdentity,
+    user_id: &str,
+    group: &MlsGroup,
+    seat_list: &SeatList,
+    data: &v0::DataMlsJoinIntent,
+) -> Result<(Option<u32>, Option<i64>)> {
+    if !seat_list.is_v2() {
+        verify_join_signature(identity, user_id, &group.id, data)?;
+        return Ok((None, None));
+    }
+
+    let (Some(generation), Some(issued_at)) = (data.generation, data.issued_at) else {
+        return Err(create_error!(FailedValidation {
+            error: "a join intent on a v2 channel needs generation and issued_at".to_string()
+        }));
+    };
+    if group.generation != Some(generation) {
+        return Err(create_error!(FailedValidation {
+            error: "join intent generation is not the group's".to_string()
+        }));
+    }
+
+    let payload = TextJoinPayload {
+        user_id: user_id.to_string(),
+        device_id: data.device_id.clone(),
+        channel_id: group.channel_id.clone(),
+        generation,
+        group_id: group.id.clone(),
+        key_package_ref: data.key_package_ref.clone(),
+        issued_at,
+    }
+    .build()?;
+    if !identity.verify_payload(&payload, &data.signature) {
+        return Err(create_error!(FailedValidation {
+            error: "invalid join intent signature".to_string()
+        }));
+    }
+
+    Ok((Some(generation), Some(issued_at)))
+}
+
+/// The stored intent row, stamped now. `generation` and `issued_at` are
+/// the verified Text join payload fields (`None` on Call and v1 intents).
+fn join_intent_row(
+    group: &MlsGroup,
+    user_id: &str,
+    data: &v0::DataMlsJoinIntent,
+    generation: Option<u32>,
+    issued_at: Option<i64>,
+) -> MlsJoinIntent {
     MlsJoinIntent {
         id: MlsJoinIntent::composite_id(&group.id, user_id, &data.device_id),
         group_id: group.id.clone(),
@@ -336,6 +631,8 @@ fn join_intent_row(group: &MlsGroup, user_id: &str, data: &v0::DataMlsJoinIntent
         key_package_ref: data.key_package_ref.clone(),
         signature: data.signature.clone(),
         created_at: Timestamp::now_utc(),
+        generation,
+        issued_at,
     }
 }
 
@@ -368,13 +665,10 @@ async fn store_join_intent(db: &Database, intent: &MlsJoinIntent) -> Result<()> 
 }
 
 /// Fan out to each member USER's private topic; member devices filter
-/// and self-schedule admission with leaf-index staggered timers
-async fn fan_out_join_requested(
-    group: &MlsGroup,
-    user_id: &str,
-    data: &v0::DataMlsJoinIntent,
-    rejoin: bool,
-) {
+/// and self-schedule admission with leaf-index staggered timers. The event
+/// carries the stored row's signed fields, so an admitter rebuilds the
+/// payload the server verified (§3.13 "Carriers").
+async fn fan_out_join_requested(group: &MlsGroup, intent: &MlsJoinIntent, rejoin: bool) {
     let member_users: HashSet<String> = group
         .members
         .iter()
@@ -385,11 +679,13 @@ async fn fan_out_join_requested(
         EventV1::MlsJoinRequested {
             group_id: group.id.clone(),
             channel_id: group.channel_id.clone(),
-            user_id: user_id.to_string(),
-            device_id: data.device_id.clone(),
-            key_package_ref: data.key_package_ref.clone(),
-            signature: data.signature.clone(),
+            user_id: intent.user_id.clone(),
+            device_id: intent.device_id.clone(),
+            key_package_ref: intent.key_package_ref.clone(),
+            signature: intent.signature.clone(),
             rejoin,
+            generation: intent.generation,
+            issued_at: intent.issued_at,
         }
         .private(member_user)
         .await;
@@ -399,15 +695,17 @@ async fn fan_out_join_requested(
 /// The Text path (W2 decisions 1, 5 and 7, design §6.1 "Join intent").
 /// Every flag case is its own `#[test]`: `overwrite_config` runs once per
 /// process, BEFORE the harness primes the config cache, so these need
-/// nextest (one process per test). The test config has every flag on.
+/// nextest (one process per test). The test config has every flag on
+/// except `formats_v2`, which the v2 cases turn on.
 #[cfg(test)]
 mod tests {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-    use iso8601_timestamp::Timestamp;
+    use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         events::client::EventV1, mls_join_intent_payload, Account, BotInformation,
         ChannelEntitlementState, Database, MlsCommit, MlsCommitOutcome, MlsGroup, MlsMemberDevice,
-        PartialChannel, Session, User,
+        PartialChannel, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListV2Lines,
+        Session, TextJoinPayload, User,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -419,8 +717,8 @@ mod tests {
     use super::super::{dispatch_group, require_channel_access, GroupDispatch};
     use super::join_intent;
     use crate::util::test::{
-        ProtectedChannel, TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_SLOT_CAP,
-        MEMBER_DEVICE_SEED,
+        ProtectedChannel, TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_ISSUED_AT,
+        FIXTURE_SLOT_CAP, MEMBER_DEVICE_SEED, NEW_OWNER_DEVICE_SEED, OWNER_DEVICE_SEED,
     };
 
     /// Call the route as rocket does
@@ -431,8 +729,15 @@ mod tests {
         group_id: &str,
         data: v0::DataMlsJoinIntent,
     ) -> Result<EmptyResponse> {
+        use revolt_database::voice::VoiceClient;
+        use std::collections::HashMap;
+
+        // No SFU nodes: the Text path never lists, and on a call group the
+        // sibling close gets no SFU answer, so it refuses
+        let voice_client = VoiceClient::new(HashMap::new());
         join_intent(
             <&State<Database>>::from(db),
+            <&State<VoiceClient>>::from(&voice_client),
             user.clone(),
             session.clone(),
             group_id.to_string(),
@@ -457,6 +762,53 @@ mod tests {
             device_id: device.device_id.clone(),
             key_package_ref: key_package_ref.to_string(),
             signature: device.sign(&payload),
+            generation: None,
+            issued_at: None,
+        }
+    }
+
+    /// The Text join payload (design §3.13) of `device` for `group`
+    fn text_payload(
+        device: &TestE2EEDevice,
+        group: &MlsGroup,
+        key_package_ref: &str,
+        generation: u32,
+        issued_at: i64,
+    ) -> String {
+        TextJoinPayload {
+            user_id: device.user_id.clone(),
+            device_id: device.device_id.clone(),
+            channel_id: group.channel_id.clone(),
+            generation,
+            group_id: group.id.clone(),
+            key_package_ref: key_package_ref.to_string(),
+            issued_at,
+        }
+        .build()
+        .expect("a text join payload")
+    }
+
+    /// A v2 join intent by `device` for `group`: the Text join payload at
+    /// the group's generation, signed by it, carrying both signed fields
+    fn signed_text_intent(
+        device: &TestE2EEDevice,
+        group: &MlsGroup,
+        key_package_ref: &str,
+        issued_at: i64,
+    ) -> v0::DataMlsJoinIntent {
+        let generation = group.generation.expect("a Text group generation");
+        v0::DataMlsJoinIntent {
+            device_id: device.device_id.clone(),
+            key_package_ref: key_package_ref.to_string(),
+            signature: device.sign(&text_payload(
+                device,
+                group,
+                key_package_ref,
+                generation,
+                issued_at,
+            )),
+            generation: Some(generation),
+            issued_at: Some(issued_at),
         }
     }
 
@@ -468,12 +820,13 @@ mod tests {
         }
     }
 
-    /// A device id of `user` that is in no directory (a leaf only)
-    fn synthetic_device(user: &User, index: u32) -> MlsMemberDevice {
-        MlsMemberDevice {
-            user_id: user.id.clone(),
-            device_id: format!("{:032x}", 0xd0_0000 + index),
-        }
+    /// A leaf of a device of `user` registered with the key for `seed` and
+    /// bound to no session: an Add requires a registered identity (S2-D17c)
+    async fn registered_leaf(harness: &TestHarness, user: &User, seed: u8) -> MlsMemberDevice {
+        let device = harness
+            .new_e2ee_device(user, &Ulid::new().to_string(), seed)
+            .await;
+        leaf(&device)
     }
 
     /// A fresh session of `account`, with a new device bound to it
@@ -525,6 +878,7 @@ mod tests {
                     created_at: Timestamp::now_utc(),
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
+                    welcome: None,
                 },
                 &hash,
                 0,
@@ -538,6 +892,51 @@ mod tests {
             assert!(group.has_member(&device.user_id, &device.device_id));
         }
         group
+    }
+
+    /// One Text commit by `committer` at the next epoch of `group_id`,
+    /// adding `added` and removing `removed`, stamped `created_at`, through
+    /// the database primitive (the AD hash is the stored seat list's; the
+    /// entitlement operand is unlimited). Rule 6 measures the Text window
+    /// back from `created_at`, so a later stamp ages every stored intent.
+    async fn commit_at(
+        harness: &TestHarness,
+        group_id: &str,
+        committer: &TestE2EEDevice,
+        added: Vec<MlsMemberDevice>,
+        removed: Vec<MlsMemberDevice>,
+        created_at: Timestamp,
+    ) -> Result<MlsCommitOutcome> {
+        let db = &harness.db;
+        let group = db.fetch_mls_group(group_id).await.expect("the group");
+        let hash = db
+            .fetch_seat_list(&group.channel_id)
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .commit_ad_sha256()
+            .expect("the AD hash");
+        let epoch = group.current_epoch + 1;
+        let commit = b"opaque text commit";
+        db.insert_mls_text_commit(
+            &MlsCommit {
+                id: MlsCommit::composite_id(group_id, epoch),
+                group_id: group_id.to_string(),
+                epoch,
+                committer: leaf(committer),
+                commit: STANDARD_NO_PAD.encode(commit),
+                size: commit.len() as i64,
+                added,
+                removed,
+                created_at,
+                rejoin_intents: vec![],
+                removed_reasons: vec![],
+                welcome: None,
+            },
+            &hash,
+            0,
+        )
+        .await
     }
 
     /// The refusal's response body; panics when the request was accepted or
@@ -622,15 +1021,106 @@ mod tests {
         }
     }
 
+    /// The 3.1.1 group salt of the v2 fixture list
+    fn v2_group_salt() -> String {
+        "ab".repeat(32)
+    }
+
+    /// As [`text_fixture`], but the genesis list is a v2 list (§4.1.1, no
+    /// authority, `history: hidden`, `pre_history: kept`). Needs
+    /// `formats_v2` on: protect takes a v2 genesis only then (#218).
+    async fn text_v2_fixture() -> Text {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let (member_account, member_session, member) = harness.new_user().await;
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        let entitlement = harness
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        harness.join_server(&server, &member).await;
+
+        let body = SeatListBody {
+            channel_id: channel.id().to_string(),
+            version: 1,
+            device_cap: FIXTURE_DEVICE_CAP,
+            issued_at: FIXTURE_ISSUED_AT,
+            signer_user_id: owner.id.clone(),
+            signer_device_id: owner_device.device_id.clone(),
+            seats: vec![owner.id.clone(), member.id.clone()],
+            v2: Some(SeatListV2Lines {
+                authority_sha256: None,
+                history: SeatListHistory::Hidden,
+                history_boundary: None,
+                pre_history: SeatListPreHistory::Kept,
+                group_salt: v2_group_salt(),
+            }),
+        }
+        .build()
+        .expect("a canonical v2 seat list body");
+        let protect = v0::DataProtectChannel {
+            seat_list: v0::DataSeatList {
+                signature: owner_device.sign(&body),
+                body,
+                signer_device_id: owner_device.device_id.clone(),
+                handover: None,
+                authority: None,
+            },
+        };
+        harness.protect_with_db(&channel, &protect).await;
+        let channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the protected channel");
+        assert!(harness
+            .db
+            .fetch_seat_list(channel.id())
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .is_v2());
+
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        let group = harness
+            .new_text_group(&channel, &owner_device, 0, None)
+            .await;
+        assert_eq!(group.members, vec![leaf(&owner_device)]);
+
+        Text {
+            harness,
+            owner,
+            owner_account,
+            owner_session,
+            member,
+            member_account,
+            member_session,
+            member_device,
+            protected: ProtectedChannel {
+                server,
+                channel,
+                entitlement,
+                owner_device,
+                seat_list: protect.seat_list,
+            },
+            group,
+        }
+    }
+
     /// The `MlsJoinRequested` on `topic_user`'s private topic for `device`
-    /// and `key_package_ref`; returns its `rejoin` flag
-    async fn join_requested(
+    /// and `key_package_ref`; returns its signed Text payload fields and
+    /// its `rejoin` flag, `(generation, issued_at, rejoin)`
+    async fn join_request_carriers(
         harness: &mut TestHarness,
         topic_user: &str,
         group_id: &str,
         device: &TestE2EEDevice,
         key_package_ref: &str,
-    ) -> bool {
+    ) -> (Option<u32>, Option<i64>, bool) {
         let event = harness
             .wait_for_event(&format!("{topic_user}!"), |event| {
                 matches!(
@@ -648,13 +1138,30 @@ mod tests {
             .await;
         match event {
             EventV1::MlsJoinRequested {
-                user_id, rejoin, ..
+                user_id,
+                rejoin,
+                generation,
+                issued_at,
+                ..
             } => {
                 assert_eq!(user_id, device.user_id);
-                rejoin
+                (generation, issued_at, rejoin)
             }
             other => panic!("not a join request: {:?}", other),
         }
+    }
+
+    /// As [`join_request_carriers`]; returns its `rejoin` flag
+    async fn join_requested(
+        harness: &mut TestHarness,
+        topic_user: &str,
+        group_id: &str,
+        device: &TestE2EEDevice,
+        key_package_ref: &str,
+    ) -> bool {
+        join_request_carriers(harness, topic_user, group_id, device, key_package_ref)
+            .await
+            .2
     }
 
     #[test]
@@ -851,13 +1358,11 @@ mod tests {
         assert_eq!(FIXTURE_DEVICE_CAP, 5);
 
         // The owner holds 4 member devices: a fifth is accepted
-        let group = add_to_group(
-            harness,
-            &group_id,
-            owner_device,
-            (1..=3).map(|i| synthetic_device(&text.owner, i)).collect(),
-        )
-        .await;
+        let mut owner_leaves = Vec::new();
+        for seed in 0x01..=0x03 {
+            owner_leaves.push(registered_leaf(harness, &text.owner, seed).await);
+        }
+        let group = add_to_group(harness, &group_id, owner_device, owner_leaves).await;
         assert_eq!(group.member_devices_of(&text.owner.id).count(), 4);
         let (fifth_session, fifth) =
             new_bound_device(harness, &text.owner_account, &text.owner, 0x05).await;
@@ -911,7 +1416,10 @@ mod tests {
             harness,
             &group_id,
             owner_device,
-            vec![leaf(&text.member_device), synthetic_device(&text.member, 1)],
+            vec![
+                leaf(&text.member_device),
+                registered_leaf(harness, &text.member, 0x21).await,
+            ],
         )
         .await;
         assert_eq!(group.member_devices_of(&text.member.id).count(), 2);
@@ -1012,19 +1520,39 @@ mod tests {
         assert_eq!(entitlement.state, ChannelEntitlementState::Frozen);
     }
 
+    /// S1 took a rejoin here ("a rejoin only needs a Remove"). S2 makes a
+    /// rejoin a recovery operation (S2-D32, §6.3 "Recovery gates"): the
+    /// available gate AND an entitlement that allows text traffic, which
+    /// Frozen does not, so the rejoin is refused as the new device is
     #[test]
-    fn an_inactive_entitlement_refuses_new_devices_only() {
-        crate::util::test::rt().block_on(an_inactive_entitlement_refuses_new_devices_only_case())
+    fn a_frozen_entitlement_refuses_new_devices_and_rejoins() {
+        crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(None))
     }
 
-    async fn an_inactive_entitlement_refuses_new_devices_only_case() {
+    /// Deleted refuses a new device as Frozen does, and a rejoin with it.
+    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` took the
+    /// rejoin, under the S1 rule that S2-D32 replaces; it was dropped at
+    /// the merge, this test covering all it would now assert.)
+    #[test]
+    fn a_deleted_entitlement_refuses_new_devices_and_rejoins() {
+        crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(Some(
+            ChannelEntitlementState::Deleted,
+        )))
+    }
+
+    /// `state` `None` = Frozen through [`freeze_entitlement`]
+    async fn inactive_entitlement_refuses_joins(state: Option<ChannelEntitlementState>) {
         let text = text_fixture().await;
         let db = &text.harness.db;
         let group_id = &text.group.id;
 
-        freeze_entitlement(db, text.protected.channel.id()).await;
+        match state {
+            None => freeze_entitlement(db, text.protected.channel.id()).await,
+            Some(state) => set_entitlement_state(db, text.protected.channel.id(), state).await,
+        }
 
-        // A new device would need an Add, and Adds need an Active entitlement
+        // A new device would need an Add, and an Add of a seated member's
+        // new device needs an entitlement that allows text traffic
         refused(
             post(
                 db,
@@ -1038,16 +1566,20 @@ mod tests {
             "a new device",
         );
 
-        // A rejoin only needs a Remove, which never needs the entitlement
-        post(
-            db,
-            &text.owner,
-            &text.owner_session,
-            group_id,
-            signed_intent(&text.protected.owner_device, group_id, "o1"),
-        )
-        .await
-        .expect("a rejoin");
+        // A rejoin is recovery, which needs the same predicate
+        refused(
+            post(
+                db,
+                &text.owner,
+                &text.owner_session,
+                group_id,
+                signed_intent(&text.protected.owner_device, group_id, "o1"),
+            )
+            .await,
+            "InvalidOperation",
+            "a rejoin",
+        );
+        assert!(stored_intents(db, group_id).await.is_empty());
     }
 
     /// Set the channel's entitlement state, raw (S1 has no primitive for it)
@@ -1121,48 +1653,6 @@ mod tests {
             stored_intents(db, group_id).await,
             vec![(text.member.id.clone(), text.member_device.device_id.clone())]
         );
-    }
-
-    /// Deleted refuses a new device as Frozen does, and still takes a rejoin
-    #[test]
-    fn a_deleted_entitlement_refuses_new_devices_only() {
-        crate::util::test::rt().block_on(a_deleted_entitlement_refuses_new_devices_only_case())
-    }
-
-    async fn a_deleted_entitlement_refuses_new_devices_only_case() {
-        let text = text_fixture().await;
-        let db = &text.harness.db;
-        let group_id = &text.group.id;
-
-        set_entitlement_state(
-            db,
-            text.protected.channel.id(),
-            ChannelEntitlementState::Deleted,
-        )
-        .await;
-        refused(
-            post(
-                db,
-                &text.member,
-                &text.member_session,
-                group_id,
-                signed_intent(&text.member_device, group_id, "m1"),
-            )
-            .await,
-            "InvalidOperation",
-            "a new device",
-        );
-        assert!(stored_intents(db, group_id).await.is_empty());
-
-        post(
-            db,
-            &text.owner,
-            &text.owner_session,
-            group_id,
-            signed_intent(&text.protected.owner_device, group_id, "o1"),
-        )
-        .await
-        .expect("a rejoin");
     }
 
     #[test]
@@ -1313,9 +1803,10 @@ mod tests {
         .expect("the successor");
     }
 
-    /// The flag cases: a seated member's new device, and the owner's rejoin.
-    /// `refusal` is the expected `FeatureDisabled` feature, `None` = served.
-    async fn text_join_under_flags(refusal: Option<&str>) {
+    /// The flag cases: a seated member's new device (growth) and the owner's
+    /// rejoin (recovery, S2-D32). Each refusal is the expected
+    /// `FeatureDisabled` feature, `None` = served.
+    async fn text_join_under_flags(new_device_refusal: Option<&str>, rejoin_refusal: Option<&str>) {
         let text = text_fixture().await;
         let db = &text.harness.db;
         let group_id = &text.group.id;
@@ -1337,36 +1828,41 @@ mod tests {
         )
         .await;
 
-        match refusal {
-            None => {
-                new_device.expect("a new device");
-                rejoin.expect("a rejoin");
-                assert_eq!(stored_intents(db, group_id).await.len(), 2);
-            }
-            Some(feature) => {
-                for (case, result) in [("new device", new_device), ("rejoin", rejoin)] {
+        let mut served = 0;
+        for (case, result, refusal) in [
+            ("new device", new_device, new_device_refusal),
+            ("rejoin", rejoin, rejoin_refusal),
+        ] {
+            match refusal {
+                None => {
+                    result.expect(case);
+                    served += 1;
+                }
+                Some(feature) => {
                     let body = refused(result, "FeatureDisabled", case);
                     assert_eq!(body["feature"], feature, "{}: {}", case, body);
                 }
-                assert!(stored_intents(db, group_id).await.is_empty());
             }
         }
+        assert_eq!(stored_intents(db, group_id).await.len(), served);
         assert_open_with(db, group_id, &text.group.members).await;
     }
 
     #[test]
     fn a_text_join_with_every_flag_on_is_accepted() {
-        crate::util::test::rt().block_on(text_join_under_flags(None))
+        crate::util::test::rt().block_on(text_join_under_flags(None, None))
     }
 
+    /// S1 refused the rejoin here too; S2 makes it recovery (S2-D32, §7.1
+    /// flag-off table #220), so growth off stops the new device only
     #[test]
-    fn a_text_join_with_growth_off_is_refused() {
+    fn a_text_join_with_growth_off_refuses_new_devices_only() {
         crate::util::test::rt().block_on(async {
             revolt_config::overwrite_config(|settings| {
                 settings.features.protected_channels.enabled = false;
             })
             .await;
-            text_join_under_flags(Some("protected_channels")).await
+            text_join_under_flags(Some("protected_channels"), None).await
         })
     }
 
@@ -1377,7 +1873,7 @@ mod tests {
                 settings.features.e2ee_enabled = false;
             })
             .await;
-            text_join_under_flags(Some("e2ee")).await
+            text_join_under_flags(Some("e2ee"), Some("e2ee")).await
         })
     }
 
@@ -1388,7 +1884,491 @@ mod tests {
                 settings.features.media_e2ee_enabled = false;
             })
             .await;
-            text_join_under_flags(None).await
+            text_join_under_flags(None, None).await
+        })
+    }
+
+    /// v2 (§3.13, #218): a seated member's new device and the owner's
+    /// rejoin sign the Text join payload; both signed fields are stored and
+    /// fanned out
+    #[test]
+    fn a_v2_intent_verifies_over_the_text_join_payload() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_intent_verifies_over_the_text_join_payload_case().await
+        })
+    }
+
+    async fn a_v2_intent_verifies_over_the_text_join_payload_case() {
+        let mut text = text_v2_fixture().await;
+        let group_id = text.group.id.clone();
+        let owner_id = text.owner.id.clone();
+
+        post(
+            &text.harness.db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            signed_text_intent(&text.member_device, &text.group, "m1", FIXTURE_ISSUED_AT),
+        )
+        .await
+        .expect("a new device's v2 intent");
+        let stored = text
+            .harness
+            .db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(
+            (stored[0].generation, stored[0].issued_at),
+            (Some(0), Some(FIXTURE_ISSUED_AT))
+        );
+        assert_eq!(
+            join_request_carriers(
+                &mut text.harness,
+                &owner_id,
+                &group_id,
+                &text.member_device,
+                "m1"
+            )
+            .await,
+            (Some(0), Some(FIXTURE_ISSUED_AT), false)
+        );
+
+        let owner_device = &text.protected.owner_device;
+        post(
+            &text.harness.db,
+            &text.owner,
+            &text.owner_session,
+            &group_id,
+            signed_text_intent(owner_device, &text.group, "o1", FIXTURE_ISSUED_AT + 1),
+        )
+        .await
+        .expect("the owner's v2 rejoin");
+        assert_eq!(
+            join_request_carriers(&mut text.harness, &owner_id, &group_id, owner_device, "o1")
+                .await,
+            (Some(0), Some(FIXTURE_ISSUED_AT + 1), true)
+        );
+    }
+
+    /// v2 (§3.13, #218): an intent without `generation` or `issued_at`,
+    /// signed over the S1 payload (with or without the two fields), at
+    /// another generation, or with an out-of-range `issued_at` is
+    /// `FailedValidation`, and nothing is stored
+    #[test]
+    fn a_v2_channel_refuses_an_intent_without_the_text_payload() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_channel_refuses_an_intent_without_the_text_payload_case().await
+        })
+    }
+
+    async fn a_v2_channel_refuses_an_intent_without_the_text_payload_case() {
+        let text = text_v2_fixture().await;
+        let db = &text.harness.db;
+        let group = &text.group;
+        let group_id = &group.id;
+        let device = &text.member_device;
+        let good = || signed_text_intent(device, group, "m1", FIXTURE_ISSUED_AT);
+
+        let mut no_generation = good();
+        no_generation.generation = None;
+        let mut no_issued_at = good();
+        no_issued_at.issued_at = None;
+        let s1 = signed_intent(device, group_id, "m1");
+        let mut s1_with_fields = signed_intent(device, group_id, "m1");
+        s1_with_fields.generation = Some(0);
+        s1_with_fields.issued_at = Some(FIXTURE_ISSUED_AT);
+        let mut other_generation = good();
+        other_generation.generation = Some(1);
+        other_generation.signature =
+            device.sign(&text_payload(device, group, "m1", 1, FIXTURE_ISSUED_AT));
+        let mut out_of_range = good();
+        out_of_range.issued_at = Some(-1);
+
+        for (case, body) in [
+            ("no generation", no_generation),
+            ("no issued_at", no_issued_at),
+            ("the S1 payload", s1),
+            ("the S1 payload with both fields", s1_with_fields),
+            ("another generation", other_generation),
+            ("issued_at out of range", out_of_range),
+        ] {
+            refused(
+                post(db, &text.member, &text.member_session, group_id, body).await,
+                "FailedValidation",
+                case,
+            );
+        }
+        assert!(stored_intents(db, group_id).await.is_empty());
+
+        post(db, &text.member, &text.member_session, group_id, good())
+            .await
+            .expect("the Text join payload");
+    }
+
+    /// v1 (§3.13): the S1 payload is verified and `generation`/`issued_at`
+    /// are ignored, never stored or fanned out; an intent signed over the
+    /// Text payload is refused
+    #[test]
+    fn a_v1_channel_ignores_the_text_fields() {
+        crate::util::test::rt().block_on(a_v1_channel_ignores_the_text_fields_case())
+    }
+
+    async fn a_v1_channel_ignores_the_text_fields_case() {
+        let mut text = text_fixture().await;
+        let group_id = text.group.id.clone();
+        let owner_id = text.owner.id.clone();
+
+        let mut with_fields = signed_intent(&text.member_device, &group_id, "m1");
+        with_fields.generation = Some(0);
+        with_fields.issued_at = Some(FIXTURE_ISSUED_AT);
+        post(
+            &text.harness.db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            with_fields,
+        )
+        .await
+        .expect("the S1 payload on a v1 channel");
+        let stored = text
+            .harness
+            .db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents");
+        assert_eq!(stored.len(), 1);
+        assert_eq!((stored[0].generation, stored[0].issued_at), (None, None));
+        assert_eq!(
+            join_request_carriers(
+                &mut text.harness,
+                &owner_id,
+                &group_id,
+                &text.member_device,
+                "m1"
+            )
+            .await,
+            (None, None, false)
+        );
+
+        let (second_session, second) = new_bound_device(
+            &text.harness,
+            &text.member_account,
+            &text.member,
+            MEMBER_DEVICE_SEED + 1,
+        )
+        .await;
+        refused(
+            post(
+                &text.harness.db,
+                &text.member,
+                &second_session,
+                &group_id,
+                signed_text_intent(&second, &text.group, "m2", FIXTURE_ISSUED_AT),
+            )
+            .await,
+            "FailedValidation",
+            "the Text payload on a v1 channel",
+        );
+    }
+
+    /// S2-D28: a Text intent the route stored stays outstanding for
+    /// `text_rejoin_window_secs` (24 h by default), measured from its
+    /// server `created_at`: the rule-6 eviction it justifies is refused
+    /// 25 h on and admitted 23 h on, never at the 30 s Call window
+    #[test]
+    fn a_text_intent_stays_outstanding_for_the_text_window() {
+        crate::util::test::rt().block_on(a_text_intent_stays_outstanding_for_the_text_window_case())
+    }
+
+    async fn a_text_intent_stays_outstanding_for_the_text_window_case() {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+        let member_leaf = leaf(&text.member_device);
+
+        // Added a minute ago, so the rejoin intent is newer than the Add, as
+        // rule 6 requires
+        let added_at = Timestamp::now_utc()
+            .checked_sub(Duration::seconds(60))
+            .expect("a time");
+        let added = commit_at(
+            harness,
+            &group_id,
+            owner_device,
+            vec![member_leaf.clone()],
+            vec![],
+            added_at,
+        )
+        .await;
+        assert!(matches!(added, Ok(MlsCommitOutcome::Won)), "{:?}", added);
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            signed_intent(&text.member_device, &group_id, "m1"),
+        )
+        .await
+        .expect("the rejoin intent");
+        let intent = db
+            .fetch_mls_join_intents_for_group(&group_id)
+            .await
+            .expect("intents")
+            .into_iter()
+            .find(|intent| intent.device_id == member_leaf.device_id)
+            .expect("the stored intent");
+        let later = |hours: i64| {
+            intent
+                .created_at
+                .checked_add(Duration::hours(hours))
+                .expect("a time")
+        };
+        let is_member =
+            |group: &MlsGroup| group.has_member(&member_leaf.user_id, &member_leaf.device_id);
+
+        // 25 h on: past the window, so no rule admits the Remove
+        refused(
+            commit_at(
+                harness,
+                &group_id,
+                owner_device,
+                vec![],
+                vec![member_leaf.clone()],
+                later(25),
+            )
+            .await,
+            "FailedValidation",
+            "a 25 h old intent",
+        );
+        assert!(is_member(
+            &db.fetch_mls_group(&group_id).await.expect("the group")
+        ));
+
+        // 23 h on: still outstanding, so it evicts (rule 6, recorded for the
+        // recovery re-Add) and is consumed
+        let evicted = commit_at(
+            harness,
+            &group_id,
+            owner_device,
+            vec![],
+            vec![member_leaf.clone()],
+            later(23),
+        )
+        .await;
+        assert!(
+            matches!(evicted, Ok(MlsCommitOutcome::Won)),
+            "{:?}",
+            evicted
+        );
+        let group = db.fetch_mls_group(&group_id).await.expect("the group");
+        assert!(!is_member(&group));
+        assert!(group.rejoin_readd.iter().any(|entry| {
+            entry.user_id == member_leaf.user_id && entry.device_id == member_leaf.device_id
+        }));
+        assert!(stored_intents(db, &group_id).await.is_empty());
+    }
+
+    /// #212: the join intent's cap count leaves out a device listed in
+    /// `pending_device_removals` (the Add that follows must remove it in
+    /// the same commit), and nothing else
+    #[test]
+    fn the_device_cap_excludes_pending_device_removals_only() {
+        crate::util::test::rt()
+            .block_on(the_device_cap_excludes_pending_device_removals_only_case())
+    }
+
+    async fn the_device_cap_excludes_pending_device_removals_only_case() {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+
+        // Entitlement cap 2, and the member holds 2 member devices
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, Some(2))
+            .await;
+        let second = registered_leaf(harness, &text.member, 0x21).await;
+        add_to_group(
+            harness,
+            &group_id,
+            owner_device,
+            vec![leaf(&text.member_device), second.clone()],
+        )
+        .await;
+        let (third_session, third) =
+            new_bound_device(harness, &text.member_account, &text.member, 0x23).await;
+        let third_intent = || signed_intent(&third, &group_id, "m3");
+        let body = refused(
+            post(db, &text.member, &third_session, &group_id, third_intent()).await,
+            "DeviceCapReached",
+            "at the cap",
+        );
+        assert_eq!(body["max"], 2, "{}", body);
+
+        // The second device is queued for removal, so it no longer counts
+        let channels = db
+            .add_pending_device_removal(&second.user_id, &second.device_id, Timestamp::now_utc())
+            .await
+            .expect("the pending entry");
+        assert_eq!(channels, vec![text.protected.channel.id().to_string()]);
+        post(db, &text.member, &third_session, &group_id, third_intent())
+            .await
+            .expect("under the cap once the pending device is left out");
+        assert!(stored_intents(db, &group_id)
+            .await
+            .contains(&(text.member.id.clone(), third.device_id.clone())));
+    }
+
+    /// How the list signer's device was lost
+    enum SignerLoss {
+        /// The open group carries `signer_lost`; the identity is still there
+        Flagged,
+        /// The identity is gone and nothing set `signer_lost`
+        IdentityGone,
+    }
+
+    /// #213 with the growth flag off: the signer user's replacement device
+    /// is growth until the signer device is lost, then recovery; the lost
+    /// device's leaf still counts toward the cap (#212); a seated member's
+    /// new device stays growth throughout
+    async fn the_signer_users_replacement_is_recovery(loss: SignerLoss) {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+        let owner_device = &text.protected.owner_device;
+        let (replacement_session, replacement) = new_bound_device(
+            harness,
+            &text.owner_account,
+            &text.owner,
+            NEW_OWNER_DEVICE_SEED,
+        )
+        .await;
+        let replacement_intent = || signed_intent(&replacement, &group_id, "r1");
+
+        let body = refused(
+            post(
+                db,
+                &text.owner,
+                &replacement_session,
+                &group_id,
+                replacement_intent(),
+            )
+            .await,
+            "FeatureDisabled",
+            "before the loss",
+        );
+        assert_eq!(body["feature"], "protected_channels", "{}", body);
+
+        match loss {
+            SignerLoss::Flagged => {
+                let channels = db
+                    .add_pending_device_removal(
+                        &owner_device.user_id,
+                        &owner_device.device_id,
+                        Timestamp::now_utc(),
+                    )
+                    .await
+                    .expect("signer_lost");
+                assert_eq!(channels, vec![text.protected.channel.id().to_string()]);
+                let group = db.fetch_mls_group(&group_id).await.expect("the group");
+                assert!(group.signer_lost.is_some());
+                db.fetch_e2ee_identity(&owner_device.user_id, &owner_device.device_id)
+                    .await
+                    .expect("the signer identity is still registered");
+            }
+            SignerLoss::IdentityGone => {
+                assert!(db
+                    .delete_e2ee_device(&owner_device.user_id, &owner_device.device_id)
+                    .await
+                    .expect("the identity delete"));
+                let group = db.fetch_mls_group(&group_id).await.expect("the group");
+                assert!(group.signer_lost.is_none());
+            }
+        }
+
+        // The lost device still holds its leaf: at cap 1 the replacement is
+        // refused, and recovery goes through a successor instead (§6.3)
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, Some(1))
+            .await;
+        let body = refused(
+            post(
+                db,
+                &text.owner,
+                &replacement_session,
+                &group_id,
+                replacement_intent(),
+            )
+            .await,
+            "DeviceCapReached",
+            "the lost leaf counts",
+        );
+        assert_eq!(body["max"], 1, "{}", body);
+
+        harness
+            .grant_entitlement(&text.protected.channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        post(
+            db,
+            &text.owner,
+            &replacement_session,
+            &group_id,
+            replacement_intent(),
+        )
+        .await
+        .expect("the replacement device, growth off");
+        assert!(stored_intents(db, &group_id)
+            .await
+            .contains(&(text.owner.id.clone(), replacement.device_id.clone())));
+
+        let body = refused(
+            post(
+                db,
+                &text.member,
+                &text.member_session,
+                &group_id,
+                signed_intent(&text.member_device, &group_id, "m1"),
+            )
+            .await,
+            "FeatureDisabled",
+            "a member's new device",
+        );
+        assert_eq!(body["feature"], "protected_channels", "{}", body);
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_while_signer_lost() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::Flagged).await
+        })
+    }
+
+    #[test]
+    fn growth_off_admits_the_signer_users_replacement_when_its_identity_is_gone() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.enabled = false;
+            })
+            .await;
+            the_signer_users_replacement_is_recovery(SignerLoss::IdentityGone).await
         })
     }
 
@@ -1411,6 +2391,8 @@ mod tests {
                     device_id: format!("{:032x}", 0xb07),
                     key_package_ref: "k1".to_string(),
                     signature: STANDARD_NO_PAD.encode([1u8; 64]),
+                    generation: None,
+                    issued_at: None,
                 },
             };
             if malformed {
@@ -1556,8 +2538,10 @@ mod tests {
             .await
             .expect("the hidden channel");
 
-        // The owner (a viewer, seated, bound) reaches the join rules: served
-        // whenever the growth gate passes, media flag or not
+        // The owner (a viewer, seated, bound) reaches the join rules. Its
+        // device holds the group's leaf, so its intent is a rejoin, which is
+        // recovery (S2-D32): served whenever E2EE is on, growth or media
+        // flag or not
         let owner_answer = post(
             db,
             &oracle.owner,
@@ -1566,10 +2550,11 @@ mod tests {
             signed_intent(&oracle.owner_device, &oracle.hidden_group_id, "o1"),
         )
         .await;
-        if features.e2ee_enabled && features.protected_channels.enabled {
+        if features.e2ee_enabled {
             owner_answer.expect("the owner is served");
         } else {
-            refused(owner_answer, "FeatureDisabled", "the owner, a gate off");
+            let body = refused(owner_answer, "FeatureDisabled", "the owner, E2EE off");
+            assert_eq!(body["feature"], "e2ee", "{}", body);
         }
 
         for caller in &oracle.callers {
@@ -1683,5 +2668,778 @@ mod tests {
             .await;
             hidden_and_deleted_text_groups_answer_as_unknown().await
         })
+    }
+
+    /// The call path's sibling close (sibling-device plan §3, §4): the
+    /// user's device B joins a call group whose only leaf is the same
+    /// user's device A. The call path is driven directly with a
+    /// `VoiceClient` whose one node is a loopback stub answering as a
+    /// LiveKit Twirp endpoint does, and the channel is pinned to that node
+    /// in Redis as `join_call` pins it. The flag case is its own `#[test]`,
+    /// as above.
+    mod sibling_close {
+        use std::{
+            collections::HashMap,
+            io::{Read, Write},
+            net::{SocketAddr, TcpListener, TcpStream},
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc, Mutex, PoisonError,
+            },
+            thread::JoinHandle,
+            time::Duration,
+        };
+
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+        use iso8601_timestamp::Timestamp;
+        use revolt_config::LiveKitNode;
+        use revolt_database::{
+            voice::{delete_channel_node, screen_leg_identity, set_channel_node, VoiceClient},
+            Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsMemberDevice, Session,
+            User,
+        };
+        use revolt_models::v0;
+        use revolt_result::{create_database_error, create_error, Result};
+        use rocket_empty::EmptyResponse;
+        use ulid::Ulid;
+
+        use super::super::{call_join_intent, sibling_registration_gone};
+        use super::{leaf, new_bound_device, refused, signed_intent, stored_intents};
+        use crate::util::test::{TestE2EEDevice, TestHarness};
+
+        /// The node the stub is registered under (in no `Revolt.toml`)
+        const NODE: &str = "sibling-close-stub-node";
+
+        /// The one SFU call the sibling close makes
+        const LIST: &str = "/twirp/livekit.RoomService/ListParticipants";
+
+        /// The refusal the client cites, unchanged by the sibling close
+        const SIBLING_REFUSAL: &str = "another device of this user is already in the call group";
+
+        /// (status line, content type, body)
+        type Reply = (&'static str, &'static str, Vec<u8>);
+
+        /// A Twirp 200 carrying a protobuf `ListParticipantsResponse`
+        fn listed(body: Vec<u8>) -> Reply {
+            ("HTTP/1.1 200 OK", "application/protobuf", body)
+        }
+
+        /// The SFU's structured "no such room": `Ok(None)` to the listing
+        fn no_such_room() -> Reply {
+            (
+                "HTTP/1.1 404 Not Found",
+                "application/json",
+                br#"{"code":"not_found","msg":"stub: not found"}"#.to_vec(),
+            )
+        }
+
+        /// A real SFU failure: `Err` to the listing
+        fn internal() -> Reply {
+            (
+                "HTTP/1.1 500 Internal Server Error",
+                "application/json",
+                br#"{"code":"internal","msg":"stub: boom"}"#.to_vec(),
+            )
+        }
+
+        fn encode_varint(mut value: usize, out: &mut Vec<u8>) {
+            while value >= 0x80 {
+                out.push((value as u8 & 0x7f) | 0x80);
+                value >>= 7;
+            }
+            out.push(value as u8);
+        }
+
+        fn length_delimited(tag: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![(tag << 3) | 2];
+            encode_varint(payload.len(), &mut out);
+            out.extend_from_slice(payload);
+            out
+        }
+
+        /// Protobuf wire bytes of a `ListParticipantsResponse` listing each
+        /// identity: `participants` = field 1, ParticipantInfo `identity` =
+        /// field 2, the layout `revolt-database`'s
+        /// `sfu_stub::list_participants_response` encodes (its decoding
+        /// test reads it back through the real client). No identities = an
+        /// empty body, a room with nobody in it.
+        fn listing(identities: &[&str]) -> Vec<u8> {
+            identities
+                .iter()
+                .flat_map(|identity| length_delimited(1, &length_delimited(2, identity.as_bytes())))
+                .collect()
+        }
+
+        /// A `VoiceClient` with one node, [`NODE`], at `url`
+        fn stub_client(url: &str) -> VoiceClient {
+            VoiceClient::new(HashMap::from([(
+                NODE.to_string(),
+                LiveKitNode {
+                    url: url.to_string(),
+                    lat: 0.0,
+                    lon: 0.0,
+                    key: "stubkey".to_string(),
+                    secret: "stubsecret-stubsecret-stubsecret".to_string(),
+                    private: true,
+                    remote: false,
+                },
+            )]))
+        }
+
+        /// A loopback SFU answering its n-th request with the n-th reply,
+        /// and any request past them with [`internal`]
+        struct Stub {
+            url: String,
+            addr: SocketAddr,
+            stop: Arc<AtomicBool>,
+            /// Every request read, as (path, body)
+            seen: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+            thread: Option<JoinHandle<()>>,
+        }
+
+        impl Stub {
+            fn serve(replies: Vec<Reply>) -> Stub {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+                let addr = listener.local_addr().expect("local addr");
+                let stop = Arc::new(AtomicBool::new(false));
+                let seen = Arc::new(Mutex::new(Vec::new()));
+
+                let thread = {
+                    let (stop, seen) = (stop.clone(), seen.clone());
+                    std::thread::spawn(move || {
+                        let mut replies = replies.into_iter();
+                        for stream in listener.incoming() {
+                            if stop.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Ok(mut stream) = stream else { continue };
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                            let Some((head, body)) = read_request(&mut stream) else {
+                                continue;
+                            };
+                            let path = head
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or_default()
+                                .to_string();
+                            seen.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push((path, body));
+                            let reply = replies.next().unwrap_or_else(internal);
+                            let _ = write_response(&mut stream, &reply);
+                        }
+                    })
+                };
+
+                Stub {
+                    url: format!("http://{addr}"),
+                    addr,
+                    stop,
+                    seen,
+                    thread: Some(thread),
+                }
+            }
+
+            /// Stop the stub and return every request it read, in order
+            fn finish(mut self) -> Vec<(String, Vec<u8>)> {
+                if let Some(thread) = self.stop_thread() {
+                    thread.join().expect("the SFU stub thread panicked");
+                }
+                self.seen
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            }
+
+            fn stop_thread(&mut self) -> Option<JoinHandle<()>> {
+                let thread = self.thread.take()?;
+                self.stop.store(true, Ordering::SeqCst);
+                // Wake the blocking accept; the loop sees `stop` and ends
+                let _ = TcpStream::connect(self.addr);
+                Some(thread)
+            }
+        }
+
+        impl Drop for Stub {
+            fn drop(&mut self) {
+                if let Some(thread) = self.stop_thread() {
+                    let _ = thread.join();
+                }
+            }
+        }
+
+        /// Read one whole HTTP request (head plus `content-length` body, so
+        /// closing never resets an unread request). `None` if the peer
+        /// closed or stalled first.
+        fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).ok()?;
+                if read == 0 {
+                    return None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_string();
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().to_string())
+                        })
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    if request.len() >= end + 4 + length {
+                        let body = request[end + 4..end + 4 + length].to_vec();
+                        return Some((head, body));
+                    }
+                }
+            }
+        }
+
+        /// Write one reply and let the connection close
+        fn write_response(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
+            let (status_line, content_type, body) = reply;
+            let mut response = format!(
+                "{status_line}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            stream.write_all(&response)
+        }
+
+        struct Sibling {
+            harness: TestHarness,
+            user: User,
+            /// Bound to `joiner`
+            session: Session,
+            /// Device A, bound to the user's first session: the leaf
+            sibling: TestE2EEDevice,
+            /// Device B, which joins
+            joiner: TestE2EEDevice,
+            channel_id: String,
+        }
+
+        /// A user owning a server channel, with two registered devices
+        async fn sibling_fixture() -> Sibling {
+            let harness = TestHarness::new().await;
+            let (account, first_session, user) = harness.new_user().await;
+            let (_, channel) = harness.new_protectable_channel(&user).await;
+            let sibling = harness
+                .new_e2ee_device(&user, &first_session.id, 0x50)
+                .await;
+            let (session, joiner) = new_bound_device(&harness, &account, &user, 0x51).await;
+            assert_ne!(sibling.device_id, joiner.device_id);
+
+            Sibling {
+                harness,
+                user,
+                session,
+                sibling,
+                joiner,
+                channel_id: channel.id().to_string(),
+            }
+        }
+
+        /// An open call group in the fixture's channel holding `members`
+        /// (the first is its creator), stored through the database primitive
+        async fn call_group(fixture: &Sibling, members: Vec<MlsMemberDevice>) -> MlsGroup {
+            let db = &fixture.harness.db;
+            let group = MlsGroup {
+                id: format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0),
+                channel_id: fixture.channel_id.clone(),
+                open: true,
+                created_by: members[0].clone(),
+                created_at: Timestamp::now_utc(),
+                current_epoch: 0,
+                members,
+                closed_at: None,
+                superseded_by: None,
+                kind: MlsGroupKind::Call,
+                generation: None,
+                seat_list_ad_sha256: None,
+                pending_removals: vec![],
+                member_added: vec![],
+                pending_device_removals: vec![],
+                signer_lost: None,
+                rejoin_readd: vec![],
+            };
+            assert!(matches!(
+                db.create_mls_group(&group, None).await.expect("call group"),
+                MlsGroupCreateOutcome::Created
+            ));
+            db.fetch_mls_group(&group.id).await.expect("the call group")
+        }
+
+        /// `data` through the call path as the fixture's user on B's
+        /// session, against a stub SFU answering `replies`, with the
+        /// group's channel pinned to the stub's node when `pinned` (and
+        /// unpinned before returning). Returns the answer and every request
+        /// the SFU read, as (path, whether it names the channel as the room).
+        async fn join(
+            fixture: &Sibling,
+            group: &MlsGroup,
+            data: v0::DataMlsJoinIntent,
+            pinned: bool,
+            replies: Vec<Reply>,
+        ) -> (Result<EmptyResponse>, Vec<(String, bool)>) {
+            let stub = Stub::serve(replies);
+            let voice_client = stub_client(&stub.url);
+            if pinned {
+                set_channel_node(&group.channel_id, NODE)
+                    .await
+                    .expect("pin the node");
+            }
+            let result = call_join_intent(
+                &fixture.harness.db,
+                &voice_client,
+                fixture.user.clone(),
+                fixture.session.clone(),
+                group.id.clone(),
+                data,
+            )
+            .await;
+            if pinned {
+                delete_channel_node(&group.channel_id)
+                    .await
+                    .expect("unpin the node");
+            }
+
+            let room = group.channel_id.as_bytes();
+            let seen = stub
+                .finish()
+                .into_iter()
+                .map(|(path, body)| {
+                    let names_room = body.windows(room.len()).any(|window| window == room);
+                    (path, names_room)
+                })
+                .collect();
+            (result, seen)
+        }
+
+        /// B's valid intent for `group`
+        fn intent(fixture: &Sibling, group: &MlsGroup) -> v0::DataMlsJoinIntent {
+            signed_intent(&fixture.joiner, &group.id, "b1")
+        }
+
+        /// The listing the SFU really answers once the sibling has gone:
+        /// B itself is live (it sends the intent from inside the call), A's
+        /// screen leg lingers, another user holds a seat, and A's own seat
+        /// is absent
+        fn stale_sibling_listing(fixture: &Sibling) -> Vec<u8> {
+            let joiner = format!("{}:{}", fixture.user.id, fixture.joiner.device_id);
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let sibling_leg = screen_leg_identity(&sibling);
+            let other = format!("{}:{:032x}", Ulid::new(), 0xf0_0002);
+            listing(&[joiner.as_str(), sibling_leg.as_str(), other.as_str()])
+        }
+
+        /// The one listing of the group's room
+        fn one_listing() -> Vec<(String, bool)> {
+            vec![(LIST.to_string(), true)]
+        }
+
+        /// The plain "another device" 400, message and all
+        #[track_caller]
+        fn assert_sibling_refusal(result: Result<EmptyResponse>, case: &str) {
+            let body = refused(result, "FailedValidation", case);
+            assert_eq!(body["error"], SIBLING_REFUSAL, "{}: {}", case, body);
+        }
+
+        /// Whether the group is open (and `closed_at` agrees)
+        async fn is_open(db: &Database, group_id: &str) -> bool {
+            let group = db.fetch_mls_group(group_id).await.expect("the group");
+            assert_eq!(group.open, group.closed_at.is_none(), "{:?}", group);
+            group.open
+        }
+
+        /// The closing answer, then the group closed with no intent stored
+        async fn assert_closed(db: &Database, group: &MlsGroup, result: Result<EmptyResponse>) {
+            refused(result, "NotFound", "a sole stale sibling");
+            assert!(!is_open(db, &group.id).await, "the group was left open");
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        /// Delete A's identity row (and its keys) through the driver
+        /// primitive, the state a device removal leaves behind
+        async fn remove_sibling(fixture: &Sibling) {
+            let db = &fixture.harness.db;
+            let (user_id, device_id) = (&fixture.user.id, &fixture.sibling.device_id);
+            assert!(db
+                .delete_e2ee_device(user_id, device_id)
+                .await
+                .expect("delete the sibling's row"));
+            refused(
+                db.fetch_e2ee_identity(user_id, device_id).await,
+                "NotFound",
+                "the removed sibling's row",
+            );
+        }
+
+        #[test]
+        fn a_sole_stale_sibling_closes_the_group() {
+            crate::util::test::rt().block_on(a_sole_stale_sibling_closes_the_group_case())
+        }
+
+        async fn a_sole_stale_sibling_closes_the_group_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The SFU answers for the room, and the sibling is not in it:
+            // only its screen leg is, beside the live joiner and another
+            // user. A verdict on the joiner's seat would see B live and
+            // refuse.
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn a_live_sibling_is_refused() {
+            crate::util::test::rt().block_on(a_live_sibling_is_refused_case())
+        }
+
+        async fn a_live_sibling_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The sibling is still registered: its row is no evidence, and
+            // the listing decides
+            assert!(db
+                .fetch_e2ee_identity(&fixture.user.id, &fixture.sibling.device_id)
+                .await
+                .is_ok());
+
+            // The sibling still holds its seat (a failed eviction) and the
+            // joiner is not listed, so only the sibling's own seat can
+            // refuse: a verdict on the joiner's seat would close
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[sibling.as_str()]))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_sibling_refusal(result, "a live sibling");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn a_sibling_beside_another_member_is_refused() {
+            crate::util::test::rt().block_on(a_sibling_beside_another_member_is_refused_case())
+        }
+
+        async fn a_sibling_beside_another_member_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let other = MlsMemberDevice {
+                user_id: Ulid::new().to_string(),
+                device_id: format!("{:032x}", 0xf0_0001),
+            };
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling), other]).await;
+
+            // Every member absent from the SFU: another user's leaf may
+            // still hold the group, so this is never a sibling close, and
+            // the SFU is not even asked
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "a sibling beside another member");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn a_forged_sibling_intent_never_closes() {
+            crate::util::test::rt().block_on(a_forged_sibling_intent_never_closes_case())
+        }
+
+        async fn a_forged_sibling_intent_never_closes_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // A closable group, but the intent is not signed by B: refused
+            // by the signature check, before the SFU is asked
+            let mut forged = intent(&fixture, &group);
+            forged.signature = STANDARD_NO_PAD.encode([0u8; 64]);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                forged,
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            let body = refused(result, "FailedValidation", "a forged intent");
+            assert_eq!(body["error"], "invalid join intent signature", "{}", body);
+            assert!(
+                is_open(db, &group.id).await,
+                "a forged intent closed the group"
+            );
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: B's genuine intent on the same setup closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn an_unpinned_channel_is_refused() {
+            crate::util::test::rt().block_on(an_unpinned_channel_is_refused_case())
+        }
+
+        async fn an_unpinned_channel_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // No node pinned for the channel: no SFU to ask, no answer
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                false,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "no node pinned");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: pinned, the same intent closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn an_unanswered_listing_is_refused() {
+            crate::util::test::rt().block_on(an_unanswered_listing_is_refused_case())
+        }
+
+        async fn an_unanswered_listing_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+            // The SFU has no such room (`Ok(None)`), or the listing fails
+            // (`Err`): neither is an answer to close on
+            for (case, reply) in [
+                ("no such room", no_such_room()),
+                ("a failed listing", internal()),
+            ] {
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    true,
+                    vec![reply],
+                )
+                .await;
+                assert_eq!(seen, one_listing(), "{}", case);
+                assert_sibling_refusal(result, case);
+                assert!(is_open(db, &group.id).await, "{}", case);
+            }
+            assert!(stored_intents(db, &group.id).await.is_empty());
+
+            // Control: an answered listing without the sibling closes it
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, one_listing());
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn the_sibling_close_off_keeps_the_refusal() {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.mls_sibling_close = false;
+                })
+                .await;
+
+                let fixture = sibling_fixture().await;
+                let db = &fixture.harness.db;
+                let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+
+                // A sole stale sibling, which closes with the flag on
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    true,
+                    vec![listed(stale_sibling_listing(&fixture))],
+                )
+                .await;
+                assert_eq!(seen, vec![]);
+                assert_sibling_refusal(result, "the kill switch off");
+                assert!(is_open(db, &group.id).await);
+                assert!(stored_intents(db, &group.id).await.is_empty());
+            })
+        }
+
+        #[test]
+        fn only_a_missing_row_reads_as_a_removed_sibling() {
+            assert!(sibling_registration_gone::<()>(&Err(create_error!(
+                NotFound
+            ))));
+            assert!(!sibling_registration_gone(&Ok(())));
+            assert!(!sibling_registration_gone::<()>(&Err(
+                create_database_error!("find_one", "e2ee_identities")
+            )));
+            assert!(!sibling_registration_gone::<()>(&Err(create_error!(
+                InternalError
+            ))));
+        }
+
+        #[test]
+        fn a_sole_removed_sibling_closes_the_group() {
+            crate::util::test::rt().block_on(a_sole_removed_sibling_closes_the_group_case())
+        }
+
+        async fn a_sole_removed_sibling_closes_the_group_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            remove_sibling(&fixture).await;
+
+            // No node pinned, so the SFU has no answer to give: the missing
+            // registration alone closes the group, and the SFU is not asked
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                false,
+                vec![listed(stale_sibling_listing(&fixture))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+
+            // Pinned, with the sibling's seat still listed (a listing alone
+            // would refuse): the missing registration closes it first, and
+            // the SFU is still not asked
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+            let sibling = format!("{}:{}", fixture.user.id, fixture.sibling.device_id);
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[sibling.as_str()]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_closed(db, &group, result).await;
+        }
+
+        #[test]
+        fn a_removed_sibling_beside_another_member_is_refused() {
+            crate::util::test::rt()
+                .block_on(a_removed_sibling_beside_another_member_is_refused_case())
+        }
+
+        async fn a_removed_sibling_beside_another_member_is_refused_case() {
+            let fixture = sibling_fixture().await;
+            let db = &fixture.harness.db;
+            let other = MlsMemberDevice {
+                user_id: Ulid::new().to_string(),
+                device_id: format!("{:032x}", 0xf0_0003),
+            };
+            let group = call_group(&fixture, vec![leaf(&fixture.sibling), other]).await;
+            remove_sibling(&fixture).await;
+
+            // Another user's leaf still holds the group, which members
+            // repair by removing the sibling's leaf: never a close
+            let (result, seen) = join(
+                &fixture,
+                &group,
+                intent(&fixture, &group),
+                true,
+                vec![listed(listing(&[]))],
+            )
+            .await;
+            assert_eq!(seen, vec![]);
+            assert_sibling_refusal(result, "a removed sibling beside another member");
+            assert!(is_open(db, &group.id).await);
+            assert!(stored_intents(db, &group.id).await.is_empty());
+        }
+
+        #[test]
+        fn the_sibling_close_off_keeps_the_refusal_for_a_removed_sibling() {
+            crate::util::test::rt().block_on(async {
+                revolt_config::overwrite_config(|settings| {
+                    settings.features.mls_sibling_close = false;
+                })
+                .await;
+
+                let fixture = sibling_fixture().await;
+                let db = &fixture.harness.db;
+                let group = call_group(&fixture, vec![leaf(&fixture.sibling)]).await;
+                remove_sibling(&fixture).await;
+
+                // A sole removed sibling, which closes with the flag on
+                let (result, seen) = join(
+                    &fixture,
+                    &group,
+                    intent(&fixture, &group),
+                    false,
+                    vec![listed(stale_sibling_listing(&fixture))],
+                )
+                .await;
+                assert_eq!(seen, vec![]);
+                assert_sibling_refusal(result, "the kill switch off, a removed sibling");
+                assert!(is_open(db, &group.id).await);
+                assert!(stored_intents(db, &group.id).await.is_empty());
+            })
+        }
     }
 }

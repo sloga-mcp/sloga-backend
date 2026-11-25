@@ -657,12 +657,14 @@ mod tests {
                 signer_user_id: OWNER.to_string(),
                 signer_device_id: OWNER_DEVICE.to_string(),
                 seats,
+                v2: None,
             }
             .build()
             .unwrap(),
             signature: signature(version),
             signer_device_id: OWNER_DEVICE.to_string(),
             handover: None,
+            authority: None,
         }
     }
 
@@ -2185,6 +2187,7 @@ mod tests {
                 &seat_list(CHANNEL, 2, &[OWNER, A], at(0, 1)),
                 true,
                 timestamp(at(0, 1)),
+                None,
             )
             .await
             .unwrap();
@@ -2571,6 +2574,41 @@ mod tests {
         });
     }
 
+    /// Test-only stamp of `keys_received_at` on a seat row, on both drivers
+    /// (the Text commit that adds the user's device stamps it, S2 2.3). Only
+    /// a seat that received the keys cools when it is released (S2-D21).
+    async fn stamp_keys_received(db: &Database, channel_id: &str, user: &str, at_ms: i64) {
+        let id = crate::ChannelSeat::composite_id(channel_id, user);
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .channel_seats
+                    .lock()
+                    .await
+                    .get_mut(&id)
+                    .expect("seat")
+                    .keys_received_at = Some(timestamp(at_ms));
+            }
+            #[cfg(feature = "mongodb")]
+            Database::MongoDb(mongo) => {
+                use ::mongodb::bson::doc;
+
+                let collection = mongo.col::<crate::ChannelSeat>("channel_seats");
+                let mut seat = collection
+                    .find_one(doc! { "_id": &id })
+                    .await
+                    .unwrap()
+                    .expect("seat");
+                seat.keys_received_at = Some(timestamp(at_ms));
+                let result = collection
+                    .replace_one(doc! { "_id": &id }, &seat)
+                    .await
+                    .unwrap();
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn downgrade_with_cooling_seats_is_pending() {
         database_test!(|db| async move {
@@ -2598,9 +2636,15 @@ mod tests {
                 &seat_list(CHANNEL, 2, &seated, at(0, 14)),
                 true,
                 timestamp(at(0, 14)),
+                None,
             )
             .await
             .unwrap();
+            // Every member received the channel's keys (S2 2.3), so a
+            // release cools (S2-D21) instead of freeing the slot at once
+            for member in &members {
+                stamp_keys_received(&db, CHANNEL, member, at(0, 14)).await;
+            }
             // Seven released: they cool for 14 days and still count
             let kept: Vec<&str> = seated
                 .iter()
@@ -2615,9 +2659,22 @@ mod tests {
                 &seat_list(CHANNEL, 3, &kept, at(0, 15)),
                 true,
                 timestamp(at(0, 15)),
+                // A list that releases seats needs a reason (S2-D20)
+                Some("making room for a smaller tier"),
             )
             .await
             .unwrap();
+            // The premise: the seven released seats cool, so 12 seats are
+            // in use against the 10 of the smaller tier
+            let seats = db.fetch_channel_seats(CHANNEL).await.unwrap();
+            assert_eq!(
+                seats
+                    .iter()
+                    .filter(|seat| seat.is_cooling(timestamp(at(0, 16))))
+                    .count(),
+                7
+            );
+            assert_eq!(crate::channel_seats_used(&seats, timestamp(at(0, 16))), 12);
 
             let pending = change_tier(&db, &tank.id, 10, "owner-down", at(0, 16))
                 .await
@@ -2689,6 +2746,7 @@ mod tests {
                 &seat_list(CHANNEL, 2, &[OWNER, A], at(0, 1)),
                 true,
                 timestamp(at(0, 1)),
+                None,
             )
             .await
             .unwrap();
@@ -3016,6 +3074,9 @@ mod tests {
             seat_list_ad_sha256: None,
             pending_removals: vec![],
             member_added: vec![],
+            pending_device_removals: vec![],
+            signer_lost: None,
+            rejoin_readd: vec![],
         }
     }
 
@@ -3067,6 +3128,7 @@ mod tests {
                     created_at: timestamp(at(0, 14)),
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
+                    welcome: None,
                 }),
                 Some(&MlsJoinIntent {
                     id: MlsJoinIntent::composite_id(&text.id, A, OWNER_DEVICE),
@@ -3076,6 +3138,8 @@ mod tests {
                     key_package_ref: "ref".to_string(),
                     signature: signature(1),
                     created_at: timestamp(at(0, 14)),
+                    generation: None,
+                    issued_at: None,
                 }),
             )
             .await;

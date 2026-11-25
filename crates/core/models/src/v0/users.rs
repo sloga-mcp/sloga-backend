@@ -84,6 +84,15 @@ auto_derived_partial!(
             serde(skip_serializing_if = "crate::if_false", default)
         )]
         pub e2ee_enabled: bool,
+        /// Whether this account only takes end-to-end encrypted direct
+        /// and group messages
+        ///
+        /// Public. Only `PUT /e2ee/only` sets it; no user edit can.
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "crate::if_false", default)
+        )]
+        pub e2ee_only: bool,
 
         /// Linked streaming channels (Twitch / YouTube), public by design
         #[cfg_attr(

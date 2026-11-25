@@ -32,7 +32,8 @@ const GROUP_ID_RAW_LEN: usize = 32;
 /// `lowercase_hex(SHA-256("sloga-text-group-v1" LF channel_id LF decimal(g)))`.
 ///
 /// A pure derivation: it does not check the channel id charset or the
-/// generation cap (63); callers compare its output with an id they hold.
+/// generation cap (`MAX_TEXT_GROUP_GENERATION`, 65535 since S2-D33);
+/// callers compare its output with an id they hold.
 pub(crate) fn text_group_id(channel_id: &str, generation: u32) -> String {
     let digest = Sha256::digest(format!("{CONTEXT_TEXT_GROUP}\n{channel_id}\n{generation}"));
     digest.iter().map(|byte| format!("{byte:02x}")).collect()

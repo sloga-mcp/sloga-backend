@@ -1,6 +1,8 @@
+use revolt_config::config;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
-use revolt_database::{Database, SoftResSheet, User};
+use revolt_database::{Channel, Database, SoftResSheet, User};
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result};
@@ -13,13 +15,14 @@ use crate::util::softres::{authorize_manage_sheet, can_see_full, publish_sheet_u
 use crate::util::softres_catalog;
 
 /// Channel gate + sheet fetch + manage authorization (creator or
-/// ManageMessages).
+/// ManageMessages). The channel is handed back for the checks that depend
+/// on it.
 async fn resolve_managed_sheet(
     db: &Database,
     target: &Reference<'_>,
     sheet_id: &str,
     user: &User,
-) -> Result<(SoftResSheet, PermissionValue)> {
+) -> Result<(SoftResSheet, PermissionValue, Channel)> {
     let channel = target.as_channel(db).await?;
 
     let permission_channel = channel.permission_target(db).await?.into_owned();
@@ -34,7 +37,7 @@ async fn resolve_managed_sheet(
 
     authorize_manage_sheet(&sheet, &user.id, &permissions)?;
 
-    Ok((sheet, permissions))
+    Ok((sheet, permissions, channel))
 }
 
 /// # Edit Soft-Reserve Sheet
@@ -60,7 +63,16 @@ pub async fn softres_edit(
         })
     })?;
 
-    let (mut sheet, permissions) = resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
+    let (mut sheet, permissions, channel) =
+        resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
+
+    // An edit rewrites the sheet's title, note and hard reserves, plain text
+    // that an encrypted-only account or group never takes. Refused right
+    // after the channel, permission and manage checks, before the event
+    // read and the write. Locking, unlocking and the export write no text
+    // and stay allowed.
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await?;
 
     if let Some(title) = data.title {
         sheet.title = title;
@@ -157,7 +169,7 @@ pub async fn softres_lock(
     target: Reference<'_>,
     sheet_id: String,
 ) -> Result<Json<v0::SoftRes>> {
-    let (sheet, permissions) = resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
+    let (sheet, permissions, _) = resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
 
     // Exactly-once arbitration (may race the event-cancel hook); losers
     // simply return the already-locked state without a duplicate fan-out.
@@ -185,7 +197,7 @@ pub async fn softres_unlock(
     target: Reference<'_>,
     sheet_id: String,
 ) -> Result<Json<v0::SoftRes>> {
-    let (sheet, permissions) = resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
+    let (sheet, permissions, _) = resolve_managed_sheet(db, &target, &sheet_id, &user).await?;
 
     db.set_sheet_unlocked(&sheet.id).await?;
 
@@ -202,9 +214,12 @@ mod test {
     use crate::{rocket, util::test::TestHarness};
     use revolt_database::Member;
     use revolt_models::v0;
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::json;
 
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_request, set_e2ee_only,
+    };
     use super::super::softres_reserve::test::create_sheet;
 
     #[test]
@@ -346,5 +361,123 @@ mod test {
             .dispatch()
             .await;
         assert_eq!(response.status(), Status::Ok);
+    }
+
+    /// Editing a sheet in a direct message with an encrypted-only side is
+    /// refused and changes nothing; locking and unlocking stay allowed.
+    /// Control: with the flags lifted the same edit is applied.
+    #[test]
+    fn e2ee_only_softres_edit_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            e2ee_only_softres_edit_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn e2ee_only_softres_edit_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = create_sheet(
+            &harness,
+            &author_session.token,
+            dm.id(),
+            json!({ "title": "Sunday MC", "edition": "classic", "raids": ["mc"] }),
+        )
+        .await;
+        let sheet_id = message.softres.expect("softres").id;
+        let path = format!("/channels/{}/softres/{}", dm.id(), sheet_id);
+        let lock_path = format!("{path}/lock");
+        let edit = json!({ "title": "Moved", "note": "bring flasks" });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer =
+            e2ee_request(&harness, Method::Patch, &path, &author_session, Some(&edit)).await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        // Locking and unlocking write no text
+        let answer = e2ee_request(&harness, Method::Post, &lock_path, &author_session, None).await;
+        assert_accepted(&answer, "a lock");
+        assert_eq!(answer.1["locked"], true, "{}", answer.1);
+        let answer =
+            e2ee_request(&harness, Method::Delete, &lock_path, &author_session, None).await;
+        assert_accepted(&answer, "an unlock");
+        // `locked` is omitted from the body when false
+        assert!(!answer.1["locked"].as_bool().unwrap_or(false), "{}", answer.1);
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer =
+            e2ee_request(&harness, Method::Patch, &path, &author_session, Some(&edit)).await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+
+        let sheet = harness.db.fetch_sheet(&sheet_id).await.expect("sheet");
+        assert_eq!(sheet.title, "Sunday MC", "a refused edit changed the title");
+        assert_eq!(sheet.note, None, "a refused edit changed the note");
+        assert_eq!(sheet.edited_at, None, "a refused edit was recorded");
+
+        // Control: no flags, the same edit
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer =
+            e2ee_request(&harness, Method::Patch, &path, &author_session, Some(&edit)).await;
+        assert_accepted(&answer, "no flags");
+        assert_eq!(
+            harness
+                .db
+                .fetch_sheet(&sheet_id)
+                .await
+                .expect("sheet")
+                .title,
+            "Moved"
+        );
+    }
+
+    /// With `only_enforced = false` the same edit is applied
+    #[test]
+    fn e2ee_only_softres_edit_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_softres_edit_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_softres_edit_allowed_when_not_enforced_case() {
+        assert!(
+            !revolt_config::config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, _, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = create_sheet(
+            &harness,
+            &author_session.token,
+            dm.id(),
+            json!({ "title": "Sunday MC", "edition": "classic", "raids": ["mc"] }),
+        )
+        .await;
+        let sheet_id = message.softres.expect("softres").id;
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        let answer = e2ee_request(
+            &harness,
+            Method::Patch,
+            &format!("/channels/{}/softres/{}", dm.id(), sheet_id),
+            &author_session,
+            Some(&json!({ "title": "Moved" })),
+        )
+        .await;
+        assert_accepted(&answer, "an encrypted-only author and peer");
+        assert_eq!(
+            harness
+                .db
+                .fetch_sheet(&sheet_id)
+                .await
+                .expect("sheet")
+                .title,
+            "Moved"
+        );
     }
 }

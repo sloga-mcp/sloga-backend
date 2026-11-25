@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+
 use revolt_result::Result;
 
-use crate::{E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey};
+use crate::{
+    E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, E2EERemovedDevice,
+};
 
 #[cfg(feature = "mongodb")]
 mod mongodb;
@@ -13,6 +17,13 @@ pub trait AbstractE2EE: Sync + Send {
 
     /// Fetch all device identities for a user
     async fn fetch_e2ee_identities(&self, user_id: &str) -> Result<Vec<E2EEIdentity>>;
+
+    /// The subset of `user_ids` that has at least one device identity.
+    /// One query; an empty slice gives an empty set.
+    async fn fetch_e2ee_user_ids_with_identity(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashSet<String>>;
 
     /// Insert a new device identity
     ///
@@ -32,6 +43,17 @@ pub trait AbstractE2EE: Sync + Send {
         session_id: &str,
         at: iso8601_timestamp::Timestamp,
     ) -> Result<()>;
+
+    /// Set a device's `last_session_id` to `""` in ONE filtered update that
+    /// matches only while the row is bound to `session_id` (multi-device
+    /// D5). Returns whether a row matched; never touches `last_seen_at`,
+    /// never deletes, never clobbers a different binding.
+    async fn unbind_e2ee_identity_session_if(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        session_id: &str,
+    ) -> Result<bool>;
 
     /// Delete a device: identity, one-time keys and queued envelopes.
     /// Idempotent; returns whether the identity existed.
@@ -161,4 +183,82 @@ pub trait AbstractE2EE: Sync + Send {
 
     /// Delete ALL of a user's key-backup blobs (account-deletion cascade).
     async fn delete_all_e2ee_backups(&self, user_id: &str) -> Result<usize>;
+
+    /// Record a removal tombstone (multi-device D8). Idempotent: an existing
+    /// tombstone for (user_id, device_id) is kept as it is, `removed_at`
+    /// included.
+    async fn upsert_e2ee_removed_device(&self, removed: &E2EERemovedDevice) -> Result<()>;
+
+    /// Whether (user_id, device_id) carries a removal tombstone
+    async fn is_e2ee_device_removed(&self, user_id: &str, device_id: &str) -> Result<bool>;
+
+    /// Delete ALL of a user's removal tombstones (account-deletion
+    /// cascade). Returns how many were removed.
+    async fn delete_all_e2ee_removed_devices(&self, user_id: &str) -> Result<usize>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::super::tests::make_device;
+
+    #[tokio::test]
+    async fn user_ids_with_identity_returns_only_listed_users_with_a_device() {
+        database_test!(|db| async move {
+            let (with_one, with_two, without, unlisted) =
+                ("user_one", "user_two", "user_none", "user_unlisted");
+
+            db.insert_e2ee_identity(&make_device(with_one).identity)
+                .await
+                .unwrap();
+            // Two devices still give one entry
+            db.insert_e2ee_identity(&make_device(with_two).identity)
+                .await
+                .unwrap();
+            db.insert_e2ee_identity(&make_device(with_two).identity)
+                .await
+                .unwrap();
+            // Has a device but is not asked about
+            db.insert_e2ee_identity(&make_device(unlisted).identity)
+                .await
+                .unwrap();
+
+            let asked = vec![
+                with_one.to_string(),
+                with_two.to_string(),
+                without.to_string(),
+            ];
+            let found = db.fetch_e2ee_user_ids_with_identity(&asked).await.unwrap();
+            assert_eq!(
+                found,
+                HashSet::from([with_one.to_string(), with_two.to_string()])
+            );
+
+            // Nobody asked about has a device
+            let found = db
+                .fetch_e2ee_user_ids_with_identity(&[without.to_string()])
+                .await
+                .unwrap();
+            assert!(found.is_empty());
+
+            // An empty slice is an empty set, not everyone
+            let found = db.fetch_e2ee_user_ids_with_identity(&[]).await.unwrap();
+            assert!(found.is_empty());
+
+            // A removed device no longer counts
+            let device = make_device(without);
+            db.insert_e2ee_identity(&device.identity).await.unwrap();
+            let found = db.fetch_e2ee_user_ids_with_identity(&asked).await.unwrap();
+            assert_eq!(found.len(), 3);
+            db.delete_e2ee_device(without, &device.identity.device_id)
+                .await
+                .unwrap();
+            let found = db.fetch_e2ee_user_ids_with_identity(&asked).await.unwrap();
+            assert_eq!(
+                found,
+                HashSet::from([with_one.to_string(), with_two.to_string()])
+            );
+        });
+    }
 }

@@ -288,6 +288,10 @@ pub enum ErrorType {
     AlreadyConnected,
     NotConnected,
     UnknownNode,
+    /// An Answer reached a direct message or group call that nobody is in
+    /// any more; the client shows "Call ended" instead of starting a new
+    /// call
+    CallEnded,
     // ? Remote control errors
     /// The sharer already has a pending control offer in this channel — a
     /// second offer must not silently overwrite the first while the target's
@@ -366,6 +370,22 @@ pub enum ErrorType {
         max: usize,
     },
 
+    // ? E2EE device errors
+    /// The E2EE device id was removed from the account (`DELETE
+    /// /e2ee/keys/{device}`) and can never be published again; the install
+    /// sets up a new device instead (multi-device plan D8)
+    E2EEDeviceRemoved,
+    /// `DELETE /e2ee/keys/{device}` refused: another session is live on the
+    /// device, or this session cannot show it is the device or another of
+    /// the account's devices. Nothing was removed
+    E2EEDeviceHeldElsewhere,
+    /// An unencrypted write was refused because one side of the conversation
+    /// takes encrypted messages only. `side` is one of `sender`,
+    /// `recipient`, `group`, `member`.
+    EncryptionRequired {
+        side: String,
+    },
+
     // ? Payment and Cipher errors
     /// Payments are switched off in the config (`[features.payments]`)
     PaymentsDisabled,
@@ -388,7 +408,7 @@ pub enum ErrorType {
     /// The channel's Text group is mid-resecure; the client refreshes its
     /// seats and text group, then retries. `reason` is one of
     /// `pending_removal`, `stale_epoch`, `stale_group`, `not_member`,
-    /// `stale_seat_list`.
+    /// `stale_seat_list`, `owner_device_lost`.
     ProtectedChannelResecuring {
         reason: String,
     },
@@ -416,6 +436,18 @@ pub enum ErrorType {
     SeatListNamesRemovedUsers {
         users: Vec<String>,
     },
+    /// A kick or ban in a server with a protected channel, or a seat list
+    /// that releases someone, needs a non-empty `X-Audit-Log-Reason`. The
+    /// reason is not part of the signed list, so a refused list is re-sent
+    /// with the same bytes and the header.
+    RemovalReasonRequired,
+    /// An ownership transfer of a server with protected channels must carry,
+    /// for each of them, a seat list with a handover to the new owner;
+    /// `channel_ids` names the channels the request lacks one for
+    ProtectedHandoverRequired {
+        channel_ids: Vec<String>,
+    },
+
     // ? Prot errors
     /// The Prot account holds less than the debit needs
     InsufficientProt {
@@ -575,6 +607,50 @@ mod tests {
         );
     }
 
+    /// The type the client keys its "set this device up again" prompt on
+    /// (multi-device D8)
+    #[cfg(feature = "serde")]
+    #[test]
+    fn device_removed_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(E2EEDeviceRemoved)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceRemoved" }));
+    }
+
+    /// The type the client keys its "this app shares a device" copy on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn device_held_elsewhere_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(E2EEDeviceHeldElsewhere)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "E2EEDeviceHeldElsewhere" }));
+    }
+
+    /// The type and the side the client keys its "encrypted only" notice on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn encryption_required_error_serializes_by_name() {
+        let error = create_error!(EncryptionRequired {
+            side: "sender".to_string(),
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "EncryptionRequired", "side": "sender" })
+        );
+        assert_eq!(
+            serde_json::to_string(&error).unwrap(),
+            r#"{"type":"EncryptionRequired","side":"sender"}"#
+        );
+    }
+
+    /// The type the client keys its "Call ended" notice on
+    #[cfg(feature = "serde")]
+    #[test]
+    fn call_ended_error_serializes_by_name() {
+        let value = serde_json::to_value(create_error!(CallEnded)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "CallEnded" }));
+    }
+
     #[cfg(feature = "serde")]
     #[test]
     fn sec009_serialized_error_with_fields_has_no_location() {
@@ -716,6 +792,55 @@ mod tests {
 
             let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
             assert_eq!(format!("{:?}", decoded.error_type), name);
+        }
+    }
+
+    /// S2-D20: the type the kick, ban and seat-list dialogs key on, with no
+    /// fields
+    #[cfg(feature = "serde")]
+    #[test]
+    fn removal_reason_required_round_trips() {
+        let value = serde_json::to_value(create_error!(RemovalReasonRequired)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "RemovalReasonRequired" })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        assert!(matches!(
+            decoded.error_type,
+            ErrorType::RemovalReasonRequired
+        ));
+    }
+
+    /// S2-D25 [S2b]: the channels still lacking a handover survive a round
+    /// trip under `channel_ids`
+    #[cfg(feature = "serde")]
+    #[test]
+    fn protected_handover_required_round_trips() {
+        let error = create_error!(ProtectedHandoverRequired {
+            channel_ids: vec![
+                "01HZXDDDDDDDDDDDDDDDDDDDDD".to_string(),
+                "01HZXEEEEEEEEEEEEEEEEEEEEE".to_string(),
+            ],
+        });
+
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "ProtectedHandoverRequired",
+                "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD", "01HZXEEEEEEEEEEEEEEEEEEEEE"],
+            })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        match decoded.error_type {
+            ErrorType::ProtectedHandoverRequired { channel_ids } => assert_eq!(
+                channel_ids,
+                ["01HZXDDDDDDDDDDDDDDDDDDDDD", "01HZXEEEEEEEEEEEEEEEEEEEEE"]
+            ),
+            other => panic!("unexpected error type {other:?}"),
         }
     }
 }

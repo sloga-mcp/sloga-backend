@@ -14,7 +14,9 @@ use axum::{
 use axum_typed_multipart::{FieldData, TryFromMultipart, TypedMultipart};
 use lazy_static::lazy_static;
 use revolt_config::{config, report_internal_error};
-use revolt_database::{iso8601_timestamp::Timestamp, Database, FileHash, Metadata, User};
+use revolt_database::{
+    iso8601_timestamp::Timestamp, upload_hash_block_key, Database, FileHash, Metadata, User,
+};
 use revolt_files::{
     create_thumbnail, decode_image, delete_from_s3, fetch_from_s3, is_animated, upload_to_s3,
     FileKeyring, AUTHENTICATION_TAG_SIZE_BYTES, LEGACY_KEY_ID,
@@ -31,6 +33,35 @@ use utoipa::ToSchema;
 use crate::{
     exif::strip_metadata, metadata::generate_metadata, mime_type::determine_mime_type, AppState,
 };
+
+mod evidence;
+
+/// Whether any `(kind, hash)` pair is on the Take It Down re-upload block
+/// list (`kind` as in `upload_hash_block_key`). A failed lookup is an error,
+/// so a database fault refuses the upload instead of letting it through.
+pub(crate) async fn upload_blocked(db: &Database, hashes: &[(&str, &str)]) -> Result<bool> {
+    for (kind, hash) in hashes {
+        if db
+            .is_hash_blocked(&upload_hash_block_key(kind, hash))
+            .await?
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Refuse an upload whose hash is blocked, with the error a blocked mime
+/// type gets. Logs no hash and no user id.
+pub(crate) async fn refuse_blocked_upload(db: &Database, hashes: &[(&str, &str)]) -> Result<()> {
+    if upload_blocked(db, hashes).await? {
+        tracing::info!("upload refused by the re-upload block");
+        return Err(create_error!(FileTypeNotAllowed));
+    }
+
+    Ok(())
+}
 
 /// Compute the sha256 of a file by streaming it, without loading it into memory
 fn hash_file(f: &mut File) -> std::io::Result<sha2::digest::Output<sha2::Sha256>> {
@@ -79,6 +110,9 @@ pub async fn router() -> Router<AppState> {
                 .layer(DefaultBodyLimit::max(crate::e2ee::E2EE_BLOB_BODY_LIMIT)),
         )
         .route("/e2ee/:blob_id", get(crate::e2ee::fetch_blob))
+        // Take It Down evidence, reviewers only; static segments win over
+        // the tag routes below
+        .route("/takedown/evidence/:file_id", get(evidence::fetch_evidence))
         // Chunked/resumable uploads. The literal `upload` segment wins over
         // the `/:tag/:file_id` parameter route (axum static-over-param
         // precedence), and file ids are 42-char nanoids so `upload` can
@@ -293,6 +327,11 @@ async fn upload_file(
     // Generate sha256 hash by streaming the file off disk
     let original_hash = report_internal_error!(hash_file(file.contents.as_file_mut()))?;
 
+    // Take It Down re-upload block, before the dedupe below can reuse a
+    // stored object
+    let original_hex = format!("{original_hash:02x}");
+    refuse_blocked_upload(&db, &[("orig", original_hex.as_str())]).await?;
+
     // Generate an ID for this file
     let id = if matches!(tag, Tag::emojis) {
         ulid::Ulid::new().to_string()
@@ -349,6 +388,9 @@ async fn upload_file(
             && file_hash.content_type.starts_with("video/");
 
         if !file_hash.iv.is_empty() && !stale_video {
+            // The reused object is the processed one
+            refuse_blocked_upload(&db, &[("proc", file_hash.processed_hash.as_str())]).await?;
+
             // The stored file may have been transcoded into a different container
             let filename = filename_for_mime(filename, mime_type, &file_hash.content_type);
 
@@ -407,6 +449,12 @@ async fn upload_file(
         hasher.update(&buf);
         hasher.finalize()
     };
+
+    // Processing can turn a different original into blocked bytes; checked
+    // before anything is stored
+    let processed_hex = format!("{processed_hash:02x}");
+    refuse_blocked_upload(&db, &[("proc", processed_hex.as_str())]).await?;
+
     let process_ratio = new_file_size as f32 / original_file_size as f32;
     let time_to_process = Instant::now() - now;
 
@@ -546,8 +594,18 @@ fn filename_for_mime(filename: String, old_mime: &str, new_mime: &str) -> String
 
 #[cfg(test)]
 mod upload_tests {
-    use super::{commit_storage, filename_for_mime, is_other_object};
-    use revolt_database::{iso8601_timestamp::Timestamp, Database, FileHash, Metadata};
+    use std::io::Write;
+
+    use super::{
+        commit_storage, filename_for_mime, is_other_object, upload_blocked, upload_file, Tag,
+        UploadPayload,
+    };
+    use axum::extract::{Path, State};
+    use axum_typed_multipart::{FieldData, FieldMetadata, TypedMultipart};
+    use revolt_database::{
+        iso8601_timestamp::Timestamp, upload_hash_block_key, Database, FileHash, Metadata,
+        UploadHashBlock, User,
+    };
     use revolt_files::{
         delete_from_s3, fetch_from_s3, object_exists_in_s3, upload_to_s3, FileKeyring,
     };
@@ -814,6 +872,149 @@ mod upload_tests {
             filename_for_mime("photo.jpeg".into(), "image/jpeg", "image/jpeg"),
             "photo.jpeg"
         );
+    }
+
+    const BLOCK_REQUEST: &str = "01TD0000000000000000000009";
+
+    async fn block(db: &Database, kind: &str, hash: &str) {
+        db.insert_upload_hash_block(&UploadHashBlock {
+            id: upload_hash_block_key(kind, hash),
+            request_id: BLOCK_REQUEST.to_string(),
+            created_at: Timestamp::now_utc(),
+            also_request_ids: vec![],
+        })
+        .await
+        .unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:02x}", sha2::Sha256::digest(bytes))
+    }
+
+    /// A stored, already-uploaded hash row, so a matching upload takes the
+    /// dedupe reuse and never reaches S3
+    async fn stored_row(db: &Database, bytes: &[u8], processed_hash: &str) {
+        db.insert_attachment_hash(&FileHash {
+            processed_hash: processed_hash.to_string(),
+            path: format!("rk/k1/{}", sha256_hex(bytes)),
+            iv: "iv".to_string(),
+            key_id: Some("k1".to_string()),
+            content_type: "text/plain".to_string(),
+            ..placeholder_row(&sha256_hex(bytes))
+        })
+        .await
+        .unwrap();
+    }
+
+    fn user() -> User {
+        User {
+            // limits() parses the id as a ULID
+            id: ulid::Ulid::new().to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn payload(bytes: &[u8]) -> TypedMultipart<UploadPayload> {
+        let mut contents = tempfile::NamedTempFile::new().unwrap();
+        contents.write_all(bytes).unwrap();
+        TypedMultipart(UploadPayload {
+            file: FieldData {
+                metadata: FieldMetadata {
+                    file_name: Some("note.txt".to_string()),
+                    ..Default::default()
+                },
+                contents,
+            },
+        })
+    }
+
+    async fn upload(db: &Database, bytes: &[u8]) -> revolt_result::Result<String> {
+        upload_file(
+            State(db.clone()),
+            user(),
+            Path(Tag::attachments),
+            payload(bytes),
+        )
+        .await
+        .map(|response| response.0.id)
+    }
+
+    fn assert_refused(result: revolt_result::Result<String>, case: &str) {
+        match result {
+            Err(error) => assert!(
+                matches!(
+                    error.error_type,
+                    revolt_result::ErrorType::FileTypeNotAllowed
+                ),
+                "{case}: expected FileTypeNotAllowed, got {error:?}"
+            ),
+            Ok(id) => panic!("{case}: a blocked upload was stored as {id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_blocked_matches_kind_and_hash() {
+        let db = Database::Reference(Default::default());
+        block(&db, "orig", "aa").await;
+
+        assert!(upload_blocked(&db, &[("orig", "aa")]).await.unwrap());
+        assert!(upload_blocked(&db, &[("proc", "bb"), ("orig", "aa")])
+            .await
+            .unwrap());
+        // Same hash under another kind is a different key
+        assert!(!upload_blocked(&db, &[("proc", "aa")]).await.unwrap());
+        assert!(!upload_blocked(&db, &[("chunk", "aa")]).await.unwrap());
+        assert!(!upload_blocked(&db, &[]).await.unwrap());
+    }
+
+    /// Take It Down re-upload block on the single-POST path: a blocked
+    /// original is refused before anything is written, and a dedupe hit whose
+    /// stored processed hash is blocked is refused instead of reused. The
+    /// control: an unblocked dedupe hit still goes through.
+    #[tokio::test]
+    async fn blocked_uploads_are_refused_before_any_write() {
+        test_env().await;
+        let db = Database::Reference(Default::default());
+
+        // Blocked original, no row yet: no hash row is created
+        let original = b"takedown re-upload block: original";
+        block(&db, "orig", &sha256_hex(original)).await;
+        assert_refused(upload(&db, original).await, "blocked original");
+        assert!(
+            db.fetch_attachment_hash(&sha256_hex(original))
+                .await
+                .is_err(),
+            "a refused upload must not create a hash row"
+        );
+
+        // Blocked original with a stored row: the dedupe is never reached
+        let stored = b"takedown re-upload block: stored original";
+        stored_row(&db, stored, "processed-stored").await;
+        block(&db, "orig", &sha256_hex(stored)).await;
+        assert_refused(upload(&db, stored).await, "blocked original, stored");
+
+        // Unblocked original whose stored processed bytes are blocked
+        let reprocessed = b"takedown re-upload block: processed";
+        stored_row(&db, reprocessed, "processed-blocked").await;
+        block(&db, "proc", "processed-blocked").await;
+        assert_refused(upload(&db, reprocessed).await, "blocked processed hash");
+
+        for bytes in [&original[..], &stored[..], &reprocessed[..]] {
+            assert!(
+                db.fetch_attachments_by_hashes(&[sha256_hex(bytes)])
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a refused upload must not mint a file"
+            );
+        }
+
+        // Control: an unblocked dedupe hit is reused as before
+        let allowed = b"takedown re-upload block: allowed";
+        stored_row(&db, allowed, "processed-allowed").await;
+        let id = upload(&db, allowed).await.expect("an unblocked upload");
+        let file = db.fetch_attachment_by_id(&id).await.unwrap();
+        assert_eq!(file.hash.as_deref(), Some(sha256_hex(allowed).as_str()));
     }
 }
 

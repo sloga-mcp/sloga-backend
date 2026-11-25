@@ -1,4 +1,11 @@
 use iso8601_timestamp::Timestamp;
+#[cfg(feature = "validator")]
+use validator::Validate;
+
+#[cfg(feature = "validator")]
+use super::takedown::validate_ticked;
+use super::takedown::{redact, redact_option};
+use super::TakedownRole;
 
 auto_derived!(
     /// User-generated platform moderation report
@@ -34,7 +41,7 @@ auto_derived!(
         /// Extortion or blackmail
         IllegalExtortion,
 
-        /// Revenge or child pornography
+        /// Legacy: revenge or underage pornography; sent by older clients
         IllegalPornography,
 
         /// Illegal hacking activity
@@ -64,6 +71,12 @@ auto_derived!(
 
         /// Harassment or abuse targeted at another user
         Harassment,
+
+        /// Intimate images shared without consent
+        NonConsensualIntimateImage,
+
+        /// Child sexual abuse material
+        ChildSexualAbuseMaterial,
     }
 
     /// Reason for reporting a user
@@ -88,6 +101,9 @@ auto_derived!(
 
         /// User is not of minimum age to use the platform
         Underage,
+
+        /// Intimate images shared without consent
+        NonConsensualIntimateImage,
     }
 
     /// The content being reported
@@ -166,3 +182,81 @@ auto_derived!(
         pub encrypted: bool,
     }
 );
+
+/// Take It Down fields sent with an in-app report. They go only into the
+/// linked Take It Down request, never into the report or its event.
+///
+/// Outside `auto_derived!` so `Debug` can be hand-written: it never prints
+/// personal data.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "schemas", derive(JsonSchema))]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[cfg_attr(feature = "validator", derive(Validate))]
+#[derive(Clone, Eq, PartialEq)]
+pub struct DataInAppTakedown {
+    pub role: TakedownRole,
+    /// How the reporter is authorized to act for the person shown
+    #[cfg_attr(feature = "validator", validate(length(max = 1000)))]
+    pub authority_note: Option<String>,
+    /// Typed full name used as the electronic signature
+    #[cfg_attr(feature = "validator", validate(length(min = 1, max = 200)))]
+    pub signature: String,
+    #[cfg_attr(feature = "validator", validate(custom = "validate_ticked"))]
+    pub signature_ack: bool,
+    #[cfg_attr(feature = "validator", validate(custom = "validate_ticked"))]
+    pub statement_ack: bool,
+    /// Contact email; the account's email when absent
+    #[cfg_attr(feature = "validator", validate(length(max = 254), email))]
+    pub email: Option<String>,
+    #[cfg_attr(feature = "validator", validate(length(max = 4000)))]
+    pub extra: Option<String>,
+}
+
+impl std::fmt::Debug for DataInAppTakedown {
+    /// Prints flags and which fields are filled in, never their content
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // deliberately printed or redacted here
+        let DataInAppTakedown {
+            role,
+            authority_note,
+            signature,
+            signature_ack,
+            statement_ack,
+            email,
+            extra,
+        } = self;
+
+        f.debug_struct("DataInAppTakedown")
+            .field("role", role)
+            .field("authority_note", &redact_option(authority_note))
+            .field("signature", &redact(signature))
+            .field("signature_ack", signature_ack)
+            .field("statement_ack", statement_ack)
+            .field("email", &redact_option(email))
+            .field("extra", &redact_option(extra))
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataInAppTakedown;
+    use crate::v0::TakedownRole;
+
+    #[test]
+    fn in_app_takedown_debug_prints_no_personal_data() {
+        let takedown = DataInAppTakedown {
+            role: TakedownRole::Authorized,
+            authority_note: Some("NOTE-SECRET".to_string()),
+            signature: "SIGNATURE-SECRET".to_string(),
+            signature_ack: true,
+            statement_ack: true,
+            email: Some("EMAIL-SECRET@example.com".to_string()),
+            extra: Some("EXTRA-SECRET".to_string()),
+        };
+        let printed = format!("{takedown:?} {takedown:#?}");
+        assert!(!printed.contains("SECRET"), "{printed}");
+        assert!(printed.contains("Authorized"));
+    }
+}
