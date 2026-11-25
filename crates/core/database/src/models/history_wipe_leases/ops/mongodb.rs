@@ -6,7 +6,7 @@ use crate::{HistoryWipeLease, MongoDb};
 
 use super::AbstractHistoryWipeLeases;
 
-/// Created by the first claim's upsert; keyed by `_id` only (no migration)
+/// Created by init.rs and revision 80; keyed by `_id` only
 static COL: &str = "history_wipe_leases";
 
 /// 11000, as a write error or a command error (`findAndModify` reports a

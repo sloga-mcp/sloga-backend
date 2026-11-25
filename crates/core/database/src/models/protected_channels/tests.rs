@@ -9228,9 +9228,21 @@ async fn s4_the_wipe_write_needs_the_flag_and_never_rewrites_a_later_state() {
 }
 
 /// What the Mongo protect runs after its message probe (test-only, see
-/// `run_protect_probe_hook`); keyed by channel id like `TEXT_CREATE_HOOK`
-static PROTECT_PROBE_HOOK: std::sync::Mutex<Option<(String, TextCreateHook)>> =
-    std::sync::Mutex::new(None);
+/// `run_protect_probe_hook`), one per channel id, so tests that set one for
+/// different channels never replace or clear each other's
+static PROTECT_PROBE_HOOK: std::sync::Mutex<Vec<(String, TextCreateHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Set (`Some`) or clear (`None`) the probe hook of `channel_id`
+fn set_protect_probe_hook(channel_id: &str, hook: Option<TextCreateHook>) {
+    let mut hooks = PROTECT_PROBE_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    hooks.retain(|(id, _)| id != channel_id);
+    if let Some(hook) = hook {
+        hooks.push((channel_id.to_string(), hook));
+    }
+}
 
 /// Called by the Mongo protect (`ops/mongodb.rs`, `#[cfg(test)]` only)
 /// inside every transaction attempt, after its message probe read
@@ -9238,8 +9250,8 @@ pub(super) async fn run_protect_probe_hook(channel_id: &str) {
     let hook = PROTECT_PROBE_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .as_ref()
-        .filter(|(id, _)| id == channel_id)
+        .iter()
+        .find(|(id, _)| id == channel_id)
         .map(|(_, hook)| hook.clone());
     if let Some(hook) = hook {
         hook().await;
@@ -9276,25 +9288,105 @@ async fn s4_a_send_racing_protect_never_leaves_plaintext_above_the_boundary() {
                     })
                 })
             };
-            *PROTECT_PROBE_HOOK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                Some((CHANNEL.to_string(), hook));
+            set_protect_probe_hook(CHANNEL, Some(hook));
             let genesis = s4_submit(
                 1,
                 &[USER_A],
                 s4_lines(Some(&boundary), SeatListPreHistory::Kept),
             );
             let protected = db.protect_channel(CHANNEL, &genesis, at(0)).await;
-            *PROTECT_PROBE_HOOK
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            set_protect_probe_hook(CHANNEL, None);
 
             assert!(
                 fired.load(SeqCst) >= 1,
                 "the hook never ran: the test proves nothing"
             );
             let channel_protected = db.fetch_channel(CHANNEL).await.unwrap().is_protected();
+            let racer_stored = db.fetch_message(&racer.id).await.is_ok();
+            assert!(
+                !(channel_protected && racer_stored),
+                "plaintext {} above the boundary {boundary} in a protected channel",
+                racer.id
+            );
+            assert!(
+                matches!(&protected, Err(error) if is_history_moved(error)),
+                "{protected:?}"
+            );
+            assert!(racer_stored);
+        })
+        .await;
+    });
+}
+
+/// How long the slow protect's first attempt waits before the send: more
+/// than `TRANSACTION_RETRY_BUDGET` (10 s, `ops/mongodb.rs`)
+const SLOW_FIRST_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(11);
+
+/// Final audit FB4: the race above, on its own channel, with a first
+/// attempt that outlasts the retry budget before the send. The first
+/// attempt still gets its one retry, which reads the row and answers
+/// `ProtectHistoryMoved`. MONGODB only. Control: the budget counting the
+/// first attempt, and protect answers `DatabaseError`.
+#[tokio::test]
+async fn s4_a_send_racing_a_slow_protect_still_gets_one_retry() {
+    database_test!(|db| async move {
+        let Database::MongoDb(_) = &db else {
+            return;
+        };
+        with_flags(S4_ON, async {
+            let channel_id = race_channel(9_801);
+            server_ready(&db).await;
+            let boundary = message_id_at(-2_000, 1);
+            let mut channel = text_channel(Some(boundary.clone()));
+            if let Channel::TextChannel { id, .. } = &mut channel {
+                *id = channel_id.clone();
+            }
+            db.insert_channel(&channel).await.unwrap();
+            let mut grant = entitlement(10);
+            grant.channel_id = channel_id.clone();
+            db.upsert_channel_entitlement(&grant, at(0)).await.unwrap();
+            let in_channel = |id: &str| Message {
+                channel: channel_id.clone(),
+                ..plaintext(id)
+            };
+            db.insert_message(&in_channel(&boundary)).await.unwrap();
+            let racer = in_channel(&message_id_at(-1_000, 42));
+
+            let fired = std::sync::Arc::new(AtomicI64::new(0));
+            let hook: TextCreateHook = {
+                let (db, racer, fired) = (db.clone(), racer.clone(), fired.clone());
+                std::sync::Arc::new(move || {
+                    let (db, racer, fired) = (db.clone(), racer.clone(), fired.clone());
+                    Box::pin(async move {
+                        if fired.fetch_add(1, SeqCst) == 0 {
+                            tokio::time::sleep(SLOW_FIRST_ATTEMPT).await;
+                            held_send(&db, &racer).await;
+                        }
+                    })
+                })
+            };
+            set_protect_probe_hook(&channel_id, Some(hook));
+            let genesis = s4_submit_in(
+                &channel_id,
+                1,
+                &[USER_A],
+                s4_lines(Some(&boundary), SeatListPreHistory::Kept),
+                AT0_MS,
+            );
+            let started = std::time::Instant::now();
+            let protected = db.protect_channel(&channel_id, &genesis, at(0)).await;
+            let took = started.elapsed();
+            set_protect_probe_hook(&channel_id, None);
+
+            assert!(
+                fired.load(SeqCst) >= 1,
+                "the hook never ran: the test proves nothing"
+            );
+            assert!(
+                took >= SLOW_FIRST_ATTEMPT,
+                "the first attempt was not slow ({took:?}): the test proves nothing"
+            );
+            let channel_protected = db.fetch_channel(&channel_id).await.unwrap().is_protected();
             let racer_stored = db.fetch_message(&racer.id).await.is_ok();
             assert!(
                 !(channel_protected && racer_stored),

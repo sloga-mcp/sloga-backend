@@ -372,6 +372,11 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection("server_legal_holds")
         .await
         .expect("Failed to create server_legal_holds collection.");
+
+    // Keyed by `_id` (the channel id) only (revision 80).
+    db.create_collection("history_wipe_leases")
+        .await
+        .expect("Failed to create history_wipe_leases collection.");
     // Prot wallet ledger (revision 76).
     for collection in PROT_COLLECTIONS {
         db.create_collection(collection)

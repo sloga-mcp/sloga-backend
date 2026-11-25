@@ -3115,14 +3115,18 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
     // block. S5b's `<= 79` block is not on this branch: the gap at 79 is
     // expected, and that block lands between the two.
     if revision <= 80 {
-        info!("Running migration [revision 80 / 12-11-2026]: Create the mls_history_links collection with its history_links_by_holder index, and the server_legal_holds collection (protected channels S4)");
+        info!("Running migration [revision 80 / 12-11-2026]: Create the mls_history_links collection with its history_links_by_holder index, and the server_legal_holds and history_wipe_leases collections (protected channels S4)");
 
-        // Two new collections; every other S4 field is an additive serde
+        // Three new collections; every other S4 field is an additive serde
         // default (docs/protected-channels-design.md 2.7 "S4 migration
-        // block"). An earlier run of this block may have created either, so
-        // only NamespaceExists is tolerated; any other failure panics, so the
-        // revision is not advanced.
-        for collection in ["mls_history_links", "server_legal_holds"] {
+        // block"). An earlier run of this block may have created any of
+        // them, so only NamespaceExists is tolerated; any other failure
+        // panics, so the revision is not advanced.
+        for collection in [
+            "mls_history_links",
+            "server_legal_holds",
+            "history_wipe_leases",
+        ] {
             if let Err(error) = db.db().create_collection(collection).await {
                 // 48 = NamespaceExists.
                 let exists = matches!(
@@ -3135,7 +3139,8 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             }
         }
 
-        // server_legal_holds is keyed by `_id` (the server id) only.
+        // server_legal_holds is keyed by `_id` (the server id) only, and
+        // history_wipe_leases by `_id` (the channel id) only.
 
         // Built from the same spec as init.rs, because the test database is
         // not migrated. A re-run is a no-op when key, name and options
@@ -4242,7 +4247,7 @@ mod afk_backfill_tests {
     }
 
     /// docs/protected-channels-design.md 2.7 "S4 migration block": the
-    /// block creates the two S4 collections, tolerating only an
+    /// block creates the three S4 collections, tolerating only an
     /// already-existing one, and the one S4 index from the spec init.rs
     /// uses (the test database is not migrated), and touches no data. The
     /// spec itself is pinned against MongoDB by
@@ -4263,8 +4268,10 @@ mod afk_backfill_tests {
             "one index step"
         );
         assert!(
-            block.contains("forcollectionin[\"mls_history_links\",\"server_legal_holds\"]"),
-            "the block creates both S4 collections"
+            block.contains(
+                "forcollectionin[\"mls_history_links\",\"server_legal_holds\",\"history_wipe_leases\",]"
+            ),
+            "the block creates the three S4 collections"
         );
         assert!(
             block.contains("command.code==48"),
@@ -4287,6 +4294,7 @@ mod afk_backfill_tests {
             "history_links_index(),",
             "create_collection(\"mls_history_links\")",
             "create_collection(\"server_legal_holds\")",
+            "create_collection(\"history_wipe_leases\")",
         ] {
             assert_eq!(
                 init.matches(needle).count(),
@@ -6264,14 +6272,22 @@ mod tests {
         names
     }
 
+    /// The collections the S4 block creates, spelled out here
+    const S4_COLLECTIONS: [&str; 3] = [
+        "mls_history_links",
+        "server_legal_holds",
+        "history_wipe_leases",
+    ];
+
     /// The S4 schema (docs/protected-channels-design.md 2.7 "S4 migration
     /// block"): `mls_history_links` carrying exactly `_id_` and
     /// `history_links_by_holder` on `{ group_id: 1, epoch: -1 }`, spelled
     /// out here rather than read from `history_links_index()` so a drift in
-    /// the shared spec fails, and `server_legal_holds` keyed by `_id` only.
+    /// the shared spec fails, and `server_legal_holds` and
+    /// `history_wipe_leases` keyed by `_id` only.
     async fn assert_has_the_s4_schema(mongo: &crate::MongoDb) {
         let collections = collection_names(mongo).await;
-        for name in ["mls_history_links", "server_legal_holds"] {
+        for name in S4_COLLECTIONS {
             assert!(
                 collections.iter().any(|collection| collection == name),
                 "{name} missing from {collections:?}"
@@ -6303,6 +6319,7 @@ mod tests {
         for (collection, want) in [
             ("mls_history_links", vec!["_id_", "history_links_by_holder"]),
             ("server_legal_holds", vec!["_id_"]),
+            ("history_wipe_leases", vec!["_id_"]),
         ] {
             let mut names = mongo
                 .col::<Document>(collection)
@@ -6314,7 +6331,7 @@ mod tests {
         }
     }
 
-    /// A fresh database (init.rs) carries both S4 collections and the
+    /// A fresh database (init.rs) carries the three S4 collections and the
     /// history-link index.
     #[tokio::test]
     async fn init_creates_the_s4_collections_and_index() {
@@ -6343,8 +6360,8 @@ mod tests {
         guard.disarm();
     }
 
-    /// Revision 80 on a database stored at 80 (S5b migrated, neither S4
-    /// collection present) creates both collections and the history-link
+    /// Revision 80 on a database stored at 80 (S5b migrated, no S4
+    /// collection present) creates the three collections and the history-link
     /// index and returns LATEST_REVISION. A second run (the stored revision
     /// unadvanced after a crash) is a no-op over them and their rows, a
     /// database stored at 79 (S2 shipped, S5b's block not on this branch)
@@ -6369,14 +6386,14 @@ mod tests {
             };
 
             // The revision-80 shape, as far as S4 is concerned: an existing
-            // collection beside it, and neither S4 collection.
+            // collection beside it, and no S4 collection.
             mongo
                 .db()
                 .create_collection("mls_groups")
                 .await
                 .expect("create mls_groups");
             let before = collection_names(&mongo).await;
-            for name in ["mls_history_links", "server_legal_holds"] {
+            for name in S4_COLLECTIONS {
                 assert!(
                     !before.iter().any(|collection| collection == name),
                     "{name} must not exist before revision 80: {before:?}"
@@ -6400,6 +6417,11 @@ mod tests {
                 .insert_one(doc! { "_id": "S1", "set_by": "U1" })
                 .await
                 .expect("insert a hold");
+            mongo
+                .col::<Document>("history_wipe_leases")
+                .insert_one(doc! { "_id": "C1", "holder": "H1" })
+                .await
+                .expect("insert a lease");
 
             // A re-run over the created collections and index succeeds.
             assert_eq!(
@@ -6408,7 +6430,7 @@ mod tests {
                 "a re-run"
             );
             assert_has_the_s4_schema(&mongo).await;
-            for collection in ["mls_history_links", "server_legal_holds"] {
+            for collection in S4_COLLECTIONS {
                 assert_eq!(
                     mongo
                         .col::<Document>(collection)

@@ -4,7 +4,8 @@
 //! 2.5 (c)): read concern `snapshot`, write concern `majority`, retried as a
 //! whole on `TransientTransactionError` (which covers write conflicts with a
 //! concurrent seat PUT or Text commit on the same group document) for as
-//! long as `TRANSACTION_RETRY_BUDGET` allows, the commit step retried on
+//! long as `TRANSACTION_RETRY_BUDGET` allows (the first attempt always gets
+//! one retry, however long it took), the commit step retried on
 //! `UnknownTransactionCommitResult` at most `MAX_COMMIT_ATTEMPTS` times;
 //! after that the existing database error is returned. The deployment runs
 //! a replica set (`rs0`), which transactions require.
@@ -94,7 +95,8 @@ fn is_call_row(row: &Document) -> bool {
 }
 
 /// How long one call keeps retrying its transaction on transient errors
-/// (see the module docs). A retry starts only while this has not run out.
+/// (see the module docs). Any retry after the first starts only while this
+/// has not run out.
 const TRANSACTION_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Backstop on whole-transaction attempts inside the budget, so a stalled
@@ -268,10 +270,12 @@ async fn retry_backoff(attempt_no: u32) {
     tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
 }
 
-/// Whether a failed attempt may be retried: inside the time budget and the
-/// attempt backstop
+/// Whether a failed attempt may be retried. The first attempt always gets
+/// one retry, however long it took: a lost race is answered by re-reading
+/// once. Later retries only inside the time budget and the attempt backstop.
 fn may_retry(attempt_no: u32, started: std::time::Instant) -> bool {
-    attempt_no < MAX_TRANSACTION_ATTEMPTS && started.elapsed() < TRANSACTION_RETRY_BUDGET
+    attempt_no == 1
+        || (attempt_no < MAX_TRANSACTION_ATTEMPTS && started.elapsed() < TRANSACTION_RETRY_BUDGET)
 }
 
 async fn commit_with_retry(session: &mut ClientSession) -> mongodb::error::Result<()> {
