@@ -13,6 +13,7 @@ pub mod config;
 pub mod events;
 
 mod database;
+mod e2ee_claim_lock;
 mod websocket;
 
 /// How often a run of failing accepts, or the recovery from one, may be

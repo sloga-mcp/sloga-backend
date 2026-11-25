@@ -2403,12 +2403,13 @@ mod tests {
         }
     }
 
-    /// The oracle case polled straight from the test thread overflows the
-    /// default 2 MiB test stack in a debug build: measured 2026-11-12, base
-    /// 12cfa219 needs 2,093,056 to 2,099,200 bytes and S4-W1 2,097,152 to
-    /// 2,105,344. Run it on a thread with room, as `payments/webhook.rs`
-    /// does. A panic in the case still fails the test.
-    fn on_a_big_stack(case: impl FnOnce() + Send + 'static) {
+    /// The oracle polls every caller class times three variants times four
+    /// targets of route futures straight from this thread (`block_on`, plus
+    /// the HTTP leg), and since the acutest merge that overflows the default
+    /// 2 MiB test stack in a debug build on both drivers. Run each case on a
+    /// thread with room (the `webhook.rs` pattern). A panic in the case still
+    /// fails the test.
+    fn on_a_roomy_stack(case: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(case)
@@ -2419,7 +2420,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_every_flag_on() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt()
                 .block_on(Box::pin(hidden_and_missing_channels_answer_alike(false)))
         })
@@ -2427,7 +2428,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_e2ee_off() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt().block_on(async {
                 revolt_config::overwrite_config(|settings| {
                     settings.features.e2ee_enabled = false;
@@ -2440,7 +2441,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_off() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt().block_on(async {
                 revolt_config::overwrite_config(|settings| {
                     settings.features.protected_channels.enabled = false;
@@ -2453,7 +2454,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_media_off() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt().block_on(async {
                 revolt_config::overwrite_config(|settings| {
                     settings.features.media_e2ee_enabled = false;
@@ -2466,7 +2467,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_growth_and_media_off() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt().block_on(async {
                 revolt_config::overwrite_config(|settings| {
                     settings.features.protected_channels.enabled = false;
@@ -2480,7 +2481,7 @@ mod tests {
 
     #[test]
     fn hidden_and_missing_channels_answer_alike_on_a_v2_channel() {
-        on_a_big_stack(|| {
+        on_a_roomy_stack(|| {
             crate::util::test::rt()
                 .block_on(Box::pin(hidden_and_missing_channels_answer_alike(true)))
         })

@@ -135,6 +135,7 @@ async fn main() {
         cron_task_wrapper(prot_cipher_backfill::task, db.clone(), amqp.clone()),
         cron_task_wrapper(protected_access_sweep::task, db.clone(), amqp.clone()),
         cron_task_wrapper(history_wipes::task, db.clone(), amqp.clone()),
+        cron_task_wrapper(takedown::task, db.clone(), amqp.clone()),
     );
 }
 

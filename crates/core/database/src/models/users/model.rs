@@ -74,6 +74,12 @@ auto_derived_partial!(
         /// fetched, signature-verified key bundle, never from this flag
         #[serde(skip_serializing_if = "crate::if_false", default)]
         pub e2ee_enabled: bool,
+        /// Whether this account only takes end-to-end encrypted direct
+        /// and group messages
+        ///
+        /// Public. Only `PUT /e2ee/only` and account deletion write it.
+        #[serde(skip_serializing_if = "crate::if_false", default)]
+        pub e2ee_only: bool,
 
         /// Linked streaming channels (public denormalized copy; tokens live
         /// ONLY in the private user_stream_connections collection)
@@ -384,6 +390,7 @@ impl Default for User {
             privileged: Default::default(),
             bot: Default::default(),
             e2ee_enabled: Default::default(),
+            e2ee_only: Default::default(),
             connections: Default::default(),
             name_style: Default::default(),
             custom_badge: Default::default(),
@@ -1363,6 +1370,8 @@ impl User {
                 discriminator: Some("0000".to_string()),
                 flags: Some(2),
                 relations: Some(Vec::new()),
+                // A deleted account is never encrypted-only
+                e2ee_only: Some(false),
                 ..Default::default()
             },
             vec![
@@ -1573,6 +1582,16 @@ impl User {
         // must keep its recovery path), so the account-deletion cascade is
         // where they die — the ONLY implicit deletion of a backup (design §5).
         db.delete_all_e2ee_backups(&self.id).await?;
+
+        // Removal tombstones (multi-device D8) outlive device revocation by
+        // design; they die with the account.
+        db.delete_all_e2ee_removed_devices(&self.id).await?;
+
+        // The encrypted DM fan-out signal's own Redis keys (who this account
+        // wrote to, who wrote to it) die with the account. Best-effort: they
+        // expire on their own anyway.
+        crate::util::antispam::forget_e2ee_fanout(&config().await.features.antispam, &self.id)
+            .await;
 
         // Streaming connections hold YouTube refresh tokens — revoke
         // (best-effort) and delete here or they outlive the account and the
@@ -2699,6 +2718,78 @@ mod tests {
             user.delete(&db)
                 .await
                 .expect("the retried deletion succeeds");
+        });
+    }
+
+    /// Multi-device D8: deleting the account removes its E2EE removal
+    /// tombstones, and no other account's
+    #[tokio::test]
+    async fn delete_removes_the_accounts_e2ee_removal_tombstones() {
+        database_test!(|db| async move {
+            const OTHER: &str = "01JA00000000000000000OTHER";
+            let mut user = User {
+                id: "01JA0000000000000000000TMB".to_string(),
+                username: "Tombstoned".to_string(),
+                discriminator: "1002".to_string(),
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+
+            let removed_at = iso8601_timestamp::Timestamp::now_utc();
+            for (user_id, fill) in [(user.id.as_str(), "a"), (user.id.as_str(), "b"), (OTHER, "a")] {
+                db.upsert_e2ee_removed_device(&crate::E2EERemovedDevice::new(
+                    user_id,
+                    &fill.repeat(32),
+                    removed_at,
+                ))
+                .await
+                .unwrap();
+            }
+            assert!(db
+                .is_e2ee_device_removed(&user.id, &"a".repeat(32))
+                .await
+                .unwrap());
+
+            user.delete(&db).await.unwrap();
+
+            for fill in ["a", "b"] {
+                assert!(
+                    !db.is_e2ee_device_removed(&user.id, &fill.repeat(32))
+                        .await
+                        .unwrap(),
+                    "the deleted account's tombstone for {fill} survived"
+                );
+            }
+            assert!(
+                db.is_e2ee_device_removed(OTHER, &"a".repeat(32))
+                    .await
+                    .unwrap(),
+                "another account's tombstone was removed"
+            );
+        });
+    }
+
+    /// A deleted account does not stay encrypted-only, in memory or stored
+    #[tokio::test]
+    async fn mark_deleted_clears_e2ee_only() {
+        database_test!(|db| async move {
+            let mut user = User {
+                id: "01JA0000000000000000000EO1".to_string(),
+                username: "EncryptedOnly".to_string(),
+                discriminator: "1003".to_string(),
+                e2ee_only: true,
+                ..Default::default()
+            };
+            db.insert_user(&user).await.unwrap();
+            assert!(db.fetch_user(&user.id).await.unwrap().e2ee_only);
+
+            user.mark_deleted(&db).await.unwrap();
+
+            assert!(!user.e2ee_only, "the in-memory user kept the flag");
+            assert!(
+                !db.fetch_user(&user.id).await.unwrap().e2ee_only,
+                "the stored user kept the flag"
+            );
         });
     }
 }

@@ -3056,11 +3056,31 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
             .expect("Failed to create Prot indexes.");
     }
 
-    // Protected channels S2 = 78/79, lands after add-device (77/78) and S5a
-    // (76/77); the steward sequences numbers at land time. A top-level
-    // sibling after the Prot ledger's revision 76 block, so a database at 77
-    // or 78 runs only this block (design 2.7). Add-device's `<= 77` block is
-    // not on this branch: the gap at 77 is expected.
+    // Follows the Prot ledger block (revision 76) as its own top-level guard:
+    // a database already at 77 runs this block and then the S2 78 block.
+    if revision <= 77 {
+        info!("Running migration [revision 77 / 01-11-2026]: Create e2ee_removed_devices collection (E2EE device removal tombstones)");
+
+        // Multi-device plan D8. Same idempotency contract as prior collection
+        // migrations, from the same spec as init.rs. A failed createIndexes
+        // panics, so the revision is not advanced without the index.
+        db.db()
+            .create_collection(super::init::E2EE_REMOVED_DEVICES_COLLECTION)
+            .await
+            .ok();
+
+        db.db()
+            .run_command(doc! {
+                "createIndexes": super::init::E2EE_REMOVED_DEVICES_COLLECTION,
+                "indexes": [super::init::e2ee_removed_devices_index()]
+            })
+            .await
+            .expect("Failed to create e2ee_removed_devices index.");
+    }
+
+    // Protected channels S2 = 78/79, after add-device (77/78) and S5a
+    // (76/77). A top-level sibling after add-device's revision 77 block, so
+    // a database at 78 runs only this block (design 2.7).
     if revision <= 78 {
         info!("Running migration [revision 78 / 26-10-2026]: Add the channel_seats active-seat sweep index and the mls_commits Text Welcome lookup index (protected channels S2)");
 
@@ -3774,16 +3794,61 @@ mod afk_backfill_tests {
     fn latest_revision_is_81() {
         assert_eq!(
             LATEST_REVISION, 81,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, add-device 77 (not on this branch), protected channels S2 78, S5b 79 (not on this branch), protected channels S4 80"
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, E2EE removal tombstones 77, protected channels S2 78, S5b 79 (not on this branch), protected channels S4 80"
+        );
+    }
+
+    /// Revision 77 (E2EE removal tombstones): exactly one `if revision <= 77`
+    /// block, at the top level of `run_migrations` after the 76 (Prot) block
+    /// closes (the nesting trap the 72 to 76 pins describe). Protected
+    /// channels S4's 80 is now the last migration (pinned below).
+    #[test]
+    fn revision_77_is_one_top_level_block_after_76() {
+        let needle_76 = format!("if revision <= 76 {OPEN}");
+        let needle_77 = format!("if revision <= 77 {OPEN}");
+        assert_eq!(shipping().matches(&needle_77).count(), 1, "exactly one `{needle_77}`");
+
+        let at_76 = shipping().find(&needle_76).expect("the 76 guard");
+        let at_77 = shipping().find(&needle_77).expect("the 77 guard");
+        let open_76 = at_76 + needle_76.len() - 1;
+        let block_76 = braced(shipping(), open_76);
+        assert!(
+            !block_76.contains("if revision <= 77"),
+            "the revision 77 guard must not be nested inside the 76 block"
+        );
+        assert!(
+            at_77 > open_76 + block_76.len(),
+            "the revision 77 guard must come after the 76 block closes"
+        );
+
+        let depth_at = |at: usize| -> i64 {
+            shipping()[..at]
+                .chars()
+                .map(|ch| match ch {
+                    OPEN => 1,
+                    CLOSE => -1,
+                    _ => 0,
+                })
+                .sum()
+        };
+        assert_eq!(
+            depth_at(at_77),
+            depth_at(at_76),
+            "the 77 guard must sit at the same (top) level as the 76 guard"
+        );
+
+        let open_77 = at_77 + needle_77.len() - 1;
+        assert!(
+            braced(shipping(), open_77).contains("e2ee_removed_devices_index()"),
+            "revision 77 must build the shared init.rs spec"
         );
     }
 
     /// The AFK backfill was the last migration when it landed; revision 80
-    /// (protected channels S4) now is. The 72, 73, 74, 75, 76, 78 and 80
-    /// guards are pinned to exactly one block each, the last one to
-    /// `LATEST_REVISION - 1`, and no block is guarded by 77 or 79
-    /// (add-device's and S5b's numbers, which this branch does not carry;
-    /// whoever lands one of them flips its count here to 1).
+    /// (protected channels S4) now is. The 72 to 78 and 80 guards are pinned
+    /// to exactly one block each, the last one to `LATEST_REVISION - 1`, and
+    /// no block is guarded by 79 (S5b's number, which this branch does not
+    /// carry; whoever lands it flips its count here to 1).
     #[test]
     fn backfill_is_guarded_by_revision_72_and_revision_80_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
@@ -3823,8 +3888,8 @@ mod afk_backfill_tests {
         );
         assert_eq!(
             guards.iter().filter(|guard| **guard == 77).count(),
-            0,
-            "no `if revision <= 77` block: 77 is add-device's, not S2's"
+            1,
+            "exactly one `if revision <= 77` block"
         );
         assert_eq!(
             guards.iter().filter(|guard| **guard == 78).count(),
@@ -3858,10 +3923,11 @@ mod afk_backfill_tests {
     /// database already at 72 would skip the backfill forever, and every
     /// other pin in this module would still pass. The revision-73, 74, 75, 76
     /// and 78 guards carry the same trap one to five blocks later, so each is
-    /// pinned the same way against the block before it (S2's 78 against the
-    /// 76 block: add-device's 77 is not on this branch).
+    /// pinned the same way against the block before it (S2's 78 against
+    /// add-device's 77, and against the 76 block as before; the 77 guard
+    /// itself is pinned by `revision_77_is_one_top_level_block_after_76`).
     #[test]
-    fn revision_72_to_76_and_78_guards_are_top_level_siblings_of_the_previous_block() {
+    fn revision_72_to_78_guards_are_top_level_siblings_of_the_previous_block() {
         let depth_at = |at: usize| -> i64 {
             shipping()[..at]
                 .chars()
@@ -3881,7 +3947,7 @@ mod afk_backfill_tests {
             );
             shipping().find(&needle).expect("the guard")
         };
-        let (at_70, at_71, at_72, at_73, at_74, at_75, at_76, at_78) = (
+        let (at_70, at_71, at_72, at_73, at_74, at_75, at_76, at_77, at_78) = (
             guard(70),
             guard(71),
             guard(72),
@@ -3889,6 +3955,7 @@ mod afk_backfill_tests {
             guard(74),
             guard(75),
             guard(76),
+            guard(77),
             guard(78),
         );
 
@@ -3971,6 +4038,19 @@ mod afk_backfill_tests {
             "the revision 78 guard must come after the 76 block closes"
         );
 
+        // And after add-device: nested inside the 77 block, the S2 indexes
+        // would never be built on a database already at 78.
+        let open_77 = at_77 + format!("if revision <= 77 {OPEN}").len() - 1;
+        let block_77 = braced(shipping(), open_77);
+        assert!(
+            !block_77.contains("if revision <= 78"),
+            "the revision 78 guard must not be nested inside the 77 block"
+        );
+        assert!(
+            at_78 > open_77 + block_77.len(),
+            "the revision 78 guard must come after the 77 block closes"
+        );
+
         let body = shipping()
             .find("pub async fn run_migrations(")
             .expect("run_migrations");
@@ -3985,13 +4065,14 @@ mod afk_backfill_tests {
                 depth_at(at_74),
                 depth_at(at_75),
                 depth_at(at_76),
+                depth_at(at_77),
                 depth_at(at_78)
             ),
             (
                 top_level, top_level, top_level, top_level, top_level, top_level, top_level,
-                top_level
+                top_level, top_level
             ),
-            "the 70, 71, 72, 73, 74, 75, 76 and 78 guards must all sit at the top level of run_migrations"
+            "the 70 to 78 guards must all sit at the top level of run_migrations"
         );
     }
 
@@ -4736,7 +4817,7 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            // Revisions 74 to 76, 78 and 80 run after it (they touch no server);
+            // Revisions 74 to 78 and 80 run after it (they touch no server);
             // the return is LATEST_REVISION.
             assert_eq!(
                 super::run_migrations(&mongo, 73).await,
@@ -6041,6 +6122,131 @@ mod tests {
                 super::LATEST_REVISION
             );
             assert_has_the_s2_indexes(&mongo).await;
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Every `e2ee_removed_devices` index as listIndexes reports it, by name
+    async fn removed_devices_indexes(mongo: &crate::MongoDb) -> Vec<Document> {
+        let listed = mongo
+            .db()
+            .run_command(doc! { "listIndexes": "e2ee_removed_devices" })
+            .await
+            .expect("listIndexes");
+        let mut indexes: Vec<Document> = listed
+            .get_document("cursor")
+            .and_then(|cursor| cursor.get_array("firstBatch"))
+            .expect("a listIndexes first batch")
+            .iter()
+            .filter_map(|index| index.as_document().cloned())
+            .collect();
+        indexes.sort_by(|a, b| a.get_str("name").ok().cmp(&b.get_str("name").ok()));
+        indexes
+    }
+
+    /// Multi-device D8's index, spelled out here rather than read from
+    /// `e2ee_removed_devices_index()`, so a drift in the shared spec fails
+    fn assert_is_the_removed_devices_index(indexes: &[Document]) {
+        let names: Vec<&str> = indexes
+            .iter()
+            .map(|index| index.get_str("name").expect("name"))
+            .collect();
+        assert_eq!(names, ["_id_", "user_device"], "{indexes:?}");
+
+        let index = &indexes[1];
+        let key: Vec<(&str, &Bson)> = index
+            .get_document("key")
+            .expect("key")
+            .iter()
+            .map(|(field, order)| (field.as_str(), order))
+            .collect();
+        assert_eq!(
+            key,
+            vec![("user_id", &Bson::Int32(1)), ("device_id", &Bson::Int32(1))],
+            "keyed on (user_id, device_id), in that order: {index:?}"
+        );
+        assert_eq!(index.get_bool("unique").ok(), Some(true), "unique: {index:?}");
+    }
+
+    /// A fresh database (init.rs) carries the removal tombstone collection
+    /// and its unique index
+    #[tokio::test]
+    async fn init_creates_the_e2ee_removed_devices_index() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_init_e2ee_removed".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            super::super::init::create_database(&mongo).await;
+            assert_is_the_removed_devices_index(&removed_devices_indexes(&mongo).await);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 77 creates the collection and its unique index on a
+    /// database at 77 (after the Prot block), returns LATEST_REVISION, is a
+    /// no-op when re-run, and the index then refuses a second tombstone for
+    /// one (user, device)
+    #[tokio::test]
+    async fn revision_77_creates_the_e2ee_removed_devices_index_and_is_rerunnable() {
+        let db = crate::DatabaseInfo::Test("migration_rev77_e2ee_removed".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            assert_eq!(
+                super::run_migrations(&mongo, 77).await,
+                super::LATEST_REVISION
+            );
+            assert_is_the_removed_devices_index(&removed_devices_indexes(&mongo).await);
+
+            let tombstones = mongo.col::<Document>("e2ee_removed_devices");
+            tombstones
+                .insert_one(doc! { "_id": "U:D", "user_id": "U", "device_id": "D" })
+                .await
+                .expect("a first tombstone");
+
+            assert_eq!(
+                super::run_migrations(&mongo, 77).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            assert_is_the_removed_devices_index(&removed_devices_indexes(&mongo).await);
+            assert!(
+                tombstones
+                    .insert_one(doc! { "_id": "other", "user_id": "U", "device_id": "D" })
+                    .await
+                    .is_err(),
+                "the unique index must refuse a second tombstone for (U, D)"
+            );
+            assert_eq!(tombstones.count_documents(doc! {}).await.expect("count"), 1);
         }
 
         db.drop_database().await;

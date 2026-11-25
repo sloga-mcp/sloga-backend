@@ -190,4 +190,61 @@ impl AbstractAttachments for ReferenceDb {
             Err(create_error!(NotFound))
         }
     }
+
+    /// Fetch an attachment by its id, whatever its tag or state.
+    async fn fetch_attachment_by_id(&self, id: &str) -> Result<File> {
+        let files = self.files.lock().await;
+        files
+            .get(id)
+            .cloned()
+            .ok_or_else(|| create_error!(NotFound))
+    }
+
+    /// Fetch every attachment whose original hash is in `hashes`, in any state.
+    async fn fetch_attachments_by_hashes(&self, hashes: &[String]) -> Result<Vec<File>> {
+        let files = self.files.lock().await;
+        Ok(files
+            .values()
+            .filter(|file| file.hash.as_ref().is_some_and(|hash| hashes.contains(hash)))
+            .cloned()
+            .collect())
+    }
+
+    /// Hide attachments but keep the stored objects.
+    async fn hide_attachments(&self, ids: &[String]) -> Result<()> {
+        let mut files = self.files.lock().await;
+        // Unknown ids are skipped, as an `update_many` on MongoDB matches nothing
+        for id in ids {
+            if let Some(file) = files.get_mut(id) {
+                file.deleted = Some(true);
+                file.reported = Some(true);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Undo a hide: `deleted` false, `reported` untouched.
+    async fn unhide_attachments(&self, ids: &[String]) -> Result<()> {
+        let mut files = self.files.lock().await;
+        for id in ids {
+            if let Some(file) = files.get_mut(id) {
+                file.deleted = Some(false);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// End a hold: `reported` false, `deleted` untouched.
+    async fn release_attachment_hold(&self, ids: &[String]) -> Result<()> {
+        let mut files = self.files.lock().await;
+        for id in ids {
+            if let Some(file) = files.get_mut(id) {
+                file.reported = Some(false);
+            }
+        }
+
+        Ok(())
+    }
 }

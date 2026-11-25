@@ -1623,8 +1623,12 @@ mod tests {
         }
         .build()
         .expect("a text join payload");
+        // No SFU nodes: the Text path never lists
+        let voice_client =
+            revolt_database::voice::VoiceClient::new(std::collections::HashMap::new());
         Box::pin(super::super::join_intent::join_intent(
             State::from(db),
+            State::from(&voice_client),
             caller.user.clone(),
             caller.session.clone(),
             group.id.clone(),

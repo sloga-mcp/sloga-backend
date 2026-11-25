@@ -1,19 +1,42 @@
 //! Staff routes: support tools for privileged accounts.
 //!
-//! Every route here needs a privileged account, an MFA ticket bound to the
-//! session user and an `X-Audit-Log-Reason`. There is no staff audit-log
-//! collection: each call logs an `AUDIT ...` line, and a write is also
-//! recorded by its own ledger row (actor and reason). The Prot routes are
-//! not gated on `[features.boosts.protection]`, so support can inspect and
-//! correct wallets while Prot is switched off.
+//! The Prot routes need a privileged account, an MFA ticket bound to the
+//! session user and an `X-Audit-Log-Reason`. Each call logs an `AUDIT ...`
+//! line, and a write is also recorded by its own ledger row (actor and
+//! reason). The Prot routes are not gated on `[features.boosts.protection]`,
+//! so support can inspect and correct wallets while Prot is switched off.
+//!
+//! The Take It Down routes (`takedown_*`) are narrower: only privileged
+//! accounts on `[features.takedown] reviewers` with MFA turned on. Reading
+//! needs no ticket; every action needs the ticket and the reason. They log
+//! to the `staff_audit` collection, never with requester details.
 use revolt_rocket_okapi::revolt_okapi::openapi3::OpenApi;
 use rocket::Route;
 
 mod prot_adjust;
 mod prot_orders;
+mod takedown_common;
+mod takedown_holds;
+mod takedown_queue;
+mod takedown_remove;
+mod takedown_review;
+#[cfg(test)]
+mod takedown_tests;
 
 pub fn routes() -> (Vec<Route>, OpenApi) {
-    openapi_get_routes_spec![prot_orders::fetch_prot_order, prot_adjust::adjust_prot]
+    openapi_get_routes_spec![
+        prot_orders::fetch_prot_order,
+        prot_adjust::adjust_prot,
+        takedown_queue::list_takedown_requests,
+        takedown_queue::fetch_takedown_request,
+        takedown_remove::remove_takedown_targets,
+        takedown_review::decline_takedown_request,
+        takedown_review::request_takedown_info,
+        takedown_review::close_takedown_request,
+        takedown_holds::move_takedown_to_child_safety,
+        takedown_holds::unhide_takedown_files,
+        takedown_holds::restore_takedown_files,
+    ]
 }
 
 /// Whether `value` looks like an id the server hands out or a client nonce:

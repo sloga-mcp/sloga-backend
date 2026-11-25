@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     consumers::outbound::fcm::{notification_data, NotificationData},
-    utils::Consumer,
+    utils::{call_push_ttl, now_unix, CallPushTtl, Consumer},
 };
 
 use super::up_limiter::{Admit, Bucket, DestKey, Offender, Rejected, SubKey, UpLimiter};
@@ -42,11 +42,13 @@ const MAX_BODY_BYTES: usize = 1000;
 /// web-push refuses plaintext above this many bytes (http_ece.rs).
 const MAX_PAYLOAD_BYTES: usize = 3052;
 
-/// TTL for everything except call rings: one day.
+/// TTL for everything except call pushes: one day.
 const DEFAULT_TTL_SECS: u32 = 86400;
 
-/// Ring TTL if `call_ring_duration` does not fit in a u32.
-const FALLBACK_RING_TTL_SECS: u32 = 30;
+/// TTL for a call push that reaches the builder with no lifetime worked out
+/// for it: one ring of the default length. `consume` always works one out,
+/// so this only keeps a call push from ever getting the one-day default.
+const FALLBACK_RING_TTL_SECS: u32 = 45;
 
 /// Longest a send waits, in all, while every rejection token of its
 /// destination is reserved by sends in flight. Past it, the push is dropped.
@@ -196,6 +198,35 @@ impl Consumer for UnifiedPushOutboundConsumer {
             },
         };
 
+        // The ring length every service and every app agrees on, never the
+        // raw setting.
+        let ring_secs = revolt_config::effective_call_ring_secs(
+            revolt_config::config().await.api.livekit.call_ring_duration,
+        );
+
+        // Decided before any work is done for this push, and before the
+        // lookup and the limiter can spend anything on it.
+        let call_ttl = match &payload.notification {
+            PayloadKind::DmCallStartEnd(alert) => {
+                let Some(lifetime) = call_push_lifetime(alert, now_unix(), ring_secs) else {
+                    // The push sat in a queue for longer than the call rang.
+                    // Sending it now would make a phone ring for a call
+                    // nobody is waiting on.
+                    info!(
+                        "Not sending a UnifiedPush call push for session {}: its ring time is already over",
+                        payload.session_id
+                    );
+
+                    return Ok(());
+                };
+
+                Some(lifetime)
+            }
+            _ => None,
+        };
+
+        // A call push is the same map of strings the FCM arm sends: one app
+        // reads both. It names the caller and the conversation by id only.
         let Some(data) = notification_data(payload.notification).await? else {
             return Ok(());
         };
@@ -256,9 +287,6 @@ impl Consumer for UnifiedPushOutboundConsumer {
 
         let key = limit_key(&host, addr.ip());
 
-        // Read before the gate: the message is built in a sync closure.
-        let ring_secs = revolt_config::config().await.api.livekit.call_ring_duration;
-
         // Signing and encryption run only once the send is admitted.
         let gated = gated_send(
             &self.limiter,
@@ -280,7 +308,7 @@ impl Consumer for UnifiedPushOutboundConsumer {
                     Some(signature),
                     &bytes,
                     &ty,
-                    ring_secs,
+                    call_ttl,
                 )?)
             },
         )
@@ -602,14 +630,27 @@ fn encode_payload(data: NotificationData) -> Result<(String, Vec<u8>)> {
     Ok((ty, bytes))
 }
 
-/// Urgency and TTL for a notification type. A ring is useless once the call
-/// has stopped ringing, and it should wake a dozing device.
-fn delivery_params(ty: &str, call_ring_duration: usize) -> (Urgency, u32) {
+/// How long a call push may live, in seconds, or `None` if it must not be
+/// sent at all.
+///
+/// The distributor holds a push for a phone it cannot reach right now. A
+/// ring handed over after the caller gave up would make that phone ring for
+/// nobody, so a ring lives only for what is left of its ring time, and one
+/// already past it is not sent. The push that says a call is over lives for
+/// a minute. Pure: the clock and the ring length are handed in.
+fn call_push_lifetime(alert: &DmCallPayload, now_unix: i64, ring_secs: usize) -> Option<u32> {
+    match call_push_ttl(alert, now_unix, ring_secs) {
+        CallPushTtl::Drop => None,
+        CallPushTtl::Secs(secs) => Some(secs),
+    }
+}
+
+/// Urgency and TTL for a notification type. A call push should wake a dozing
+/// device, and it lives for `call_ttl`, the lifetime `call_push_lifetime`
+/// worked out for it. `call_ttl` means nothing for any other type.
+fn delivery_params(ty: &str, call_ttl: Option<u32>) -> (Urgency, u32) {
     if ty == "push.dm.call" {
-        (
-            Urgency::High,
-            u32::try_from(call_ring_duration).unwrap_or(FALLBACK_RING_TTL_SECS),
-        )
+        (Urgency::High, call_ttl.unwrap_or(FALLBACK_RING_TTL_SECS))
     } else {
         (Urgency::Normal, DEFAULT_TTL_SECS)
     }
@@ -621,9 +662,9 @@ fn build_message(
     signature: Option<VapidSignature>,
     payload: &[u8],
     ty: &str,
-    call_ring_duration: usize,
+    call_ttl: Option<u32>,
 ) -> Result<WebPushMessage, WebPushError> {
-    let (urgency, ttl) = delivery_params(ty, call_ring_duration);
+    let (urgency, ttl) = delivery_params(ty, call_ttl);
 
     let mut builder = WebPushMessageBuilder::new(subscription);
     if let Some(signature) = signature {
@@ -903,6 +944,7 @@ mod tests {
     use super::*;
 
     use std::{
+        collections::HashMap,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         sync::{
@@ -961,12 +1003,31 @@ mod tests {
         assert!(exceeds_payload_cap(&vec![b'a'; MAX_PAYLOAD_BYTES + 1]));
     }
 
+    // A call push no longer lives for the configured ring length whatever
+    // its age: it lives for the lifetime worked out for it, which is what is
+    // left of the ring, or a minute for the push that says the call is over.
     #[test]
     fn call_rings_are_urgent_and_short_lived() {
-        assert_eq!(delivery_params("push.dm.call", 30), (Urgency::High, 30));
-        assert_eq!(delivery_params("push.dm.call", 45), (Urgency::High, 45));
+        for secs in [45, 1, 60] {
+            assert_eq!(
+                delivery_params("push.dm.call", Some(secs)),
+                (Urgency::High, secs)
+            );
+        }
     }
 
+    /// A call push with no lifetime worked out for it still lives for one
+    /// ring only, never for the day every other push gets.
+    #[test]
+    fn a_call_push_with_no_lifetime_gets_one_default_ring() {
+        assert_eq!(FALLBACK_RING_TTL_SECS, 45);
+        assert_eq!(
+            delivery_params("push.dm.call", None),
+            (Urgency::High, FALLBACK_RING_TTL_SECS)
+        );
+    }
+
+    /// The lifetime of a call push never reaches any other type.
     #[test]
     fn other_types_are_normal_for_a_day() {
         for ty in [
@@ -976,7 +1037,13 @@ mod tests {
             "push.fr.accept",
             "push.calendar",
         ] {
-            assert_eq!(delivery_params(ty, 30), (Urgency::Normal, DEFAULT_TTL_SECS));
+            for call_ttl in [None, Some(30)] {
+                assert_eq!(
+                    delivery_params(ty, call_ttl),
+                    (Urgency::Normal, DEFAULT_TTL_SECS),
+                    "{ty}, {call_ttl:?}"
+                );
+            }
         }
     }
 
@@ -1145,9 +1212,9 @@ mod tests {
     #[test]
     fn pinned_request_keeps_the_hostname_and_headers() {
         let subscription = test_subscription();
-        let msg = build_message(&subscription, None, b"{}", "push.message", 30).unwrap();
+        let msg = build_message(&subscription, None, b"{}", "push.message", None).unwrap();
         let expected = build_request::<AsyncBody>(
-            build_message(&subscription, None, b"{}", "push.message", 30).unwrap(),
+            build_message(&subscription, None, b"{}", "push.message", None).unwrap(),
         );
 
         let request = pinned_request(msg, "[2606:4700:4700::1111]:443".parse().unwrap()).unwrap();
@@ -1214,7 +1281,7 @@ mod tests {
     #[test]
     fn request_is_aes128gcm_without_topic() {
         let subscription = test_subscription();
-        let msg = build_message(&subscription, None, b"{}", "push.message", 30).unwrap();
+        let msg = build_message(&subscription, None, b"{}", "push.message", None).unwrap();
 
         // The same builder IsahcWebPushClient::send uses.
         let request = build_request::<isahc::AsyncBody>(msg);
@@ -1229,16 +1296,366 @@ mod tests {
         assert_eq!(headers.get("Urgency").unwrap().to_str().unwrap(), "normal");
     }
 
-    #[test]
-    fn call_ring_request_is_urgent_and_short_lived() {
+    /// The TTL and Urgency headers of the request a call push with this
+    /// lifetime becomes, through the same builder `consume` uses.
+    fn call_request_headers(call_ttl: Option<u32>) -> (String, String) {
         let subscription = test_subscription();
-        let msg = build_message(&subscription, None, b"{}", "push.dm.call", 45).unwrap();
+        let msg = build_message(&subscription, None, b"{}", "push.dm.call", call_ttl).unwrap();
 
         let request = build_request::<isahc::AsyncBody>(msg);
         let headers = request.headers();
 
-        assert_eq!(headers.get("TTL").unwrap().to_str().unwrap(), "45");
-        assert_eq!(headers.get("Urgency").unwrap().to_str().unwrap(), "high");
+        (
+            headers.get("TTL").unwrap().to_str().unwrap().to_string(),
+            headers
+                .get("Urgency")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string(),
+        )
+    }
+
+    // The builder now takes the lifetime worked out for the call push, not
+    // the configured ring length.
+    #[test]
+    fn call_ring_request_is_urgent_and_short_lived() {
+        assert_eq!(
+            call_request_headers(Some(45)),
+            ("45".to_string(), "high".to_string())
+        );
+    }
+
+    /// Midnight UTC on 2026-09-23, in unix seconds.
+    const STARTED_UNIX: i64 = 1_790_121_600;
+
+    /// The same moment, as the voice service writes it into a ring.
+    const STARTED_AT: &str = "2026-09-23T00:00:00.000Z";
+
+    const RING_SECS: usize = 45;
+
+    /// A ring as servers from before the call id sent it.
+    fn ring() -> DmCallPayload {
+        DmCallPayload {
+            initiator_id: "01CALLER".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            started_at: Some(STARTED_AT.to_string()),
+            ended: false,
+            ..Default::default()
+        }
+    }
+
+    /// The push that says a call is over, as servers from before the call id
+    /// sent it: it never carried a start.
+    fn ended() -> DmCallPayload {
+        DmCallPayload {
+            initiator_id: "01CALLER".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            started_at: None,
+            ended: true,
+            ..Default::default()
+        }
+    }
+
+    /// `base` with every newer field set. No real push carries all three,
+    /// which is why the key-set test wants one that does.
+    fn with_every_field(base: DmCallPayload) -> DmCallPayload {
+        DmCallPayload {
+            call_id: Some("01CALL".to_string()),
+            reason: Some(CALL_REASON_ANSWERED_ELSEWHERE.to_string()),
+            video: Some(true),
+            ..base
+        }
+    }
+
+    /// The header counts down with the ring: a distributor that cannot reach
+    /// the phone gives up when the ring does. At the last second the push
+    /// still goes out, with one second to live.
+    #[test]
+    fn a_ring_lives_for_what_is_left_of_its_ring_time() {
+        for (elapsed, left) in [(0_i64, 45_u32), (20, 25), (44, 1), (45, 1)] {
+            let lifetime = call_push_lifetime(&ring(), STARTED_UNIX + elapsed, RING_SECS);
+            assert_eq!(lifetime, Some(left), "{elapsed} s into the ring");
+
+            assert_eq!(
+                call_request_headers(lifetime),
+                (left.to_string(), "high".to_string()),
+                "{elapsed} s into the ring"
+            );
+        }
+
+        // A ring that carries no start cannot be aged, so it gets one whole
+        // ring: a late ring is better than a lost call.
+        let no_start = DmCallPayload {
+            started_at: None,
+            ..ring()
+        };
+        assert_eq!(
+            call_push_lifetime(&no_start, STARTED_UNIX + 3_600, RING_SECS),
+            Some(45)
+        );
+    }
+
+    /// A ring that sat in the queue for longer than the call rang is not
+    /// sent at all.
+    #[test]
+    fn a_ring_past_its_time_is_not_sent() {
+        for elapsed in [46_i64, 60, 3_600] {
+            assert_eq!(
+                call_push_lifetime(&ring(), STARTED_UNIX + elapsed, RING_SECS),
+                None,
+                "{elapsed} s after the ring started"
+            );
+        }
+    }
+
+    /// The push that stops a ring is never dropped for being late, and its
+    /// lifetime does not follow the ring length.
+    #[test]
+    fn an_ended_call_push_lives_for_a_minute_however_late() {
+        let with_start = DmCallPayload {
+            started_at: Some(STARTED_AT.to_string()),
+            ..ended()
+        };
+
+        for alert in [ended(), with_start] {
+            for ring_secs in [RING_SECS, 120] {
+                let lifetime = call_push_lifetime(&alert, STARTED_UNIX + 3_600, ring_secs);
+                assert_eq!(lifetime, Some(60));
+
+                assert_eq!(
+                    call_request_headers(lifetime),
+                    ("60".to_string(), "high".to_string())
+                );
+            }
+        }
+    }
+
+    /// This file's shipping code with all whitespace removed, so a reformat
+    /// cannot move a pin.
+    fn shipping_source() -> String {
+        let source = include_str!("unifiedpush.rs");
+        let end = source.find("#[cfg(test)]").expect("the test module marker");
+
+        source[..end].split_whitespace().collect()
+    }
+
+    /// The pure functions above only matter if `consume` obeys them. It needs
+    /// a database and a queue to run, so its order is pinned on the source
+    /// instead: the ring length comes through the one shared rule, a call
+    /// push is decided before anything is mapped, looked up or sent, a ring
+    /// past its time returns without sending, and the lifetime decided there
+    /// is the one the request is built with.
+    #[test]
+    fn consume_decides_a_call_push_before_any_other_work() {
+        let source = shipping_source();
+
+        let start = source.find("asyncfnconsume(").expect("consume");
+        let consume = &source[start..];
+        let end = consume.find("fnhttp_client()").expect("http_client");
+        let consume = &consume[..end];
+
+        assert!(consume.contains(
+            "letring_secs=revolt_config::effective_call_ring_secs(\
+             revolt_config::config().await.api.livekit.call_ring_duration"
+        ));
+        assert_eq!(consume.matches("call_ring_duration").count(), 1);
+
+        let decision = consume
+            .find("letSome(lifetime)=call_push_lifetime(alert,now_unix(),ring_secs)else{")
+            .expect("the decision");
+        let after = &consume[decision..];
+        let gives_up = decision + after.find("returnOk(());").expect("the early return");
+        let hands_on = consume
+            .find("Some(lifetime)}_=>None,};")
+            .expect("the lifetime handed on");
+        let mapped = consume
+            .find("notification_data(payload.notification)")
+            .expect("the mapping");
+        let lookup = consume.find("resolve_destination(").expect("the lookup");
+        let gate = consume.find("gated_send(").expect("the send");
+
+        assert!(decision < gives_up, "{decision} {gives_up}");
+        assert!(gives_up < hands_on, "{gives_up} {hands_on}");
+        assert!(hands_on < mapped, "{hands_on} {mapped}");
+        assert!(mapped < lookup, "{mapped} {lookup}");
+        assert!(lookup < gate, "{lookup} {gate}");
+
+        assert!(consume.contains("&bytes,&ty,call_ttl"));
+    }
+
+    /// What the app reads for a call push: the JSON this arm encrypts,
+    /// decoded from the very bytes it hands to the encryption.
+    async fn call_wire_map(alert: DmCallPayload) -> HashMap<String, Value> {
+        let data = notification_data(PayloadKind::DmCallStartEnd(alert))
+            .await
+            .expect("mapping a call push cannot fail")
+            .expect("a call push is sent");
+
+        let (ty, bytes) = encode_payload(data).expect("a call push encodes");
+        assert_eq!(ty, "push.dm.call");
+        assert!(!exceeds_payload_cap(&bytes));
+
+        serde_json::from_slice(&bytes).expect("a JSON object")
+    }
+
+    /// The ring length every service agrees on, as a call push spells it.
+    async fn ring_secs_text() -> String {
+        revolt_config::effective_call_ring_secs(
+            revolt_config::config().await.api.livekit.call_ring_duration,
+        )
+        .to_string()
+    }
+
+    fn strings(pairs: &[(&str, &str)]) -> HashMap<String, Value> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+            .collect()
+    }
+
+    /// The exact map, values included: the app reads every one as a string.
+    /// Without the newer fields it is key for key the push that apps from
+    /// before them know.
+    #[tokio::test]
+    async fn a_ring_is_the_exact_map_of_strings_the_app_reads() {
+        let duration = ring_secs_text().await;
+
+        // What the app counts the ring down from: the agreed ring length,
+        // which is never outside 5 to 120 seconds.
+        let secs: usize = duration.parse().expect("a number of seconds");
+        assert!((5..=120).contains(&secs), "{secs}");
+
+        assert_eq!(
+            call_wire_map(ring()).await,
+            strings(&[
+                ("type", "push.dm.call"),
+                ("initiator_id", "01CALLER"),
+                ("channel_id", "01CHANNEL"),
+                ("started_at", STARTED_AT),
+                ("ended", "false"),
+                ("duration", duration.as_str()),
+            ])
+        );
+
+        let video_ring = DmCallPayload {
+            call_id: Some("01CALL".to_string()),
+            video: Some(true),
+            ..ring()
+        };
+        assert_eq!(
+            call_wire_map(video_ring).await,
+            strings(&[
+                ("type", "push.dm.call"),
+                ("initiator_id", "01CALLER"),
+                ("channel_id", "01CHANNEL"),
+                ("started_at", STARTED_AT),
+                ("ended", "false"),
+                ("duration", duration.as_str()),
+                ("call_id", "01CALL"),
+                ("video", "true"),
+            ])
+        );
+    }
+
+    /// The same for the push that says a call is over. One with no start
+    /// still carries the key, empty, as it always has.
+    #[tokio::test]
+    async fn an_ended_call_push_is_the_exact_map_of_strings_the_app_reads() {
+        let duration = ring_secs_text().await;
+
+        assert_eq!(
+            call_wire_map(ended()).await,
+            strings(&[
+                ("type", "push.dm.call"),
+                ("initiator_id", "01CALLER"),
+                ("channel_id", "01CHANNEL"),
+                ("started_at", ""),
+                ("ended", "true"),
+                ("duration", duration.as_str()),
+            ])
+        );
+
+        let declined = DmCallPayload {
+            call_id: Some("01CALL".to_string()),
+            reason: Some(CALL_REASON_DECLINED.to_string()),
+            video: Some(false),
+            ..ended()
+        };
+        assert_eq!(
+            call_wire_map(declined).await,
+            strings(&[
+                ("type", "push.dm.call"),
+                ("initiator_id", "01CALLER"),
+                ("channel_id", "01CHANNEL"),
+                ("started_at", ""),
+                ("ended", "true"),
+                ("duration", duration.as_str()),
+                ("call_id", "01CALL"),
+                ("reason", "declined"),
+                ("video", "false"),
+            ])
+        );
+    }
+
+    /// A call push names the caller and the conversation by id only. It
+    /// travels through a distributor and a push server the user chose, and
+    /// the app looks up names and pictures itself, so no display name, photo
+    /// link or group name may ever be added to it.
+    #[tokio::test]
+    async fn a_call_push_has_no_key_outside_the_agreed_set() {
+        const AGREED: [&str; 9] = [
+            "type",
+            "initiator_id",
+            "channel_id",
+            "started_at",
+            "ended",
+            "duration",
+            "call_id",
+            "reason",
+            "video",
+        ];
+
+        for alert in [
+            ring(),
+            ended(),
+            with_every_field(ring()),
+            with_every_field(ended()),
+        ] {
+            for (key, value) in call_wire_map(alert).await {
+                assert!(
+                    AGREED.contains(&key.as_str()),
+                    "{key} is not a key a call push may carry"
+                );
+                assert!(value.is_string(), "{key} is not a string");
+            }
+        }
+
+        // With every field set, all nine are there and nothing else.
+        assert_eq!(
+            call_wire_map(with_every_field(ring())).await.len(),
+            AGREED.len()
+        );
+    }
+
+    /// One app reads the call push of this arm and of the FCM arm with the
+    /// same code, so this arm sends the FCM map untouched.
+    #[tokio::test]
+    async fn a_call_push_is_the_map_the_fcm_arm_sends() {
+        for alert in [
+            ring(),
+            ended(),
+            with_every_field(ring()),
+            with_every_field(ended()),
+        ] {
+            let fcm = notification_data(PayloadKind::DmCallStartEnd(alert.clone()))
+                .await
+                .expect("mapping a call push cannot fail")
+                .expect("FCM sends call pushes")
+                .into_payload();
+
+            assert_eq!(call_wire_map(alert).await, fcm);
+        }
     }
 
     #[test]
@@ -1256,7 +1673,7 @@ mod tests {
         assert_eq!(json["body"].as_str().unwrap().len(), 999);
 
         let subscription = test_subscription();
-        let msg = build_message(&subscription, None, &bytes, &ty, 30).unwrap();
+        let msg = build_message(&subscription, None, &bytes, &ty, None).unwrap();
         let payload = msg.payload.expect("encrypted payload");
 
         assert_eq!(payload.content_encoding, ContentEncoding::Aes128Gcm);
@@ -1400,7 +1817,7 @@ mod tests {
         let mut subscription = test_subscription();
         subscription.endpoint = format!("http://pin-test.invalid:9{path}");
 
-        build_message(&subscription, None, b"{}", "push.message", 30).unwrap()
+        build_message(&subscription, None, b"{}", "push.message", None).unwrap()
     }
 
     /// A `make_msg` for `gated_send` that counts how often it ran.

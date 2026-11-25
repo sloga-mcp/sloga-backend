@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
 use indexmap::{IndexMap, IndexSet};
 use iso8601_timestamp::Timestamp;
-use revolt_config::{config, FeaturesLimits};
+use revolt_config::{config, E2EEFeatures, FeaturesLimits};
 use revolt_models::v0::{
     self, BulkMessageResponse, DataMessageSend, Embed, MessageAuthor, MessageFlags, MessageSort,
     MessageWebhook, PushNotification, ReplyIntent, SendableEmbed, Text,
@@ -17,7 +17,9 @@ use crate::{
     events::client::EventV1,
     is_valid_device_id, is_valid_group_id,
     util::{
-        bulk_permissions::BulkDatabasePermissionQuery, idempotency::IdempotencyKey,
+        bulk_permissions::BulkDatabasePermissionQuery,
+        e2ee_only,
+        idempotency::IdempotencyKey,
         permissions::DatabasePermissionQuery,
     },
     Channel, Database, Emoji, File, MessageInteraction, User, AMQP,
@@ -1314,6 +1316,141 @@ impl Message {
         });
     }
 
+    /// Driver half of the encrypted-only rule: a group marked encrypted-only
+    /// takes no row other than a system message
+    ///
+    /// `channel` is the read `insert_message` already makes for the
+    /// protected check, so this adds no read. The config is read only for a
+    /// row that is not a system message going into a marked group. Author
+    /// flags are checked by the routes and by `send_without_notifications`,
+    /// not here.
+    pub(crate) async fn validate_e2ee_only_insert(&self, channel: &Result<Channel>) -> Result<()> {
+        if self.system.is_some()
+            || !matches!(
+                channel,
+                Ok(Channel::Group {
+                    e2ee_only: true,
+                    ..
+                })
+            )
+        {
+            return Ok(());
+        }
+
+        let config = config().await;
+        self.e2ee_only_insert_allowed(&config.features.e2ee, channel)
+    }
+
+    /// The decision of [`Message::validate_e2ee_only_insert`] under `cfg`
+    pub(crate) fn e2ee_only_insert_allowed(
+        &self,
+        cfg: &E2EEFeatures,
+        channel: &Result<Channel>,
+    ) -> Result<()> {
+        match channel {
+            Ok(channel) if self.system.is_none() => {
+                e2ee_only::plain_write_allowed_unauthored(cfg, channel)
+            }
+            // A channel that cannot be read is left to the protected check
+            _ => Ok(()),
+        }
+    }
+
+    /// Send funnel half of the encrypted-only rule, ahead of the insert
+    ///
+    /// Gives the answer `e2ee_only::plain_write_allowed` gives the routes,
+    /// for any caller that skips them. System and webhook rows are not
+    /// checked here (a marked group refuses a webhook row at the insert).
+    async fn validate_e2ee_only_send(
+        &self,
+        db: &Database,
+        known: Option<&Channel>,
+        user: Option<&v0::User>,
+    ) -> Result<()> {
+        if self.system.is_some() || self.webhook.is_some() {
+            return Ok(());
+        }
+
+        let config = config().await;
+        self.e2ee_only_send_allowed(db, &config.features.e2ee, known, user).await
+    }
+
+    /// The decision of [`Message::validate_e2ee_only_send`] under `cfg`
+    ///
+    /// Reads nothing while the refusals are switched off or for a system or
+    /// webhook row. `known` is the caller's copy of this message's channel:
+    /// what is read from it (the kind, the server, the group mark and the
+    /// direct message pair) never changes once the channel exists, so with
+    /// it a server channel or Saved Notes costs no read at all. Without it,
+    /// or when its id is not this message's channel, the channel is read.
+    /// Accounts are read only for a direct message or an unmarked group: the
+    /// author when `user` is not the author, and the other account of a
+    /// direct message.
+    pub(crate) async fn e2ee_only_send_allowed(
+        &self,
+        db: &Database,
+        cfg: &E2EEFeatures,
+        known: Option<&Channel>,
+        user: Option<&v0::User>,
+    ) -> Result<()> {
+        if self.system.is_some() || self.webhook.is_some() || !e2ee_only::enforced(cfg) {
+            return Ok(());
+        }
+
+        let fetched: Channel;
+        let channel: &Channel = match known {
+            Some(channel) if channel.id() == self.channel => channel,
+            _ => {
+                fetched = match db.fetch_channel(&self.channel).await {
+                    Ok(channel) => channel,
+                    // A missing channel is left to the insert's own checks
+                    Err(error) if matches!(error.error_type, ErrorType::NotFound) => {
+                        return Ok(())
+                    }
+                    Err(error) => return Err(error),
+                };
+                &fetched
+            }
+        };
+        if !Message::e2ee_only_send_reads_accounts(channel) {
+            return Ok(());
+        }
+
+        // A marked group refuses whoever the author is
+        e2ee_only::plain_write_allowed_unauthored(cfg, channel)?;
+
+        // The guard reads only the author's id and flag
+        let author = match user {
+            Some(user) if user.id == self.author => User {
+                id: user.id.clone(),
+                e2ee_only: user.e2ee_only,
+                ..Default::default()
+            },
+            _ => match db.fetch_user(&self.author).await {
+                Ok(author) => author,
+                Err(error) if matches!(error.error_type, ErrorType::NotFound) => User {
+                    id: self.author.clone(),
+                    ..Default::default()
+                },
+                Err(error) => return Err(error),
+            },
+        };
+
+        e2ee_only::plain_write_allowed(db, cfg, &author, channel, None).await
+    }
+
+    /// Whether the send funnel needs any account to decide for `channel`.
+    /// Saved Notes and server channels always take the message.
+    pub(crate) fn e2ee_only_send_reads_accounts(channel: &Channel) -> bool {
+        match channel {
+            Channel::DirectMessage { .. } | Channel::Group { .. } => true,
+            Channel::SavedMessages { .. }
+            | Channel::TextChannel { .. }
+            | Channel::Thread { .. }
+            | Channel::Forum { .. } => false,
+        }
+    }
+
     /// Refuse a partial that would write a plaintext-bearing field onto a row
     /// carrying `encrypted` (protected messages are never edited, design 7.4)
     ///
@@ -1407,6 +1544,35 @@ impl Message {
         // If this is true, you MUST call tasks::ack::queue yourself.
         mentions_elsewhere: bool,
     ) -> Result<()> {
+        self.send_without_notifications_in(
+            db,
+            None,
+            user,
+            member,
+            is_dm,
+            generate_embeds,
+            mentions_elsewhere,
+        )
+        .await
+    }
+
+    /// [`Message::send_without_notifications`] with the caller's copy of the
+    /// channel, when it has one, for the encrypted-only check
+    #[allow(clippy::too_many_arguments)]
+    async fn send_without_notifications_in(
+        &mut self,
+        db: &Database,
+        known: Option<&Channel>,
+        user: Option<v0::User>,
+        member: Option<v0::Member>,
+        is_dm: bool,
+        generate_embeds: bool,
+        mentions_elsewhere: bool,
+    ) -> Result<()> {
+        // Encrypted-only conversations: the routes refuse first, this catches
+        // any caller that does not
+        self.validate_e2ee_only_send(db, known, user.as_ref()).await?;
+
         // The driver re-reads the channel and enforces the protected-channel
         // stored shape (design 2.6) itself; no caller snapshot is trusted
         db.insert_message(self).await?;
@@ -1504,9 +1670,11 @@ impl Message {
     ) -> Result<()> {
         // `channel` is the caller's snapshot and may predate a protect; it is
         // never used for the protected decision. `insert_message` re-reads
-        // the channel immediately before the write (design 2.6).
-        self.send_without_notifications(
+        // the channel immediately before the write (design 2.6). The
+        // encrypted-only check reads only what cannot change from it.
+        self.send_without_notifications_in(
             db,
+            Some(channel),
             user.clone(),
             member.clone(),
             matches!(channel, Channel::DirectMessage { .. }),
@@ -4264,5 +4432,393 @@ mod protected_read_view_tests {
         // A thread's stray at or below the parent's boundary is not served
         // once the parent's wipe is requested
         assert!(!row("A", false).is_servable(&ProtectedReadView::of_read_target(&thread, &parent)));
+    }
+}
+
+/// The encrypted-only backstops: the send funnel and the insert, reached
+/// directly, the way a caller that skips the route checks would. Runs on
+/// whichever driver `TEST_DB` names.
+#[cfg(test)]
+mod e2ee_only_backstop_tests {
+    use super::*;
+
+    fn e2ee(only_enforced: bool) -> E2EEFeatures {
+        E2EEFeatures {
+            only_enforced,
+            ..Default::default()
+        }
+    }
+
+    async fn person(db: &Database, e2ee_only: bool) -> User {
+        let id = Ulid::new().to_string();
+        let user = User {
+            username: format!("u{}", &id[16..]),
+            discriminator: "0001".to_string(),
+            id,
+            e2ee_only,
+            ..Default::default()
+        };
+        db.insert_user(&user).await.unwrap();
+        user
+    }
+
+    async fn stored_channel(db: &Database, channel: Channel) -> Channel {
+        db.insert_channel(&channel).await.unwrap();
+        channel
+    }
+
+    fn dm(author: &str, peer: &str) -> Channel {
+        Channel::DirectMessage {
+            id: Ulid::new().to_string(),
+            active: true,
+            recipients: vec![author.to_string(), peer.to_string()],
+            last_message_id: None,
+        }
+    }
+
+    fn group(author: &str, marked: bool) -> Channel {
+        Channel::Group {
+            id: Ulid::new().to_string(),
+            name: "group".to_string(),
+            owner: author.to_string(),
+            description: None,
+            recipients: vec![author.to_string(), Ulid::new().to_string()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: marked,
+        }
+    }
+
+    fn saved(author: &str) -> Channel {
+        Channel::SavedMessages {
+            id: Ulid::new().to_string(),
+            user: author.to_string(),
+        }
+    }
+
+    fn text_channel() -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": Ulid::new().to_string(),
+            "server": Ulid::new().to_string(),
+            "name": "general",
+        }))
+        .expect("text channel")
+    }
+
+    fn plain(author: &str, channel: &Channel) -> Message {
+        Message {
+            id: Ulid::new().to_string(),
+            channel: channel.id().to_string(),
+            author: author.to_string(),
+            content: Some("hello".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn system(channel: &Channel) -> Message {
+        SystemMessage::UserAdded {
+            id: Ulid::new().to_string(),
+            by: Ulid::new().to_string(),
+        }
+        .into_message(channel.id().to_string())
+    }
+
+    /// The side a result refuses with, or `None` when it allows. Any other
+    /// error fails the test.
+    fn side_of(result: Result<()>) -> Option<String> {
+        match result {
+            Ok(()) => None,
+            Err(error) => match error.error_type {
+                ErrorType::EncryptionRequired { side } => Some(side),
+                other => panic!("expected EncryptionRequired, got {other:?}"),
+            },
+        }
+    }
+
+    async fn is_stored(db: &Database, message: &Message) -> bool {
+        db.fetch_message(&message.id).await.is_ok()
+    }
+
+    /// An encrypted-only author is refused by the funnel in a direct message
+    /// and in any group, with or without the author handed in, and nothing
+    /// is stored; Saved Notes and server channels take the message
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn funnel_refuses_an_encrypted_only_author() {
+        database_test!(|db| async move {
+            let only = person(&db, true).await;
+            let open = person(&db, false).await;
+            let model_only = only.clone().into_self(true).await;
+            assert!(model_only.e2ee_only);
+
+            let cases = [
+                (stored_channel(&db, dm(&only.id, &open.id)).await, Some("sender")),
+                (stored_channel(&db, group(&only.id, false)).await, Some("sender")),
+                (stored_channel(&db, group(&only.id, true)).await, Some("group")),
+                (stored_channel(&db, saved(&only.id)).await, None),
+                (stored_channel(&db, text_channel()).await, None),
+            ];
+
+            for (channel, expected) in &cases {
+                let is_dm = channel.is_direct_dm();
+                for handed in [true, false] {
+                    let case = format!("{channel:?} handed={handed}");
+                    let author = handed.then(|| model_only.clone());
+
+                    let mut message = plain(&only.id, channel);
+                    let result = message
+                        .send_without_notifications(&db, author, None, is_dm, false, true)
+                        .await;
+                    assert_eq!(side_of(result).as_deref(), *expected, "{case}");
+                    assert_eq!(is_stored(&db, &message).await, expected.is_none(), "{case}");
+                }
+            }
+        });
+    }
+
+    /// A marked group refuses a plain row from any author through the funnel
+    /// and through the insert, a webhook row included; an unmarked group,
+    /// a direct message, Saved Notes and a server channel store plain rows
+    /// from an open author
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn insert_refuses_plain_rows_in_a_marked_group_only() {
+        database_test!(|db| async move {
+            let open = person(&db, false).await;
+            let peer = person(&db, false).await;
+            let model_open = open.clone().into_self(true).await;
+
+            let marked = stored_channel(&db, group(&open.id, true)).await;
+
+            let mut message = plain(&open.id, &marked);
+            let author = Some(model_open.clone());
+            let result = message
+                .send_without_notifications(&db, author, None, false, false, true)
+                .await;
+            assert_eq!(side_of(result).as_deref(), Some("group"));
+            assert!(!is_stored(&db, &message).await);
+
+            let message = plain(&open.id, &marked);
+            assert_eq!(side_of(db.insert_message(&message).await).as_deref(), Some("group"));
+            assert!(!is_stored(&db, &message).await);
+
+            let mut hooked = plain(&Ulid::new().to_string(), &marked);
+            hooked.webhook = Some(MessageWebhook {
+                name: "hook".to_string(),
+                avatar: None,
+            });
+            assert_eq!(side_of(db.insert_message(&hooked).await).as_deref(), Some("group"));
+            assert!(!is_stored(&db, &hooked).await);
+
+            for channel in [
+                group(&open.id, false),
+                dm(&open.id, &peer.id),
+                saved(&open.id),
+                text_channel(),
+            ] {
+                let channel = stored_channel(&db, channel).await;
+                let message = plain(&open.id, &channel);
+                db.insert_message(&message).await.unwrap();
+                assert!(is_stored(&db, &message).await, "{channel:?}");
+
+                let mut message = plain(&open.id, &channel);
+                message
+                    .send_without_notifications(
+                        &db,
+                        Some(model_open.clone()),
+                        None,
+                        channel.is_direct_dm(),
+                        false,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                assert!(is_stored(&db, &message).await, "{channel:?}");
+            }
+        });
+    }
+
+    /// Server-written rows ("X was added") are still stored in a marked
+    /// group, through the funnel and the insert
+    #[tokio::test]
+    async fn system_rows_are_stored_in_a_marked_group() {
+        database_test!(|db| async move {
+            let owner = person(&db, true).await;
+            let marked = stored_channel(&db, group(&owner.id, true)).await;
+
+            let message = system(&marked);
+            db.insert_message(&message).await.unwrap();
+            assert!(is_stored(&db, &message).await);
+
+            let mut message = system(&marked);
+            message
+                .send_without_notifications(&db, None, None, false, false, true)
+                .await
+                .unwrap();
+            assert!(is_stored(&db, &message).await);
+        });
+    }
+
+    /// With the refusals switched off the insert backstop allows everything;
+    /// on, only a plain row in a marked group is refused
+    #[test]
+    fn not_enforced_lifts_the_insert_backstop() {
+        let (on, off) = (e2ee(true), e2ee(false));
+        let author = Ulid::new().to_string();
+
+        let marked = group(&author, true);
+        let unmarked = group(&author, false);
+        let row = plain(&author, &marked);
+        let system_row = system(&marked);
+
+        assert_eq!(
+            side_of(row.e2ee_only_insert_allowed(&on, &Ok(marked.clone()))).as_deref(),
+            Some("group")
+        );
+        assert_eq!(side_of(row.e2ee_only_insert_allowed(&off, &Ok(marked.clone()))), None);
+        assert_eq!(side_of(system_row.e2ee_only_insert_allowed(&on, &Ok(marked.clone()))), None);
+        assert_eq!(side_of(row.e2ee_only_insert_allowed(&on, &Ok(unmarked.clone()))), None);
+        assert_eq!(
+            side_of(row.e2ee_only_insert_allowed(&on, &Err(create_error!(NotFound)))),
+            None
+        );
+    }
+
+    /// A plain message from an open author into a direct message whose other
+    /// account is encrypted-only is refused by the funnel with `recipient`,
+    /// with or without the author handed in, and nothing is stored
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn funnel_refuses_a_direct_message_to_an_encrypted_only_peer() {
+        database_test!(|db| async move {
+            let open = person(&db, false).await;
+            let only = person(&db, true).await;
+            let model_open = open.clone().into_self(true).await;
+
+            let channel = stored_channel(&db, dm(&open.id, &only.id)).await;
+
+            for handed in [true, false] {
+                let author = handed.then(|| model_open.clone());
+
+                let mut message = plain(&open.id, &channel);
+                let result = message
+                    .send_without_notifications(&db, author, None, true, false, true)
+                    .await;
+                assert_eq!(side_of(result).as_deref(), Some("recipient"), "handed={handed}");
+                assert!(!is_stored(&db, &message).await, "handed={handed}");
+            }
+        });
+    }
+
+    /// With the refusals switched off the funnel allows every case it refuses
+    /// when on, and the direct message to an encrypted-only peer is stored
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn not_enforced_lifts_the_funnel() {
+        database_test!(|db| async move {
+            let (on, off) = (e2ee(true), e2ee(false));
+            let open = person(&db, false).await;
+            let only = person(&db, true).await;
+            let other = person(&db, false).await;
+
+            let to_peer = dm(&open.id, &only.id);
+            let cases = [
+                (&open, to_peer.clone(), Some("recipient")),
+                (&only, dm(&only.id, &other.id), Some("sender")),
+                (&only, group(&only.id, false), Some("sender")),
+                (&open, group(&open.id, true), Some("group")),
+                (&open, group(&open.id, false), None),
+                (&only, saved(&only.id), None),
+                (&only, text_channel(), None),
+            ];
+
+            for (author, channel, expected) in cases {
+                let channel = stored_channel(&db, channel).await;
+                let message = plain(&author.id, &channel);
+                for known in [None, Some(&channel)] {
+                    let case = format!("{channel:?} known={}", known.is_some());
+                    assert_eq!(
+                        side_of(message.e2ee_only_send_allowed(&db, &on, known, None).await)
+                            .as_deref(),
+                        expected,
+                        "{case}"
+                    );
+                    assert_eq!(
+                        side_of(message.e2ee_only_send_allowed(&db, &off, known, None).await),
+                        None,
+                        "{case} not enforced"
+                    );
+                }
+            }
+
+            // Past the funnel nothing else refuses a direct message
+            let message = plain(&open.id, &to_peer);
+            db.insert_message(&message).await.unwrap();
+            assert!(is_stored(&db, &message).await);
+        });
+    }
+
+    /// The caller's copy of the channel is used only when its id is the
+    /// message's channel: a copy of another channel falls back to the read
+    /// and the direct message is still refused, and a matching copy is used
+    /// as is (the channel below is never stored, so a read would find
+    /// nothing and allow)
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn funnel_trusts_only_a_copy_of_the_message_channel() {
+        database_test!(|db| async move {
+            let on = e2ee(true);
+            let open = person(&db, false).await;
+            let only = person(&db, true).await;
+
+            let stored = stored_channel(&db, dm(&open.id, &only.id)).await;
+            let message = plain(&open.id, &stored);
+            let elsewhere = text_channel();
+            assert_eq!(
+                side_of(message.e2ee_only_send_allowed(&db, &on, Some(&elsewhere), None).await)
+                    .as_deref(),
+                Some("recipient")
+            );
+
+            let unstored = dm(&open.id, &only.id);
+            let message = plain(&open.id, &unstored);
+            assert_eq!(
+                side_of(message.e2ee_only_send_allowed(&db, &on, None, None).await),
+                None,
+                "a missing channel is left to the insert"
+            );
+            assert_eq!(
+                side_of(message.e2ee_only_send_allowed(&db, &on, Some(&unstored), None).await)
+                    .as_deref(),
+                Some("recipient")
+            );
+        });
+    }
+
+    /// The funnel loads no account for Saved Notes or a server channel; only
+    /// a direct message or a group gets past this to the author and peer
+    /// lookups in `e2ee_only_send_allowed`
+    #[test]
+    fn funnel_reads_accounts_only_for_direct_messages_and_groups() {
+        let author = Ulid::new().to_string();
+
+        for (channel, expected) in [
+            (dm(&author, "01E2EEONLYPEER000000000001"), true),
+            (group(&author, false), true),
+            (group(&author, true), true),
+            (saved(&author), false),
+            (text_channel(), false),
+        ] {
+            assert_eq!(
+                Message::e2ee_only_send_reads_accounts(&channel),
+                expected,
+                "{channel:?}"
+            );
+        }
     }
 }

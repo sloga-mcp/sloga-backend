@@ -3,16 +3,18 @@ use std::{borrow::Cow, collections::HashMap};
 
 use iso8601_timestamp::Timestamp;
 use redis_kiss::get_connection;
-use revolt_config::config;
+use revolt_config::{config, E2EEFeatures};
 use revolt_models::v0::{self, MessageAuthor};
 use revolt_permissions::OverrideField;
-use revolt_result::Result;
+use revolt_result::{ErrorType, Result};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    events::client::EventV1, Database, File, Message, PartialMessage, PartialServer, Server,
-    SystemMessage, User, AMQP,
+    events::client::EventV1,
+    util::e2ee_only::{self, E2EE_GROUP_MAX, SIDE_MEMBER, SIDE_RECIPIENT, SIDE_SENDER},
+    Database, E2EEIdentity, File, Message, PartialMessage, PartialServer, Server, SystemMessage,
+    User, AMQP,
 };
 
 #[cfg(feature = "mongodb")]
@@ -82,6 +84,13 @@ auto_derived!(
             /// Voice call configuration for this group (limits, on/off)
             #[serde(skip_serializing_if = "Option::is_none")]
             voice: Option<VoiceInformation>,
+
+            /// Whether this group only takes end-to-end encrypted messages.
+            ///
+            /// Set when the group is created. No client edit can set or
+            /// clear it: it is not in `PartialChannel` or `FieldsChannel`.
+            #[serde(skip_serializing_if = "crate::if_false", default)]
+            e2ee_only: bool,
         },
         /// Text channel belonging to a server
         TextChannel {
@@ -886,10 +895,28 @@ impl Channel {
     }
 
     /// Create a group
+    ///
+    /// There is no session to check here, so a group that would be marked
+    /// encrypted-only is refused while the marks are enforced (see
+    /// [`Channel::create_group_from_session`]).
     pub async fn create_group(
+        db: &Database,
+        data: v0::DataCreateGroup,
+        owner_id: String,
+    ) -> Result<Channel> {
+        Channel::create_group_from_session(db, data, owner_id, None).await
+    }
+
+    /// Create a group for a creator signed in with `owner_session_id`
+    ///
+    /// The group is marked encrypted-only when the creator or anyone added
+    /// with them is encrypted-only (see [`Channel::new_group_e2ee_only`]).
+    /// Every refusal comes before the icon is claimed.
+    pub async fn create_group_from_session(
         db: &Database,
         mut data: v0::DataCreateGroup,
         owner_id: String,
+        owner_session_id: Option<&str>,
     ) -> Result<Channel> {
         data.users.insert(owner_id.to_string());
 
@@ -900,6 +927,16 @@ impl Channel {
             }));
         }
 
+        let recipients = data.users.into_iter().collect::<Vec<String>>();
+        let e2ee_only = Channel::new_group_e2ee_only(
+            db,
+            &config.features.e2ee,
+            &owner_id,
+            owner_session_id,
+            &recipients,
+        )
+        .await?;
+
         let id = ulid::Ulid::new().to_string();
 
         let icon = if let Some(icon_id) = data.icon {
@@ -908,7 +945,6 @@ impl Channel {
             None
         };
 
-        let recipients = data.users.into_iter().collect::<Vec<String>>();
         let channel = Channel::Group {
             id,
 
@@ -926,6 +962,8 @@ impl Channel {
             spoiler: data.spoiler.unwrap_or(false),
 
             voice: None,
+
+            e2ee_only,
         };
 
         db.insert_channel(&channel).await?;
@@ -936,6 +974,100 @@ impl Channel {
         }
 
         Ok(channel)
+    }
+
+    /// Whether a new group of `recipients` (the creator `owner_id` included)
+    /// is marked encrypted-only, or why it cannot be created
+    ///
+    /// Marked when any of them is encrypted-only, whether or not the marks
+    /// are enforced. While they are, a marked group is refused:
+    /// - `sender` unless `owner_session_id` is bound to one of the creator's
+    ///   published devices,
+    /// - `member` above `E2EE_GROUP_MAX` members, with a bot among them, or
+    ///   with anyone who has no published device.
+    pub async fn new_group_e2ee_only(
+        db: &Database,
+        cfg: &E2EEFeatures,
+        owner_id: &str,
+        owner_session_id: Option<&str>,
+        recipients: &[String],
+    ) -> Result<bool> {
+        let users = db.fetch_users(recipients).await?;
+        if !users.iter().any(|user| user.e2ee_only) {
+            return Ok(false);
+        }
+
+        if !e2ee_only::enforced(cfg) {
+            return Ok(true);
+        }
+
+        // An empty id would match a device row that is bound to no session
+        let session_id = owner_session_id.unwrap_or_default();
+        let bound = if session_id.is_empty() {
+            Err(create_error!(NotAuthenticated))
+        } else {
+            E2EEIdentity::require_device_bound_session(db, owner_id, session_id).await
+        };
+        match bound {
+            Ok(()) => {}
+            Err(error) if matches!(error.error_type, ErrorType::NotAuthenticated) => {
+                return Err(e2ee_only::refused(SIDE_SENDER));
+            }
+            Err(error) => return Err(error),
+        }
+
+        if recipients.len() > E2EE_GROUP_MAX || users.iter().any(|user| user.bot.is_some()) {
+            return Err(e2ee_only::refused(SIDE_MEMBER));
+        }
+
+        // An id with no user row has no device either
+        let with_device = db.fetch_e2ee_user_ids_with_identity(recipients).await?;
+        if recipients.iter().any(|id| !with_device.contains(id)) {
+            return Err(e2ee_only::refused(SIDE_MEMBER));
+        }
+
+        Ok(true)
+    }
+
+    /// Whether `user` may join this group under the encrypted-only rules
+    ///
+    /// Nothing is refused while the marks are not enforced. A marked group
+    /// refuses with `member` once it has `E2EE_GROUP_MAX` members, and a bot
+    /// or an account with no published device at any size. A group that is
+    /// not marked refuses an encrypted-only account with `recipient`. Other
+    /// channels are left to the caller.
+    pub async fn e2ee_only_join_allowed(
+        &self,
+        db: &Database,
+        cfg: &E2EEFeatures,
+        user: &User,
+    ) -> Result<()> {
+        if !e2ee_only::enforced(cfg) {
+            return Ok(());
+        }
+
+        match self {
+            Channel::Group {
+                e2ee_only: true,
+                recipients,
+                ..
+            } => {
+                if recipients.len() >= E2EE_GROUP_MAX || user.bot.is_some() {
+                    return Err(e2ee_only::refused(SIDE_MEMBER));
+                }
+
+                let with_device = db
+                    .fetch_e2ee_user_ids_with_identity(&[user.id.clone()])
+                    .await?;
+                if !with_device.contains(&user.id) {
+                    return Err(e2ee_only::refused(SIDE_MEMBER));
+                }
+
+                Ok(())
+            }
+            Channel::Group { .. } if user.e2ee_only => Err(e2ee_only::refused(SIDE_RECIPIENT)),
+            _ => Ok(()),
+        }
     }
 
     /// Create a DM (or return the existing one / saved messages)
@@ -973,6 +1105,9 @@ impl Channel {
     }
 
     /// Add user to a group
+    ///
+    /// The encrypted-only join rules ([`Channel::e2ee_only_join_allowed`])
+    /// are checked before anything is written.
     pub async fn add_user_to_group(
         &mut self,
         db: &Database,
@@ -980,18 +1115,23 @@ impl Channel {
         user: &User,
         by_id: &str,
     ) -> Result<()> {
-        if let Channel::Group { recipients, .. } = self {
+        let config = config().await;
+        if let Channel::Group { recipients, .. } = &*self {
             if recipients.contains(&String::from(&user.id)) {
                 return Err(create_error!(AlreadyInGroup));
             }
 
-            let config = config().await;
             if recipients.len() >= config.features.limits.global.group_size {
                 return Err(create_error!(GroupTooLarge {
                     max: config.features.limits.global.group_size
                 }));
             }
+        }
 
+        self.e2ee_only_join_allowed(db, &config.features.e2ee, user)
+            .await?;
+
+        if let Channel::Group { recipients, .. } = self {
             recipients.push(String::from(&user.id));
         }
 
@@ -1855,6 +1995,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice,
+            e2ee_only: false,
         };
 
         // Default group (unconfigured): calling is ON with no limit.
@@ -2275,6 +2416,7 @@ mod tests {
             nsfw: false,
             spoiler: false,
             voice: None,
+            e2ee_only: false,
         };
         assert!(!group.is_protected());
         assert!(refused_with(
@@ -3005,6 +3147,7 @@ mod tests {
                 nsfw,
                 spoiler,
                 voice: None,
+                e2ee_only: false,
             };
 
             for channel in [text, forum, group] {
@@ -3333,5 +3476,444 @@ mod tests {
             1,
             "one delete site"
         );
+    }
+}
+
+/// Encrypted-only groups: the mark at creation and the join rules. Runs on
+/// whichever driver `TEST_DB` names.
+#[cfg(test)]
+mod e2ee_only_group_tests {
+    use iso8601_timestamp::Timestamp;
+    use revolt_config::E2EEFeatures;
+    use revolt_models::v0;
+    use revolt_result::{Error, ErrorType, Result};
+    use ulid::Ulid;
+
+    use crate::{
+        BotInformation, Channel, Database, E2EEIdentity, E2EESignedKey, File, FileUsedFor,
+        FileUsedForType, Metadata, User,
+    };
+
+    /// The creator's session in these tests
+    const SESSION: &str = "01E2EEONLYGROUPSESSION0001";
+
+    fn config(only_enforced: bool) -> E2EEFeatures {
+        E2EEFeatures {
+            only_enforced,
+            ..Default::default()
+        }
+    }
+
+    /// A stored account
+    async fn person(db: &Database, e2ee_only: bool, bot: bool) -> User {
+        let id = Ulid::new().to_string();
+        let user = User {
+            username: format!("u{}", &id[16..]),
+            discriminator: "0001".to_string(),
+            id,
+            e2ee_only,
+            bot: bot.then(|| BotInformation {
+                owner: "01E2EEONLYGROUPBOTOWNER001".to_string(),
+            }),
+            ..Default::default()
+        };
+        db.insert_user(&user).await.unwrap();
+        user
+    }
+
+    /// Publish a device of `user_id` bound to `session_id`. The row is stored
+    /// through the database primitive, which checks no key or signature.
+    async fn device(db: &Database, user_id: &str, session_id: &str) {
+        let device_id = Ulid::new().to_string().to_lowercase();
+        let now = Timestamp::now_utc();
+        db.insert_e2ee_identity(&E2EEIdentity {
+            id: E2EEIdentity::composite_id(user_id, &device_id),
+            user_id: user_id.to_string(),
+            protocol_version: 1,
+            ed25519_key: format!("ed25519-{device_id}"),
+            curve25519_key: format!("curve25519-{device_id}"),
+            signature: "signature".to_string(),
+            fallback_key: E2EESignedKey {
+                key_id: "fallback0".to_string(),
+                key: format!("fallback-{device_id}"),
+                signature: "signature".to_string(),
+            },
+            previous_fallback_key: None,
+            created_at: now,
+            last_seen_at: now,
+            last_session_id: session_id.to_string(),
+            device_id,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn data(members: &[&User]) -> v0::DataCreateGroup {
+        v0::DataCreateGroup {
+            name: "group".to_string(),
+            users: members.iter().map(|member| member.id.clone()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn group(marked: bool, recipients: Vec<String>) -> Channel {
+        Channel::Group {
+            id: Ulid::new().to_string(),
+            name: "group".to_string(),
+            owner: recipients.first().cloned().unwrap_or_default(),
+            description: None,
+            recipients,
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: marked,
+        }
+    }
+
+    fn ids(count: usize) -> Vec<String> {
+        (0..count).map(|_| Ulid::new().to_string()).collect()
+    }
+
+    fn is_marked(channel: &Channel) -> bool {
+        matches!(
+            channel,
+            Channel::Group {
+                e2ee_only: true,
+                ..
+            }
+        )
+    }
+
+    /// The side a result refuses with, or `None` when it allows. Any other
+    /// error fails the test.
+    fn side_of<T: std::fmt::Debug>(result: Result<T>) -> Option<String> {
+        match result {
+            Ok(_) => None,
+            Err(Error {
+                error_type: ErrorType::EncryptionRequired { side },
+                ..
+            }) => Some(side),
+            Err(other) => panic!("expected EncryptionRequired, got {other:?}"),
+        }
+    }
+
+    /// No group was stored for `user`
+    async fn assert_no_group(db: &Database, user: &User) {
+        let channels = db.find_direct_messages(&user.id).await.unwrap();
+        assert!(
+            !channels
+                .iter()
+                .any(|channel| matches!(channel, Channel::Group { .. })),
+            "a refused group was stored: {channels:?}"
+        );
+    }
+
+    /// The creator's flag or any member's flag marks the group; nobody's flag
+    /// leaves it unmarked. The mark is stored.
+    #[tokio::test]
+    async fn new_group_is_marked_by_the_creator_or_a_member() {
+        database_test!(|db| async move {
+            let open = person(&db, false, false).await;
+            let only = person(&db, true, false).await;
+            let member = person(&db, false, false).await;
+            let only_member = person(&db, true, false).await;
+            for user in [&open, &only, &member, &only_member] {
+                device(&db, &user.id, SESSION).await;
+            }
+
+            let create = |creator: &User, members: &[&User]| {
+                Channel::create_group_from_session(
+                    &db,
+                    data(members),
+                    creator.id.clone(),
+                    Some(SESSION),
+                )
+            };
+
+            let plain = create(&open, &[&member]).await.unwrap();
+            assert!(!is_marked(&plain));
+            assert!(!is_marked(&db.fetch_channel(plain.id()).await.unwrap()));
+
+            let by_creator = create(&only, &[&member]).await.unwrap();
+            assert!(is_marked(&by_creator));
+            assert!(is_marked(&db.fetch_channel(by_creator.id()).await.unwrap()));
+
+            let by_member = create(&open, &[&only_member]).await.unwrap();
+            assert!(is_marked(&by_member));
+            assert!(is_marked(&db.fetch_channel(by_member.id()).await.unwrap()));
+        });
+    }
+
+    /// Every refusal side of a group that would be marked, and that a
+    /// refusal stores nothing
+    #[tokio::test]
+    async fn marked_group_refusals() {
+        database_test!(|db| async move {
+            let create = |creator: &User, members: &[&User], session: Option<&'static str>| {
+                Channel::create_group_from_session(&db, data(members), creator.id.clone(), session)
+            };
+
+            let member = person(&db, false, false).await;
+            device(&db, &member.id, "member-session").await;
+
+            // The creator has no device at all
+            let only = person(&db, true, false).await;
+            let result = create(&only, &[&member], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+            assert_no_group(&db, &only).await;
+
+            // The creator's device is bound to another session
+            let elsewhere = person(&db, true, false).await;
+            device(&db, &elsewhere.id, "another-session").await;
+            let result = create(&elsewhere, &[&member], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+            assert_no_group(&db, &elsewhere).await;
+
+            // A device bound to no session does not match an empty or a
+            // missing session, and `create_group` has no session at all
+            let unbound = person(&db, true, false).await;
+            device(&db, &unbound.id, "").await;
+            for session in [Some(""), None] {
+                let result = create(&unbound, &[&member], session).await;
+                assert_eq!(side_of(result).as_deref(), Some("sender"), "{session:?}");
+            }
+            let result = Channel::create_group(&db, data(&[&member]), unbound.id.clone()).await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+            assert_no_group(&db, &unbound).await;
+
+            // A creator with no device, marked by a member's flag
+            let open = person(&db, false, false).await;
+            let only_member = person(&db, true, false).await;
+            device(&db, &only_member.id, "member-session").await;
+            let result = create(&open, &[&only_member], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+            assert_no_group(&db, &open).await;
+
+            // From here the creator acts as one of their devices
+            let creator = person(&db, true, false).await;
+            device(&db, &creator.id, SESSION).await;
+
+            // A member with no device
+            let deviceless = person(&db, false, false).await;
+            let result = create(&creator, &[&member, &deviceless], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("member"));
+
+            // An encrypted-only member with no device
+            let deviceless_only = person(&db, true, false).await;
+            let result = create(&creator, &[&deviceless_only], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("member"));
+
+            // A bot, even one with a device row
+            let bot = person(&db, false, true).await;
+            device(&db, &bot.id, "bot-session").await;
+            let result = create(&creator, &[&member, &bot], Some(SESSION)).await;
+            assert_eq!(side_of(result).as_deref(), Some("member"));
+            assert_no_group(&db, &creator).await;
+
+            // The control: everyone has a device
+            let channel = create(&creator, &[&member], Some(SESSION)).await.unwrap();
+            assert!(is_marked(&channel));
+        });
+    }
+
+    /// 24 members counting the creator are allowed; 25 are refused
+    #[tokio::test]
+    async fn marked_group_cap_counts_the_creator() {
+        database_test!(|db| async move {
+            let creator = person(&db, true, false).await;
+            device(&db, &creator.id, SESSION).await;
+
+            let mut members = vec![];
+            for _ in 0..crate::util::e2ee_only::E2EE_GROUP_MAX {
+                let member = person(&db, false, false).await;
+                device(&db, &member.id, "member-session").await;
+                members.push(member);
+            }
+            let members: Vec<&User> = members.iter().collect();
+
+            // 23 members and the creator
+            let channel = Channel::create_group_from_session(
+                &db,
+                data(&members[..23]),
+                creator.id.clone(),
+                Some(SESSION),
+            )
+            .await
+            .unwrap();
+            assert!(is_marked(&channel));
+            match &channel {
+                Channel::Group { recipients, .. } => assert_eq!(recipients.len(), 24),
+                _ => unreachable!(),
+            }
+
+            // 24 members and the creator
+            let result = Channel::create_group_from_session(
+                &db,
+                data(&members),
+                creator.id.clone(),
+                Some(SESSION),
+            )
+            .await;
+            assert_eq!(side_of(result).as_deref(), Some("member"));
+        });
+    }
+
+    /// A refused group leaves its icon unclaimed; the same request once it
+    /// can be created claims it
+    #[tokio::test]
+    async fn refused_group_leaves_its_icon_unclaimed() {
+        database_test!(|db| async move {
+            let creator = person(&db, true, false).await;
+            let icon = File {
+                id: "01E2EEONLYGROUPICON0000001".to_string(),
+                tag: "icons".to_string(),
+                filename: "icon.png".to_string(),
+                hash: None,
+                uploaded_at: None,
+                uploader_id: Some(creator.id.clone()),
+                used_for: None,
+                deleted: None,
+                reported: None,
+                metadata: Metadata::File,
+                content_type: "image/png".to_string(),
+                size: 1,
+                message_id: None,
+                user_id: None,
+                server_id: None,
+                object_id: None,
+            };
+            db.insert_attachment(&icon).await.unwrap();
+            let with_icon = || v0::DataCreateGroup {
+                icon: Some(icon.id.clone()),
+                ..data(&[])
+            };
+
+            let result = Channel::create_group_from_session(
+                &db,
+                with_icon(),
+                creator.id.clone(),
+                Some(SESSION),
+            )
+            .await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+            let stored = db.fetch_attachment("icons", &icon.id).await.unwrap();
+            assert_eq!(stored.used_for, None, "the refusal claimed the icon");
+
+            device(&db, &creator.id, SESSION).await;
+            let channel = Channel::create_group_from_session(
+                &db,
+                with_icon(),
+                creator.id.clone(),
+                Some(SESSION),
+            )
+            .await
+            .unwrap();
+            let stored = db.fetch_attachment("icons", &icon.id).await.unwrap();
+            assert_eq!(
+                stored.used_for,
+                Some(FileUsedFor {
+                    id: channel.id().to_string(),
+                    object_type: FileUsedForType::ChannelIcon,
+                })
+            );
+        });
+    }
+
+    /// With the marks not enforced a group is still marked, and nothing that
+    /// would refuse it does
+    #[tokio::test]
+    async fn not_enforced_marks_without_refusing() {
+        database_test!(|db| async move {
+            let only = person(&db, true, false).await;
+            let open = person(&db, false, false).await;
+            let bot = person(&db, false, true).await;
+            let deviceless = person(&db, false, false).await;
+
+            let (on, off) = (config(true), config(false));
+
+            // No session, a bot, a member with no device, and over the cap
+            let mut all = vec![only.id.clone(), bot.id.clone(), deviceless.id.clone()];
+            all.extend(ids(crate::util::e2ee_only::E2EE_GROUP_MAX));
+
+            let result = Channel::new_group_e2ee_only(&db, &off, &only.id, None, &all).await;
+            assert!(matches!(result, Ok(true)), "{result:?}");
+
+            let result = Channel::new_group_e2ee_only(&db, &on, &only.id, None, &all).await;
+            assert_eq!(side_of(result).as_deref(), Some("sender"));
+
+            // Nobody encrypted-only: unmarked either way
+            let plain = [open.id.clone(), bot.id.clone(), deviceless.id.clone()];
+            for cfg in [&off, &on] {
+                let result = Channel::new_group_e2ee_only(&db, cfg, &open.id, None, &plain).await;
+                assert!(matches!(result, Ok(false)), "{result:?}");
+            }
+        });
+    }
+
+    /// The join rules of `add_user_to_group`, for a marked group and an
+    /// unmarked one, with the marks enforced and not
+    #[tokio::test]
+    async fn join_rules() {
+        database_test!(|db| async move {
+            let on = config(true);
+            let off = config(false);
+
+            let with_device = person(&db, false, false).await;
+            device(&db, &with_device.id, "joiner-session").await;
+            let only_with_device = person(&db, true, false).await;
+            device(&db, &only_with_device.id, "joiner-session").await;
+            let deviceless = person(&db, false, false).await;
+            let only_deviceless = person(&db, true, false).await;
+            let bot = person(&db, false, true).await;
+            device(&db, &bot.id, "bot-session").await;
+
+            let marked = group(true, ids(2));
+            let unmarked = group(false, ids(2));
+
+            let cases: [(&Channel, &User, Option<&str>); 10] = [
+                (&marked, &with_device, None),
+                (&marked, &only_with_device, None),
+                (&marked, &deviceless, Some("member")),
+                (&marked, &only_deviceless, Some("member")),
+                (&marked, &bot, Some("member")),
+                (&unmarked, &with_device, None),
+                (&unmarked, &deviceless, None),
+                (&unmarked, &bot, None),
+                (&unmarked, &only_with_device, Some("recipient")),
+                (&unmarked, &only_deviceless, Some("recipient")),
+            ];
+            for (channel, user, expected) in cases {
+                let case = format!("marked={} joiner={}", is_marked(channel), user.id);
+                let result = channel.e2ee_only_join_allowed(&db, &on, user).await;
+                assert_eq!(side_of(result).as_deref(), expected, "{case}");
+                let result = channel.e2ee_only_join_allowed(&db, &off, user).await;
+                assert_eq!(side_of(result), None, "{case} not enforced");
+            }
+
+            // The cap: a 24th member joins, a 25th does not
+            let almost_full = group(true, ids(23));
+            let result = almost_full
+                .e2ee_only_join_allowed(&db, &on, &with_device)
+                .await;
+            assert_eq!(side_of(result), None);
+            let full = group(true, ids(24));
+            let result = full.e2ee_only_join_allowed(&db, &on, &with_device).await;
+            assert_eq!(side_of(result).as_deref(), Some("member"));
+            let result = full.e2ee_only_join_allowed(&db, &off, &with_device).await;
+            assert_eq!(side_of(result), None);
+
+            // Other channels are not this check's business
+            let saved = Channel::SavedMessages {
+                id: Ulid::new().to_string(),
+                user: only_deviceless.id.clone(),
+            };
+            let result = saved
+                .e2ee_only_join_allowed(&db, &on, &only_deviceless)
+                .await;
+            assert_eq!(side_of(result), None);
+        });
     }
 }

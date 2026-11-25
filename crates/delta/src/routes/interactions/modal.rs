@@ -101,8 +101,14 @@ pub async fn interaction_modal(
     permissions.throw_if_lacking_channel_permission(ChannelPermission::SendMessage)?;
 
     // A thread is judged by its parent: a thread under a protected channel
-    // takes no bot traffic either
-    crate::util::interactions::ensure_interactions_allowed_in(&channel, &permission_channel)?;
+    // takes no bot traffic either. An encrypted-only group takes no form.
+    crate::util::interactions::ensure_interactions_allowed_in(
+        db,
+        &user,
+        &channel,
+        &permission_channel,
+    )
+    .await?;
 
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
 
@@ -722,5 +728,139 @@ mod test {
             answers[1].1
         );
         assert_eq!(answers[0], answers[1]);
+    }
+
+    /// A group of `owner` and a new bot, stored directly and unmarked
+    async fn group_with_bot(
+        harness: &TestHarness,
+        owner: &User,
+    ) -> (revolt_database::Channel, Bot) {
+        let (bot, _) = Bot::create(&harness.db, TestHarness::rand_string(), owner, None)
+            .await
+            .expect("`Bot`");
+        let group = revolt_database::Channel::Group {
+            id: ulid::Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone(), bot.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        (group, bot)
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &revolt_database::Database, channel_id: &str, marked: bool) {
+        match db {
+            revolt_database::Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(revolt_database::Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            revolt_database::Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// Encrypted-only: a bot may not open a form in a marked group
+    /// (`group`): no submission row, the source slot unclaimed. With the
+    /// mark lifted the identical request opens the form (the control), so
+    /// the refusal consumed nothing. The acting account is the bot, which
+    /// can never be encrypted-only itself, so `sender` does not arise here.
+    ///
+    /// Control: the helper's `plain_write_allowed` call removed → the first
+    /// request opens the form.
+    #[test]
+    fn modal_open_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(modal_open_in_an_encrypted_only_group_is_refused_case())
+    }
+
+    async fn modal_open_in_an_encrypted_only_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+
+        let source = command_row("tok-group", &bot.id, &user.id, group.id());
+        harness
+            .db
+            .insert_interaction(&source)
+            .await
+            .expect("interaction");
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let refused = open_modal(&harness, &bot, &source.id, "tok-group").await;
+        assert_eq!(refused.0, Status::Forbidden, "{:?}", refused);
+        let error: serde_json::Value = serde_json::from_str(&refused.1).expect("JSON");
+        assert_eq!(error["type"], "EncryptionRequired", "{}", refused.1);
+        assert_eq!(error["side"], "group", "{}", refused.1);
+
+        let stored = harness
+            .db
+            .fetch_interaction(&source.id)
+            .await
+            .expect("interaction");
+        assert!(!stored.responded, "a refused form must not claim the slot");
+        assert_eq!(
+            interactions_in(&harness.db, group.id()).await,
+            1,
+            "no submission row was written"
+        );
+
+        mark_group_raw(&harness.db, group.id(), false).await;
+        let opened = open_modal(&harness, &bot, &source.id, "tok-group").await;
+        assert_eq!(opened.0, Status::Ok, "{:?}", opened);
+        assert_eq!(interactions_in(&harness.db, group.id()).await, 2);
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn modal_open_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(
+            modal_open_in_an_encrypted_only_group_is_allowed_when_not_enforced_case(),
+        )
+    }
+
+    async fn modal_open_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (_, _session, user) = harness.new_user().await;
+        let (group, bot) = group_with_bot(&harness, &user).await;
+        let source = command_row("tok-group", &bot.id, &user.id, group.id());
+        harness
+            .db
+            .insert_interaction(&source)
+            .await
+            .expect("interaction");
+        mark_group_raw(&harness.db, group.id(), true).await;
+
+        let opened = open_modal(&harness, &bot, &source.id, "tok-group").await;
+        assert_eq!(opened.0, Status::Ok, "{:?}", opened);
+        assert_eq!(interactions_in(&harness.db, group.id()).await, 2);
     }
 }

@@ -12,10 +12,10 @@ use rocket::{serde::json::Json, State};
 /// management UI.
 ///
 /// For your own devices the listing includes registration/last-seen times,
-/// the remaining one-time key count (drives replenishment) and the session
-/// the device is bound to with that session's name (protected channels
-/// design §7.2, S2-D38); for peers only the device id, protocol version and
-/// identity key are returned.
+/// the remaining one-time key count (drives replenishment), the current and
+/// previous fallback keys, and the session the device is bound to with that
+/// session's name (protected channels design §7.2, S2-D38); for peers only
+/// the device id, protocol version and identity key are returned.
 ///
 /// Peer listings require a device-bound session (design §8) — only an
 /// E2EE-capable device has any use for them. Listing your OWN devices is
@@ -46,12 +46,14 @@ pub async fn fetch_devices(
         super::require_e2ee_fetch_eligible(db, &user, &target).await?;
     }
 
-    // Names of the caller's own sessions only: a device bound to a session
-    // that is gone (or is not the caller's) lists no name
+    // Own listing only: the names of the caller's own sessions, from one
+    // lookup (a device bound to "", to a session that is gone or is not the
+    // caller's, or to an unnamed session lists no name)
     let session_names: HashMap<String, String> = if own {
         db.fetch_sessions(&user.id)
             .await?
             .into_iter()
+            .filter(|session| session.user_id == user.id && !session.name.is_empty())
             .map(|session| (session.id, session.name))
             .collect()
     } else {
@@ -69,6 +71,20 @@ pub async fn fetch_devices(
             None
         };
 
+        let created_at = own.then(|| identity.created_at.to_string());
+        let last_seen_at = own.then(|| identity.last_seen_at.to_string());
+
+        // Own listing only (multi-device D6): the public fallback keys let
+        // an install tell its own keys from a twin's
+        let (fallback_key, previous_fallback_key) = if own {
+            (
+                Some(identity.fallback_key.into()),
+                identity.previous_fallback_key.map(Into::into),
+            )
+        } else {
+            (None, None)
+        };
+
         let (session_id, session_name) = if own {
             (
                 Some(identity.last_session_id.clone()),
@@ -83,14 +99,16 @@ pub async fn fetch_devices(
         let session_name = session_name.filter(|_| session_id.is_some());
 
         devices.push(v0::E2EEDeviceInfo {
-            created_at: own.then(|| identity.created_at.to_string()),
-            last_seen_at: own.then(|| identity.last_seen_at.to_string()),
+            created_at,
+            last_seen_at,
             device_id: identity.device_id,
             protocol_version: identity.protocol_version,
             ed25519_key: identity.ed25519_key,
             curve25519_key: identity.curve25519_key,
             signature: identity.signature,
             one_time_key_count,
+            fallback_key,
+            previous_fallback_key,
             session_id,
             session_name,
         });

@@ -31,6 +31,9 @@ mod referrals;
 mod remote_control_audit;
 mod safety_reports;
 mod safety_snapshots;
+mod staff_audit;
+mod takedown;
+mod upload_hash_blocks;
 mod server_bans;
 mod server_boosts;
 mod server_legal_holds;
@@ -87,6 +90,9 @@ pub use referrals::now_ms;
 pub use remote_control_audit::*;
 pub use safety_reports::*;
 pub use safety_snapshots::*;
+pub use staff_audit::*;
+pub use takedown::*;
+pub use upload_hash_blocks::*;
 pub use server_bans::*;
 pub use server_boosts::*;
 pub use server_legal_holds::*;
@@ -148,6 +154,9 @@ pub trait AbstractDatabase:
     + remote_control_audit::AbstractRemoteControlAudit
     + safety_reports::AbstractReport
     + safety_snapshots::AbstractSnapshot
+    + staff_audit::AbstractStaffAudit
+    + takedown::AbstractTakedownRequests
+    + upload_hash_blocks::AbstractUploadHashBlocks
     + server_bans::AbstractServerBans
     + server_boosts::AbstractServerBoosts
     + server_legal_holds::AbstractServerLegalHolds

@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
+use revolt_config::config;
 use revolt_database::events::client::EventV1;
+use revolt_database::util::e2ee_only;
 use revolt_database::util::permissions::DatabasePermissionQuery;
 use revolt_database::util::reference::Reference;
-use revolt_database::{Database, SoftResReserveRow, SoftResSheet, User};
+use revolt_database::{Channel, Database, SoftResReserveRow, SoftResSheet, User};
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission, PermissionValue};
 use revolt_result::{create_error, Result};
@@ -17,12 +19,13 @@ use crate::util::softres::{can_see_full, validate_reserve_items};
 /// Resolve the sheet after the usual channel permission gate, rejecting
 /// locked sheets (manual lock, event-cancel lock, or the snapshotted
 /// `locks_at` instant having passed — a pure compare, no event fetch).
+/// The channel is handed back for the checks that depend on it.
 async fn resolve_open_sheet(
     db: &Database,
     target: &Reference<'_>,
     sheet_id: &str,
     user: &User,
-) -> Result<(SoftResSheet, PermissionValue)> {
+) -> Result<(SoftResSheet, PermissionValue, Channel)> {
     let channel = target.as_channel(db).await?;
 
     let permission_channel = channel.permission_target(db).await?.into_owned();
@@ -48,7 +51,7 @@ async fn resolve_open_sheet(
         return Err(create_error!(SoftResLocked));
     }
 
-    Ok((sheet, permissions))
+    Ok((sheet, permissions, channel))
 }
 
 /// Publish `SoftresReserveUpdate` for a row change. For hidden sheets the
@@ -140,7 +143,14 @@ pub async fn softres_reserve(
         })
     })?;
 
-    let (sheet, permissions) = resolve_open_sheet(db, &target, &sheet_id, &user).await?;
+    let (sheet, permissions, channel) = resolve_open_sheet(db, &target, &sheet_id, &user).await?;
+
+    // A reserve row carries a character name and a note, plain text that an
+    // encrypted-only account or group never takes. Refused right after the
+    // channel, permission and sheet checks, before the row is validated or
+    // written.
+    let e2ee_config = config().await.features.e2ee.clone();
+    e2ee_only::plain_write_allowed(db, &e2ee_config, &user, &channel, None).await?;
 
     // Character names are letters-only (WoW name rules — a free charset
     // buys nothing and hurts addon-import robustness).
@@ -269,7 +279,9 @@ pub async fn softres_unreserve(
     target: Reference<'_>,
     sheet_id: String,
 ) -> Result<Json<v0::SoftRes>> {
-    let (sheet, permissions) = resolve_open_sheet(db, &target, &sheet_id, &user).await?;
+    // A retraction only removes the caller's own row, so it carries no
+    // plain content and stays allowed in an encrypted-only conversation.
+    let (sheet, permissions, _) = resolve_open_sheet(db, &target, &sheet_id, &user).await?;
 
     let previous = db.remove_reserve(&sheet.id, &user.id).await?;
 
@@ -300,8 +312,12 @@ pub mod test {
     use crate::{rocket, util::test::TestHarness};
     use revolt_database::Member;
     use revolt_models::v0;
-    use rocket::http::{ContentType, Header, Status};
+    use rocket::http::{ContentType, Header, Method, Status};
     use serde_json::json;
+
+    use super::super::message_send::test::{
+        assert_accepted, assert_encryption_required, e2ee_dm, e2ee_request, set_e2ee_only,
+    };
 
     pub async fn create_sheet(
         harness: &TestHarness,
@@ -657,6 +673,126 @@ pub mod test {
         assert!(state.reserves.is_some(), "creator sees rows");
         assert!(state.item_counts.is_some(), "creator sees counts");
         assert_eq!(user.id, user.id);
+    }
+
+    /// A reserve on a sheet in a direct message with an encrypted-only side
+    /// is refused and stores no row; retracting stays allowed. Control:
+    /// with the flags lifted the same reserve is stored.
+    #[test]
+    fn e2ee_only_reserve_refused_without_side_effects() {
+        crate::util::test::rt().block_on(Box::pin(
+            e2ee_only_reserve_refused_without_side_effects_case(),
+        ))
+    }
+
+    async fn e2ee_only_reserve_refused_without_side_effects_case() {
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = create_sheet(
+            &harness,
+            &author_session.token,
+            dm.id(),
+            json!({ "title": "Sunday MC", "edition": "classic", "raids": ["mc"] }),
+        )
+        .await;
+        let sheet_id = message.softres.expect("softres").id;
+        let path = format!("/channels/{}/softres/{}/reserve", dm.id(), sheet_id);
+        let row = json!({ "character_name": "Leeroy", "class": "paladin", "items": [17204] });
+
+        set_e2ee_only(&harness, &mut author, true).await;
+        let answer = e2ee_request(&harness, Method::Put, &path, &author_session, Some(&row)).await;
+        assert_encryption_required(&answer, "sender", "an encrypted-only author");
+
+        // Retracting writes nothing plain
+        let answer = e2ee_request(&harness, Method::Delete, &path, &author_session, None).await;
+        assert_accepted(&answer, "a retraction");
+
+        set_e2ee_only(&harness, &mut author, false).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+        let answer = e2ee_request(&harness, Method::Put, &path, &author_session, Some(&row)).await;
+        assert_encryption_required(&answer, "recipient", "an encrypted-only peer");
+        let answer = e2ee_request(
+            &harness,
+            Method::Put,
+            &path,
+            &peer_session,
+            Some(&json!({ "character_name": "Jenkins", "class": "mage", "items": [18563] })),
+        )
+        .await;
+        assert_encryption_required(&answer, "sender", "the encrypted-only peer");
+
+        let rows = harness
+            .db
+            .fetch_reserves_for_sheet(&sheet_id)
+            .await
+            .expect("reserves");
+        assert!(
+            rows.is_empty(),
+            "a refused reserve stored a row: {}",
+            rows.len()
+        );
+
+        // Control: no flags, the same reserve
+        set_e2ee_only(&harness, &mut peer, false).await;
+        let answer = e2ee_request(&harness, Method::Put, &path, &author_session, Some(&row)).await;
+        assert_accepted(&answer, "no flags");
+        assert_eq!(answer.1["total_reserves"], 1, "{}", answer.1);
+    }
+
+    /// With `only_enforced = false` the same reserves are stored
+    #[test]
+    fn e2ee_only_reserve_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.e2ee.only_enforced = false;
+            })
+            .await;
+            Box::pin(e2ee_only_reserve_allowed_when_not_enforced_case()).await
+        })
+    }
+
+    async fn e2ee_only_reserve_allowed_when_not_enforced_case() {
+        assert!(
+            !revolt_config::config().await.features.e2ee.only_enforced,
+            "precondition: the refusals are switched off"
+        );
+
+        let harness = TestHarness::new().await;
+        let (author_session, mut author, peer_session, mut peer, dm) = e2ee_dm(&harness).await;
+        let message = create_sheet(
+            &harness,
+            &author_session.token,
+            dm.id(),
+            json!({ "title": "Sunday MC", "edition": "classic", "raids": ["mc"] }),
+        )
+        .await;
+        let sheet_id = message.softres.expect("softres").id;
+        let path = format!("/channels/{}/softres/{}/reserve", dm.id(), sheet_id);
+        set_e2ee_only(&harness, &mut author, true).await;
+        set_e2ee_only(&harness, &mut peer, true).await;
+
+        for (session, row, case) in [
+            (
+                &author_session,
+                json!({ "character_name": "Leeroy", "class": "paladin", "items": [17204] }),
+                "an encrypted-only author and peer",
+            ),
+            (
+                &peer_session,
+                json!({ "character_name": "Jenkins", "class": "mage", "items": [18563] }),
+                "the encrypted-only peer",
+            ),
+        ] {
+            let answer = e2ee_request(&harness, Method::Put, &path, session, Some(&row)).await;
+            assert_accepted(&answer, case);
+        }
+
+        let rows = harness
+            .db
+            .fetch_reserves_for_sheet(&sheet_id)
+            .await
+            .expect("reserves");
+        assert_eq!(rows.len(), 2);
     }
 }
 

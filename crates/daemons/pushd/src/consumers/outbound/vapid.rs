@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     io::Cursor,
     panic::{catch_unwind, AssertUnwindSafe},
@@ -7,7 +7,9 @@ use std::{
     time::Duration,
 };
 
-use crate::utils::{is_protected, Consumer, PROTECTED_PUSH_TITLE};
+use crate::utils::{
+    call_push_ttl, is_protected, now_unix, CallPushTtl, Consumer, PROTECTED_PUSH_TITLE,
+};
 
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
@@ -270,6 +272,54 @@ fn sign(pem: &[u8], subscription: &SubscriptionInfo) -> Result<VapidSignature, W
     .unwrap_or(Err(WebPushError::InvalidCryptoKeys))
 }
 
+/// How long the push service may hold a call push for a browser, in seconds, or `None` when
+/// the browser is sent nothing.
+///
+/// A browser can only show a notification, it cannot take one back. So the end of a call is
+/// never sent: it used to show "X is calling you" a second time. A ring whose time is already
+/// over is not sent either.
+fn call_push_lifetime(alert: &DmCallPayload, now_unix: i64, ring_secs: usize) -> Option<u32> {
+    if alert.ended {
+        return None;
+    }
+
+    match call_push_ttl(alert, now_unix, ring_secs) {
+        CallPushTtl::Drop => None,
+        CallPushTtl::Secs(secs) => Some(secs),
+    }
+}
+
+/// The notification a browser shows for a ring: `text` under `body`, and beside it the call
+/// id, stop reason and video flag, each only when the ring carries it. Nothing else goes in.
+fn call_push_body(alert: &DmCallPayload, text: String) -> serde_json::Result<String> {
+    // A sorted map, so the output never depends on hash order once there is a second key
+    let mut body = BTreeMap::new();
+    body.insert("body", serde_json::Value::String(text));
+
+    if let Some(call_id) = &alert.call_id {
+        body.insert("call_id", serde_json::Value::String(call_id.clone()));
+    }
+
+    if let Some(reason) = &alert.reason {
+        body.insert("reason", serde_json::Value::String(reason.clone()));
+    }
+
+    // Text like every other value here: the apps read each field of a call push as a string
+    if let Some(video) = alert.video {
+        body.insert("video", serde_json::Value::String(video.to_string()));
+    }
+
+    serde_json::to_string(&body)
+}
+
+/// Sets how long the push service may hold the message. `None` leaves the crate's default
+/// (28 days), which is what every push other than a ring gets.
+fn apply_ttl(builder: &mut WebPushMessageBuilder<'_>, ttl: Option<u32>) {
+    if let Some(ttl) = ttl {
+        builder.set_ttl(ttl);
+    }
+}
+
 #[derive(Clone)]
 #[allow(unused)]
 pub struct VapidOutboundConsumer {
@@ -296,10 +346,12 @@ impl VapidOutboundConsumer {
         pem: &[u8],
         subscription: &SubscriptionInfo,
         payload_body: &[u8],
+        ttl: Option<u32>,
     ) -> Result<(), WebPushError> {
         let mut builder = WebPushMessageBuilder::new(subscription);
         builder.set_vapid_signature(sign(pem, subscription)?);
         builder.set_payload(ContentEncoding::AesGcm, payload_body);
+        apply_ttl(&mut builder, ttl);
 
         self.client.send(builder.build()?).await
     }
@@ -378,6 +430,9 @@ impl Consumer for VapidOutboundConsumer {
             },
         };
 
+        // Only a ring sets this; every other push keeps the crate's default lifetime
+        let mut ttl: Option<u32> = None;
+
         let payload_body = match payload.notification {
             PayloadKind::FRReceived(alert) => {
                 let name = alert
@@ -414,6 +469,17 @@ impl Consumer for VapidOutboundConsumer {
             PayloadKind::Generic(alert) => serde_json::to_string(&alert)?,
             PayloadKind::MessageNotification(alert) => message_body(&alert)?,
             PayloadKind::DmCallStartEnd(alert) => {
+                let ring_secs = revolt_config::effective_call_ring_secs(
+                    revolt_config::config().await.api.livekit.call_ring_duration,
+                );
+
+                // Decided before any database read, so the end of a call and a ring that
+                // is already over cost nothing more
+                let Some(lifetime) = call_push_lifetime(&alert, now_unix(), ring_secs) else {
+                    return Ok(());
+                };
+                ttl = Some(lifetime);
+
                 let initiator_name = if let Some(server_id) =
                     self.db.fetch_channel(&alert.channel_id).await?.server()
                 {
@@ -423,22 +489,18 @@ impl Consumer for VapidOutboundConsumer {
                 }?;
 
                 let channel = self.db.fetch_channel(&alert.channel_id).await?;
-                let mut body = HashMap::new();
 
-                match channel {
+                let text = match channel {
                     revolt_database::Channel::DirectMessage { .. } => {
-                        body.insert("body", format!("{} is calling you", initiator_name));
+                        format!("{} is calling you", initiator_name)
                     }
                     revolt_database::Channel::Group { name, .. } => {
-                        body.insert(
-                            "body",
-                            format!("{} is calling your group, {}", initiator_name, name),
-                        );
+                        format!("{} is calling your group, {}", initiator_name, name)
                     }
                     _ => bail!("Invalid DmCallStart/End channel type"),
-                }
+                };
 
-                serde_json::to_string(&body)?
+                call_push_body(&alert, text)?
             }
             PayloadKind::CalendarEvent(alert) => {
                 let (title, body) = alert.render();
@@ -462,7 +524,7 @@ impl Consumer for VapidOutboundConsumer {
         let subscription_ref = &subscription;
         let body = payload_body.as_bytes();
         let (result, used_legacy) = deliver(self.legacy_pkey.is_some(), move |legacy| {
-            this.attempt(this.key(legacy), subscription_ref, body)
+            this.attempt(this.key(legacy), subscription_ref, body, ttl)
         })
         .await;
 
@@ -889,5 +951,226 @@ mod tests {
         assert!(wire.contains(fixtures::AUTHOR_NAME));
         assert!(wire.contains(fixtures::CHANNEL_NAME));
         assert!(wire.contains(fixtures::AVATAR_URL));
+    }
+
+    /// A ring start as voice-ingress stamps it (`Timestamp::to_string`)
+    const RING_STARTED_AT: &str = "2026-11-13T15:00:00.000Z";
+
+    /// The same moment in Unix seconds
+    const RING_STARTED_UNIX: i64 = 1_794_582_000;
+
+    const RING_SECS: usize = 45;
+
+    const RING_TEXT: &str = "Alice is calling you";
+
+    /// A ring as apps that know nothing of call ids send it: the four old fields only
+    fn ring() -> DmCallPayload {
+        DmCallPayload {
+            initiator_id: "01USER".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            started_at: Some(RING_STARTED_AT.to_string()),
+            ended: false,
+            ..Default::default()
+        }
+    }
+
+    /// A ring with every optional field set
+    fn full_ring() -> DmCallPayload {
+        DmCallPayload {
+            call_id: Some("01CALL".to_string()),
+            reason: Some(CALL_REASON_DECLINED.to_string()),
+            video: Some(true),
+            ..ring()
+        }
+    }
+
+    fn body_of(alert: &DmCallPayload) -> String {
+        call_push_body(alert, RING_TEXT.to_string()).expect("body")
+    }
+
+    #[test]
+    fn vapid_call_end_sends_nothing() {
+        // Every way a ring can stop, with and without a reason, and even one second into a
+        // ring that would itself still be fresh
+        for reason in [
+            None,
+            Some(CALL_REASON_ANSWERED_ELSEWHERE),
+            Some(CALL_REASON_DECLINED),
+            Some(CALL_REASON_CANCELLED),
+            Some(CALL_REASON_ENDED),
+        ] {
+            for started_at in [None, Some(RING_STARTED_AT.to_string())] {
+                let ended = DmCallPayload {
+                    started_at,
+                    ended: true,
+                    call_id: Some("01CALL".to_string()),
+                    reason: reason.map(str::to_string),
+                    ..ring()
+                };
+
+                assert_eq!(
+                    call_push_lifetime(&ended, RING_STARTED_UNIX + 1, RING_SECS),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vapid_fresh_ring_lives_for_what_is_left_of_it() {
+        assert_eq!(
+            call_push_lifetime(&ring(), RING_STARTED_UNIX + 10, RING_SECS),
+            Some(35)
+        );
+
+        // A ring with no start time cannot be aged, so it gets the whole ring time
+        let undated = DmCallPayload {
+            started_at: None,
+            ..ring()
+        };
+        assert_eq!(
+            call_push_lifetime(&undated, RING_STARTED_UNIX + 10, RING_SECS),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn vapid_stale_ring_sends_nothing() {
+        for late_by in [1, 60, 24 * 60 * 60] {
+            assert_eq!(
+                call_push_lifetime(&ring(), RING_STARTED_UNIX + 45 + late_by, RING_SECS),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn vapid_ring_body_is_unchanged_without_the_new_fields() {
+        assert_eq!(body_of(&ring()), r#"{"body":"Alice is calling you"}"#);
+
+        // Against the one-key map this arm built before: the same bytes, escaping included
+        for text in [
+            RING_TEXT,
+            "\"Zo\u{eb}\" \\ <b> is calling your group, \u{732b}\n",
+        ] {
+            let mut before = HashMap::new();
+            before.insert("body", text.to_string());
+
+            assert_eq!(
+                call_push_body(&ring(), text.to_string()).expect("body"),
+                serde_json::to_string(&before).expect("body")
+            );
+        }
+    }
+
+    #[test]
+    fn vapid_ring_body_carries_the_fields_the_ring_has() {
+        assert_eq!(
+            body_of(&full_ring()),
+            r#"{"body":"Alice is calling you","call_id":"01CALL","reason":"declined","video":"true"}"#
+        );
+
+        let call_id_only = DmCallPayload {
+            call_id: Some("01CALL".to_string()),
+            ..ring()
+        };
+        assert_eq!(
+            body_of(&call_id_only),
+            r#"{"body":"Alice is calling you","call_id":"01CALL"}"#
+        );
+
+        // A voice call that says so is not the same as a ring that says nothing
+        let voice = DmCallPayload {
+            video: Some(false),
+            ..ring()
+        };
+        assert_eq!(
+            body_of(&voice),
+            r#"{"body":"Alice is calling you","video":"false"}"#
+        );
+    }
+
+    /// A call push may carry these keys and no others. `body` is the one the other push arms
+    /// do not have: a browser has no app behind it to look the caller up, so the line it shows
+    /// is written here, as it always was, and travels encrypted to that browser. Nothing else
+    /// about the caller or the group may ride beside it.
+    #[test]
+    fn vapid_call_push_has_no_key_outside_the_allowed_set() {
+        const ALLOWED: [&str; 4] = ["body", "call_id", "reason", "video"];
+
+        for alert in [ring(), full_ring()] {
+            let rendered: serde_json::Value = serde_json::from_str(&body_of(&alert)).expect("json");
+            let rendered = rendered.as_object().expect("object");
+
+            for (key, value) in rendered {
+                assert!(ALLOWED.contains(&key.as_str()), "unexpected key `{key}`");
+                // Every field of a call push is text, the video flag included
+                assert!(value.is_string(), "`{key}` is not a string");
+            }
+
+            // The line is exactly the text handed in: nothing is appended to it here
+            assert_eq!(rendered["body"], RING_TEXT);
+        }
+    }
+
+    #[test]
+    fn vapid_ring_lifetime_reaches_the_message() {
+        let subscription = SubscriptionInfo::new(
+            "https://push.example.com/endpoint",
+            SYNTHETIC_PUBLIC,
+            "c2VjcmV0c2VjcmV0c2VjcmV0",
+        );
+
+        let mut builder = WebPushMessageBuilder::new(&subscription);
+        apply_ttl(&mut builder, Some(35));
+        assert_eq!(builder.build().expect("message").ttl, 35);
+
+        // Every other push keeps the crate's 28 days
+        let mut builder = WebPushMessageBuilder::new(&subscription);
+        apply_ttl(&mut builder, None);
+        assert_eq!(builder.build().expect("message").ttl, 2_419_200);
+    }
+
+    /// This file's shipping code with all whitespace removed, so a reformat cannot move a pin
+    fn shipping_source() -> String {
+        let source = include_str!("vapid.rs");
+        let end = source.find("#[cfg(test)]").expect("test module");
+
+        source[..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The pure functions above only matter if `consume` obeys them. It needs a database and a
+    /// push service to run, so its order is pinned on the source instead: the call arm decides
+    /// first, returns without sending when there is nothing to send, and hands the lifetime on
+    /// to every attempt (the legacy-key retry goes through the same closure).
+    #[test]
+    fn vapid_call_arm_decides_before_it_reads_or_sends() {
+        let source = shipping_source();
+
+        let start = source
+            .find("PayloadKind::DmCallStartEnd(alert)=>{")
+            .expect("call arm");
+        let arm = &source[start..];
+        let arm = &arm[..arm
+            .find("PayloadKind::CalendarEvent(alert)=>{")
+            .expect("the arm after the call arm")];
+
+        let decision = arm
+            .find(
+                "letSome(lifetime)=call_push_lifetime(&alert,now_unix(),ring_secs)else{returnOk(());};ttl=Some(lifetime);",
+            )
+            .expect("the decision, its early return and the lifetime it hands on");
+        let first_read = arm.find("self.db.").expect("a database read");
+        assert!(decision < first_read);
+
+        // The ring length comes through the one shared rule, never the raw setting
+        assert!(arm.contains("revolt_config::effective_call_ring_secs("));
+        assert!(arm.contains(".api.livekit.call_ring_duration"));
+
+        assert!(source.contains("this.attempt(this.key(legacy),subscription_ref,body,ttl)"));
+        assert!(source.contains("apply_ttl(&mutbuilder,ttl);"));
     }
 }

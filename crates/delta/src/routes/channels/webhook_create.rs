@@ -1,5 +1,6 @@
+use revolt_config::config;
 use revolt_database::{
-    util::{permissions::DatabasePermissionQuery, reference::Reference},
+    util::{e2ee_only, permissions::DatabasePermissionQuery, reference::Reference},
     Channel, Database, File, User, Webhook,
 };
 use revolt_models::v0;
@@ -47,6 +48,10 @@ pub async fn create_webhook(
         return Err(create_error!(ChannelProtected));
     }
 
+    // For the same reason a group marked encrypted-only gets none, refused
+    // at the same point.
+    e2ee_only::plain_write_allowed_unauthored(&config().await.features.e2ee, &channel)?;
+
     let webhook_id = Ulid::new().to_string();
 
     let avatar = match &data.avatar {
@@ -72,7 +77,7 @@ pub async fn create_webhook(
 #[cfg(test)]
 mod test {
     use iso8601_timestamp::Timestamp;
-    use revolt_database::{events::client::EventV1, Channel, File, Metadata, User};
+    use revolt_database::{events::client::EventV1, Channel, Database, File, Metadata, User};
     use rocket::http::{ContentType, Header, Status};
     use serde_json::{json, Value};
     use ulid::Ulid;
@@ -283,5 +288,124 @@ mod test {
 
         assert_eq!(webhook_count(&harness, &protected.channel).await, 0);
         assert_eq!(webhook_count(&harness, &ordinary).await, 0);
+    }
+
+    /// A group owned by `owner`, stored directly and unmarked
+    async fn group_of(harness: &TestHarness, owner: &User) -> Channel {
+        let group = Channel::Group {
+            id: Ulid::new().to_string(),
+            name: "Group".to_string(),
+            owner: owner.id.clone(),
+            description: None,
+            recipients: vec![owner.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: false,
+        };
+        harness.db.insert_channel(&group).await.expect("group");
+        group
+    }
+
+    /// Set or clear a stored group's encrypted-only mark, raw: no route
+    /// writes it after creation
+    async fn mark_group_raw(db: &Database, channel_id: &str, marked: bool) {
+        match db {
+            Database::Reference(reference) => {
+                match reference.channels.lock().await.get_mut(channel_id) {
+                    Some(Channel::Group { e2ee_only, .. }) => *e2ee_only = marked,
+                    other => panic!("expected a group, got {:?}", other),
+                }
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channels")
+                    .update_one(
+                        doc! { "_id": channel_id },
+                        doc! { "$set": { "e2ee_only": marked } },
+                    )
+                    .await
+                    .expect("raw mark");
+                assert_eq!(result.matched_count, 1);
+            }
+        }
+    }
+
+    /// A group marked encrypted-only refuses the create (`group`) with no
+    /// webhook row and the avatar left unclaimed. With the mark lifted the
+    /// identical request, same avatar, creates the webhook (the control), so
+    /// the refusal consumed nothing.
+    ///
+    /// Control: the `plain_write_allowed_unauthored` line removed → the
+    /// first create succeeds.
+    #[test]
+    fn webhook_create_in_an_encrypted_only_group_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(
+            webhook_create_in_an_encrypted_only_group_is_refused_case(),
+        ))
+    }
+
+    async fn webhook_create_in_an_encrypted_only_group_is_refused_case() {
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let token = session.token.to_string();
+        let group = group_of(&harness, &owner).await;
+        let avatar = upload_avatar(&harness, &owner).await;
+        let body = json!({ "name": "hook", "avatar": avatar });
+
+        mark_group_raw(&harness.db, group.id(), true).await;
+        let refused = create(&harness, &token, group.id(), &body).await;
+        assert_eq!(refused.0, Status::Forbidden, "{}", refused.1);
+        assert_eq!(refused.1["type"], "EncryptionRequired", "{}", refused.1);
+        assert_eq!(refused.1["side"], "group", "{}", refused.1);
+        assert_eq!(webhook_count(&harness, &group).await, 0);
+        let file = harness
+            .db
+            .fetch_attachment("avatars", &avatar)
+            .await
+            .expect("the avatar");
+        assert!(file.used_for.is_none(), "{:?}", file.used_for);
+
+        mark_group_raw(&harness.db, group.id(), false).await;
+        let created = create(&harness, &token, group.id(), &body).await;
+        assert_eq!(created.0, Status::Ok, "{}", created.1);
+        assert_eq!(webhook_count(&harness, &group).await, 1);
+    }
+
+    /// `only_enforced = false` lifts the refusal. Process-wide config, so
+    /// nextest only (one process per test).
+    #[test]
+    fn webhook_create_in_an_encrypted_only_group_is_allowed_when_not_enforced() {
+        crate::util::test::rt().block_on(Box::pin(
+            webhook_create_in_an_encrypted_only_group_is_allowed_when_not_enforced_case(),
+        ))
+    }
+
+    async fn webhook_create_in_an_encrypted_only_group_is_allowed_when_not_enforced_case() {
+        // Must run before the harness primes the config cache
+        revolt_config::overwrite_config(|settings| {
+            settings.features.e2ee.only_enforced = false;
+        })
+        .await;
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let group = group_of(&harness, &owner).await;
+        mark_group_raw(&harness.db, group.id(), true).await;
+
+        let created = create(
+            &harness,
+            &session.token.to_string(),
+            group.id(),
+            &json!({ "name": "hook" }),
+        )
+        .await;
+        assert_eq!(created.0, Status::Ok, "{}", created.1);
+        assert_eq!(webhook_count(&harness, &group).await, 1);
     }
 }

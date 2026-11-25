@@ -5719,10 +5719,14 @@ mod tests {
                 protocol,
             }
         };
+        // No SFU nodes: the Text path never lists
+        let voice_client =
+            revolt_database::voice::VoiceClient::new(std::collections::HashMap::new());
         let join = |index: usize, protocol: Option<u32>| {
             let party = &setup.members[index];
             super::super::join_intent::join_intent(
                 State::from(db),
+                State::from(&voice_client),
                 party.user.clone(),
                 party.session.clone(),
                 setup.group_id.clone(),

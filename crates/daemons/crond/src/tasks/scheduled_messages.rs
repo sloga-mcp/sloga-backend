@@ -1,9 +1,11 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use revolt_config::AntispamFeatures;
+use revolt_config::{AntispamFeatures, E2EEFeatures};
 use revolt_database::{
     events::client::EventV1,
-    util::{antispam, idempotency::IdempotencyKey, permissions::DatabasePermissionQuery},
+    util::{
+        antispam, e2ee_only, idempotency::IdempotencyKey, permissions::DatabasePermissionQuery,
+    },
     Channel, Database, File, FileUsedForType, Message, MessageFilter, MessageQuery,
     MessageTimePeriod, ScheduledMessage, ScheduledMessageStatus, User, AMQP,
 };
@@ -34,6 +36,12 @@ const DM_PAUSED_REASON: &str =
 /// protected after it was scheduled.
 const CHANNEL_PROTECTED_REASON: &str = "the channel is now end-to-end encrypted";
 
+/// Failure reason for a row whose conversation only takes end-to-end
+/// encrypted messages since it was scheduled (the author's or the DM peer's
+/// setting was turned on).
+const ENCRYPTION_REQUIRED_REASON: &str =
+    "this conversation now only takes end-to-end encrypted messages";
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -53,7 +61,9 @@ fn now_ms() -> i64 {
 pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
     loop {
         let now = now_ms();
-        let antispam = revolt_config::config().await.features.antispam;
+        let features = revolt_config::config().await.features;
+        let antispam = features.antispam;
+        let e2ee = features.e2ee;
 
         match db.fetch_due_scheduled_messages(now).await {
             Ok(due) => {
@@ -69,7 +79,7 @@ pub async fn task(db: Database, amqp: AMQP) -> Result<()> {
                         }
                     }
 
-                    settle(&db, Some(&amqp), &row, now, &antispam).await;
+                    settle(&db, Some(&amqp), &row, now, &antispam, &e2ee).await;
                 }
             }
             Err(err) => {
@@ -113,13 +123,14 @@ async fn settle(
     row: &ScheduledMessage,
     now: i64,
     cfg: &AntispamFeatures,
+    e2ee: &E2EEFeatures,
 ) {
     if row.scheduled_at < now - DELIVERY_GRACE_MS {
         fail(db, row, "missed its delivery window").await;
         return;
     }
 
-    if let Err(reason) = deliver(db, amqp, row, cfg).await {
+    if let Err(reason) = deliver(db, amqp, row, cfg, e2ee).await {
         fail(db, row, &reason).await;
     } else if let Err(err) = db.mark_scheduled_message_sent(&row.id).await {
         // The message IS delivered; a failed mark leaves the
@@ -209,6 +220,7 @@ async fn deliver(
     amqp: Option<&AMQP>,
     row: &ScheduledMessage,
     cfg: &AntispamFeatures,
+    e2ee: &E2EEFeatures,
 ) -> std::result::Result<(), String> {
     // The channel may have been deleted since scheduling (the cascade
     // normally cancels rows; this is the backstop for wholesale server
@@ -279,6 +291,38 @@ async fn deliver(
             row.channel
         );
         return Err(CHANNEL_PROTECTED_REASON.to_string());
+    }
+
+    // The same holds for a direct message or group that only takes
+    // encrypted messages: the author's or the DM peer's setting can be
+    // turned on after the row was scheduled, so it is checked again as of
+    // now, against the freshly fetched author. Placed like the protected
+    // check and before the anti-spam check, the attachment hand-over and
+    // the insert. A refused row fails like any other and is never retried;
+    // `fail` releases the attachments claimed against it, and the embed
+    // media (claimed only on delivery) is released here.
+    if let Err(error) = e2ee_only::plain_write_allowed(db, e2ee, &user, &channel, None).await {
+        if matches!(error.error_type, ErrorType::EncryptionRequired { .. }) {
+            log::info!(
+                "Dropped scheduled message {} to {}: encryption required",
+                row.id,
+                row.channel
+            );
+            let media: Vec<String> = row
+                .data
+                .embeds
+                .iter()
+                .flatten()
+                .filter_map(|embed| embed.media.clone())
+                .collect();
+            e2ee_only::release_refused_attachments(db, &user.id, &media).await;
+            return Err(ENCRYPTION_REQUIRED_REASON.to_string());
+        }
+
+        return Err(format!(
+            "the message could not be sent ({:?})",
+            error.error_type
+        ));
     }
 
     // Archived or locked threads reject scheduled sends exactly like live
@@ -478,7 +522,8 @@ mod tests {
     use iso8601_timestamp::Timestamp;
     use revolt_database::{
         DatabaseInfo, DmGuard, Member, MemberCompositeKey, MessageFilter, MessageQuery,
-        MessageTimePeriod, Metadata, PartialChannel, Relationship, RelationshipStatus, Server,
+        MessageTimePeriod, Metadata, PartialChannel, PartialUser, Relationship, RelationshipStatus,
+        Server,
     };
 
     fn make_user(username: &str, relations: Option<Vec<Relationship>>) -> User {
@@ -657,7 +702,7 @@ mod tests {
             .await
             .expect("claim_scheduled_message"));
 
-        settle(db, None, &row, now_ms(), cfg).await;
+        settle(db, None, &row, now_ms(), cfg, &E2EEFeatures::default()).await;
 
         db.fetch_scheduled_message(&row.id)
             .await
@@ -862,12 +907,21 @@ mod tests {
     /// Claim and settle a stored row exactly as the task loop does, and
     /// return the row as stored afterwards.
     async fn claim_and_settle(db: &Database, row: &ScheduledMessage) -> ScheduledMessage {
+        claim_and_settle_with(db, row, &E2EEFeatures::default()).await
+    }
+
+    /// `claim_and_settle` with the given encrypted-only switches
+    async fn claim_and_settle_with(
+        db: &Database,
+        row: &ScheduledMessage,
+        e2ee: &E2EEFeatures,
+    ) -> ScheduledMessage {
         assert!(db
             .claim_scheduled_message(&row.id)
             .await
             .expect("claim_scheduled_message"));
 
-        settle(db, None, row, now_ms(), &AntispamFeatures::default()).await;
+        settle(db, None, row, now_ms(), &AntispamFeatures::default(), e2ee).await;
 
         db.fetch_scheduled_message(&row.id)
             .await
@@ -1041,6 +1095,192 @@ mod tests {
         });
     }
 
+    /// Turn the Encrypted-only setting on for `user_id` after the row was
+    /// scheduled, writing the stored field directly
+    async fn set_e2ee_only(db: &Database, user_id: &str) {
+        db.update_user(
+            user_id,
+            &PartialUser {
+                e2ee_only: Some(true),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("update_user");
+        assert!(db.fetch_user(user_id).await.expect("fetch_user").e2ee_only);
+    }
+
+    /// The other account in `dm_fixture`'s DM
+    fn dm_peer_id(dm: &Channel, author: &User) -> String {
+        match dm {
+            Channel::DirectMessage { recipients, .. } => recipients
+                .iter()
+                .find(|id| *id != &author.id)
+                .cloned()
+                .expect("a DM peer"),
+            _ => panic!("fixture channel is not a DM"),
+        }
+    }
+
+    /// An author and a group they own with one other member, marked
+    /// encrypted-only. Stored directly: how a group comes to be marked is
+    /// not under test here.
+    #[allow(clippy::disallowed_methods)]
+    async fn marked_group_fixture(db: &Database) -> (User, Channel) {
+        let author = make_user("e2ee-author", None);
+        let member = make_user("e2ee-member", None);
+        let group = Channel::Group {
+            id: Ulid::new().to_string(),
+            name: "encrypted".to_string(),
+            owner: author.id.clone(),
+            description: None,
+            recipients: vec![author.id.clone(), member.id.clone()],
+            icon: None,
+            last_message_id: None,
+            permissions: None,
+            nsfw: false,
+            spoiler: false,
+            voice: None,
+            e2ee_only: true,
+        };
+        insert_fixtures(db, &[&author, &member], &group).await;
+        (author, group)
+    }
+
+    /// A row refused because the conversation requires encryption: Failed
+    /// with that reason and never claimable again (no retry), no message
+    /// delivered, and the attachment still claimed by the ROW (never handed
+    /// over) and released into the deletion sweep
+    async fn assert_refused_as_encryption_required(
+        db: &Database,
+        settled: &ScheduledMessage,
+        attachment: &str,
+        case: &str,
+    ) {
+        assert!(
+            matches!(settled.status, ScheduledMessageStatus::Failed),
+            "{case}: row ended {:?}: {:?}",
+            settled.status,
+            settled.failure_reason
+        );
+        assert_eq!(
+            settled.failure_reason.as_deref(),
+            Some(ENCRYPTION_REQUIRED_REASON),
+            "{case}"
+        );
+        assert!(
+            !db.claim_scheduled_message(&settled.id)
+                .await
+                .expect("claim_scheduled_message"),
+            "{case}: a failed row could be claimed again"
+        );
+        assert!(
+            find_delivered(db, settled).await.is_none(),
+            "{case}: a plain scheduled message was delivered"
+        );
+
+        let file = db
+            .fetch_attachment("attachments", attachment)
+            .await
+            .expect("fetch_attachment");
+        assert_eq!(
+            file.used_for.as_ref().map(|used_for| used_for.id.as_str()),
+            Some(settled.id.as_str()),
+            "{case}: the attachment was handed over before the refusal"
+        );
+        assert_eq!(
+            file.deleted,
+            Some(true),
+            "{case}: the attachment was not released"
+        );
+    }
+
+    /// Rows scheduled before encryption became required fail at delivery,
+    /// whichever side requires it: the author, the DM peer, or a marked
+    /// group. The peer case is the one only this check refuses: the send
+    /// funnel's own backstop looks at the author and the group mark only.
+    #[test]
+    fn scheduled_row_fails_closed_once_encryption_is_required() {
+        rt().block_on(async {
+            // The author turned the setting on after scheduling
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, true).await;
+            let (row, attachment) = schedule_with_attachment(&db, &author, &dm).await;
+            set_e2ee_only(&db, &author.id).await;
+            let settled = claim_and_settle(&db, &row).await;
+            assert_refused_as_encryption_required(&db, &settled, &attachment, "the author").await;
+
+            // The DM peer turned it on
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, true).await;
+            let (row, attachment) = schedule_with_attachment(&db, &author, &dm).await;
+            set_e2ee_only(&db, &dm_peer_id(&dm, &author)).await;
+            let settled = claim_and_settle(&db, &row).await;
+            assert_refused_as_encryption_required(&db, &settled, &attachment, "the peer").await;
+
+            // A marked group
+            let db = Database::Reference(Default::default());
+            let (author, group) = marked_group_fixture(&db).await;
+            let (row, attachment) = schedule_with_attachment(&db, &author, &group).await;
+            let settled = claim_and_settle(&db, &row).await;
+            assert_refused_as_encryption_required(&db, &settled, &attachment, "a marked group")
+                .await;
+        });
+    }
+
+    /// Defence in depth for the peer case above: with crond's own check
+    /// lifted (`only_enforced = false` passed to delivery only), the send
+    /// funnel still reads the global switch and refuses the row for the
+    /// encrypted-only peer. Nothing is delivered. (crond's tests cannot
+    /// override the global config, so the fully lifted path is covered by
+    /// the funnel's own model tests.)
+    #[test]
+    fn scheduled_row_to_an_encrypted_only_peer_is_still_refused_by_the_send_funnel() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, true).await;
+            let (row, _attachment) = schedule_with_attachment(&db, &author, &dm).await;
+            set_e2ee_only(&db, &dm_peer_id(&dm, &author)).await;
+
+            let lifted = E2EEFeatures {
+                only_enforced: false,
+                ..Default::default()
+            };
+            let settled = claim_and_settle_with(&db, &row, &lifted).await;
+
+            assert!(
+                matches!(settled.status, ScheduledMessageStatus::Failed),
+                "row ended {:?}: {:?}",
+                settled.status,
+                settled.failure_reason
+            );
+            let reason = settled.failure_reason.clone().unwrap_or_default();
+            assert!(
+                reason.contains("EncryptionRequired") && reason.contains("recipient"),
+                "{reason}"
+            );
+        });
+    }
+
+    /// Control for the cases above: the same fixtures with no flag deliver
+    #[test]
+    fn scheduled_row_without_encryption_required_delivers() {
+        rt().block_on(async {
+            let db = Database::Reference(Default::default());
+            let (author, dm) = dm_fixture(&db, true).await;
+            let (row, _) = schedule_with_attachment(&db, &author, &dm).await;
+            let settled = claim_and_settle(&db, &row).await;
+            assert!(
+                matches!(settled.status, ScheduledMessageStatus::Sent),
+                "row ended {:?}: {:?}",
+                settled.status,
+                settled.failure_reason
+            );
+            assert!(find_delivered(&db, &settled).await.is_some());
+        });
+    }
+
     async fn dm_active(db: &Database, id: &str) -> bool {
         match db.fetch_channel(id).await.expect("fetch dm") {
             Channel::DirectMessage { active, .. } => active,
@@ -1122,9 +1362,15 @@ mod tests {
         let dm_row = claimed_row(&author, dm.id());
         let group_row = claimed_row(&author, group.id());
         for row in [&dm_row, &group_row] {
-            deliver(&db, Some(&amqp), row, &AntispamFeatures::default())
-                .await
-                .unwrap_or_else(|reason| panic!("deliver failed: {reason}"));
+            deliver(
+                &db,
+                Some(&amqp),
+                row,
+                &AntispamFeatures::default(),
+                &E2EEFeatures::default(),
+            )
+            .await
+            .unwrap_or_else(|reason| panic!("deliver failed: {reason}"));
         }
         let dm_message = delivered_id(&db, &dm_row).await;
         let group_message = delivered_id(&db, &group_row).await;

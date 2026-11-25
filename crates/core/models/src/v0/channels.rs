@@ -79,6 +79,15 @@ auto_derived!(
             /// Voice call configuration for this group (limits, on/off)
             #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
             voice: Option<VoiceInformation>,
+
+            /// Whether this group only takes end-to-end encrypted messages.
+            /// Set when the group is created; no edit route can set or
+            /// clear it.
+            #[cfg_attr(
+                feature = "serde",
+                serde(skip_serializing_if = "crate::if_false", default)
+            )]
+            e2ee_only: bool,
         },
         /// Text channel belonging to a server
         TextChannel {
@@ -814,6 +823,15 @@ auto_derived!(
         /// before.
         #[cfg_attr(feature = "serde", serde(default))]
         pub rejoin: Option<bool>,
+        /// This join answers a ring. For a direct message or group whose call
+        /// nobody is in any more it is refused with `CallEnded` instead of
+        /// starting a new call.
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub answer: Option<bool>,
+        /// The caller pressed the video button. A hint for the ring only; it
+        /// grants nothing.
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub video: Option<bool>,
     }
 
     /// Report that this client has been idle in a voice call
@@ -1170,6 +1188,34 @@ mod tests {
         let data: DataJoinCall =
             serde_json::from_str(r#"{"force_disconnect":true,"rejoin":true}"#).unwrap();
         assert_eq!(data.rejoin, Some(true));
+    }
+
+    /// An older client sends neither `answer` nor `video` and must still be
+    /// understood as a plain join; both travel under exactly these wire keys.
+    #[test]
+    fn join_call_answer_and_video_default_to_absent() {
+        let data: DataJoinCall = serde_json::from_str(r#"{"force_disconnect":true}"#).unwrap();
+        assert_eq!(data.answer, None);
+        assert_eq!(data.video, None);
+
+        let data: DataJoinCall = serde_json::from_str(r#"{"answer":true,"video":true}"#).unwrap();
+        assert_eq!(data.answer, Some(true));
+        assert_eq!(data.video, Some(true));
+
+        // Both fields carry the same serde-default attribute as `rejoin`.
+        let source = include_str!("channels.rs");
+        let start = source
+            .find("pub struct DataJoinCall {")
+            .expect("the struct exists");
+        let body = &source[start..];
+        for declaration in ["pub answer: Option<bool>,", "pub video: Option<bool>,"] {
+            let field = body.find(declaration).expect("the field exists");
+            let attributes = &body[body[..field].rfind("///").expect("a doc comment")..field];
+            assert!(
+                attributes.contains("#[cfg_attr(feature = \"serde\", serde(default))]"),
+                "{declaration} lost its serde default: {attributes}"
+            );
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod publish_keys;
 mod put_backup;
 mod revoke_device;
 mod send_messages;
+mod set_only;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -57,7 +58,8 @@ pub const MAX_QUEUE_DEPTH: u64 = 512;
 /// source of over-64-KiB envelopes — client submission stays olm-only).
 pub const MAX_QUEUE_BYTES: u64 = 32 * 1024 * 1024;
 
-/// All E2EE routes sit behind the operator feature flag
+/// All E2EE routes sit behind the operator feature flag, except turning
+/// Encrypted-only chats off (`PUT /e2ee/only`), which always works
 pub async fn require_e2ee_enabled() -> Result<()> {
     if !revolt_config::config().await.features.e2ee_enabled {
         return Err(create_error!(FeatureDisabled {
@@ -176,5 +178,6 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         get_backup::get_backup,
         get_backup_status::get_backup_status,
         delete_backup::delete_backup,
+        set_only::set_only,
     ]
 }

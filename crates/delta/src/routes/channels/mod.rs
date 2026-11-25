@@ -67,6 +67,7 @@ mod thread_create;
 mod thread_list;
 mod thread_members;
 mod soundboard_trigger;
+mod voice_decline;
 mod voice_join;
 mod voice_screen_leg;
 mod voice_stop_ring;
@@ -106,6 +107,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         voice_join::call,
         voice_screen_leg::screen_leg,
         voice_stop_ring::stop_ring,
+        voice_decline::decline_call,
         soundboard_trigger::trigger_sound,
         captions_send::send_caption,
         annotations_send::send_annotation,
