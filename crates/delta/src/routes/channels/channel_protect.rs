@@ -2030,6 +2030,8 @@ mod test {
                 matches!(event, EventV1::PollClose { id, .. } if *id == open_poll)
                     || matches!(event, EventV1::SoftresSheetUpdate { id, .. } if *id == open_sheet)
             });
+    }
+
     /// The pledge that funds [`crowdfunded_setup`]'s launch goal
     const PLEDGED: i64 = 1_200;
 
