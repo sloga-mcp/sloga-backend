@@ -1246,7 +1246,9 @@ impl ProtTxnBody for LaunchBody {
                     seat_list_channel_server(channel) == Some(goal.server_id.as_str())
                 })
                 .ok_or_else(|| refuse(create_error!(NotFound)))?;
-        check_channel_protectable(Some(&channel)).map_err(refuse)?;
+        // No boundary: a launch needs an empty channel (S1), whatever S4
+        // allows a protect with history.
+        check_channel_protectable(Some(&channel), None).map_err(refuse)?;
         // `last_message_id` lags stored messages: ask the messages themselves
         let message: Option<Document> =
             find_one_in(db, session, MESSAGES, doc! { "channel": &input.channel_id }).await?;
@@ -4094,6 +4096,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         })
         .await
         .unwrap();

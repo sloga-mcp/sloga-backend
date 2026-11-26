@@ -375,6 +375,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         })
         .await
         .unwrap();
@@ -3077,6 +3078,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         }
     }
 
@@ -3129,6 +3131,8 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: None,
+                    added_protocols: vec![],
+                    history_visible: None,
                 }),
                 Some(&MlsJoinIntent {
                     id: MlsJoinIntent::composite_id(&text.id, A, OWNER_DEVICE),
@@ -3140,6 +3144,7 @@ mod tests {
                     created_at: timestamp(at(0, 14)),
                     generation: None,
                     issued_at: None,
+                    protocol: None,
                 }),
             )
             .await;

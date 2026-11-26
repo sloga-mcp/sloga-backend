@@ -1533,7 +1533,9 @@ impl AbstractProtTanks for ReferenceDb {
             .get(&input.channel_id)
             .filter(|channel| seat_list_channel_server(channel) == Some(goal.server_id.as_str()))
             .ok_or_else(|| create_error!(NotFound))?;
-        check_channel_protectable(Some(channel))?;
+        // No boundary: a launch needs an empty channel (S1), whatever S4
+        // allows a protect with history.
+        check_channel_protectable(Some(channel), None)?;
         // `last_message_id` lags stored messages: ask the messages themselves
         if messages
             .values()
