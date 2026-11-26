@@ -173,13 +173,13 @@ pub async fn create_group(
 ///    the channel's existing Text group is recovery, the available gate
 ///    without the growth flag (S2-D32, #220);
 /// 5. the 6.1 create rules: the channel is protected, its entitlement
-///    allows Text traffic, the caller is seated, a seat list is stored, the
-///    minimum text protocol on a v2 list ([`check_text_protocol`]), the
-///    group id derives from the channel, the generation and (on a v2
-///    channel) the stored salt, the caller is the current seat list's
-///    signer user, the successor
-///    rule, the creator rule ([`text_group_creator`]: the signer device, or
-///    the S2-D17d recovery exception) and the successor rate limit.
+///    allows Text traffic (`Active` or `Grace`, S5b D14), the caller is
+///    seated, a seat list is stored, the minimum text protocol on a v2 list
+///    ([`check_text_protocol`]), the group id derives from the channel, the
+///    generation and (on a v2 channel) the stored salt, the caller is the
+///    current seat list's signer user, the successor rule, the creator rule
+///    ([`text_group_creator`]: the signer device, or the S2-D17d recovery
+///    exception) and the successor rate limit.
 ///
 /// The media flag, the voice channel and call presence play no part. Only
 /// `create_text_mls_group_as` is called, which re-checks the creator rule,
@@ -325,11 +325,10 @@ async fn as_missing_channel<T>(db: &Database, user: &User, session: &Session) ->
 }
 
 /// The entitlement predicate both Text create tiers need (6.3 "Recovery
-/// gates", #220): before S5 lands it is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic()` (`Active` or `Grace`)
-/// replaces this helper at the merge.
+/// gates", #220): S5b's `ChannelEntitlement::allows_text_traffic()`
+/// (`Active` or `Grace`, D14).
 fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
-    entitlement.is_active()
+    entitlement.allows_text_traffic()
 }
 
 fn invalid(error: &str) -> revolt_result::Error {
@@ -2056,7 +2055,6 @@ mod tests {
             .expect("re-grant");
 
         for state in [
-            ChannelEntitlementState::Grace,
             ChannelEntitlementState::Frozen,
             ChannelEntitlementState::Deleted,
         ] {
@@ -2072,6 +2070,61 @@ mod tests {
         // The entitlement was the only thing in the way
         set_entitlement(db, channel_id, Some(ChannelEntitlementState::Active)).await;
         assert_created(fixture.create_as_owner(request).await, "active again");
+    }
+
+    /// S5b D14: Grace keeps text traffic going, so the owner's device still
+    /// creates the successor generation (and Frozen still refuses the next)
+    #[test]
+    fn grace_allows_a_successor_generation() {
+        crate::util::test::rt().block_on(grace_allows_a_successor_generation_case())
+    }
+
+    async fn grace_allows_a_successor_generation_case() {
+        let fixture = fixture().await;
+        let db = fixture.db();
+        let first = fixture
+            .harness
+            .new_text_group(
+                &fixture.protected.channel,
+                &fixture.protected.owner_device,
+                0,
+                None,
+            )
+            .await;
+
+        set_entitlement(
+            db,
+            fixture.channel_id(),
+            Some(ChannelEntitlementState::Grace),
+        )
+        .await;
+        let request = fixture.owner_request(Some(1), Some(first.id.as_str()));
+        assert_created(fixture.create_as_owner(request.clone()).await, "grace");
+        let successor = db
+            .fetch_mls_group(&request.group_id)
+            .await
+            .expect("the successor");
+        assert_eq!(successor.generation, Some(1));
+        assert!(successor.open);
+        let first = db
+            .fetch_mls_group(&first.id)
+            .await
+            .expect("the first group");
+        assert!(!first.open);
+
+        set_entitlement(
+            db,
+            fixture.channel_id(),
+            Some(ChannelEntitlementState::Frozen),
+        )
+        .await;
+        let next = fixture.owner_request(Some(2), Some(request.group_id.as_str()));
+        assert_refused(
+            fixture.create_as_owner(next.clone()).await,
+            "InvalidOperation",
+            "frozen",
+        );
+        assert_no_group(db, &next.group_id, "frozen").await;
     }
 
     #[test]

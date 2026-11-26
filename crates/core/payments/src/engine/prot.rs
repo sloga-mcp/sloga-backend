@@ -7,8 +7,10 @@
 //! - a paid order is credited once, under `purchase:{order_id}`, and never
 //!   refused for the wallet cap or the flags: the money is already taken
 //! - a reversal claws back up to what the order credited, from the wallet
-//!   only, under `clawback:{order_id}`; Prot already gone is recorded as the
-//!   row's shortfall, never taken from anywhere else
+//!   under `clawback:{order_id}` and, when the wallet is short, from the
+//!   buyer's held pledges (S5b, `clawback-hold:`); Prot already gone is
+//!   recorded as the row's shortfall, never taken from anywhere else (a
+//!   tank, another pledger)
 //! - after any credit to a wallet commits, the account is checked again: a
 //!   deleted one is forfeited (the second pass), so a credit that races an
 //!   account deletion is never left in a dead wallet
@@ -19,10 +21,9 @@
 use revolt_database::events::client::EventV1;
 use revolt_database::{
     cipher_prot_posted, cipher_prot_shortfall, cipher_prot_target, prot_key_admin,
-    prot_key_clawback, prot_key_purchase, prot_user_account, CipherMembership, CipherProtSync,
-    Database, OrderState, PaymentOrder, PaymentProvider, ProtAmount, ProtApplyOutcome,
-    ProtLedgerEntry, ProtPosting, ProtRef, VoidReason, PROT_ACTOR_PAYMENTS, PROT_SYS_ADJUST,
-    PROT_SYS_CLAWED, PROT_SYS_ISSUED,
+    prot_key_purchase, prot_user_account, CipherMembership, CipherProtSync, Database, OrderState,
+    PaymentOrder, PaymentProvider, ProtAmount, ProtApplyOutcome, ProtLedgerEntry, ProtPosting,
+    ProtRef, VoidReason, PROT_ACTOR_PAYMENTS, PROT_SYS_ADJUST, PROT_SYS_ISSUED,
 };
 use revolt_models::v0::{self, CipherReturnTo, ProductFamily, ProtEntryKind};
 use revolt_result::{create_error, Result};
@@ -62,7 +63,7 @@ async fn wallet_balance(db: &Database, user_id: &str) -> Result<i64> {
 /// the posting committed. Two postings can publish out of order; the
 /// version lets the client keep the newer one. A failed read publishes
 /// nothing (the client refetches `/@me`).
-async fn publish_balance(db: &Database, user_id: &str) {
+pub(super) async fn publish_balance(db: &Database, user_id: &str) {
     match db.fetch_prot_account(&prot_user_account(user_id)).await {
         Ok(Some(account)) => {
             EventV1::ProtBalanceUpdate {
@@ -87,7 +88,7 @@ async fn publish_balance(db: &Database, user_id: &str) {
 /// `user_id` has committed, a deleted (or missing) account has its wallet
 /// forfeited. Checked after the write, so either the deletion's own forfeit
 /// sees the credit, or this sees the deletion.
-async fn forfeit_if_deleted(db: &Database, user_id: &str, now_ms: i64) -> Result<()> {
+pub(super) async fn forfeit_if_deleted(db: &Database, user_id: &str, now_ms: i64) -> Result<()> {
     if buyer_is_live(db, user_id).await? {
         return Ok(());
     }
@@ -311,34 +312,31 @@ pub async fn create_prot_checkout(
 
 /// The session user's wallet: balance and version from one account read
 /// (both 0 without an account), the part of the balance under the D17
-/// purchase hold (Purchase credits in the last `contribute_hold_hours`, at
-/// most the balance; 0 when the hold is 0), the newest unexpired Prot
-/// checkout, and the [`PROT_RECENT_LIMIT`] newest ledger rows
+/// purchase hold (Purchase credits in the last `contribute_hold_hours`, net
+/// of what was clawed back of those purchases, at most the balance; 0 when
+/// the hold is 0), the newest unexpired Prot checkout, and the
+/// [`PROT_RECENT_LIMIT`] newest ledger rows. Read-only, so it answers
+/// while Prot is off too (owner answer, S5b contracts section 25): a
+/// balance still binds after the flag is turned off.
 pub async fn prot_me(
     db: &Database,
     ps: &ProtSalesSettings,
     user_id: &str,
     now_ms: i64,
 ) -> Result<v0::ProtMe> {
-    if !ps.enabled {
-        return Err(create_error!(ProtDisabled));
-    }
-
     let wallet = prot_user_account(user_id);
     let (balance, version) = db
         .fetch_prot_account(&wallet)
         .await?
         .map_or((0, 0), |account| (account.balance, account.version));
 
+    // A refunded recent purchase is no longer held: its clawback took that
+    // Prot back already (carry-forward 2)
     let hold_ms = ps.hold_ms();
     let held = if hold_ms > 0 && balance > 0 {
-        db.sum_prot_credits_since(
-            &wallet,
-            &[ProtEntryKind::Purchase],
-            now_ms.saturating_sub(hold_ms),
-        )
-        .await?
-        .clamp(0, balance)
+        db.held_purchase_prot(user_id, now_ms.saturating_sub(hold_ms))
+            .await?
+            .clamp(0, balance)
     } else {
         0
     };
@@ -438,8 +436,8 @@ pub(super) async fn apply_purchase(
 /// A reversal of a Fulfilled Prot order, after the dispute bookkeeping
 /// (`reverse_fulfilled`). An opened or won dispute changes nothing more
 /// (NoOp). A refund (full or partial) or a lost dispute claws back up to
-/// what the order credited, bonus included, from the wallet only
-/// (`clawback:{order_id}`, the shortfall recorded on the row), then records
+/// what the order credited, bonus included, from the wallet and then the
+/// buyer's held pledges ([`clawback_purchase`]), then records
 /// the order Refunded. An order unlinked by an account deletion has no
 /// wallet to claw from (the deletion forfeited it); it is only recorded.
 pub(super) async fn reverse_prot_fulfilled(
@@ -472,9 +470,13 @@ pub(super) async fn reverse_prot_fulfilled(
     Ok(ReverseOutcome::Applied)
 }
 
-/// The clawback of a Prot purchase: `UpTo(what purchase:{order_id}
-/// credited)` from the wallet to `sys:clawed`, once. Nothing when the order
-/// was never credited or is clawed back already.
+/// The clawback of a Prot purchase, once: up to what `purchase:{order_id}`
+/// credited, from the wallet (`clawback:{order_id}`) and, when the wallet
+/// is short, from the buyer's held pledges newest first
+/// (`clawback-hold:{order_id}:{pledge_id}`), all in one database
+/// transaction (`db.clawback_prot_purchase`). The `clawback:` row records
+/// the final shortfall. Nothing when the order was never credited or is
+/// clawed back already.
 pub(super) async fn clawback_purchase(
     db: &Database,
     order_id: &str,
@@ -492,28 +494,11 @@ pub(super) async fn clawback_purchase(
         return Ok(());
     };
 
-    let key = prot_key_clawback(order_id);
-    if db.fetch_prot_entry_by_key(&key).await?.is_some() {
-        return Ok(());
-    }
-
-    let posting = ProtPosting {
-        key,
-        kind: ProtEntryKind::Clawback,
-        debit: prot_user_account(user_id),
-        credit: PROT_SYS_CLAWED.to_string(),
-        amount: ProtAmount::UpTo(purchase.amount),
-        debit_floor: 0,
-        actor: PROT_ACTOR_PAYMENTS.to_string(),
-        reference: ProtRef {
-            order_id: Some(order_id.to_string()),
-            ..Default::default()
-        },
-        reason: None,
-        created_at: now_ms,
-    };
-
-    if let ProtApplyOutcome::Applied(entry) = db.apply_prot_posting(&posting).await? {
+    // A settled reversal is AlreadyApplied: nothing written, nothing published
+    if let ProtApplyOutcome::Applied(entry) = db
+        .clawback_prot_purchase(user_id, order_id, purchase.amount, now_ms)
+        .await?
+    {
         let shortfall = entry.shortfall.unwrap_or(0);
         if shortfall > 0 {
             log::warn!(
@@ -639,8 +624,10 @@ pub(super) async fn membership_shortfall(db: &Database, m: &CipherMembership) ->
 
 /// The 14-day "hypothetical clawback", read-only: would clawing `m` back to
 /// `target_after` be fully covered? Covered when the membership has no
-/// recorded shortfall and the wallet holds what still needs clawing back
-/// (`max(0, posted - target_after)`; nothing needed is covered).
+/// recorded shortfall and the wallet plus the member's held pledges (which
+/// the clawback drains after the wallet, carry-forward 1) hold what still
+/// needs clawing back (`max(0, posted - target_after)`; nothing needed is
+/// covered). Without a held pledge this is the wallet alone, as in S5a.
 pub(super) async fn window_clawback_covered(
     db: &Database,
     m: &CipherMembership,
@@ -657,7 +644,10 @@ pub(super) async fn window_clawback_covered(
     if needed == 0 {
         return Ok(true);
     }
-    Ok(wallet_balance(db, &m.user_id).await? >= needed)
+    let unspent = wallet_balance(db, &m.user_id)
+        .await?
+        .saturating_add(db.sum_held_prot_pledges(&m.user_id).await?);
+    Ok(unspent >= needed)
 }
 
 // ---------------------------------------------------------------------------
@@ -666,8 +656,10 @@ pub(super) async fn window_clawback_covered(
 
 /// What the ledger says about one order, for support before a refund: the
 /// order's credited, clawed-back and shortfall sums (rows with
-/// `ref.order_id` = the order), the buyer's current balance, and, for a
-/// Cipher order of the buyer's CURRENT membership incarnation
+/// `ref.order_id` = the order; `clawed_back` is the wallet part, the Prot
+/// taken back from held pledges is `clawed_back_holds`), the buyer's
+/// current balance, and, for a Cipher order of the buyer's CURRENT
+/// membership incarnation
 /// (`orders[0] <= order_id`: listed, or removed since by a window
 /// downgrade), that membership's posted, target and shortfall. Otherwise (a
 /// Prot order, an unlinked one, no membership, an order of a replaced
@@ -679,6 +671,7 @@ pub async fn admin_prot_order(db: &Database, order_id: &str) -> Result<v0::ProtA
         .ok_or_else(|| create_error!(NotFound))?;
 
     let (mut credited, mut clawed_back, mut shortfall) = (0_i64, 0_i64, 0_i64);
+    let mut clawed_back_holds = 0_i64;
     for row in db.fetch_prot_entries_by_order(order_id).await? {
         match row.kind {
             ProtEntryKind::Purchase
@@ -687,6 +680,9 @@ pub async fn admin_prot_order(db: &Database, order_id: &str) -> Result<v0::ProtA
             ProtEntryKind::Clawback => {
                 clawed_back = clawed_back.saturating_add(row.amount);
                 shortfall = shortfall.saturating_add(row.shortfall.unwrap_or(0));
+            }
+            ProtEntryKind::ClawbackHold => {
+                clawed_back_holds = clawed_back_holds.saturating_add(row.amount);
             }
             _ => {}
         }
@@ -720,6 +716,7 @@ pub async fn admin_prot_order(db: &Database, order_id: &str) -> Result<v0::ProtA
         membership_posted: m_posted,
         membership_target: m_target,
         membership_shortfall: m_shortfall,
+        clawed_back_holds,
     })
 }
 
@@ -794,6 +791,27 @@ pub async fn admin_prot_adjust(
     })
 }
 
+/// Account deletion (D11), before the wallet forfeit: every held pledge of
+/// `user_id` leaves its goal's hold to `sys:forfeited`
+/// (`db.forfeit_held_prot_pledges`: kind ForfeitHold, `Exact(remaining)`,
+/// key `forfeit-hold:{pledge_id}`, the pledge Forfeited and the goal's
+/// pledged total lowered). Runs whatever the flags say. Nothing is
+/// published.
+pub async fn forfeit_held_pledges_on_deletion(
+    db: &Database,
+    user_id: &str,
+    now_ms: i64,
+) -> Result<()> {
+    for entry in db.forfeit_held_prot_pledges(user_id, now_ms).await? {
+        log::info!(
+            "payments: account deletion of {user_id} forfeited a held pledge of {} Prot ({})",
+            entry.amount,
+            entry.key
+        );
+    }
+    Ok(())
+}
+
 /// Account deletion (D11): the whole wallet goes to `sys:forfeited`
 /// (`db.forfeit_prot_wallet`: kind Forfeit, `All`, key
 /// `forfeit:{user_id}:{n}`, actor `sys:account-deletion`; its passes repeat,
@@ -822,9 +840,10 @@ mod tests {
     use revolt_config::{FeaturePayments, ProtectionFeatures};
     use revolt_database::test_teardown::TestDatabaseGuard;
     use revolt_database::{
-        prot_key_cipher_founding, prot_key_cipher_upgrade, prot_key_forfeit, BotInformation,
-        CipherRevokeReason, DatabaseInfo, PartialUser, User, PROT_ACTOR_CIPHER,
-        PROT_ACTOR_DELETION, PROT_SYS_FORFEITED,
+        prot_hold_account, prot_key_cipher_founding, prot_key_cipher_upgrade, prot_key_clawback,
+        prot_key_clawback_hold, prot_key_forfeit, prot_key_forfeit_hold, prot_key_pledge,
+        BotInformation, CipherRevokeReason, DatabaseInfo, PartialUser, ProtGoal, ProtPledge, User,
+        PROT_ACTOR_CIPHER, PROT_ACTOR_DELETION, PROT_SYS_CLAWED, PROT_SYS_FORFEITED,
     };
     use revolt_models::v0::{CipherTier, Sku, UserFlags};
     use revolt_result::ErrorType;
@@ -2300,6 +2319,7 @@ mod tests {
                 membership_posted: None,
                 membership_target: None,
                 membership_shortfall: None,
+                clawed_back_holds: 0,
             }
         );
 
@@ -2521,10 +2541,7 @@ mod tests {
             enabled: false,
             ..prot_settings()
         };
-        assert!(matches!(
-            error_type(prot_me(&db, &off, "u1", NOW).await),
-            ErrorType::ProtDisabled
-        ));
+        assert!(prot_me(&db, &off, "u1", NOW).await.is_ok());
 
         let empty = prot_me(&db, &ps, "u1", NOW).await.unwrap();
         assert_eq!(
@@ -2826,6 +2843,7 @@ mod tests {
                 membership_posted: Some(16_500),
                 membership_target: Some(16_500),
                 membership_shortfall: Some(0),
+                clawed_back_holds: 0,
             }
         );
 
@@ -2861,6 +2879,404 @@ mod tests {
             error_type(admin_prot_order(&db, "01UNKNOWN0000000000000000").await),
             ErrorType::NotFound
         ));
+        drop_db(&db).await;
+    }
+
+    // --- held pledges (S5b) -------------------------------------------
+
+    const SERVER: &str = "01SERVERS5B4I0000000000000";
+    const GOAL: &str = "01GOALS5B4I000000000000000";
+    const PLEDGE: &str = "01PLEDGES5B4I0000000000001";
+    const OTHER_PLEDGE: &str = "01PLEDGES5B4I0000000000002";
+
+    /// The Funding launch goal [`GOAL`] of [`SERVER`], `pledged` of `target`
+    /// already pledged. The goal paths are not this file's: it is stored as
+    /// it is, and only its pledged total and state matter here.
+    fn funding_goal(target: i64, pledged: i64) -> ProtGoal {
+        ProtGoal {
+            id: GOAL.to_string(),
+            kind: v0::ProtGoalKind::Launch,
+            server_id: SERVER.to_string(),
+            channel_id: None,
+            tank_id: None,
+            created_by: "owner".to_string(),
+            create_nonce: "create".to_string(),
+            slots: 10,
+            days: Some(30),
+            daily_cost: 40,
+            base_daily_cost: None,
+            target_prot: target,
+            pledged_total: pledged,
+            state: v0::ProtGoalState::Funding,
+            deadline_at: NOW + 30 * DAY,
+            funded_at: None,
+            launch_deadline_at: None,
+            launched_at: None,
+            closed_at: None,
+            refund7_done: false,
+            open_key: Some(format!("launch:{SERVER}")),
+            version: 1,
+            created_at: NOW,
+            updated_at: NOW,
+        }
+    }
+
+    async fn insert_goal(db: &Database, goal: &ProtGoal) {
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .prot_goals
+                    .lock()
+                    .await
+                    .insert(goal.id.clone(), goal.clone());
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<ProtGoal>("prot_goals")
+                    .insert_one(goal)
+                    .await
+                    .expect("the goal");
+            }
+        }
+    }
+
+    /// A held pledge `id` of `amount` from the wallet of `user` into
+    /// [`GOAL`]'s hold, as `pledge_prot` leaves it: its PledgeHold row and
+    /// the pledge document (the goal counts it in its pledged total)
+    async fn hold_pledge(db: &Database, id: &str, user: &str, amount: i64, at: i64) {
+        db.apply_prot_posting(&ProtPosting {
+            key: prot_key_pledge(user, GOAL, id),
+            kind: ProtEntryKind::PledgeHold,
+            debit: prot_user_account(user),
+            credit: prot_hold_account(GOAL),
+            amount: ProtAmount::Exact(amount),
+            debit_floor: 0,
+            actor: user.to_string(),
+            reference: ProtRef {
+                goal_id: Some(GOAL.to_string()),
+                pledge_id: Some(id.to_string()),
+                ..Default::default()
+            },
+            reason: None,
+            created_at: at,
+        })
+        .await
+        .unwrap();
+
+        let pledge = ProtPledge {
+            id: id.to_string(),
+            goal_id: GOAL.to_string(),
+            server_id: SERVER.to_string(),
+            user_id: user.to_string(),
+            kind: v0::ProtGoalKind::Launch,
+            amount,
+            remaining: amount,
+            state: v0::ProtPledgeState::Held,
+            captured: 0,
+            launch_returned: 0,
+            version: 1,
+            created_at: at,
+            updated_at: at,
+        };
+        match db {
+            Database::Reference(reference) => {
+                reference
+                    .prot_pledges
+                    .lock()
+                    .await
+                    .insert(pledge.id.clone(), pledge);
+            }
+            Database::MongoDb(mongo) => {
+                mongo
+                    .col::<ProtPledge>("prot_pledges")
+                    .insert_one(&pledge)
+                    .await
+                    .expect("the pledge");
+            }
+        }
+    }
+
+    async fn pledge_now(db: &Database, id: &str) -> ProtPledge {
+        db.fetch_prot_pledge(id).await.unwrap().expect("the pledge")
+    }
+
+    async fn goal_now(db: &Database) -> ProtGoal {
+        db.fetch_prot_goal(GOAL).await.unwrap().expect("the goal")
+    }
+
+    /// Carry-forward 1: a T99 member who pledged 16,000 of the 16,500 grant
+    /// and is refunded within the window still has the number released. The
+    /// wallet's 500 and the held pledge cover the undo, and the clawback
+    /// takes both, nothing short. Control: count the wallet alone and the
+    /// refund revokes and retires the number instead.
+    #[tokio::test]
+    async fn window_release_counts_held_pledges() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+
+        let first = buy_cipher(&db, &stripe, &s, "u1", CipherTier::T99, "pi_new", NOW).await;
+        sync_cipher_prot(&db, &grants_on(), "u1", NOW)
+            .await
+            .unwrap();
+        insert_goal(&db, &funding_goal(20_000, 16_000)).await;
+        hold_pledge(&db, PLEDGE, "u1", 16_000, NOW + HOUR).await;
+        assert_eq!(balance(&db, "u1").await, 500);
+
+        // Covered, though the wallet alone is not
+        let m = membership(&db, "u1").await;
+        assert!(window_clawback_covered(&db, &m, 0).await.unwrap());
+
+        assert_eq!(
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &first.id,
+                ReverseKind::Refund,
+                refunded(NOW + DAY, true),
+                NOW + DAY
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::Applied
+        );
+
+        // Released: no membership, and the number is free again
+        assert!(db.fetch_cipher_membership("u1").await.unwrap().is_none());
+        assert_eq!(
+            db.fetch_cipher_number_by_order(&first.id).await.unwrap(),
+            None
+        );
+        assert_eq!(db.count_claimed_cipher_numbers().await.unwrap(), 0);
+        assert_eq!(order(&db, &first.id).await.state, OrderState::Refunded);
+
+        // 500 from the wallet, 16,000 from the pledge
+        let row = entry(&db, &prot_key_clawback(&first.id))
+            .await
+            .expect("the clawback row");
+        assert_eq!(
+            (row.amount, row.requested, row.shortfall),
+            (500, Some(16_500), Some(0))
+        );
+        let hold = entry(&db, &prot_key_clawback_hold(&first.id, PLEDGE))
+            .await
+            .expect("the clawback-hold row");
+        assert_eq!(hold.kind, ProtEntryKind::ClawbackHold);
+        assert_eq!(hold.amount, 16_000);
+        assert_eq!(hold.debit, prot_hold_account(GOAL));
+        assert_eq!(hold.credit, PROT_SYS_CLAWED);
+        assert_eq!(balance(&db, "u1").await, 0);
+        let pledge = pledge_now(&db, PLEDGE).await;
+        assert_eq!(
+            (pledge.state, pledge.remaining),
+            (v0::ProtPledgeState::ClawedBack, 0)
+        );
+        assert_eq!(goal_now(&db).await.pledged_total, 0);
+
+        // The next buyer gets the released number
+        buy_cipher(
+            &db,
+            &stripe,
+            &s,
+            "u2",
+            CipherTier::T99,
+            "pi_next",
+            NOW + 2 * DAY,
+        )
+        .await;
+        assert_eq!(membership(&db, "u2").await.number, 1);
+        drop_db(&db).await;
+    }
+
+    /// Carry-forward 2: a refunded recent purchase is no longer held. 5,000
+    /// adjusted plus a p25 bought now holds 2,600; once the p25 is refunded
+    /// nothing is held (S5a still counted the refunded credit: 2,600).
+    /// Control: the S5a figure (recent Purchase credits, no clawbacks).
+    #[tokio::test]
+    async fn held_nets_a_clawed_back_recent_purchase() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let ps = prot_settings();
+        insert_user(&db, "u1").await;
+        assert!(ps.hold_ms() > HOUR);
+
+        adjust(&db, "u1", "n1", 5_000).await.unwrap();
+        let bought = buy_pack(&db, &stripe, &s, &ps, "u1", pack("p25"), "pi_1", NOW).await;
+        let me = prot_me(&db, &ps, "u1", NOW).await.unwrap();
+        assert_eq!((me.balance, me.held), (7_600, 2_600));
+
+        assert_eq!(
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &bought.id,
+                ReverseKind::Refund,
+                refunded(NOW + HOUR, true),
+                NOW + HOUR
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::Applied
+        );
+        assert_eq!(
+            entry(&db, &prot_key_clawback(&bought.id))
+                .await
+                .map(|row| row.amount),
+            Some(2_600)
+        );
+
+        // Still inside the purchase's hold, and none of it is held now
+        let me = prot_me(&db, &ps, "u1", NOW + HOUR).await.unwrap();
+        assert_eq!((me.balance, me.held), (5_000, 0));
+        drop_db(&db).await;
+    }
+
+    /// `clawed_back_holds`: a p25 mostly pledged once its hold was over,
+    /// then refunded. The wallet gives its 600, the held pledge 2,000, and
+    /// nothing is short; `clawed_back` keeps meaning the wallet part.
+    /// Control: leave the ClawbackHold rows out of the view and it reads 0.
+    #[tokio::test]
+    async fn admin_order_shows_clawed_back_holds() {
+        let db = test_db().await;
+        let stripe = MockStripe::new();
+        let s = settings();
+        let ps = prot_settings();
+        insert_user(&db, "u1").await;
+
+        let bought = buy_pack(&db, &stripe, &s, &ps, "u1", pack("p25"), "pi_1", NOW).await;
+        let after_hold = NOW + ps.hold_ms() + 1;
+        insert_goal(&db, &funding_goal(20_000, 2_000)).await;
+        hold_pledge(&db, PLEDGE, "u1", 2_000, after_hold).await;
+        assert_eq!(balance(&db, "u1").await, 600);
+
+        assert_eq!(
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &bought.id,
+                ReverseKind::Refund,
+                refunded(after_hold + HOUR, true),
+                after_hold + HOUR
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::Applied
+        );
+        let row = entry(&db, &prot_key_clawback(&bought.id))
+            .await
+            .expect("the clawback row");
+        assert_eq!(
+            (row.amount, row.requested, row.shortfall),
+            (600, Some(2_600), Some(0))
+        );
+        let hold = entry(&db, &prot_key_clawback_hold(&bought.id, PLEDGE))
+            .await
+            .expect("the clawback-hold row");
+        assert_eq!(
+            (hold.kind, hold.amount),
+            (ProtEntryKind::ClawbackHold, 2_000)
+        );
+
+        assert_eq!(
+            admin_prot_order(&db, &bought.id).await.unwrap(),
+            v0::ProtAdminOrder {
+                order_id: bought.id.clone(),
+                user_id: Some("u1".to_string()),
+                sku: p25(),
+                credited: 2_600,
+                clawed_back: 600,
+                shortfall: 0,
+                unspent: Some(0),
+                membership_posted: None,
+                membership_target: None,
+                membership_shortfall: None,
+                clawed_back_holds: 2_000,
+            }
+        );
+        let pledge = pledge_now(&db, PLEDGE).await;
+        assert_eq!(
+            (pledge.state, pledge.remaining),
+            (v0::ProtPledgeState::ClawedBack, 0)
+        );
+        assert_eq!(goal_now(&db).await.pledged_total, 0);
+
+        // A second refund event takes nothing more
+        assert_eq!(
+            reverse_order(
+                &db,
+                &stripe,
+                &s,
+                &bought.id,
+                ReverseKind::Refund,
+                refunded(after_hold + HOUR, true),
+                after_hold + 2 * HOUR
+            )
+            .await
+            .unwrap(),
+            ReverseOutcome::NoOp
+        );
+        assert_eq!(
+            db.fetch_prot_entries_by_order(&bought.id)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+        drop_db(&db).await;
+    }
+
+    /// Account deletion (9.6): each held pledge of the deleted user goes to
+    /// `sys:forfeited` under `forfeit-hold:{pledge_id}`, leaving another
+    /// pledger's Prot and the wallet (forfeited after) alone; a repeat
+    /// writes nothing
+    #[tokio::test]
+    async fn held_pledges_are_forfeited_on_account_deletion() {
+        let db = test_db().await;
+        insert_user(&db, "u1").await;
+        insert_user(&db, "u2").await;
+        adjust(&db, "u1", "n1", 1_000).await.unwrap();
+        adjust(&db, "u2", "n2", 400).await.unwrap();
+        insert_goal(&db, &funding_goal(5_000, 1_100)).await;
+        hold_pledge(&db, PLEDGE, "u1", 700, NOW).await;
+        hold_pledge(&db, OTHER_PLEDGE, "u2", 400, NOW).await;
+
+        forfeit_held_pledges_on_deletion(&db, "u1", NOW + MINUTE)
+            .await
+            .unwrap();
+        let row = entry(&db, &prot_key_forfeit_hold(PLEDGE))
+            .await
+            .expect("the forfeit-hold row");
+        assert_eq!((row.kind, row.amount), (ProtEntryKind::ForfeitHold, 700));
+        assert_eq!(row.debit, prot_hold_account(GOAL));
+        assert_eq!(row.credit, PROT_SYS_FORFEITED);
+        assert_eq!(
+            pledge_now(&db, PLEDGE).await.state,
+            v0::ProtPledgeState::Forfeited
+        );
+        let other = pledge_now(&db, OTHER_PLEDGE).await;
+        assert_eq!(
+            (other.state, other.remaining),
+            (v0::ProtPledgeState::Held, 400)
+        );
+        assert_eq!(goal_now(&db).await.pledged_total, 400);
+        assert_eq!(balance(&db, "u1").await, 300);
+
+        forfeit_held_pledges_on_deletion(&db, "u1", NOW + 2 * MINUTE)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.fetch_prot_entries_by_account(&prot_hold_account(GOAL), None, 100)
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
         drop_db(&db).await;
     }
 }

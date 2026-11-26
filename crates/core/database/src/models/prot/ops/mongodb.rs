@@ -11,19 +11,23 @@ use revolt_result::{ErrorType, Result};
 use crate::{
     is_prot_system_account, prot_key_clawback, prot_payload_hash, prot_user_account,
     AbstractCipherMemberships, CipherProtSync, MongoDb, ProtAccount, ProtAmount, ProtApplyOutcome,
-    ProtLedgerEntry, ProtPosting,
+    ProtGoal, ProtLedgerEntry, ProtPledge, ProtPosting,
 };
 
 use super::{
-    build_prot_entry, cipher_base, duplicate_outcome, forfeit_posting, is_older_incarnation,
-    plan_cipher_clawback, plan_cipher_sync, resolve_prot_amount, run_forfeit_passes,
-    state_retries_exhausted, validate_prot_posting, AbstractProtLedger, CipherSyncPlan,
-    PROT_STATE_RETRIES,
+    build_prot_entry, cipher_base, clawback_hold_posting, clawback_total, duplicate_outcome,
+    forfeit_hold_posting, forfeit_posting, goal_after_hold_debit, held_purchase_net, hold_short,
+    hold_state_broken, is_older_incarnation, plan_cipher_clawback, plan_cipher_sync,
+    plan_pledge_drain, pledge_after_hold_debit, purchase_clawback_posting, resolve_prot_amount,
+    run_forfeit_passes, state_retries_exhausted, validate_prot_posting, AbstractProtLedger,
+    CipherSyncPlan, PROT_STATE_RETRIES,
 };
 
-static LEDGER: &str = "prot_ledger";
-static ACCOUNTS: &str = "prot_accounts";
+pub(in crate::models::prot) static LEDGER: &str = "prot_ledger";
+pub(in crate::models::prot) static ACCOUNTS: &str = "prot_accounts";
 static MEMBERSHIPS: &str = "cipher_memberships";
+static PLEDGES: &str = "prot_pledges";
+static GOALS: &str = "prot_goals";
 
 /// Every retry of one transaction (body or commit) stops this long after the
 /// first attempt started
@@ -42,7 +46,7 @@ static PROT_REPLICA_SET_OK: OnceLock<()> = OnceLock::new();
 /// Prot writes need transactions, which need a replica set; a write never
 /// falls back to a non-transactional path. Called lazily by the first Prot
 /// write of the process (reads never call it).
-async fn ensure_replica_set(db: &MongoDb) -> Result<()> {
+pub(in crate::models::prot) async fn ensure_replica_set(db: &MongoDb) -> Result<()> {
     if PROT_REPLICA_SET_OK.get().is_some() {
         return Ok(());
     }
@@ -74,7 +78,7 @@ fn hello_reports_replica_set(reply: &bson::Document) -> bool {
 }
 
 /// 11000, as a write error or a command error
-fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
+pub(in crate::models::prot) fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
     match &*error.kind {
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write_error)) => {
             write_error.code == 11000
@@ -108,7 +112,7 @@ fn prot_txn_backoff(rerun: u32, remaining: Duration, jitter: f64) -> Duration {
 }
 
 /// Why a transaction body stopped without a result
-enum TxnAbort {
+pub(in crate::models::prot) enum TxnAbort {
     /// A driver error; a transient one re-runs the body, any other is a
     /// database error naming `operation` on `collection`
     Mongo {
@@ -131,13 +135,13 @@ enum TxnAbort {
 }
 
 /// How a transaction ended, for the caller to act on
-enum TxnEnd<T> {
+pub(in crate::models::prot) enum TxnEnd<T> {
     Committed(T),
     DuplicateKey { key: String, payload_hash: String },
     StateMoved,
 }
 
-fn mongo_abort(
+pub(in crate::models::prot) fn mongo_abort(
     operation: &'static str,
     collection: &'static str,
 ) -> impl FnOnce(mongodb::error::Error) -> TxnAbort {
@@ -150,7 +154,7 @@ fn mongo_abort(
 
 /// The body of one transaction: every read and write uses `session`
 #[async_trait]
-trait ProtTxnBody: Sync {
+pub(in crate::models::prot) trait ProtTxnBody: Sync {
     type Output: Send;
 
     async fn run(
@@ -171,7 +175,10 @@ trait ProtTxnBody: Sync {
 ///
 /// Each re-run of the body waits `prot_txn_backoff` first, so writers
 /// conflicting on one wallet or membership do not retry in lockstep.
-async fn run_prot_transaction<B: ProtTxnBody>(db: &MongoDb, body: &B) -> Result<TxnEnd<B::Output>> {
+pub(in crate::models::prot) async fn run_prot_transaction<B: ProtTxnBody>(
+    db: &MongoDb,
+    body: &B,
+) -> Result<TxnEnd<B::Output>> {
     let started = Instant::now();
     let mut reruns: u32 = 0;
 
@@ -248,7 +255,7 @@ async fn run_prot_transaction<B: ProtTxnBody>(db: &MongoDb, body: &B) -> Result<
 
 /// Upsert-increment one account: `balance += delta`, `version += 1`,
 /// `updated_at = now`
-async fn upsert_account(
+pub(in crate::models::prot) async fn upsert_account(
     db: &MongoDb,
     session: &mut ClientSession,
     account_id: &str,
@@ -285,11 +292,35 @@ async fn upsert_account(
 
 /// One posting inside `session` (section 4.2 steps 1-4); the posting must
 /// already be validated. Returns the row written.
-async fn post_in_session(
+pub(in crate::models::prot) async fn post_in_session(
     db: &MongoDb,
     session: &mut ClientSession,
     posting: &ProtPosting,
     payload_hash: &str,
+) -> std::result::Result<ProtLedgerEntry, TxnAbort> {
+    post_in_session_as(db, session, posting, payload_hash, None).await
+}
+
+/// `post_in_session` for a `clawback:` row whose final shortfall is known
+/// only to the caller (10.1: what neither the wallet nor the held pledges
+/// covered). Overrides the stored `shortfall` and nothing else; the payload
+/// hash does not include it.
+async fn post_in_session_with_shortfall(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    posting: &ProtPosting,
+    payload_hash: &str,
+    shortfall: i64,
+) -> std::result::Result<ProtLedgerEntry, TxnAbort> {
+    post_in_session_as(db, session, posting, payload_hash, Some(shortfall)).await
+}
+
+async fn post_in_session_as(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    posting: &ProtPosting,
+    payload_hash: &str,
+    shortfall: Option<i64>,
 ) -> std::result::Result<ProtLedgerEntry, TxnAbort> {
     let debit_system = is_prot_system_account(&posting.debit);
     let debit_account = if debit_system {
@@ -307,7 +338,10 @@ async fn post_in_session(
         debit_account.as_ref().map_or(0, |account| account.balance),
     )
     .map_err(TxnAbort::Refused)?;
-    let entry = build_prot_entry(posting, &resolved, payload_hash);
+    let mut entry = build_prot_entry(posting, &resolved, payload_hash);
+    if shortfall.is_some() {
+        entry.shortfall = shortfall;
+    }
 
     // The unique index on `key` is what stops a posting from being applied twice
     if let Err(error) = db
@@ -332,7 +366,21 @@ async fn post_in_session(
 
     let now = posting.created_at;
     if !debit_system {
-        if resolved.amount > 0 && debit_account.is_some() {
+        if resolved.amount > 0 {
+            // Carry-forward 3 (S5b 10.3): a debit only ever moves Prot out of an
+            // account that has a document. Below a negative floor (a tank) the
+            // floor alone would let a missing account go negative; S5b creates
+            // every tank: and hold: document with its tank or goal, so this is
+            // unreachable by design and refused if it is ever reached.
+            if debit_account.is_none() {
+                log::error!(
+                    "PROT_DEBIT_WITHOUT_ACCOUNT key={:?} debit={:?}",
+                    posting.key,
+                    posting.debit
+                );
+                return Err(TxnAbort::Refused(create_error!(InternalError)));
+            }
+
             // Conditional on the floor, in the same write that moves the balance
             let result = db
                 .col::<Document>(ACCOUNTS)
@@ -363,9 +411,7 @@ async fn post_in_session(
                 });
             }
         } else {
-            // Amount 0: touch (version and updated_at only). Amount > 0 with no
-            // document is only possible below a negative floor (an S5b tank),
-            // which the floor allows by construction
+            // Amount 0: touch (version and updated_at only)
             upsert_account(db, session, &posting.debit, -resolved.amount, now).await?;
         }
     }
@@ -411,6 +457,310 @@ fn bumped(
         // the budget. Any other driver error is a database error.
         Err(error) => Err(mongo_abort("update_one", MEMBERSHIPS)(error)),
     }
+}
+
+/// bson stores a u64 as Int64: a version past i64::MAX cannot be matched
+fn stored_version(version: u64) -> std::result::Result<i64, TxnAbort> {
+    i64::try_from(version).map_err(|_| {
+        log::error!("PROT_VERSION_OVERFLOW version={version}");
+        TxnAbort::Refused(create_error!(InternalError))
+    })
+}
+
+/// Ledger rows matching `filter` inside `session`
+async fn ledger_rows_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    filter: Document,
+) -> std::result::Result<Vec<ProtLedgerEntry>, TxnAbort> {
+    let mut cursor = db
+        .col::<ProtLedgerEntry>(LEDGER)
+        .find(filter)
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("find", LEDGER))?;
+
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next(&mut *session).await {
+        rows.push(row.map_err(mongo_abort("find", LEDGER))?);
+    }
+    Ok(rows)
+}
+
+/// The user's Held pledges inside `session`, newest first (`_id` descending)
+async fn held_pledges_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    user_id: &str,
+) -> std::result::Result<Vec<ProtPledge>, TxnAbort> {
+    let mut cursor = db
+        .col::<ProtPledge>(PLEDGES)
+        .find(held_pledges_filter(user_id))
+        .sort(doc! { "_id": -1_i32 })
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("find", PLEDGES))?;
+
+    let mut pledges = Vec::new();
+    while let Some(pledge) = cursor.next(&mut *session).await {
+        pledges.push(pledge.map_err(mongo_abort("find", PLEDGES))?);
+    }
+    Ok(pledges)
+}
+
+fn held_pledges_filter(user_id: &str) -> Document {
+    doc! {
+        "user_id": user_id,
+        "state": v0::ProtPledgeState::Held.as_str()
+    }
+}
+
+/// The D17 purchases of `held_purchase_prot`
+fn held_purchases_filter(user_id: &str, since_ms: i64) -> Document {
+    doc! {
+        "credit": prot_user_account(user_id),
+        "kind": v0::ProtEntryKind::Purchase.as_str(),
+        "created_at": { "$gte": since_ms }
+    }
+}
+
+/// The clawbacks of those purchases' orders
+fn held_clawbacks_filter(user_id: &str, purchases: &[ProtLedgerEntry]) -> Option<Document> {
+    let orders: Vec<&str> = purchases
+        .iter()
+        .filter_map(|row| row.reference.order_id.as_deref())
+        .collect();
+    if orders.is_empty() {
+        return None;
+    }
+
+    Some(doc! {
+        "debit": prot_user_account(user_id),
+        "kind": v0::ProtEntryKind::Clawback.as_str(),
+        "ref.order_id": { "$in": orders }
+    })
+}
+
+/// Compare-and-swap one pledge from `read` to `next` (state, remaining,
+/// version): a pledge that moved since the snapshot re-runs the body
+async fn cas_pledge_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    read: &ProtPledge,
+    next: &ProtPledge,
+) -> std::result::Result<(), TxnAbort> {
+    let version = stored_version(read.version)?;
+    let result = db
+        .col::<Document>(PLEDGES)
+        .update_one(
+            doc! {
+                "_id": &read.id,
+                "state": read.state.as_str(),
+                "remaining": read.remaining,
+                "version": version
+            },
+            doc! {
+                "$set": {
+                    "state": next.state.as_str(),
+                    "remaining": next.remaining,
+                    "updated_at": next.updated_at
+                },
+                "$inc": { "version": 1_i64 }
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("update_one", PLEDGES))?;
+
+    if result.matched_count == 0 {
+        return Err(TxnAbort::StateMoved);
+    }
+    Ok(())
+}
+
+/// Compare-and-swap one goal from `read` to `next` (pledged total, state,
+/// and the funded fields a drop below the target clears)
+async fn cas_goal_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    read: &ProtGoal,
+    next: &ProtGoal,
+) -> std::result::Result<(), TxnAbort> {
+    let version = stored_version(read.version)?;
+    let mut update = doc! {
+        "$set": {
+            "pledged_total": next.pledged_total,
+            "state": next.state.as_str(),
+            "updated_at": next.updated_at
+        },
+        "$inc": { "version": 1_i64 }
+    };
+    let mut unset = Document::new();
+    if read.funded_at.is_some() && next.funded_at.is_none() {
+        unset.insert("funded_at", "");
+    }
+    if read.launch_deadline_at.is_some() && next.launch_deadline_at.is_none() {
+        unset.insert("launch_deadline_at", "");
+    }
+    if !unset.is_empty() {
+        update.insert("$unset", unset);
+    }
+
+    let result = db
+        .col::<Document>(GOALS)
+        .update_one(
+            doc! {
+                "_id": &read.id,
+                "state": read.state.as_str(),
+                "pledged_total": read.pledged_total,
+                "version": version
+            },
+            update,
+        )
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("update_one", GOALS))?;
+
+    if result.matched_count == 0 {
+        return Err(TxnAbort::StateMoved);
+    }
+    Ok(())
+}
+
+/// One way out of a hold inside `session` (10.1 step c, 9.6): the posting
+/// (None = nothing left to move), the pledge CAS to `emptied` once nothing
+/// is left, and the goal's `pledged_total`, in the transaction's own view
+/// (a second pledge of the same goal sees the first one's write). A hold
+/// that holds less than its pledges, or a pledge without its goal, is a
+/// broken invariant and refused.
+async fn hold_debit_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    pledge: &ProtPledge,
+    posting: Option<&ProtPosting>,
+    emptied: v0::ProtPledgeState,
+    now: i64,
+) -> std::result::Result<Option<ProtLedgerEntry>, TxnAbort> {
+    let x = match posting.map(|posting| posting.amount) {
+        None => 0,
+        Some(ProtAmount::Exact(x)) => x,
+        Some(ProtAmount::UpTo(_) | ProtAmount::All) => {
+            return Err(TxnAbort::Refused(hold_state_broken("pledge", &pledge.id)));
+        }
+    };
+    let next_pledge = pledge_after_hold_debit(pledge, x, emptied, now)
+        .ok_or_else(|| TxnAbort::Refused(hold_state_broken("pledge", &pledge.id)))?;
+
+    let mut entry = None;
+    if let Some(posting) = posting {
+        let goal = db
+            .col::<ProtGoal>(GOALS)
+            .find_one(doc! { "_id": &pledge.goal_id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_abort("find_one", GOALS))?
+            .ok_or_else(|| TxnAbort::Refused(hold_state_broken("goal", &pledge.goal_id)))?;
+        let next_goal = goal_after_hold_debit(&goal, x, now)
+            .ok_or_else(|| TxnAbort::Refused(hold_state_broken("goal", &goal.id)))?;
+
+        validate_prot_posting(posting).map_err(TxnAbort::Refused)?;
+        let payload_hash = prot_payload_hash(posting);
+        let written = post_in_session(db, session, posting, &payload_hash)
+            .await
+            .map_err(|abort| match abort {
+                TxnAbort::Refused(error) => TxnAbort::Refused(hold_short(posting, error)),
+                other => other,
+            })?;
+        cas_goal_in(db, session, &goal, &next_goal).await?;
+        entry = Some(written);
+    }
+
+    cas_pledge_in(db, session, pledge, &next_pledge).await?;
+    Ok(entry)
+}
+
+/// The pledge drain (10.1 step c) inside `session`: up to `rest` from the
+/// buyer's Held pledges, newest first, each through `clawback-hold:`.
+/// Returns the rows written; what they moved is the drain's recovery.
+async fn drain_held_pledges_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    user_id: &str,
+    order_id: &str,
+    rest: i64,
+    now: i64,
+) -> std::result::Result<Vec<ProtLedgerEntry>, TxnAbort> {
+    let held = held_pledges_in(db, session, user_id).await?;
+
+    let mut rows = Vec::new();
+    for (pledge, x) in plan_pledge_drain(rest, &held) {
+        let posting = clawback_hold_posting(order_id, pledge, x, now);
+        let written = hold_debit_in(
+            db,
+            session,
+            pledge,
+            Some(&posting),
+            v0::ProtPledgeState::ClawedBack,
+            now,
+        )
+        .await?;
+        rows.extend(written);
+    }
+    Ok(rows)
+}
+
+/// A reversal's clawback inside `session` (10.1, one order for both Prot
+/// purchases and Cipher): (a) `total` is what the `clawback:` posting asks
+/// for; (b) the wallet gives `w = min(total, balance)`; (c) the held pledges
+/// give up to `total - w`; (d) the `clawback:` row records `amount = w`,
+/// `requested = total` and the FINAL shortfall `total - w - drained`.
+/// Never a tank.
+async fn claw_back_in(
+    db: &MongoDb,
+    session: &mut ClientSession,
+    posting: &ProtPosting,
+    payload_hash: &str,
+    user_id: &str,
+    order_id: &str,
+    now: i64,
+) -> std::result::Result<ProtLedgerEntry, TxnAbort> {
+    let total = clawback_total(posting).map_err(TxnAbort::Refused)?;
+    let wallet = db
+        .col::<ProtAccount>(ACCOUNTS)
+        .find_one(doc! { "_id": &posting.debit })
+        .session(&mut *session)
+        .await
+        .map_err(mongo_abort("find_one", ACCOUNTS))?;
+    let from_wallet = total.min(wallet.map_or(0, |account| account.balance).max(0));
+
+    let drained = if total > from_wallet {
+        drain_held_pledges_in(db, session, user_id, order_id, total - from_wallet, now).await?
+    } else {
+        Vec::new()
+    };
+    let from_pledges = drained
+        .iter()
+        .fold(0_i64, |sum, row| sum.saturating_add(row.amount));
+
+    let entry = post_in_session_with_shortfall(
+        db,
+        session,
+        posting,
+        payload_hash,
+        total - from_wallet - from_pledges,
+    )
+    .await?;
+
+    // The posting read the wallet in the same snapshot, so it took exactly w
+    if entry.amount != from_wallet {
+        log::error!(
+            "PROT_CLAWBACK_SPLIT_MISMATCH key={:?} wallet={from_wallet} posted={}",
+            posting.key,
+            entry.amount
+        );
+        return Err(TxnAbort::Refused(create_error!(InternalError)));
+    }
+    Ok(entry)
 }
 
 /// apply_prot_posting
@@ -527,7 +877,18 @@ impl ProtTxnBody for CipherClawbackBody {
         };
         validate_prot_posting(&posting).map_err(TxnAbort::Refused)?;
         let payload_hash = prot_payload_hash(&posting);
-        let entry = post_in_session(db, session, &posting, &payload_hash).await?;
+        // S5b: what the wallet no longer holds is drained from the member's
+        // held pledges in this transaction (10.1)
+        let entry = claw_back_in(
+            db,
+            session,
+            &posting,
+            &payload_hash,
+            &self.user_id,
+            &self.order_id,
+            self.now,
+        )
+        .await?;
 
         bumped(
             db.bump_cipher_membership_version_in(session, &self.user_id, m.version)
@@ -535,6 +896,91 @@ impl ProtTxnBody for CipherClawbackBody {
         )?;
 
         Ok(Some(ProtApplyOutcome::Applied(entry)))
+    }
+}
+
+/// clawback_prot_purchase (10.1)
+struct PurchaseClawbackBody {
+    user_id: String,
+    order_id: String,
+    posting: ProtPosting,
+    payload_hash: String,
+}
+
+#[async_trait]
+impl ProtTxnBody for PurchaseClawbackBody {
+    type Output = ProtApplyOutcome;
+
+    async fn run(
+        &self,
+        db: &MongoDb,
+        session: &mut ClientSession,
+    ) -> std::result::Result<ProtApplyOutcome, TxnAbort> {
+        // One key per reversal. Read again here so a body re-run after a
+        // commit that did land reports that row.
+        let stored = db
+            .col::<ProtLedgerEntry>(LEDGER)
+            .find_one(doc! { "key": &self.posting.key })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_abort("find_one", LEDGER))?;
+        if let Some(stored) = stored {
+            return Ok(ProtApplyOutcome::AlreadyApplied(stored));
+        }
+
+        let entry = claw_back_in(
+            db,
+            session,
+            &self.posting,
+            &self.payload_hash,
+            &self.user_id,
+            &self.order_id,
+            self.posting.created_at,
+        )
+        .await?;
+        Ok(ProtApplyOutcome::Applied(entry))
+    }
+}
+
+/// One pledge of forfeit_held_prot_pledges: None when it is no longer Held
+/// (a racing capture, return or forfeit got there first) or held nothing
+struct ForfeitHoldBody {
+    pledge_id: String,
+    now: i64,
+}
+
+#[async_trait]
+impl ProtTxnBody for ForfeitHoldBody {
+    type Output = Option<ProtLedgerEntry>;
+
+    async fn run(
+        &self,
+        db: &MongoDb,
+        session: &mut ClientSession,
+    ) -> std::result::Result<Option<ProtLedgerEntry>, TxnAbort> {
+        let pledge = db
+            .col::<ProtPledge>(PLEDGES)
+            .find_one(doc! { "_id": &self.pledge_id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_abort("find_one", PLEDGES))?;
+        let Some(pledge) = pledge else {
+            return Ok(None);
+        };
+        if pledge.state != v0::ProtPledgeState::Held {
+            return Ok(None);
+        }
+
+        let posting = (pledge.remaining > 0).then(|| forfeit_hold_posting(&pledge, self.now));
+        hold_debit_in(
+            db,
+            session,
+            &pledge,
+            posting.as_ref(),
+            v0::ProtPledgeState::Forfeited,
+            self.now,
+        )
+        .await
     }
 }
 
@@ -592,6 +1038,106 @@ impl MongoDb {
                 None,
             )),
         }
+    }
+
+    /// In-transaction twin of `held_purchase_prot` (audit 11), for the
+    /// contribute and pledge bodies: the held figure in their snapshot
+    pub(in crate::models::prot) async fn held_purchase_prot_in(
+        &self,
+        session: &mut ClientSession,
+        user_id: &str,
+        since_ms: i64,
+    ) -> std::result::Result<i64, TxnAbort> {
+        let purchases =
+            ledger_rows_in(self, session, held_purchases_filter(user_id, since_ms)).await?;
+        let clawbacks = match held_clawbacks_filter(user_id, &purchases) {
+            Some(filter) => ledger_rows_in(self, session, filter).await?,
+            None => Vec::new(),
+        };
+        Ok(held_purchase_net(
+            purchases.iter().chain(clawbacks.iter()),
+            user_id,
+            since_ms,
+        ))
+    }
+
+    /// Ledger rows matching `filter`, outside any transaction
+    async fn prot_ledger_rows(&self, filter: Document) -> Result<Vec<ProtLedgerEntry>> {
+        self.col::<ProtLedgerEntry>(LEDGER)
+            .find(filter)
+            .await
+            .map_err(|_| create_database_error!("find", LEDGER))?
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("find", LEDGER))
+    }
+
+    /// The user's Held pledges, newest first, outside any transaction
+    async fn held_prot_pledges(&self, user_id: &str) -> Result<Vec<ProtPledge>> {
+        self.col::<ProtPledge>(PLEDGES)
+            .find(held_pledges_filter(user_id))
+            .sort(doc! { "_id": -1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", PLEDGES))?
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("find", PLEDGES))
+    }
+
+    /// A clawback transaction (Prot purchase or Cipher). One key per
+    /// reversal: once `clawback:{order_id}` (`key`) exists, the reversal is
+    /// settled and `stored` reports that row. A duplicate key (the
+    /// `clawback:` row, or a `clawback-hold:` row of a racing run) or a
+    /// moved membership, pledge or goal reads that key outside the
+    /// transaction and otherwise re-runs the body on the new state.
+    async fn run_clawback<B: ProtTxnBody>(
+        &self,
+        body: &B,
+        key: &str,
+        user_id: &str,
+        operation: &str,
+        stored: fn(ProtLedgerEntry) -> B::Output,
+    ) -> Result<B::Output> {
+        for _ in 0..PROT_STATE_RETRIES {
+            match run_prot_transaction(self, body).await? {
+                TxnEnd::Committed(outcome) => return Ok(outcome),
+                TxnEnd::DuplicateKey { .. } | TxnEnd::StateMoved => {
+                    if let Some(row) = self.fetch_prot_entry_by_key(key).await? {
+                        return Ok(stored(row));
+                    }
+                }
+            }
+        }
+
+        Err(state_retries_exhausted(operation, user_id, None))
+    }
+
+    /// One pledge forfeited in its own transaction
+    async fn prot_forfeit_hold(
+        &self,
+        user_id: &str,
+        pledge_id: &str,
+        now: i64,
+    ) -> Result<Option<ProtLedgerEntry>> {
+        let body = ForfeitHoldBody {
+            pledge_id: pledge_id.to_string(),
+            now,
+        };
+
+        // A duplicate forfeit-hold: key or a moved pledge or goal: the re-run
+        // finds the pledge no longer Held, or forfeits it from the new state
+        for _ in 0..PROT_STATE_RETRIES {
+            match run_prot_transaction(self, &body).await? {
+                TxnEnd::Committed(entry) => return Ok(entry),
+                TxnEnd::DuplicateKey { .. } | TxnEnd::StateMoved => {}
+            }
+        }
+
+        Err(state_retries_exhausted(
+            "forfeit_held_prot_pledges",
+            user_id,
+            None,
+        ))
     }
 }
 
@@ -806,29 +1352,14 @@ impl AbstractProtLedger for MongoDb {
             now,
         };
 
-        for _ in 0..PROT_STATE_RETRIES {
-            match run_prot_transaction(self, &body).await? {
-                TxnEnd::Committed(outcome) => return Ok(outcome),
-                // One key per reversal: as in step 0, a row for this order
-                // settles it, whatever state it was computed from
-                TxnEnd::DuplicateKey { key, .. } => {
-                    return match self.fetch_prot_entry_by_key(&key).await? {
-                        Some(stored) => Ok(Some(ProtApplyOutcome::AlreadyApplied(stored))),
-                        None => {
-                            log::error!("PROT_DUPLICATE_KEY_WITHOUT_ROW key={key:?}");
-                            Err(create_database_error!("find_one", LEDGER))
-                        }
-                    };
-                }
-                TxnEnd::StateMoved => {}
-            }
-        }
-
-        Err(state_retries_exhausted(
-            "clawback_cipher_prot",
-            user_id,
-            None,
-        ))
+        // One key per reversal: as in step 0, a row for this order settles
+        // it, whatever state it was computed from. The duplicate may also be
+        // a `clawback-hold:` row of a racing run (S5b), so the order's own
+        // key is what is read back.
+        self.run_clawback(&body, &key, user_id, "clawback_cipher_prot", |row| {
+            Some(ProtApplyOutcome::AlreadyApplied(row))
+        })
+        .await
     }
 
     async fn forfeit_prot_wallet(
@@ -847,6 +1378,90 @@ impl AbstractProtLedger for MongoDb {
             },
         )
         .await
+    }
+
+    async fn clawback_prot_purchase(
+        &self,
+        user_id: &str,
+        order_id: &str,
+        amount: i64,
+        now: i64,
+    ) -> Result<ProtApplyOutcome> {
+        // Read first, outside any transaction: a settled reversal writes nothing
+        let posting = purchase_clawback_posting(user_id, order_id, amount, now);
+        if let Some(stored) = self.fetch_prot_entry_by_key(&posting.key).await? {
+            return Ok(ProtApplyOutcome::AlreadyApplied(stored));
+        }
+        validate_prot_posting(&posting)?;
+        ensure_replica_set(self).await?;
+
+        let key = posting.key.clone();
+        let payload_hash = prot_payload_hash(&posting);
+        let body = PurchaseClawbackBody {
+            user_id: user_id.to_string(),
+            order_id: order_id.to_string(),
+            posting,
+            payload_hash,
+        };
+        self.run_clawback(
+            &body,
+            &key,
+            user_id,
+            "clawback_prot_purchase",
+            ProtApplyOutcome::AlreadyApplied,
+        )
+        .await
+    }
+
+    async fn held_purchase_prot(&self, user_id: &str, since_ms: i64) -> Result<i64> {
+        let purchases = self
+            .prot_ledger_rows(held_purchases_filter(user_id, since_ms))
+            .await?;
+        let clawbacks = match held_clawbacks_filter(user_id, &purchases) {
+            Some(filter) => self.prot_ledger_rows(filter).await?,
+            None => Vec::new(),
+        };
+        Ok(held_purchase_net(
+            purchases.iter().chain(clawbacks.iter()),
+            user_id,
+            since_ms,
+        ))
+    }
+
+    async fn sum_held_prot_pledges(&self, user_id: &str) -> Result<i64> {
+        Ok(self
+            .held_prot_pledges(user_id)
+            .await?
+            .iter()
+            .fold(0_i64, |sum, pledge| sum.saturating_add(pledge.remaining)))
+    }
+
+    async fn forfeit_held_prot_pledges(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Vec<ProtLedgerEntry>> {
+        let mut written = Vec::new();
+
+        // Each round forfeits every pledge that was Held when it started; a
+        // pledge that landed meanwhile is picked up by the next round
+        for _ in 0..PROT_STATE_RETRIES {
+            let held = self.held_prot_pledges(user_id).await?;
+            if held.is_empty() {
+                return Ok(written);
+            }
+            ensure_replica_set(self).await?;
+
+            for pledge in held {
+                written.extend(self.prot_forfeit_hold(user_id, &pledge.id, now).await?);
+            }
+        }
+
+        if self.held_prot_pledges(user_id).await?.is_empty() {
+            return Ok(written);
+        }
+        log::error!("PROT_FORFEIT_HOLD_UNSETTLED user={user_id} rounds={PROT_STATE_RETRIES}");
+        Err(create_error!(InternalError))
     }
 }
 

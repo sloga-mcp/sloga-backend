@@ -42,12 +42,12 @@ use super::{
 /// the epoch answers before any validity check; the commit's
 /// `authenticated_data` must be the channel's newest stored seat list;
 /// Adds need the growth flag (recovery Adds do not), an entitlement that
-/// allows text traffic and eligible, seated targets within the device and
-/// leaf caps; Removes follow the Remove rule. On a channel whose stored list
-/// is v2, every added device must have joined with a text protocol of at
-/// least 2: its join intent's, or for a rejoin re-Add the protocol its
-/// eviction recorded (`ProtectedClientOutdated`). Every Text Add stores
-/// each added device's protocol on the row for the Welcome route.
+/// allows text traffic (Active or Grace) and eligible, seated targets within
+/// the device and leaf caps; Removes follow the Remove rule. On a channel
+/// whose stored list is v2, every added device must have joined with a text
+/// protocol of at least 2: its join intent's, or for a rejoin re-Add the
+/// protocol its eviction recorded (`ProtectedClientOutdated`). Every Text
+/// Add stores each added device's protocol on the row for the Welcome route.
 /// Its commit envelopes carry the declarations (`committer`, `added`,
 /// `removed`, `rejoin_intents`) receivers bind the commit to.
 #[openapi(tag = "MLS")]
@@ -345,12 +345,18 @@ async fn submit_call_commit(
 ///    idempotent after the group, the seat list or the growth flag moved on
 ///    (W0-fix8, §11);
 /// 5. validity: open; the AD binding; for Adds the growth gate (unless every
-///    Add is a recovery Add), an entitlement that allows text traffic and
-///    Add-clears-pending; the Remove rule; the Add targets and caps; on a v2
-///    list, the minimum text protocol of every added device, from its join
-///    intent or else its `rejoin_readd` entry (S4, last). The
-///    commit transaction checks them again on its own read, and that check
-///    is the one that binds; it does not check the protocol.
+///    Add is a recovery Add), an entitlement that allows text traffic
+///    (Active or Grace) and Add-clears-pending; the Remove rule; the Add
+///    targets and caps; on a v2 list, the minimum text protocol of every
+///    added device, from its join intent or else its `rejoin_readd` entry
+///    (S4, last). The commit transaction checks them again on its own read,
+///    and that check is the one that binds, except for the growth gate, the
+///    entitlement state and the protocol: the transaction is handed only the
+///    entitlement's device cap, so the state is checked here and nowhere
+///    else, and it does not check the protocol. Residual (S5b BR7): an Add
+///    checked in Grace can still commit right after the clock writes Frozen.
+///    It only adds a seated member's device, so it costs policy, not
+///    confidentiality.
 async fn submit_text_commit(
     db: &Database,
     user: User,
@@ -457,10 +463,11 @@ async fn submit_text_commit(
         .collect();
 
     // Growth is Adds only: Remove and Update commits go on with the flag
-    // off (decision 5 (W2)) and in every entitlement state. A recovery Add
-    // passes without the flag (S2-D32): the available gate above and the
-    // entitlement check here are its gate. Every Add needs an entitlement
-    // that allows text traffic (decision 7, #220), and Add-clears-pending
+    // off (decision 5 (W2)) and in every entitlement state, Frozen and
+    // Deleted included (S5b). A recovery Add passes without the flag
+    // (S2-D32): the available gate above and the entitlement check here are
+    // its gate. Every Add needs an entitlement that allows text traffic,
+    // Active or Grace (decision 7, #220, S5b D14), and Add-clears-pending
     // (S2-D17b).
     if !added.is_empty() {
         if !is_recovery_add(db, &group, &stored, &added).await? {
@@ -702,12 +709,11 @@ async fn submit_text_commit(
 }
 
 /// The entitlement predicate every Text Add needs, a new device and a
-/// recovery Add alike (design §6.3 "Recovery gates", #220): S5's
-/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`) replaces
-/// this at its merge. Remove and Update commits never read it.
+/// recovery Add alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14), and
+/// a missing entitlement refuses. Remove and Update commits never read it.
 fn allows_text_traffic(entitlement: Option<&ChannelEntitlement>) -> bool {
-    entitlement.is_some_and(|entitlement| entitlement.is_active())
+    entitlement.is_some_and(|entitlement| entitlement.allows_text_traffic())
 }
 
 /// Whether every added device is a recovery Add (design §6.1 "S2
@@ -3015,6 +3021,29 @@ mod tests {
             commit_next(&setup, &setup.owner, vec![], vec![revoked.device()]).await,
             "a Remove without an entitlement",
         );
+    }
+
+    /// S5b D14: in Grace a seated member's new device is still added
+    #[test]
+    fn grace_allows_adds_of_seated_devices() {
+        crate::util::test::rt().block_on(grace_allows_adds_of_seated_devices_case())
+    }
+
+    async fn grace_allows_adds_of_seated_devices_case() {
+        let setup = setup(1).await;
+        let db = setup.db();
+        set_entitlement(db, setup.channel_id(), Some(ChannelEntitlementState::Grace)).await;
+
+        let member = &setup.members[0];
+        assert_won(
+            commit_next(&setup, &setup.owner, vec![member.device()], vec![]).await,
+            "an Add in Grace",
+        );
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_member(&member.user.id, &member.device_id));
     }
 
     /// Never-plaintext and removal safety (S5b): Remove and Update commits

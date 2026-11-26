@@ -4,7 +4,8 @@
 //! session user and an `X-Audit-Log-Reason`. Each call logs an `AUDIT ...`
 //! line, and a write is also recorded by its own ledger row (actor and
 //! reason). The Prot routes are not gated on `[features.boosts.protection]`,
-//! so support can inspect and correct wallets while Prot is switched off.
+//! so support can inspect and correct wallets, and end a tank for abuse,
+//! while Prot is switched off.
 //!
 //! The Take It Down routes (`takedown_*`) are narrower: only privileged
 //! accounts on `[features.takedown] reviewers` with MFA turned on. Reading
@@ -15,6 +16,7 @@ use rocket::Route;
 
 mod prot_adjust;
 mod prot_orders;
+mod prot_terminate;
 mod takedown_common;
 mod takedown_holds;
 mod takedown_queue;
@@ -27,6 +29,7 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
     openapi_get_routes_spec![
         prot_orders::fetch_prot_order,
         prot_adjust::adjust_prot,
+        prot_terminate::terminate_prot_tank,
         takedown_queue::list_takedown_requests,
         takedown_queue::fetch_takedown_request,
         takedown_remove::remove_takedown_targets,

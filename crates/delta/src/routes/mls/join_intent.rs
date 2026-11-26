@@ -460,12 +460,11 @@ async fn signer_replacement(
 }
 
 /// The entitlement predicate every Text join needs, a new device and a
-/// recovery intent alike (design §6.3 "Recovery gates", #220): S5's
-/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, S2-D32
-/// amended) replaces this at its merge.
+/// recovery intent alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14,
+/// S2-D32 amended).
 fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
-    entitlement.is_active()
+    entitlement.allows_text_traffic()
 }
 
 /// The entitlement half of the recovery gate for a rejoin (§6.3 "Recovery
@@ -505,10 +504,10 @@ fn capped_device_count(group: &MlsGroup, user_id: &str) -> usize {
 ///
 /// A new device is an Add to come, and an Add of a seated member's new
 /// device needs an entitlement that allows text traffic
-/// ([`allows_text_traffic`]; §6.1 errors, §6.3 "Recovery gates"), so a
-/// missing or inactive one refuses the new device here rather than at the
-/// admitter's commit. The signer user's replacement device meets the same
-/// check under the recovery gate.
+/// ([`allows_text_traffic`]: Active or Grace, S5b D14; §6.1 errors, §6.3
+/// "Recovery gates"), so a missing, Frozen or Deleted one refuses the new
+/// device here rather than at the admitter's commit. The signer user's
+/// replacement device meets the same check under the recovery gate.
 async fn enforced_device_cap(db: &Database, channel_id: &str) -> Result<u32> {
     let entitlement = db
         .fetch_channel_entitlement(channel_id)
@@ -1578,8 +1577,9 @@ mod tests {
     }
 
     /// Deleted refuses a new device as Frozen does, and a rejoin with it.
-    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` takes the
-    /// rejoin, under the S1 rule that S2-D32 replaces.)
+    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` took the
+    /// rejoin, under the S1 rule that S2-D32 replaces; it was dropped at
+    /// the merge, this test covering all it would now assert.)
     #[test]
     fn a_deleted_entitlement_refuses_new_devices_and_rejoins() {
         crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(Some(
@@ -1667,6 +1667,39 @@ mod tests {
             .expect("entitlement read")
             .expect("an entitlement");
         assert_eq!(entitlement.state, state);
+    }
+
+    /// S5b D14 (the cross-branch pin against S2-D32): in Grace a seated
+    /// member's NEW device may still ask to join, so it can be added
+    #[test]
+    fn grace_allows_a_join_intent() {
+        crate::util::test::rt().block_on(grace_allows_a_join_intent_case())
+    }
+
+    async fn grace_allows_a_join_intent_case() {
+        let text = text_fixture().await;
+        let db = &text.harness.db;
+        let group_id = &text.group.id;
+
+        set_entitlement_state(
+            db,
+            text.protected.channel.id(),
+            ChannelEntitlementState::Grace,
+        )
+        .await;
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            group_id,
+            signed_intent(&text.member_device, group_id, "m1"),
+        )
+        .await
+        .expect("a new device's intent in Grace");
+        assert_eq!(
+            stored_intents(db, group_id).await,
+            vec![(text.member.id.clone(), text.member_device.device_id.clone())]
+        );
     }
 
     #[test]

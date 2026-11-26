@@ -186,8 +186,304 @@ auto_derived!(
         /// Same condition: cipher_prot_shortfall of that incarnation's rows (membership-wide)
         #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
         pub membership_shortfall: Option<i64>,
+        /// Sum of `amount` of ClawbackHold rows with ref.order_id = this order (Prot taken back from held
+        /// pledges); `clawed_back` keeps counting the wallet part only (S5a meaning unchanged)
+        #[cfg_attr(feature = "serde", serde(default))]
+        pub clawed_back_holds: i64,
+    }
+
+    /// Stage of a fuel tank (S5b). Serialized as the variant name.
+    #[derive(Copy)]
+    pub enum ProtTankStage {
+        Launching,
+        Active,
+        Grace,
+        Frozen,
+        Settling,
+        Deleted,
+        Terminated,
+    }
+
+    #[derive(Copy)]
+    pub enum ProtGoalState {
+        Funding,
+        Funded,
+        Launching,
+        Launched,
+        Applied,
+        Expired,
+        Cancelled,
+    }
+
+    #[derive(Copy)]
+    pub enum ProtGoalKind {
+        Launch,
+        Upgrade,
+    }
+
+    /// `ClawedBack` (BR9): a pledge a clawback drained to 0
+    #[derive(Copy)]
+    pub enum ProtPledgeState {
+        Held,
+        Captured,
+        Returned,
+        Withdrawn,
+        Forfeited,
+        ClawedBack,
+    }
+
+    /// What a tank pays for (S10 adds Server tanks; no migration)
+    #[derive(Copy)]
+    pub enum ProtPlan {
+        Channel,
+        Server,
+    }
+
+    /// The tank state every viewer of the channel may see (banner, shield, panel)
+    pub struct ProtTankSummary {
+        pub tank_id: String,
+        pub channel_id: String,
+        pub stage: ProtTankStage,
+        /// 10 | 25 | 50 | 100
+        pub slot_tier: u32,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub pending_slot_tier: Option<u32>,
+        pub daily_cost: i64,
+        /// May be negative in Grace (borrowed grace)
+        pub balance: i64,
+        /// Active only: next UTC midnight + floor(balance / daily_cost) days
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub protected_until: Option<i64>,
+        /// Grace only: exhausted_at + grace_days days
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub grace_ends_at: Option<i64>,
+        /// Grace / Frozen, and ONLY while `deletion_enabled` is on (NIT 32): exhausted_at + (grace_days +
+        /// freeze_days) days (the earliest deletion; the day-20 guard may postpone it). Absent = the client
+        /// promises no deletion date.
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub deletes_at: Option<i64>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub launched_at: Option<i64>,
+        /// The tank document's version; with `balance_version`, clients keep the
+        /// lexicographically newest (version, balance_version)
+        pub version: u64,
+        /// The tank account's version
+        pub balance_version: u64,
+    }
+
+    /// One contributor line. `user_id` is None for a hidden contributor ("Anonymous", hidden even from the owner)
+    /// AND for a deleted user ("Deleted user", `deleted: true`); a deleted user's id is never returned (NIT 25)
+    pub struct ProtContributorView {
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub user_id: Option<String>,
+        /// Net Prot (after returns); > 0
+        pub amount: i64,
+        pub hidden: bool,
+        pub deleted: bool,
+        /// This line is the caller (also when hidden)
+        pub you: bool,
+    }
+
+    pub struct ProtPledgeView {
+        pub id: String,
+        pub goal_id: String,
+        pub amount: i64,
+        pub remaining: i64,
+        pub state: ProtPledgeState,
+        pub created_at: i64,
+    }
+
+    pub struct ProtGoalView {
+        pub id: String,
+        pub kind: ProtGoalKind,
+        pub server_id: String,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub channel_id: Option<String>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub tank_id: Option<String>,
+        pub slots: u32,
+        /// Launch goals only
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub days: Option<u32>,
+        pub daily_cost: i64,
+        pub target_prot: i64,
+        pub pledged_total: i64,
+        pub state: ProtGoalState,
+        pub deadline_at: i64,
+        /// deadline_at - withdraw_cutoff_hours
+        pub withdraw_until: i64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub funded_at: Option<i64>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub launch_deadline_at: Option<i64>,
+        #[cfg_attr(
+            feature = "serde",
+            serde(skip_serializing_if = "Option::is_none", default)
+        )]
+        pub launched_at: Option<i64>,
+        pub contributors: Vec<ProtContributorView>,
+        pub your_pledges: Vec<ProtPledgeView>,
+        /// Verbatim PROT_SEAT_NOTICE
+        pub notice: String,
+    }
+
+    pub struct ProtTankView {
+        pub tank: ProtTankSummary,
+        pub contributors: Vec<ProtContributorView>,
+        /// Open goals of this tank (Upgrade), and the Launching launch goal if any
+        pub goals: Vec<ProtGoalView>,
+        /// What the caller contributed net (0 if nothing)
+        pub you_contributed: i64,
+        /// The caller passes D6 now and the stage takes top-ups
+        pub can_contribute: bool,
+        /// The caller is the server owner
+        pub is_owner: bool,
+        /// channel_seats_used(seats, now) (active + cooling), for "slots used" (audit 15)
+        pub seats_used: u32,
+        pub notice: String,
+    }
+
+    /// POST /prot/channels/<id>/contribute and POST /prot/goals/<id>/pledges
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataProtContribute {
+        /// 1..=1_000_000 (min_contribution checked by the engine)
+        pub amount: i64,
+        /// Client ULID; scopes the idempotency key
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub nonce: String,
+    }
+
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataProtLaunchGoal {
+        pub slots: u32,
+        pub days: u32,
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub nonce: String,
+    }
+
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataProtUpgradeGoal {
+        pub slots: u32,
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub nonce: String,
+    }
+
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataProtGoalLaunch {
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub channel_id: String,
+    }
+
+    #[cfg_attr(feature = "validator", derive(Validate))]
+    pub struct DataProtTier {
+        pub slots: u32,
+        #[cfg_attr(feature = "validator", validate(length(min = 1, max = 64)))]
+        pub nonce: String,
+    }
+
+    pub struct DataProtContributorPrefs {
+        pub hidden: bool,
+    }
+
+    pub struct ProtContributionResponse {
+        pub entry_id: String,
+        pub tank: ProtTankSummary,
+        /// Wallet after the posting
+        pub balance: i64,
+        pub already_applied: bool,
+        pub notice: String,
+    }
+
+    pub struct ProtPledgeResponse {
+        pub pledge: ProtPledgeView,
+        pub goal: ProtGoalView,
+        pub balance: i64,
+        pub already_applied: bool,
+        pub notice: String,
     }
 );
+
+/// Shown with every contribution and pledge, and on every write response (11.1). Byte-pinned by
+/// `prot_seat_notice_is_verbatim`; the clients carry the same text as a catalog msgid.
+pub const PROT_SEAT_NOTICE: &str =
+    "Contributing supports this server. It does not reserve a seat; the owner chooses members.";
+
+impl ProtTankStage {
+    /// Same string as serde; used by the Mongo filters
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProtTankStage::Launching => "Launching",
+            ProtTankStage::Active => "Active",
+            ProtTankStage::Grace => "Grace",
+            ProtTankStage::Frozen => "Frozen",
+            ProtTankStage::Settling => "Settling",
+            ProtTankStage::Deleted => "Deleted",
+            ProtTankStage::Terminated => "Terminated",
+        }
+    }
+}
+
+impl ProtGoalState {
+    /// Same string as serde; used by the Mongo filters
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProtGoalState::Funding => "Funding",
+            ProtGoalState::Funded => "Funded",
+            ProtGoalState::Launching => "Launching",
+            ProtGoalState::Launched => "Launched",
+            ProtGoalState::Applied => "Applied",
+            ProtGoalState::Expired => "Expired",
+            ProtGoalState::Cancelled => "Cancelled",
+        }
+    }
+}
+
+impl ProtPledgeState {
+    /// Same string as serde; used by the Mongo filters
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProtPledgeState::Held => "Held",
+            ProtPledgeState::Captured => "Captured",
+            ProtPledgeState::Returned => "Returned",
+            ProtPledgeState::Withdrawn => "Withdrawn",
+            ProtPledgeState::Forfeited => "Forfeited",
+            ProtPledgeState::ClawedBack => "ClawedBack",
+        }
+    }
+}
 
 impl ProtEntryKind {
     /// Same string as serde; used by the ledger payload hash
@@ -386,6 +682,7 @@ mod tests {
             membership_posted: None,
             membership_target: None,
             membership_shortfall: None,
+            clawed_back_holds: 0,
         };
         assert_eq!(
             serde_json::to_value(&order).unwrap(),
@@ -394,8 +691,208 @@ mod tests {
                 "sku": {"type": "CipherNew", "tier": "T99"},
                 "credited": 0,
                 "clawed_back": 0,
-                "shortfall": 0
+                "shortfall": 0,
+                "clawed_back_holds": 0
             })
         );
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod tank_tests {
+    use super::*;
+
+    const STAGES: [(ProtTankStage, &str); 7] = [
+        (ProtTankStage::Launching, "Launching"),
+        (ProtTankStage::Active, "Active"),
+        (ProtTankStage::Grace, "Grace"),
+        (ProtTankStage::Frozen, "Frozen"),
+        (ProtTankStage::Settling, "Settling"),
+        (ProtTankStage::Deleted, "Deleted"),
+        (ProtTankStage::Terminated, "Terminated"),
+    ];
+
+    const GOAL_STATES: [(ProtGoalState, &str); 7] = [
+        (ProtGoalState::Funding, "Funding"),
+        (ProtGoalState::Funded, "Funded"),
+        (ProtGoalState::Launching, "Launching"),
+        (ProtGoalState::Launched, "Launched"),
+        (ProtGoalState::Applied, "Applied"),
+        (ProtGoalState::Expired, "Expired"),
+        (ProtGoalState::Cancelled, "Cancelled"),
+    ];
+
+    const PLEDGE_STATES: [(ProtPledgeState, &str); 6] = [
+        (ProtPledgeState::Held, "Held"),
+        (ProtPledgeState::Captured, "Captured"),
+        (ProtPledgeState::Returned, "Returned"),
+        (ProtPledgeState::Withdrawn, "Withdrawn"),
+        (ProtPledgeState::Forfeited, "Forfeited"),
+        (ProtPledgeState::ClawedBack, "ClawedBack"),
+    ];
+
+    /// Fails to compile when a variant is added without a row in the tables above
+    #[allow(dead_code)]
+    fn listed_in_the_tables(
+        stage: ProtTankStage,
+        goal: ProtGoalState,
+        pledge: ProtPledgeState,
+        kind: ProtGoalKind,
+        plan: ProtPlan,
+    ) {
+        match stage {
+            ProtTankStage::Launching
+            | ProtTankStage::Active
+            | ProtTankStage::Grace
+            | ProtTankStage::Frozen
+            | ProtTankStage::Settling
+            | ProtTankStage::Deleted
+            | ProtTankStage::Terminated => {}
+        }
+        match goal {
+            ProtGoalState::Funding
+            | ProtGoalState::Funded
+            | ProtGoalState::Launching
+            | ProtGoalState::Launched
+            | ProtGoalState::Applied
+            | ProtGoalState::Expired
+            | ProtGoalState::Cancelled => {}
+        }
+        match pledge {
+            ProtPledgeState::Held
+            | ProtPledgeState::Captured
+            | ProtPledgeState::Returned
+            | ProtPledgeState::Withdrawn
+            | ProtPledgeState::Forfeited
+            | ProtPledgeState::ClawedBack => {}
+        }
+        match kind {
+            ProtGoalKind::Launch | ProtGoalKind::Upgrade => {}
+        }
+        match plan {
+            ProtPlan::Channel | ProtPlan::Server => {}
+        }
+    }
+
+    fn round_trips<T>(value: T, name: &str)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(
+            serde_json::to_value(&value).unwrap(),
+            serde_json::json!(name)
+        );
+        assert_eq!(
+            serde_json::from_value::<T>(serde_json::json!(name)).unwrap(),
+            value
+        );
+    }
+
+    /// The stored and wire names are the variant names, and `as_str` (the
+    /// Mongo filters) never drifts from serde
+    #[test]
+    fn tank_enums_round_trip_as_their_names() {
+        for (stage, name) in STAGES {
+            round_trips(stage, name);
+            assert_eq!(stage.as_str(), name);
+        }
+        for (state, name) in GOAL_STATES {
+            round_trips(state, name);
+            assert_eq!(state.as_str(), name);
+        }
+        for (state, name) in PLEDGE_STATES {
+            round_trips(state, name);
+            assert_eq!(state.as_str(), name);
+        }
+        round_trips(ProtGoalKind::Launch, "Launch");
+        round_trips(ProtGoalKind::Upgrade, "Upgrade");
+        round_trips(ProtPlan::Channel, "Channel");
+        round_trips(ProtPlan::Server, "Server");
+
+        assert!(serde_json::from_str::<ProtTankStage>(r#""active""#).is_err());
+        assert!(serde_json::from_str::<ProtPledgeState>(r#""Clawed""#).is_err());
+    }
+
+    fn summary() -> ProtTankSummary {
+        ProtTankSummary {
+            tank_id: "01TANK".to_string(),
+            channel_id: "01CHANNEL".to_string(),
+            stage: ProtTankStage::Frozen,
+            slot_tier: 25,
+            pending_slot_tier: None,
+            daily_cost: 90,
+            balance: -450,
+            protected_until: None,
+            grace_ends_at: None,
+            deletes_at: None,
+            launched_at: None,
+            version: 4,
+            balance_version: 9,
+        }
+    }
+
+    #[test]
+    fn tank_summary_without_options_omits_the_keys() {
+        assert_eq!(
+            serde_json::to_value(summary()).unwrap(),
+            serde_json::json!({
+                "tank_id": "01TANK",
+                "channel_id": "01CHANNEL",
+                "stage": "Frozen",
+                "slot_tier": 25,
+                "daily_cost": 90,
+                "balance": -450,
+                "version": 4,
+                "balance_version": 9
+            })
+        );
+
+        // and reads back from that shape (the options default to None)
+        let read: ProtTankSummary = serde_json::from_value(serde_json::json!({
+            "tank_id": "01TANK",
+            "channel_id": "01CHANNEL",
+            "stage": "Frozen",
+            "slot_tier": 25,
+            "daily_cost": 90,
+            "balance": -450,
+            "version": 4,
+            "balance_version": 9
+        }))
+        .unwrap();
+        assert_eq!(read, summary());
+
+        let mut full = summary();
+        full.pending_slot_tier = Some(10);
+        full.deletes_at = Some(1_700_000_000_000);
+        let value = serde_json::to_value(&full).unwrap();
+        assert_eq!(value["pending_slot_tier"], 10);
+        assert_eq!(value["deletes_at"], 1_700_000_000_000i64);
+        assert!(value.get("protected_until").is_none());
+    }
+
+    #[test]
+    fn contributor_view_omits_a_hidden_or_deleted_user_id() {
+        let hidden = ProtContributorView {
+            user_id: None,
+            amount: 300,
+            hidden: true,
+            deleted: false,
+            you: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&hidden).unwrap(),
+            serde_json::json!({ "amount": 300, "hidden": true, "deleted": false, "you": false })
+        );
+    }
+
+    /// The EN notice is a legal text (Terms, the pt-BR msgstr is pinned in the
+    /// client catalogs): any change here is a copy change, not a refactor
+    #[test]
+    fn prot_seat_notice_is_verbatim() {
+        assert_eq!(
+            PROT_SEAT_NOTICE,
+            "Contributing supports this server. It does not reserve a seat; the owner chooses members."
+        );
+        assert_eq!(PROT_SEAT_NOTICE.len(), 89);
     }
 }

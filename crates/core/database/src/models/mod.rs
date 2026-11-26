@@ -176,6 +176,7 @@ pub trait AbstractDatabase:
     + cipher_numbers::AbstractCipherNumbers
     + cipher_memberships::AbstractCipherMemberships
     + prot::AbstractProtLedger
+    + prot::AbstractProtTanks
 {
 }
 

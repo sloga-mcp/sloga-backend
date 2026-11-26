@@ -97,6 +97,10 @@ use crate::stripe::{CheckoutSession, CheckoutSessionParams, StripeApi, StripeErr
 /// [`ProductFamily`].
 pub mod prot;
 
+/// Prot fuel tanks, goals and pledges (S5b): the route bodies, the hourly
+/// clock, the goal sweep and the tank notices.
+pub mod tank;
+
 /// How long a worker holds an order; longer than the worst-case chain of
 /// Stripe calls (each has a 10 s timeout)
 pub const LEASE_MS: i64 = 120_000;

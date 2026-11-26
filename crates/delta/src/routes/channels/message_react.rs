@@ -28,6 +28,7 @@ pub async fn react_message(
 
     // Archived/locked threads reject participation.
     crate::util::threads::ensure_thread_writable(&channel, &permissions)?;
+    crate::util::prot_gate::refuse_if_tank_frozen(db, &channel, &permission_channel).await?;
 
     // Fetch relevant message
     let message = msg.as_message_in_channel(db, channel.id()).await?;

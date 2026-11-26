@@ -1,0 +1,3 @@
+[env]
+# The delta test harness builds every route's OpenAPI spec on the 2 MiB default test thread; at 7484f924 that already sat ~30 KB under the limit.
+RUST_MIN_STACK = "8388608"
