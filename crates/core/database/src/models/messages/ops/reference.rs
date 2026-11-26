@@ -1,6 +1,6 @@
 use crate::{
     AppendMessage, Channel, FieldsMessage, Message, MessageQuery, MessageTimePeriod,
-    PartialMessage, ReferenceDb,
+    PartialMessage, ProtectedReadView, ReferenceDb,
 };
 use indexmap::IndexSet;
 use revolt_models::v0::{MessageSort, UNREAD_COUNT_CAP};
@@ -116,6 +116,23 @@ impl AbstractMessages for ReferenceDb {
 
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>> {
+        self.fetch_servable_messages(query, &ProtectedReadView::unprotected())
+            .await
+    }
+
+    /// Fetch the messages of `query` that `view` serves: the match below
+    /// tests `Message::is_servable` before the limit is applied, as the
+    /// MongoDB driver's `$or` does
+    async fn fetch_servable_messages(
+        &self,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> Result<Vec<Message>> {
+        // A protected channel holds no text the server may search (O-12)
+        if view.protected && query.filter.query.is_some() {
+            return Ok(vec![]);
+        }
+
         let messages = self.messages.lock().await;
         let mut matched_messages: Vec<Message> = messages
             .values()
@@ -146,6 +163,11 @@ impl AbstractMessages for ReferenceDb {
                     if message.pinned.unwrap_or_default() == pinned {
                         return false;
                     }
+                }
+
+                // Keep only the rows `view` serves (design 7.5 "S4")
+                if !message.is_servable(view) {
+                    return false;
                 }
 
                 true
@@ -480,6 +502,65 @@ impl AbstractMessages for ReferenceDb {
         // TODO: remove attachments as well
 
         Ok(())
+    }
+
+    /// One batch of the `history_wipes` job, oldest first
+    ///
+    /// The same rows as MongoDB's `{ channel, _id: { $lte }, encrypted: null }`.
+    async fn fetch_history_wipe_batch(
+        &self,
+        channel: &str,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let messages = self.messages.lock().await;
+        let mut batch: Vec<&Message> = messages
+            .values()
+            .filter(|message| message.channel == channel)
+            .filter(|message| message.id.as_str() <= boundary)
+            .filter(|message| message.encrypted.is_none())
+            .collect();
+
+        batch.sort_by(|a, b| a.id.cmp(&b.id));
+        batch.truncate(usize::try_from(limit.max(1)).unwrap_or(usize::MAX));
+
+        Ok(batch.into_iter().cloned().collect())
+    }
+
+    /// Delete the listed plaintext rows of a channel at or below the boundary;
+    /// returns how many went
+    async fn delete_messages_by_ids(
+        &self,
+        channel: &str,
+        boundary: &str,
+        ids: &[String],
+    ) -> Result<u64> {
+        let listed: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        let mut messages = self.messages.lock().await;
+        let before = messages.len();
+
+        messages.retain(|id, message| {
+            let wiped = message.channel == channel
+                && id.as_str() <= boundary
+                && message.encrypted.is_none()
+                && listed.contains(id.as_str());
+            !wiped
+        });
+
+        Ok((before - messages.len()) as u64)
+    }
+
+    /// Id of the newest row of a channel
+    async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>> {
+        Ok(self
+            .messages
+            .lock()
+            .await
+            .values()
+            .filter(|message| message.channel == channel)
+            .map(|message| &message.id)
+            .max()
+            .cloned())
     }
 }
 

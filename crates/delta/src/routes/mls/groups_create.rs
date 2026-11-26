@@ -5,7 +5,7 @@ use revolt_database::{
     voice::{get_voice_state, UserVoiceChannel},
     Channel, ChannelEntitlement, Database, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
     MlsMemberDevice, SeatList, SeatListBody, Session, TextGroupCreator, User,
-    MAX_TEXT_GROUP_GENERATION,
+    MAX_TEXT_GROUP_GENERATION, MIN_TEXT_PROTOCOL_V2,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -137,6 +137,7 @@ pub async fn create_group(
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     };
 
     match db.create_mls_group(&group, data.supersedes.as_deref()).await? {
@@ -173,9 +174,10 @@ pub async fn create_group(
 ///    without the growth flag (S2-D32, #220);
 /// 5. the 6.1 create rules: the channel is protected, its entitlement
 ///    allows Text traffic (`Active` or `Grace`, S5b D14), the caller is
-///    seated, the group id derives from the channel, the generation and (on
-///    a v2 channel) the stored salt, the caller is the current seat list's
-///    signer user, the successor rule, the creator rule
+///    seated, a seat list is stored, the minimum text protocol on a v2 list
+///    ([`check_text_protocol`]), the group id derives from the channel, the
+///    generation and (on a v2 channel) the stored salt, the caller is the
+///    current seat list's signer user, the successor rule, the creator rule
 ///    ([`text_group_creator`]: the signer device, or the S2-D17d recovery
 ///    exception) and the successor rate limit.
 ///
@@ -222,6 +224,10 @@ async fn create_text_group(
         .fetch_seat_list(channel.id())
         .await?
         .ok_or_else(|| create_error!(InvalidOperation))?;
+    // After every access check above, so a non-viewer's answer never
+    // depends on the list's format, and before the id derivation, which an
+    // S1 client fails on a v2 channel: it gets the clean refusal instead
+    check_text_protocol(&list, data.protocol)?;
     let salt = group_salt(&list)?;
     check_group_id(&data.group_id, channel.id(), generation, salt.as_deref())?;
 
@@ -264,13 +270,15 @@ async fn create_text_group(
         superseded_by: None,
         kind: MlsGroupKind::Text,
         generation: Some(generation),
-        // Server-owned: the driver sets them inside its transaction
+        // Server-owned: the driver sets them inside its transaction, the
+        // epoch 0 visibility from the list it binds (2.5 "S4")
         seat_list_ad_sha256: None,
         pending_removals: vec![],
         member_added: vec![],
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     };
 
     match db
@@ -374,6 +382,23 @@ fn group_salt(list: &SeatList) -> Result<Option<String>> {
         .v2
         .ok_or_else(|| invalid("stored seat list has no group salt"))?;
     Ok(Some(lines.group_salt))
+}
+
+/// The minimum text protocol (S4 plan appendix (2) item 2, design 8.3
+/// "Text protocol"): on a channel whose stored list is v2, a Text create
+/// needs a `protocol` of at least [`MIN_TEXT_PROTOCOL_V2`], else
+/// `ProtectedClientOutdated`. It covers every Text create, a successor and
+/// a recovery successor too: each makes a v2 group its creator must run. A
+/// v1 list is never read for it. `protocol` is CLIENT-CLAIMED: it turns an
+/// honest S1 client away cleanly and protects nothing against a dishonest
+/// one.
+fn check_text_protocol(list: &SeatList, protocol: Option<u32>) -> Result<()> {
+    if list.is_v2() && !protocol.is_some_and(|protocol| protocol >= MIN_TEXT_PROTOCOL_V2) {
+        return Err(create_error!(ProtectedClientOutdated {
+            min: MIN_TEXT_PROTOCOL_V2
+        }));
+    }
+    Ok(())
 }
 
 /// The channel's derived Text group id for `generation`: v2 (3.1.1) with
@@ -596,7 +621,8 @@ mod tests {
         voice::{create_voice_state, UserVoiceChannel},
         Account, BotInformation, Channel, ChannelEntitlementState, Database, MlsGroup,
         MlsGroupCreateOutcome, MlsMemberDevice, MlsSignerLost, MlsSignerLostCause, PartialChannel,
-        SeatList, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListV2Lines, Session, User,
+        SeatList, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListV2Lines, Session,
+        User, MIN_TEXT_PROTOCOL_V2,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -671,6 +697,11 @@ mod tests {
     /// written straight to the store: the test config keeps `formats_v2`
     /// off, and a stored v2 list keeps v2 whatever the flag says (7.1, #218)
     async fn make_v2(db: &Database, channel_id: &str, salt: &str) {
+        make_v2_with(db, channel_id, salt, SeatListHistory::Visible).await
+    }
+
+    /// [`make_v2`] with the list's `history` line
+    async fn make_v2_with(db: &Database, channel_id: &str, salt: &str, history: SeatListHistory) {
         let mut list = db
             .fetch_seat_list(channel_id)
             .await
@@ -679,7 +710,7 @@ mod tests {
         let mut body = SeatListBody::parse(&list.body).expect("the stored body");
         body.v2 = Some(SeatListV2Lines {
             authority_sha256: None,
-            history: SeatListHistory::Visible,
+            history,
             history_boundary: None,
             pre_history: SeatListPreHistory::Kept,
             group_salt: salt.to_string(),
@@ -760,6 +791,7 @@ mod tests {
             supersedes: supersedes.map(str::to_string),
             kind: Some(v0::MlsGroupKind::Text),
             generation,
+            protocol: None,
         }
     }
 
@@ -989,6 +1021,19 @@ mod tests {
                 generation,
                 supersedes,
             )
+        }
+
+        /// [`Self::owner_request`] from a protocol-2 client, which a v2
+        /// channel needs (S4 minimum text protocol)
+        fn owner_request_p2(
+            &self,
+            generation: Option<u32>,
+            supersedes: Option<&str>,
+        ) -> v0::DataCreateMlsGroup {
+            v0::DataCreateMlsGroup {
+                protocol: Some(MIN_TEXT_PROTOCOL_V2),
+                ..self.owner_request(generation, supersedes)
+            }
         }
 
         async fn create_as_owner(
@@ -1485,7 +1530,7 @@ mod tests {
         ] {
             let request = v0::DataCreateMlsGroup {
                 group_id: group_id.clone(),
-                ..fixture.owner_request(Some(0), None)
+                ..fixture.owner_request_p2(Some(0), None)
             };
             assert_invalid(fixture.create_as_owner(request).await, message, case);
             assert_no_group(db, &group_id, case).await;
@@ -1493,17 +1538,17 @@ mod tests {
 
         let first = v0::DataCreateMlsGroup {
             group_id: v2_group_id(channel_id, 0, &salt),
-            ..fixture.owner_request(Some(0), None)
+            ..fixture.owner_request_p2(Some(0), None)
         };
         assert_created(fixture.create_as_owner(first.clone()).await, "v2 first");
         let successor = v0::DataCreateMlsGroup {
             group_id: v2_group_id(channel_id, 1, &salt),
-            ..fixture.owner_request(Some(1), Some(first.group_id.as_str()))
+            ..fixture.owner_request_p2(Some(1), Some(first.group_id.as_str()))
         };
         // A v1 successor id is refused on the v2 channel
         assert_invalid(
             fixture
-                .create_as_owner(fixture.owner_request(Some(1), Some(first.group_id.as_str())))
+                .create_as_owner(fixture.owner_request_p2(Some(1), Some(first.group_id.as_str())))
                 .await,
             message,
             "the v1 successor id",
@@ -1795,6 +1840,7 @@ mod tests {
             let mut request = fixture.owner_request(Some(generation), Some(previous.as_str()));
             if let Some(salt) = salt {
                 request.group_id = v2_group_id(fixture.channel_id(), generation, salt);
+                request.protocol = Some(MIN_TEXT_PROTOCOL_V2);
             }
             assert_created(
                 fixture.create_as_owner(request.clone()).await,
@@ -1917,13 +1963,13 @@ mod tests {
             make_v2(fixture.db(), channel_id, &salt).await;
             let first = v0::DataCreateMlsGroup {
                 group_id: v2_group_id(channel_id, 0, &salt),
-                ..fixture.owner_request(Some(0), None)
+                ..fixture.owner_request_p2(Some(0), None)
             };
             assert_created(fixture.create_as_owner(first.clone()).await, "v2 first");
             let last = successors(&fixture, first.group_id, 1, 2, Some(&salt)).await;
             let over = v0::DataCreateMlsGroup {
                 group_id: v2_group_id(channel_id, 3, &salt),
-                ..fixture.owner_request(Some(3), Some(last.as_str()))
+                ..fixture.owner_request_p2(Some(3), Some(last.as_str()))
             };
             assert_refused(
                 fixture.create_as_owner(over).await,
@@ -1948,7 +1994,7 @@ mod tests {
             let last = successors(&fixture, last, 2, 2, Some(&salt)).await;
             let over = v0::DataCreateMlsGroup {
                 group_id: v2_group_id(channel_id, 3, &salt),
-                ..fixture.owner_request(Some(3), Some(last.as_str()))
+                ..fixture.owner_request_p2(Some(3), Some(last.as_str()))
             };
             assert_refused(
                 fixture.create_as_owner(over).await,
@@ -2128,6 +2174,7 @@ mod tests {
                 supersedes: None,
                 kind: kind.clone(),
                 generation: None,
+                protocol: None,
             };
             assert_created(
                 fixture.create_as_owner(request.clone()).await,
@@ -2152,6 +2199,7 @@ mod tests {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         };
         assert_refused(
             fixture.create_as_owner(request.clone()).await,
@@ -2180,11 +2228,17 @@ mod tests {
         targets: Vec<(&'static str, String)>,
     }
 
-    async fn oracle_fixture() -> Oracle {
+    /// The oracle's channels; with `v2` the hidden protected channel's
+    /// stored list is v2, so a viewer's protocol-less create there meets the
+    /// minimum text protocol
+    async fn oracle_fixture(v2: bool) -> Oracle {
         let fixture = fixture().await;
         let harness = &fixture.harness;
         let db = &harness.db;
         let server = &fixture.protected.server;
+        if v2 {
+            make_v2(db, fixture.channel_id(), &salt_of(0x5a)).await;
+        }
 
         let (_, member_session, member) = harness.new_user().await;
         let (_, bot_session, mut bot) = harness.new_user().await;
@@ -2255,13 +2309,16 @@ mod tests {
     /// that does not exist (deleted or never created) gets ONE answer, the
     /// same body (which carries no `location`) and status, for a valid, a
     /// malformed and a successor request (S2: a successor picks a different
-    /// gate, after the channel check), under every flag set
-    async fn hidden_and_missing_channels_answer_alike() {
+    /// gate, after the channel check), under every flag set. With `v2` the
+    /// hidden protected channel's list is v2 and the requests carry no
+    /// `protocol` (S4): the minimum text protocol runs after the channel
+    /// check, so it changes no non-viewer's answer
+    async fn hidden_and_missing_channels_answer_alike(v2: bool) {
         let config = revolt_config::config().await;
         let e2ee = config.features.e2ee_enabled;
         let growth = config.features.protected_channels.enabled;
         let media = revolt_database::voice::media_e2ee_enabled().await;
-        let oracle = oracle_fixture().await;
+        let oracle = oracle_fixture(v2).await;
         let fixture = &oracle.fixture;
         let harness = &fixture.harness;
         let db = &harness.db;
@@ -2277,6 +2334,12 @@ mod tests {
             .expect("the hidden unprotected channel");
         assert!(hidden.is_protected());
         assert!(!unprotected.is_protected());
+        let stored = db
+            .fetch_seat_list(hidden.id())
+            .await
+            .expect("list read")
+            .expect("the hidden channel's list");
+        assert_eq!(stored.is_v2(), v2);
         for (_, channel_id) in &oracle.targets[2..] {
             assert!(db.fetch_channel(channel_id).await.is_err());
         }
@@ -2363,13 +2426,27 @@ mod tests {
                 "owner call create, media off",
             );
         }
-        let request = fixture.owner_request(Some(0), None);
+        let mut request = fixture.owner_request(Some(0), None);
         let served = fixture.create_as_owner(request.clone()).await;
         match (e2ee, growth) {
             (false, _) => assert_disabled(served, "e2ee", "owner, e2ee off"),
             (true, false) => assert_disabled(served, "protected_channels", "owner, growth off"),
             (true, true) => {
-                assert_created(served, "owner");
+                if v2 {
+                    // The viewer meets the floor the non-viewers never reach
+                    let body = assert_refused(served, "ProtectedClientOutdated", "owner, v2");
+                    assert_eq!(body["min"], 2, "owner, v2: {}", body);
+                    request = v0::DataCreateMlsGroup {
+                        group_id: v2_group_id(fixture.channel_id(), 0, &salt_of(0x5a)),
+                        ..fixture.owner_request_p2(Some(0), None)
+                    };
+                    assert_created(
+                        fixture.create_as_owner(request.clone()).await,
+                        "owner, v2, protocol 2",
+                    );
+                } else {
+                    assert_created(served, "owner");
+                }
                 let group = db
                     .fetch_mls_group(&request.group_id)
                     .await
@@ -2397,7 +2474,8 @@ mod tests {
     #[test]
     fn hidden_and_missing_channels_answer_alike_with_every_flag_on() {
         on_a_roomy_stack(|| {
-            crate::util::test::rt().block_on(Box::pin(hidden_and_missing_channels_answer_alike()))
+            crate::util::test::rt()
+                .block_on(Box::pin(hidden_and_missing_channels_answer_alike(false)))
         })
     }
 
@@ -2409,7 +2487,7 @@ mod tests {
                     settings.features.e2ee_enabled = false;
                 })
                 .await;
-                Box::pin(hidden_and_missing_channels_answer_alike()).await
+                Box::pin(hidden_and_missing_channels_answer_alike(false)).await
             })
         })
     }
@@ -2422,7 +2500,7 @@ mod tests {
                     settings.features.protected_channels.enabled = false;
                 })
                 .await;
-                Box::pin(hidden_and_missing_channels_answer_alike()).await
+                Box::pin(hidden_and_missing_channels_answer_alike(false)).await
             })
         })
     }
@@ -2435,7 +2513,7 @@ mod tests {
                     settings.features.media_e2ee_enabled = false;
                 })
                 .await;
-                Box::pin(hidden_and_missing_channels_answer_alike()).await
+                Box::pin(hidden_and_missing_channels_answer_alike(false)).await
             })
         })
     }
@@ -2449,8 +2527,319 @@ mod tests {
                     settings.features.media_e2ee_enabled = false;
                 })
                 .await;
-                Box::pin(hidden_and_missing_channels_answer_alike()).await
+                Box::pin(hidden_and_missing_channels_answer_alike(false)).await
             })
         })
+    }
+
+    #[test]
+    fn hidden_and_missing_channels_answer_alike_on_a_v2_channel() {
+        on_a_roomy_stack(|| {
+            crate::util::test::rt()
+                .block_on(Box::pin(hidden_and_missing_channels_answer_alike(true)))
+        })
+    }
+
+    /// The stored `history_visible_at_create` of `group_id`
+    async fn visible_at_create(db: &Database, group_id: &str) -> Option<bool> {
+        db.fetch_mls_group(group_id)
+            .await
+            .expect("the created group")
+            .history_visible_at_create
+    }
+
+    #[test]
+    fn every_text_create_stores_the_visibility_of_its_list() {
+        crate::util::test::rt().block_on(every_text_create_stores_the_visibility_of_its_list_case())
+    }
+
+    /// S4 (2.5 "S4", fix F3): every Text create through the route, a first
+    /// group and a successor, stores `history_visible_at_create` from the
+    /// list it binds: `Some(true)` only for a v2 `history: visible` list,
+    /// `Some(false)` for a v2 hidden list and for a v1 list
+    async fn every_text_create_stores_the_visibility_of_its_list_case() {
+        let salt = salt_of(0x5a);
+
+        // v1 first group, then the channel moves to v2: a visible successor,
+        // then a hidden one
+        let fixture = fixture().await;
+        let db = fixture.db();
+        let channel_id = fixture.channel_id();
+        let v1_first = fixture.owner_request(Some(0), None);
+        assert_created(fixture.create_as_owner(v1_first.clone()).await, "v1 first");
+        assert_eq!(
+            visible_at_create(db, &v1_first.group_id).await,
+            Some(false),
+            "v1 first"
+        );
+
+        make_v2_with(db, channel_id, &salt, SeatListHistory::Visible).await;
+        let visible = v0::DataCreateMlsGroup {
+            group_id: v2_group_id(channel_id, 1, &salt),
+            ..fixture.owner_request_p2(Some(1), Some(v1_first.group_id.as_str()))
+        };
+        assert_created(fixture.create_as_owner(visible.clone()).await, "visible");
+        assert_eq!(
+            visible_at_create(db, &visible.group_id).await,
+            Some(true),
+            "v2 visible successor"
+        );
+
+        make_v2_with(db, channel_id, &salt, SeatListHistory::Hidden).await;
+        let hidden = v0::DataCreateMlsGroup {
+            group_id: v2_group_id(channel_id, 2, &salt),
+            ..fixture.owner_request_p2(Some(2), Some(visible.group_id.as_str()))
+        };
+        assert_created(fixture.create_as_owner(hidden.clone()).await, "hidden");
+        assert_eq!(
+            visible_at_create(db, &hidden.group_id).await,
+            Some(false),
+            "v2 hidden successor"
+        );
+
+        // A first group on a v2 channel, visible and hidden
+        for (history, expected) in [
+            (SeatListHistory::Visible, true),
+            (SeatListHistory::Hidden, false),
+        ] {
+            let fixture = self::fixture().await;
+            let db = fixture.db();
+            let channel_id = fixture.channel_id();
+            make_v2_with(db, channel_id, &salt, history).await;
+            let first = v0::DataCreateMlsGroup {
+                group_id: v2_group_id(channel_id, 0, &salt),
+                ..fixture.owner_request_p2(Some(0), None)
+            };
+            assert_created(
+                fixture.create_as_owner(first.clone()).await,
+                &format!("{history:?} first"),
+            );
+            assert_eq!(
+                visible_at_create(db, &first.group_id).await,
+                Some(expected),
+                "v2 {history:?} first"
+            );
+        }
+    }
+
+    #[track_caller]
+    fn assert_outdated<T: std::fmt::Debug>(result: Result<T>, case: &str) {
+        let body = assert_refused(result, "ProtectedClientOutdated", case);
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 }),
+            "{}",
+            case
+        );
+    }
+
+    #[test]
+    fn a_v2_channel_needs_text_protocol_2() {
+        crate::util::test::rt().block_on(a_v2_channel_needs_text_protocol_2_case())
+    }
+
+    /// S4 plan appendix (2) item 2: on a channel whose stored list is v2, a
+    /// Text create without `protocol`, or below 2, is
+    /// `ProtectedClientOutdated { min: 2 }` and writes nothing, for a first
+    /// group and a successor, whether or not the id is the v2 one; protocol
+    /// 2 (and above) creates. Over HTTP too, so the `protocol` key reaches
+    /// the route.
+    async fn a_v2_channel_needs_text_protocol_2_case() {
+        let fixture = fixture().await;
+        let db = fixture.db();
+        let channel_id = fixture.channel_id();
+        let salt = salt_of(0x5a);
+        make_v2(db, channel_id, &salt).await;
+
+        let first_id = v2_group_id(channel_id, 0, &salt);
+        for protocol in [None, Some(0), Some(1)] {
+            for group_id in [first_id.clone(), text_group_id(channel_id, 0)] {
+                let case = format!("first {group_id} protocol {protocol:?}");
+                let request = v0::DataCreateMlsGroup {
+                    group_id: group_id.clone(),
+                    protocol,
+                    ..fixture.owner_request(Some(0), None)
+                };
+                assert_outdated(fixture.create_as_owner(request.clone()).await, &case);
+                let (status, body) = post(&fixture.harness, &fixture.owner_session, &request).await;
+                assert_eq!(status, Status::BadRequest, "{}: {}", case, body);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body).expect("JSON"),
+                    serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 }),
+                    "{} over HTTP",
+                    case
+                );
+                assert_no_group(db, &group_id, &case).await;
+            }
+        }
+
+        let first = v0::DataCreateMlsGroup {
+            group_id: first_id.clone(),
+            ..fixture.owner_request_p2(Some(0), None)
+        };
+        let (status, body) = post(&fixture.harness, &fixture.owner_session, &first).await;
+        assert_eq!(status, Status::Ok, "protocol 2 over HTTP: {}", body);
+        assert_eq!(
+            serde_json::from_str::<v0::ResponseCreateMlsGroup>(&body).expect("a response"),
+            v0::ResponseCreateMlsGroup::Created
+        );
+
+        // A successor of the open v2 group
+        let successor_id = v2_group_id(channel_id, 1, &salt);
+        for protocol in [None, Some(1)] {
+            let case = format!("successor protocol {protocol:?}");
+            let request = v0::DataCreateMlsGroup {
+                group_id: successor_id.clone(),
+                protocol,
+                ..fixture.owner_request(Some(1), Some(first_id.as_str()))
+            };
+            assert_outdated(fixture.create_as_owner(request).await, &case);
+            assert_no_group(db, &successor_id, &case).await;
+        }
+        let open = db
+            .fetch_mls_group(&first_id)
+            .await
+            .expect("the first group");
+        assert!(open.open);
+        assert_eq!(open.superseded_by, None);
+
+        let successor = v0::DataCreateMlsGroup {
+            group_id: successor_id.clone(),
+            protocol: Some(MIN_TEXT_PROTOCOL_V2 + 1),
+            ..fixture.owner_request(Some(1), Some(first_id.as_str()))
+        };
+        assert_created(
+            fixture.create_as_owner(successor).await,
+            "successor, protocol 3",
+        );
+        let first = db
+            .fetch_mls_group(&first_id)
+            .await
+            .expect("the first group");
+        assert_eq!(first.superseded_by, Some(successor_id));
+    }
+
+    #[test]
+    fn a_v1_channel_needs_no_protocol() {
+        crate::util::test::rt().block_on(a_v1_channel_needs_no_protocol_case())
+    }
+
+    /// The minimum text protocol never reads a v1 list: a first group with
+    /// no `protocol` and a successor claiming protocol 1 both create
+    async fn a_v1_channel_needs_no_protocol_case() {
+        let fixture = fixture().await;
+        let db = fixture.db();
+        let stored = db
+            .fetch_seat_list(fixture.channel_id())
+            .await
+            .expect("list read")
+            .expect("the stored list");
+        assert!(!stored.is_v2());
+
+        let first = fixture.owner_request(Some(0), None);
+        assert_eq!(first.protocol, None);
+        assert_created(fixture.create_as_owner(first.clone()).await, "v1 first");
+        let successor = v0::DataCreateMlsGroup {
+            protocol: Some(1),
+            ..fixture.owner_request(Some(1), Some(first.group_id.as_str()))
+        };
+        assert_created(
+            fixture.create_as_owner(successor.clone()).await,
+            "v1 successor, protocol 1",
+        );
+        assert!(
+            db.fetch_mls_group(&successor.group_id)
+                .await
+                .expect("the successor")
+                .open
+        );
+    }
+
+    #[test]
+    fn a_v2_recovery_create_needs_text_protocol_2() {
+        crate::util::test::rt().block_on(a_v2_recovery_create_needs_text_protocol_2_case())
+    }
+
+    /// A recovery successor (S2-D17d) on a v2 channel makes a v2 group the
+    /// recovering device must run, so the minimum text protocol holds for
+    /// it too: without protocol 2 it is refused and the open group stays
+    /// open; with it, it creates
+    async fn a_v2_recovery_create_needs_text_protocol_2_case() {
+        let fixture = fixture().await;
+        let harness = &fixture.harness;
+        let db = fixture.db();
+        let owner = &fixture.owner;
+        let channel_id = fixture.channel_id();
+        let salt = salt_of(0x5a);
+        make_v2(db, channel_id, &salt).await;
+
+        let first = v0::DataCreateMlsGroup {
+            group_id: v2_group_id(channel_id, 0, &salt),
+            ..fixture.owner_request_p2(Some(0), None)
+        };
+        assert_created(fixture.create_as_owner(first.clone()).await, "v2 first");
+
+        let second_session = fixture
+            .owner_account
+            .create_session(db, String::new())
+            .await
+            .expect("a second session");
+        let second = harness
+            .new_e2ee_device(owner, &second_session.id, NEW_OWNER_DEVICE_SEED)
+            .await;
+        let lost = MlsSignerLost {
+            user_id: owner.id.clone(),
+            device_id: fixture.protected.owner_device.device_id.clone(),
+            cause: MlsSignerLostCause::DeviceRevoked,
+            at: fixture_time(),
+        };
+        edit_group(db, &first.group_id, |group| group.signer_lost = Some(lost)).await;
+
+        let recovery_id = v2_group_id(channel_id, 1, &salt);
+        for protocol in [None, Some(1)] {
+            let case = format!("recovery protocol {protocol:?}");
+            let request = v0::DataCreateMlsGroup {
+                group_id: recovery_id.clone(),
+                protocol,
+                ..text_request(
+                    channel_id,
+                    &second.device_id,
+                    Some(1),
+                    Some(first.group_id.as_str()),
+                )
+            };
+            assert_outdated(
+                create(harness, owner, &second_session, request).await,
+                &case,
+            );
+            assert_no_group(db, &recovery_id, &case).await;
+        }
+        assert!(
+            db.fetch_mls_group(&first.group_id)
+                .await
+                .expect("the first group")
+                .open
+        );
+
+        let recovery = v0::DataCreateMlsGroup {
+            group_id: recovery_id.clone(),
+            protocol: Some(MIN_TEXT_PROTOCOL_V2),
+            ..text_request(
+                channel_id,
+                &second.device_id,
+                Some(1),
+                Some(first.group_id.as_str()),
+            )
+        };
+        assert_created(
+            create(harness, owner, &second_session, recovery).await,
+            "recovery, protocol 2",
+        );
+        let successor = db
+            .fetch_mls_group(&recovery_id)
+            .await
+            .expect("the recovery successor");
+        assert_eq!(successor.created_by.device_id, second.device_id);
+        assert_eq!(successor.history_visible_at_create, Some(true));
     }
 }

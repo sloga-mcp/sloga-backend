@@ -7,6 +7,7 @@ pub mod event_reminders;
 pub mod expire_supporters;
 pub mod file_deletion;
 pub mod fluxer_import;
+pub mod history_wipes;
 pub mod import_http;
 pub mod payments_reconcile;
 pub mod poll_expiry;

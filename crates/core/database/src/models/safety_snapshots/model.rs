@@ -1,7 +1,10 @@
 use revolt_models::v0::{MessageSort, ReportedMessageSnapshot};
 use revolt_result::{ErrorType, Result};
 
-use crate::{Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, Server, User};
+use crate::{
+    Database, Message, MessageFilter, MessageQuery, MessageTimePeriod, ProtectedReadView, Server,
+    User,
+};
 
 auto_derived!(
     /// Snapshot of some content
@@ -48,24 +51,27 @@ auto_derived!(
     }
 );
 
-/// Drop every row a channel with `channel_protected` does not serve (R15
-/// backstop), reporting each drop by ids only
-fn retain_servable(messages: &mut Vec<Message>, channel_protected: bool) {
-    messages.retain(|message| {
-        let servable = message.is_servable(channel_protected);
-        if !servable {
-            report_dropped_row(message);
-        }
-        servable
-    });
+/// Drop every row `view` does not serve (the backstop behind the query
+/// filter), reporting each TRUE stray by ids only; a wipe-pending drop is
+/// never reported (design 7.5 "S4")
+fn retain_servable(messages: &mut Vec<Message>, view: &ProtectedReadView) {
+    Message::retain_servable(messages, view, report_dropped_row);
 }
 
-/// The protected flag a row of `channel_id` is judged by: the channel's own,
-/// or for a thread its parent's (the permission target). `NotFound` when
-/// either is missing; any other read error as is.
-async fn message_channel_protected(db: &Database, channel_id: &str) -> Result<bool> {
-    let channel = db.fetch_channel(channel_id).await?;
-    Ok(channel.permission_target(db).await?.is_protected())
+/// The read view a row of `channel_id` is judged by: the channel's own, or
+/// for a thread its parent's (the permission target, #182). `None` when
+/// either is missing (W2 audit B3); any other read error as is.
+async fn message_read_view(db: &Database, channel_id: &str) -> Result<Option<ProtectedReadView>> {
+    let channel = match db.fetch_channel(channel_id).await {
+        Ok(channel) => channel,
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    match channel.permission_target(db).await {
+        Ok(target) => Ok(Some(ProtectedReadView::of_read_target(&channel, &target))),
+        Err(error) if matches!(error.error_type, ErrorType::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Report a row left out of a safety snapshot (ids only)
@@ -82,68 +88,85 @@ fn report_dropped_row(message: &Message) {
 impl SnapshotContent {
     /// Generate snapshot from a given message
     ///
-    /// In a protected channel every row without `encrypted` is dropped from
-    /// both context lists (R15 backstop, design 7.5), and a reported message
-    /// without `encrypted` gives `None`, so no snapshot embeds a stray
-    /// plaintext row and none of its attachments are returned. Ciphertext
-    /// rows are kept as stored. A thread's rows are judged by its parent. A
-    /// channel (or thread parent) that no longer exists gives `None` too;
-    /// any other failed channel read is an error, never a snapshot with
-    /// unfiltered rows.
+    /// Every row the channel's read view does not serve (design 7.5 "S4":
+    /// in a protected channel, plaintext above the boundary B, any plaintext
+    /// without one, and every plaintext row once a wipe is requested) is left
+    /// out of both context lists, and such a REPORTED message gives `None`,
+    /// so no snapshot embeds one and none of its attachments are returned.
+    /// Pre-boundary plaintext of a channel protected with its history is
+    /// served. Ciphertext rows are kept as stored. A thread's rows are
+    /// judged by its parent. A channel (or thread parent) that no longer
+    /// exists gives `None` too; any other failed channel read is an error,
+    /// never a snapshot with unfiltered rows.
     pub async fn generate_from_message(
         db: &Database,
         message: Message,
     ) -> Result<Option<(SnapshotContent, Vec<String>)>> {
+        // The view the context queries filter by, so each list is full
+        // around an unservable row. A channel (or a thread's parent) that
+        // no longer exists gives no server copy, like a stray (W2 audit B3):
+        // the report is still filed without it.
+        let Some(query_view) = message_read_view(db, &message.channel).await? else {
+            return Ok(None);
+        };
+
         // Collect prior context
         let mut prior_context = db
-            .fetch_messages(MessageQuery {
-                filter: MessageFilter {
-                    channel: Some(message.channel.to_string()),
-                    ..Default::default()
+            .fetch_servable_messages(
+                MessageQuery {
+                    filter: MessageFilter {
+                        channel: Some(message.channel.to_string()),
+                        ..Default::default()
+                    },
+                    limit: Some(15),
+                    time_period: MessageTimePeriod::Absolute {
+                        before: Some(message.id.to_string()),
+                        after: None,
+                        sort: Some(MessageSort::Latest),
+                    },
                 },
-                limit: Some(15),
-                time_period: MessageTimePeriod::Absolute {
-                    before: Some(message.id.to_string()),
-                    after: None,
-                    sort: Some(MessageSort::Latest),
-                },
-            })
+                &query_view,
+            )
             .await?;
 
         // Collect leading context
         let mut leading_context = db
-            .fetch_messages(MessageQuery {
-                filter: MessageFilter {
-                    channel: Some(message.channel.to_string()),
-                    ..Default::default()
+            .fetch_servable_messages(
+                MessageQuery {
+                    filter: MessageFilter {
+                        channel: Some(message.channel.to_string()),
+                        ..Default::default()
+                    },
+                    limit: Some(15),
+                    time_period: MessageTimePeriod::Absolute {
+                        before: None,
+                        after: Some(message.id.to_string()),
+                        sort: Some(MessageSort::Oldest),
+                    },
                 },
-                limit: Some(15),
-                time_period: MessageTimePeriod::Absolute {
-                    before: None,
-                    after: Some(message.id.to_string()),
-                    sort: Some(MessageSort::Oldest),
-                },
-            })
+                &query_view,
+            )
             .await?;
 
-        // Read the flag after every row it judges (the reported message was
-        // read by the caller): protect is one-way, so a row read while the
-        // channel was already protected is judged as protected. A thread is
-        // judged by its parent (W2 audit B1). A channel (or a thread's
-        // parent) that no longer exists gives no server copy, like a stray
-        // (W2 audit B3): the report is still filed without it.
-        let channel_protected = match message_channel_protected(db, &message.channel).await {
-            Ok(protected) => protected,
-            Err(error) if matches!(error.error_type, ErrorType::NotFound) => return Ok(None),
-            Err(error) => return Err(error),
+        // Read the view again after every row it judges (the reported
+        // message was read by the caller), and judge every row by this one:
+        // protect, the boundary and the wipe are one-way, so a view read
+        // later never serves a row an earlier one refused, and a protect or
+        // a wipe request landing after the first read cannot let a stray or
+        // a wipe-pending row into the snapshot. A thread is judged by its
+        // parent (W2 audit B1).
+        let Some(view) = message_read_view(db, &message.channel).await? else {
+            return Ok(None);
         };
-        if !message.is_servable(channel_protected) {
-            report_dropped_row(&message);
+        if !message.is_servable(&view) {
+            if message.is_stray(&view) {
+                report_dropped_row(&message);
+            }
             return Ok(None);
         }
 
-        retain_servable(&mut prior_context, channel_protected);
-        retain_servable(&mut leading_context, channel_protected);
+        retain_servable(&mut prior_context, &view);
+        retain_servable(&mut leading_context, &view);
 
         // Collect message attachments
         let files = message
@@ -435,14 +458,16 @@ mod tests {
         });
     }
 
-    /// The protected flag is read AFTER both context fetches and before any
-    /// row is judged. Protect is one-way, so a flag read after the rows
-    /// cannot call a row read under protection unprotected; read first, a
-    /// protect landing in between would let a stray into the snapshot. No
-    /// fault injection can land a protect between two awaits, hence source
-    /// order. (W2 audit B1/B3: the read moved into
-    /// `message_channel_protected`, which also reads a thread's parent, and
-    /// its `NotFound` now gives `None`; the order pinned here is unchanged.)
+    /// The view every row is judged by is read AFTER both context fetches
+    /// and before any row is judged. Protect, the boundary and the wipe are
+    /// one-way, so a view read after the rows cannot serve a row read under
+    /// a stricter one; read only first, a protect or a wipe request landing
+    /// in between would let a stray or a wipe-pending row into the snapshot.
+    /// The view the two fetches filter by (S4-PA-15) is a separate read made
+    /// BEFORE them, and only shapes the queries. No fault injection can land
+    /// a protect between two awaits, hence source order. (W2 audit B1/B3:
+    /// the read also reads a thread's parent and its `NotFound` gives
+    /// `None`. S4: the flag became `message_read_view`, read twice.)
     #[test]
     fn channel_flag_is_read_after_the_rows_it_judges() {
         let source = include_str!("model.rs");
@@ -456,22 +481,39 @@ mod tests {
         let body = &source[start..end];
 
         let fetches: Vec<usize> = body
-            .match_indices(".fetch_messages(")
+            .match_indices(".fetch_servable_messages(")
             .map(|(at, _)| at)
             .collect();
         assert_eq!(fetches.len(), 2, "two context fetches");
+        assert_eq!(
+            body.matches(".fetch_messages(").count(),
+            0,
+            "no unfiltered fetch"
+        );
+        assert_eq!(
+            body.matches("&query_view,").count(),
+            2,
+            "both fetches filter"
+        );
+        let query_view = body
+            .find("let Some(query_view) = message_read_view(db, &message.channel).await? else {")
+            .expect("the query view read");
         let flag = body
-            .find("let channel_protected = match message_channel_protected(db, &message.channel).await {")
+            .find("let Some(view) = message_read_view(db, &message.channel).await? else {")
             .expect("the flag read");
-        assert_eq!(body.matches("message_channel_protected(").count(), 1);
+        assert_eq!(body.matches("message_read_view(").count(), 2);
         assert_eq!(body.matches(".fetch_channel(").count(), 0);
         let judged = [
-            "if !message.is_servable(channel_protected) {",
-            "retain_servable(&mut prior_context, channel_protected);",
-            "retain_servable(&mut leading_context, channel_protected);",
+            "if !message.is_servable(&view) {",
+            "retain_servable(&mut prior_context, &view);",
+            "retain_servable(&mut leading_context, &view);",
         ]
         .map(|needle| body.find(needle).expect(needle));
 
+        assert!(
+            fetches.iter().all(|&fetch| query_view < fetch),
+            "the query view is read before both fetches"
+        );
         assert!(
             fetches.iter().all(|&fetch| fetch < flag),
             "the flag is read after both fetches"
@@ -480,6 +522,8 @@ mod tests {
             judged.iter().all(|&at| flag < at),
             "every row is judged after the flag read"
         );
+        assert_eq!(body.matches("is_servable(").count(), 1, "one judgment");
+        assert_eq!(body.matches("retain_servable(").count(), 2);
     }
 
     /// W2 audit B3: a message whose channel no longer exists gives no
@@ -548,6 +592,148 @@ mod tests {
                 .expect("snapshot")
                 .expect("an open parent serves the thread's rows");
             assert_eq!(snapshot_ids(&snapshot).0, OPEN_THREAD_ROW);
+        });
+    }
+
+    const HISTORY_CHANNEL: &str = "01JB0SNAPH1ST0RY0000000000";
+    const FULL_CHANNEL: &str = "01JB0SNAPC0NTEXT0000000000";
+
+    /// A protected channel holding its pre-protect history: boundary
+    /// `boundary`, the wipe state `wipe` (its JSON)
+    fn history_channel(id: &str, boundary: &str, wipe: serde_json::Value) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": id,
+            "server": SERVER,
+            "name": "general",
+            "protected": true,
+            "protected_history": { "boundary": boundary, "wipe": wipe },
+        }))
+        .expect("text channel with history")
+    }
+
+    fn wipe_none() -> serde_json::Value {
+        serde_json::json!({ "state": "none" })
+    }
+
+    fn wipe_requested() -> serde_json::Value {
+        serde_json::json!({ "state": "requested", "at": "2026-11-18T00:00:00.000Z", "by": AUTHOR })
+    }
+
+    /// The five rows of `seed` in `HISTORY_CHANNEL`, protected with B =
+    /// `PRIOR_STRAY` (a pre-protect plaintext row at the boundary) and
+    /// `wipe`; `LEADING_STRAY` is a stray above B
+    async fn seed_history(db: &Database, wipe: serde_json::Value) {
+        let channel = history_channel(HISTORY_CHANNEL, PRIOR_STRAY, wipe);
+        db.insert_channel(&channel).await.expect("channel");
+        for id in [PRIOR_STRAY, LEADING_STRAY] {
+            insert_raw(db, &plaintext_row(id, HISTORY_CHANNEL)).await;
+        }
+        for id in [PRIOR_CIPHERTEXT, REPORTED, LEADING_CIPHERTEXT] {
+            db.insert_message(&ciphertext_row(id, HISTORY_CHANNEL))
+                .await
+                .expect("ciphertext row");
+        }
+    }
+
+    async fn snapshot_of(db: &Database, id: &str) -> Option<(String, Vec<String>, Vec<String>)> {
+        let reported = db.fetch_message(id).await.expect("reported row");
+        SnapshotContent::generate_from_message(db, reported)
+            .await
+            .expect("a snapshot or none, never an error")
+            .map(|(snapshot, _)| snapshot_ids(&snapshot))
+    }
+
+    /// Design 7.5 "S4": a channel protected with its history snapshots the
+    /// pre-boundary plaintext row (B itself included) as context and as the
+    /// reported message, and still leaves out the stray above B
+    ///
+    /// Control: `<=` to `<` in `is_servable` -> the row at B is dropped.
+    #[tokio::test]
+    async fn boundary_snapshot_serves_pre_boundary_rows_and_drops_a_stray_above_b() {
+        database_test!(|db| async move {
+            seed_history(&db, wipe_none()).await;
+
+            assert_eq!(
+                snapshot_of(&db, REPORTED).await,
+                Some((
+                    REPORTED.to_string(),
+                    vec![PRIOR_CIPHERTEXT.to_string(), PRIOR_STRAY.to_string()],
+                    vec![LEADING_CIPHERTEXT.to_string()],
+                )),
+                "the row at B is kept, the stray above it dropped"
+            );
+            assert_eq!(
+                snapshot_of(&db, PRIOR_STRAY).await,
+                Some((
+                    PRIOR_STRAY.to_string(),
+                    vec![],
+                    vec![
+                        PRIOR_CIPHERTEXT.to_string(),
+                        REPORTED.to_string(),
+                        LEADING_CIPHERTEXT.to_string(),
+                    ],
+                )),
+                "a reported pre-boundary row gets its server copy"
+            );
+            assert_eq!(snapshot_of(&db, LEADING_STRAY).await, None);
+        });
+    }
+
+    /// S4-D21: from the moment the wipe is `Requested` the pre-boundary
+    /// plaintext is unservable here too, as context and as the reported
+    /// message
+    ///
+    /// Control: the wipe arm dropped from `is_servable` -> the row at B is
+    /// snapshotted.
+    #[tokio::test]
+    async fn wipe_pending_snapshot_drops_pre_boundary_rows() {
+        database_test!(|db| async move {
+            seed_history(&db, wipe_requested()).await;
+            let channel = db.fetch_channel(HISTORY_CHANNEL).await.expect("channel");
+            assert!(crate::ProtectedReadView::of(&channel).wiped);
+
+            assert_eq!(
+                snapshot_of(&db, REPORTED).await,
+                Some((
+                    REPORTED.to_string(),
+                    vec![PRIOR_CIPHERTEXT.to_string()],
+                    vec![LEADING_CIPHERTEXT.to_string()],
+                ))
+            );
+            assert_eq!(snapshot_of(&db, PRIOR_STRAY).await, None);
+        });
+    }
+
+    /// S4-PA-15: both context queries carry the servable predicate, so a
+    /// context list is full around unservable rows. Fifteen strays sit on
+    /// each side of the reported message, between it and the next servable
+    /// row: a post-filter alone would fetch fifteen strays and keep nothing.
+    ///
+    /// Control: the query filter dropped from either driver -> both lists
+    /// are empty.
+    #[tokio::test]
+    async fn snapshot_context_is_full_around_strays() {
+        database_test!(|db| async move {
+            let id = |ms: u64| ulid::Ulid::from_parts(ms, 0).to_string();
+            let (before_b, reported, after) = (id(1_000), id(2_000), id(4_000));
+            db.insert_channel(&history_channel(FULL_CHANNEL, &before_b, wipe_none()))
+                .await
+                .expect("channel");
+            insert_raw(&db, &plaintext_row(&before_b, FULL_CHANNEL)).await;
+            for ms in (1_500..1_515).chain(3_000..3_015) {
+                insert_raw(&db, &plaintext_row(&id(ms), FULL_CHANNEL)).await;
+            }
+            for row in [&reported, &after] {
+                db.insert_message(&ciphertext_row(row, FULL_CHANNEL))
+                    .await
+                    .expect("ciphertext row");
+            }
+
+            assert_eq!(
+                snapshot_of(&db, &reported).await,
+                Some((reported.clone(), vec![before_b], vec![after]))
+            );
         });
     }
 

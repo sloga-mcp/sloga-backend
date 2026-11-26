@@ -553,6 +553,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -748,6 +749,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         }
     }
 

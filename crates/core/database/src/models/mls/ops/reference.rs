@@ -4,12 +4,16 @@ use iso8601_timestamp::Timestamp;
 use revolt_result::Result;
 
 use crate::{
-    mls_text_rejoin_window_seconds, ChannelSeat, E2EEIdentity, MlsCommit, MlsCommitOutcome,
-    MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage, ReferenceDb,
-    MAX_MLS_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, ChannelSeat, E2EEIdentity, InsertOutcome, MlsCommit,
+    MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsHistoryLink, MlsJoinIntent,
+    MlsKeyPackage, ReferenceDb, MAX_MLS_GROUP_MEMBERS,
 };
 
-use super::plan_mls_text_commit;
+use super::{
+    check_history_link_room, history_link_created_ms, history_link_existing_outcome,
+    history_link_page_limit, history_link_usage, plan_mls_text_commit, prepare_history_link_row,
+    trim_history_link_page, HistoryLinkCaps,
+};
 
 /// The Reference form of the storage-level Text marker (R22; Mongo stores
 /// `kind: "Text"` on the document): a row the Text commit transaction wrote
@@ -21,6 +25,42 @@ const TEXT_COMMIT_KEY_PREFIX: &str = "text:";
 
 fn text_commit_key(id: &str) -> String {
     format!("{TEXT_COMMIT_KEY_PREFIX}{id}")
+}
+
+impl ReferenceDb {
+    /// `insert_mls_history_link` with explicit caps (the trait fn passes
+    /// the configured ones). Lock order (design 2.8): `mls_groups ->
+    /// mls_history_links`, both held for the whole check-and-insert, so
+    /// the slot, count and cap checks cannot interleave with another insert.
+    pub(crate) async fn insert_mls_history_link_capped(
+        &self,
+        link: &MlsHistoryLink,
+        caps: HistoryLinkCaps,
+    ) -> Result<InsertOutcome> {
+        let row = prepare_history_link_row(link)?;
+
+        // The holder group (Mongo claims its document): a Text group, open
+        // or closed (a closed G' still takes late links, design 3.14.4)
+        let groups = self.mls_groups.lock().await;
+        if !groups
+            .get(&row.group_id)
+            .is_some_and(|group| group.kind == MlsGroupKind::Text)
+        {
+            return Err(create_error!(NotFound));
+        }
+
+        let mut links = self.mls_history_links.lock().await;
+        if let Some(stored) = links.get(&row.id) {
+            return history_link_existing_outcome(stored, &row);
+        }
+
+        let usage = history_link_usage(links.values(), &row)?;
+        check_history_link_room(&row, &usage, caps)?;
+
+        links.insert(row.id.clone(), row);
+        drop(groups);
+        Ok(InsertOutcome::Inserted)
+    }
 }
 
 #[async_trait]
@@ -685,5 +725,49 @@ impl crate::AbstractMls for ReferenceDb {
             !(text_groups.contains(commit.group_id.as_str()) && commit.created_at < older_than)
         });
         Ok((before - commits.len()) as u64)
+    }
+
+    async fn insert_mls_history_link(&self, link: &MlsHistoryLink) -> Result<InsertOutcome> {
+        self.insert_mls_history_link_capped(link, HistoryLinkCaps::configured().await)
+            .await
+    }
+
+    async fn fetch_mls_history_links(
+        &self,
+        group_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MlsHistoryLink>> {
+        let limit = history_link_page_limit(limit);
+        let links = self.mls_history_links.lock().await;
+
+        let mut rows: Vec<MlsHistoryLink> = links
+            .values()
+            .filter(|link| {
+                link.group_id == group_id && before.is_none_or(|before| link.epoch < before)
+            })
+            .cloned()
+            .collect();
+        drop(links);
+
+        // The Mongo order: epoch descending, then `created_at` at the
+        // millisecond precision Mongo stores, then the writer user
+        rows.sort_by(|a, b| {
+            b.epoch
+                .cmp(&a.epoch)
+                .then_with(|| {
+                    history_link_created_ms(&a.created_at)
+                        .cmp(&history_link_created_ms(&b.created_at))
+                })
+                .then_with(|| a.writer_user_id.cmp(&b.writer_user_id))
+        });
+        rows.truncate(limit + 1);
+        Ok(trim_history_link_page(rows, limit))
+    }
+
+    async fn delete_mls_history_links_for_group(&self, group_id: &str) -> Result<()> {
+        let mut links = self.mls_history_links.lock().await;
+        links.retain(|_, link| link.group_id != group_id);
+        Ok(())
     }
 }

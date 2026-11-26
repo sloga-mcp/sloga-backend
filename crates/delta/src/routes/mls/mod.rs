@@ -24,6 +24,7 @@ mod commits_fetch;
 mod commits_submit;
 mod group_open;
 mod groups_create;
+mod history_links;
 mod join_intent;
 mod key_packages_claim;
 mod key_packages_publish;
@@ -461,6 +462,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         group_open::open_group,
         text_group::fetch_text_group,
         welcome_fetch::fetch_welcome,
+        history_links::put_history_link,
+        history_links::fetch_history_links,
     ]
 }
 
@@ -696,6 +699,7 @@ mod protected_gates {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             harness

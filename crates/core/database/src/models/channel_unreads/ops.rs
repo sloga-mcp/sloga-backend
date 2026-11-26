@@ -52,6 +52,16 @@ pub trait AbstractChannelUnreads: Sync + Send {
 
     /// Fetch unread for a specific user in a channel.
     async fn fetch_unread(&self, user_id: &str, channel_id: &str) -> Result<Option<ChannelUnread>>;
+
+    /// Remove `message_ids` from the mentions of every unread row of one
+    /// channel (the `history_wipes` job, design 7.5 "S4"). Other channels'
+    /// rows and other ids are left alone; a row whose mentions empty keeps
+    /// an empty list, as the MongoDB `$pull` of `acknowledge_message` does.
+    async fn remove_mentions_of_messages(
+        &self,
+        channel_id: &str,
+        message_ids: &[String],
+    ) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -235,6 +245,62 @@ mod tests {
 
             let unread = db.fetch_unread(&user, &id).await.unwrap();
             assert_eq!(unread.and_then(|u| u.mentions), Some(vec![message]));
+        });
+    }
+
+    /// The wipe job's mention clearing pulls only the named ids, and only
+    /// from the rows of the named channel: another channel's row naming the
+    /// same id keeps it, and the row's other mentions stay.
+    ///
+    /// Control: the channel filter dropped (each driver).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn removing_mentions_touches_only_the_named_ids_in_that_channel() {
+        database_test!(|db| async move {
+            let (wiped, other) = (new_id(), new_id());
+            let (alice, bob) = (new_id(), new_id());
+            let (gone, kept, also_gone) = (new_id(), new_id(), new_id());
+            db.insert_channel(&thread(&wiped)).await.unwrap();
+            db.insert_channel(&thread(&other)).await.unwrap();
+
+            // One call per row: the drivers differ on a second call
+            db.add_mention_to_unread(&wiped, &alice, &[gone.clone(), kept.clone()])
+                .await
+                .unwrap();
+            db.add_mention_to_unread(&wiped, &bob, &[also_gone.clone()])
+                .await
+                .unwrap();
+            db.add_mention_to_unread(&other, &alice, &[gone.clone(), also_gone.clone()])
+                .await
+                .unwrap();
+
+            db.remove_mentions_of_messages(&wiped, &[gone.clone(), also_gone.clone()])
+                .await
+                .expect("remove");
+
+            let mentions = |user: String, channel: String| {
+                let db = db.clone();
+                async move {
+                    db.fetch_unread(&user, &channel)
+                        .await
+                        .unwrap()
+                        .expect("the row stays")
+                        .mentions
+                        .unwrap_or_default()
+                }
+            };
+            assert_eq!(mentions(alice.clone(), wiped.clone()).await, vec![kept]);
+            assert!(mentions(bob.clone(), wiped.clone()).await.is_empty());
+            assert_eq!(
+                mentions(alice.clone(), other.clone()).await,
+                vec![gone, also_gone],
+                "another channel's row keeps its mentions"
+            );
+
+            // No ids: nothing to do
+            db.remove_mentions_of_messages(&other, &[])
+                .await
+                .expect("remove nothing");
         });
     }
 }

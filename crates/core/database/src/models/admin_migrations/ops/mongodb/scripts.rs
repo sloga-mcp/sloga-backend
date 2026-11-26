@@ -3111,7 +3111,7 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
 
     // The Prot fuel tanks (S5b) follow the protected-channels S2 block as
     // their own top-level guard. 77 is e2ee add-device's and 78
-    // protected-channels S2's; a database at 79 runs only this block.
+    // protected-channels S2's; a database at 79 runs this block and S4's.
     //
     // Migration chain (steward renumber, 2026-11-02): add-device `<= 77` /
     // 78, S2 `<= 78` / 79, this block `<= 79` / 80, S4 `<= 80` / 81, S6
@@ -3134,6 +3134,52 @@ pub async fn run_migrations(db: &MongoDb, revision: i32) -> i32 {
         create_prot_tank_indexes(&db.db())
             .await
             .expect("Failed to create Prot tank indexes.");
+    }
+
+    // Protected channels S4 = 80/81, assigned by the steward (design 2.7 "S4
+    // migration block": S2 78/79, S5b 79/80, S4 80/81). A top-level sibling
+    // after S5b's revision 79 block, so a database at 80 runs only this
+    // block.
+    if revision <= 80 {
+        info!("Running migration [revision 80 / 12-11-2026]: Create the mls_history_links collection with its history_links_by_holder index, and the server_legal_holds and history_wipe_leases collections (protected channels S4)");
+
+        // Three new collections; every other S4 field is an additive serde
+        // default (docs/protected-channels-design.md 2.7 "S4 migration
+        // block"). An earlier run of this block may have created any of
+        // them, so only NamespaceExists is tolerated; any other failure
+        // panics, so the revision is not advanced.
+        for collection in [
+            "mls_history_links",
+            "server_legal_holds",
+            "history_wipe_leases",
+        ] {
+            if let Err(error) = db.db().create_collection(collection).await {
+                // 48 = NamespaceExists.
+                let exists = matches!(
+                    *error.kind,
+                    crate::mongodb::error::ErrorKind::Command(ref command) if command.code == 48
+                );
+                if !exists {
+                    panic!("Failed to create {collection} collection: {error}");
+                }
+            }
+        }
+
+        // server_legal_holds is keyed by `_id` (the server id) only, and
+        // history_wipe_leases by `_id` (the channel id) only.
+
+        // Built from the same spec as init.rs, because the test database is
+        // not migrated. A re-run is a no-op when key, name and options
+        // already match; a same-named index with any other key, or this key
+        // under another name, fails createIndexes and panics, so the revision
+        // is not advanced over it.
+        db.db()
+            .run_command(doc! {
+                "createIndexes": "mls_history_links",
+                "indexes": [super::init::history_links_index()]
+            })
+            .await
+            .expect("Failed to create mls_history_links history_links_by_holder index.");
     }
 
     // Prot in-app purchases (S6) follow the earlier Prot blocks as their own
@@ -3907,6 +3953,7 @@ mod afk_backfill_tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -4118,14 +4165,15 @@ mod afk_backfill_tests {
     fn latest_revision_is_82() {
         assert_eq!(
             LATEST_REVISION, 82,
-            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, E2EE removal tombstones 77, protected channels S2 78, the Prot tanks (S5b) 79, the Prot store (S6) 81 (80 is reserved for protected channels S4)"
+            "the AFK backfill is revision 72, the ViewAuditLog backfill 73, the payments collections 74, protected channels 75, the Prot collections 76, E2EE removal tombstones 77, protected channels S2 78, the Prot tanks (S5b) 79, protected channels S4 80, the Prot store (S6) 81"
         );
     }
 
     /// Revision 77 (E2EE removal tombstones): exactly one `if revision <= 77`
     /// block, at the top level of `run_migrations` after the 76 (Prot) block
     /// closes (the nesting trap the 72 to 76 pins describe). Protected
-    /// channels S2's 78 and the Prot tanks' 79 follow it (pinned below).
+    /// channels S2's 78, the Prot tanks' 79 and protected channels S4's 80
+    /// follow it; 80 is now the last migration (pinned below).
     #[test]
     fn revision_77_is_one_top_level_block_after_76() {
         let needle_76 = format!("if revision <= 76 {OPEN}");
@@ -4168,11 +4216,11 @@ mod afk_backfill_tests {
         );
     }
 
-    /// The AFK backfill was the last migration when it landed; revision 79
-    /// (the Prot tanks, S5b) now is. The 72 to 79 guards are pinned to
+    /// The AFK backfill was the last migration when it landed; revision 81
+    /// (the Prot store, S6) now is. The 72 to 81 guards are pinned to
     /// exactly one block each, the last one to `LATEST_REVISION - 1`.
     #[test]
-    fn backfill_is_guarded_by_revision_72_and_revision_79_is_the_last_migration() {
+    fn backfill_is_guarded_by_revision_72_and_revision_81_is_the_last_migration() {
         let guards: Vec<i32> = shipping()
             .match_indices("if revision <= ")
             .map(|(at, needle)| {
@@ -4222,6 +4270,16 @@ mod afk_backfill_tests {
             guards.iter().filter(|guard| **guard == 79).count(),
             1,
             "exactly one `if revision <= 79` block"
+        );
+        assert_eq!(
+            guards.iter().filter(|guard| **guard == 80).count(),
+            1,
+            "exactly one `if revision <= 80` block"
+        );
+        assert_eq!(
+            guards.iter().filter(|guard| **guard == 81).count(),
+            1,
+            "exactly one `if revision <= 81` block"
         );
         assert_eq!(
             guards.iter().max(),
@@ -4410,6 +4468,56 @@ mod afk_backfill_tests {
         );
     }
 
+    /// The same nesting trap on S4: nested inside S5b's 79 block, the S4
+    /// collections and index would never be built on a database already at
+    /// 80 (S5b migrated first). Pinned against the 79 block, the one before
+    /// it in the chain.
+    #[test]
+    fn revision_80_guard_is_a_top_level_sibling_after_the_79_block() {
+        let depth_at = |at: usize| -> i64 {
+            shipping()[..at]
+                .chars()
+                .map(|ch| match ch {
+                    OPEN => 1,
+                    CLOSE => -1,
+                    _ => 0,
+                })
+                .sum()
+        };
+        let guard = |revision: i32| -> usize {
+            let needle = format!("if revision <= {revision} {OPEN}");
+            assert_eq!(
+                shipping().matches(&needle).count(),
+                1,
+                "exactly one `{needle}`"
+            );
+            shipping().find(&needle).expect("the guard")
+        };
+        let (at_79, at_80) = (guard(79), guard(80));
+
+        let open_79 = at_79 + format!("if revision <= 79 {OPEN}").len() - 1;
+        let block_79 = braced(shipping(), open_79);
+        assert!(
+            !block_79.contains("if revision <= 80"),
+            "the revision 80 guard must not be nested inside the 79 block"
+        );
+        assert!(
+            at_80 > open_79 + block_79.len(),
+            "the revision 80 guard must come after the 79 block closes"
+        );
+
+        let body = shipping()
+            .find("pub async fn run_migrations(")
+            .expect("run_migrations");
+        let body_open = body + shipping()[body..].find(OPEN).expect("its body");
+        let top_level = depth_at(body_open) + 1;
+        assert_eq!(
+            (depth_at(at_79), depth_at(at_80)),
+            (top_level, top_level),
+            "the 79 and 80 guards must both sit at the top level of run_migrations"
+        );
+    }
+
     /// The `if revision <= 75` block of `run_migrations`.
     fn protected_channels_block() -> &'static str {
         let needle = format!("if revision <= 75 {OPEN}");
@@ -4511,6 +4619,73 @@ mod afk_backfill_tests {
                 init.matches(needle).count(),
                 1,
                 "init.rs must build `{needle}` exactly once"
+            );
+        }
+    }
+
+    /// The `if revision <= 80` block of `run_migrations`.
+    fn protected_s4_block() -> &'static str {
+        let needle = format!("if revision <= 80 {OPEN}");
+        let at = shipping()
+            .find(&needle)
+            .expect("the revision 80 migration block");
+        braced(shipping(), at + needle.len() - 1)
+    }
+
+    /// docs/protected-channels-design.md 2.7 "S4 migration block": the
+    /// block creates the three S4 collections, tolerating only an
+    /// already-existing one, and the one S4 index from the spec init.rs
+    /// uses (the test database is not migrated), and touches no data. The
+    /// spec itself is pinned against MongoDB by
+    /// `init_creates_the_s4_collections_and_index` and
+    /// `revision_80_creates_the_s4_collections_and_index_and_is_rerunnable`.
+    #[test]
+    fn revision_80_and_init_build_the_s4_schema_from_the_shared_spec() {
+        let block: String = protected_s4_block()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        let step =
+            "\"createIndexes\":\"mls_history_links\",\"indexes\":[super::init::history_links_index()]";
+        assert_eq!(block.matches(step).count(), 1, "exactly one `{step}`");
+        assert_eq!(
+            block.matches("\"createIndexes\"").count(),
+            1,
+            "one index step"
+        );
+        assert!(
+            block.contains(
+                "forcollectionin[\"mls_history_links\",\"server_legal_holds\",\"history_wipe_leases\",]"
+            ),
+            "the block creates the three S4 collections"
+        );
+        assert!(
+            block.contains("command.code==48"),
+            "only NamespaceExists (48) may be tolerated"
+        );
+        assert!(
+            block.contains("if!exists{panic!("),
+            "any other create failure must panic"
+        );
+        for needle in ["update_", "delete_", "insert_", "drop", ".ok()", "$set"] {
+            assert!(
+                !block.contains(needle),
+                "the S4 block builds schema only, and panics on failure; found {needle}"
+            );
+        }
+
+        const INIT: &str = include_str!("init.rs");
+        let init = &INIT[..INIT.find("#[cfg(test)]").unwrap_or(INIT.len())];
+        for needle in [
+            "history_links_index(),",
+            "create_collection(\"mls_history_links\")",
+            "create_collection(\"server_legal_holds\")",
+            "create_collection(\"history_wipe_leases\")",
+        ] {
+            assert_eq!(
+                init.matches(needle).count(),
+                1,
+                "init.rs must carry `{needle}` exactly once"
             );
         }
     }
@@ -5036,8 +5211,8 @@ mod tests {
                 .await
                 .expect("insert servers");
 
-            // Revisions 74 to 78 run after it (they touch no server); the
-            // return is LATEST_REVISION.
+            // Revisions 74 to 78 and 80 run after it (they touch no server);
+            // the return is LATEST_REVISION.
             assert_eq!(
                 super::run_migrations(&mongo, 73).await,
                 super::LATEST_REVISION
@@ -6274,8 +6449,8 @@ mod tests {
     }
 
     /// Revision 81 must create the Prot in-app purchase collections and every
-    /// S6 index with its exact name and spec, starting from a database at 80
-    /// (the Prot ledger and tanks already built), leave the earlier Prot
+    /// S6 index with its exact name and spec, starting from a database at 81
+    /// (the Prot ledger, tanks and S4 already built), leave the earlier Prot
     /// indexes as they were, and be a no-op when re-run. Control: drop
     /// `prot_store_intents_token_unique` and the spec check fails; past it, a
     /// second intent with one token would be accepted.
@@ -6344,8 +6519,8 @@ mod tests {
                 return;
             };
 
-            // A database at 80 already holds the revision 76 ledger and the
-            // revision 79 tanks.
+            // A database at 81 already holds the revision 76 ledger, the
+            // revision 79 tanks and S4's revision 80 collections.
             let earlier_collections = super::PROT_COLLECTIONS
                 .into_iter()
                 .chain(super::PROT_TANK_COLLECTIONS);
@@ -6368,7 +6543,7 @@ mod tests {
             }
 
             assert_eq!(
-                super::run_migrations(&mongo, 80).await,
+                super::run_migrations(&mongo, 81).await,
                 super::LATEST_REVISION
             );
 
@@ -6480,7 +6655,7 @@ mod tests {
 
             // Re-running over populated collections changes nothing.
             assert_eq!(
-                super::run_migrations(&mongo, 80).await,
+                super::run_migrations(&mongo, 81).await,
                 super::LATEST_REVISION,
                 "a re-run"
             );
@@ -6498,8 +6673,8 @@ mod tests {
         guard.disarm();
     }
 
-    /// The end of the chain (S2 78/79, the Prot tanks 79/80, the Prot store
-    /// 81/82; 80 is reserved for S4). A database already at LATEST_REVISION
+    /// The end of the chain (S2 78/79, the Prot tanks 79/80, protected
+    /// channels S4 80/81, the Prot store 81/82). A database already at LATEST_REVISION
     /// runs nothing: no collection appears. A database at exactly 79 (S2
     /// migrated, the Prot tanks not yet) runs the Prot tank block and the
     /// later ones, never the S2 block (its collections are not created), and
@@ -6598,7 +6773,8 @@ mod tests {
                 ["_id_", "prot_pledges_goal_state", "prot_pledges_user_state"]
             );
 
-            // Back at 80 the block does not run: a dropped index stays gone
+            // At 80 the Prot tank block does not run: a dropped index stays
+            // gone
             mongo
                 .db()
                 .run_command(
@@ -6729,7 +6905,7 @@ mod tests {
     /// array) builds both S2 indexes and returns LATEST_REVISION. A database
     /// add-device migrated first (stored at 78) runs the block too, a second
     /// run (the stored revision unadvanced after a crash) is a no-op over
-    /// them, and a database at 79 does not run this block.
+    /// them, and a database at 79 or later never runs the S2 block.
     #[tokio::test]
     async fn revision_78_creates_the_s2_indexes_and_is_rerunnable() {
         // Named by hand for the same 63-character reason as above.
@@ -6850,25 +7026,27 @@ mod tests {
                 assert_eq!(names, want, "{collection} indexes");
             }
 
-            // A database already at 79 is past this block (only the Prot
-            // tanks' 79 block runs): with the S2 indexes dropped, they stay
-            // gone.
+            // A database already past S2 (79, 80) or at LATEST_REVISION never
+            // runs the S2 block: with the S2 indexes dropped, they stay gone
+            // (the later blocks touch neither collection).
             drop_s2_indexes().await;
-            assert_eq!(
-                super::run_migrations(&mongo, 79).await,
-                super::LATEST_REVISION
-            );
-            for (collection, want) in [
-                ("channel_seats", vec!["_id_", "channel_id", "user_id"]),
-                ("mls_commits", vec!["_id_", "group_epoch"]),
-            ] {
-                let mut names = mongo
-                    .col::<Document>(collection)
-                    .list_index_names()
-                    .await
-                    .expect("list indexes");
-                names.sort_unstable();
-                assert_eq!(names, want, "{collection} indexes at 79");
+            for stored in 79..=super::LATEST_REVISION {
+                assert_eq!(
+                    super::run_migrations(&mongo, stored).await,
+                    super::LATEST_REVISION
+                );
+                for (collection, want) in [
+                    ("channel_seats", vec!["_id_", "channel_id", "user_id"]),
+                    ("mls_commits", vec!["_id_", "group_epoch"]),
+                ] {
+                    let mut names = mongo
+                        .col::<Document>(collection)
+                        .list_index_names()
+                        .await
+                        .expect("list indexes");
+                    names.sort_unstable();
+                    assert_eq!(names, want, "{collection} indexes at {stored}");
+                }
             }
         }
 
@@ -7099,6 +7277,326 @@ mod tests {
                 "the unique index must refuse a second tombstone for (U, D)"
             );
             assert_eq!(tombstones.count_documents(doc! {}).await.expect("count"), 1);
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Names of the collections in the test database, sorted.
+    async fn collection_names(mongo: &crate::MongoDb) -> Vec<String> {
+        let mut names = mongo
+            .db()
+            .list_collection_names()
+            .await
+            .expect("list collections");
+        names.sort_unstable();
+        names
+    }
+
+    /// The collections the S4 block creates, spelled out here
+    const S4_COLLECTIONS: [&str; 3] = [
+        "mls_history_links",
+        "server_legal_holds",
+        "history_wipe_leases",
+    ];
+
+    /// The S4 schema (docs/protected-channels-design.md 2.7 "S4 migration
+    /// block"): `mls_history_links` carrying exactly `_id_` and
+    /// `history_links_by_holder` on `{ group_id: 1, epoch: -1 }`, spelled
+    /// out here rather than read from `history_links_index()` so a drift in
+    /// the shared spec fails, and `server_legal_holds` and
+    /// `history_wipe_leases` keyed by `_id` only.
+    async fn assert_has_the_s4_schema(mongo: &crate::MongoDb) {
+        let collections = collection_names(mongo).await;
+        for name in S4_COLLECTIONS {
+            assert!(
+                collections.iter().any(|collection| collection == name),
+                "{name} missing from {collections:?}"
+            );
+        }
+
+        let index = named_index(mongo, "mls_history_links", "history_links_by_holder")
+            .await
+            .expect("mls_history_links must carry history_links_by_holder");
+        // Ordered: key order and direction are part of an index's identity.
+        let key: Vec<(&str, &Bson)> = index
+            .get_document("key")
+            .expect("key")
+            .iter()
+            .map(|(field, order)| (field.as_str(), order))
+            .collect();
+        assert_eq!(
+            key,
+            vec![("group_id", &Bson::Int32(1)), ("epoch", &Bson::Int32(-1))],
+            "keyed on (group_id ascending, epoch descending): {index:?}"
+        );
+        let options: Vec<&str> = index
+            .keys()
+            .map(String::as_str)
+            .filter(|field| !matches!(*field, "v" | "key" | "name" | "ns"))
+            .collect();
+        assert!(options.is_empty(), "no index options: {index:?}");
+
+        for (collection, want) in [
+            ("mls_history_links", vec!["_id_", "history_links_by_holder"]),
+            ("server_legal_holds", vec!["_id_"]),
+            ("history_wipe_leases", vec!["_id_"]),
+        ] {
+            let mut names = mongo
+                .col::<Document>(collection)
+                .list_index_names()
+                .await
+                .expect("list indexes");
+            names.sort_unstable();
+            assert_eq!(names, want, "{collection} indexes");
+        }
+    }
+
+    /// A fresh database (init.rs) carries the three S4 collections and the
+    /// history-link index.
+    #[tokio::test]
+    async fn init_creates_the_s4_collections_and_index() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_init_s4_schema".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // Indexes exist only on MongoDB.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            super::super::init::create_database(&mongo).await;
+            assert_has_the_s4_schema(&mongo).await;
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// Revision 80 on a database stored at 80 (S5b migrated, no S4
+    /// collection present) creates the three collections and the history-link
+    /// index and returns LATEST_REVISION. A second run (the stored revision
+    /// unadvanced after a crash) is a no-op over them and their rows, a
+    /// database stored at 79 (S2 shipped, S5b not yet migrated) runs the
+    /// block too, after S5b's, and a database at LATEST_REVISION runs
+    /// nothing.
+    #[tokio::test]
+    async fn revision_80_creates_the_s4_collections_and_index_and_is_rerunnable() {
+        // Named by hand for the same 63-character reason as above.
+        let db = crate::DatabaseInfo::Test("migration_rev80_s4_schema".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            // The revision-80 shape, as far as S4 is concerned: an existing
+            // collection beside it, and no S4 collection.
+            mongo
+                .db()
+                .create_collection("mls_groups")
+                .await
+                .expect("create mls_groups");
+            let before = collection_names(&mongo).await;
+            for name in S4_COLLECTIONS {
+                assert!(
+                    !before.iter().any(|collection| collection == name),
+                    "{name} must not exist before revision 80: {before:?}"
+                );
+            }
+
+            assert_eq!(
+                super::run_migrations(&mongo, 80).await,
+                super::LATEST_REVISION
+            );
+            assert_has_the_s4_schema(&mongo).await;
+
+            // Rows written after the first run survive a re-run.
+            mongo
+                .col::<Document>("mls_history_links")
+                .insert_one(doc! { "_id": "G:1:U1", "group_id": "G", "epoch": 1_i64 })
+                .await
+                .expect("insert a link");
+            mongo
+                .col::<Document>("server_legal_holds")
+                .insert_one(doc! { "_id": "S1", "set_by": "U1" })
+                .await
+                .expect("insert a hold");
+            mongo
+                .col::<Document>("history_wipe_leases")
+                .insert_one(doc! { "_id": "C1", "holder": "H1" })
+                .await
+                .expect("insert a lease");
+
+            // A re-run over the created collections and index succeeds.
+            assert_eq!(
+                super::run_migrations(&mongo, 80).await,
+                super::LATEST_REVISION,
+                "a re-run"
+            );
+            assert_has_the_s4_schema(&mongo).await;
+            for collection in S4_COLLECTIONS {
+                assert_eq!(
+                    mongo
+                        .col::<Document>(collection)
+                        .count_documents(doc! {})
+                        .await
+                        .expect("count"),
+                    1,
+                    "{collection} rows survive a re-run"
+                );
+            }
+
+            let drop_s4_index = || {
+                let mongo = mongo.clone();
+                async move {
+                    mongo
+                        .db()
+                        .run_command(doc! {
+                            "dropIndexes": "mls_history_links",
+                            "index": "history_links_by_holder"
+                        })
+                        .await
+                        .expect("drop the S4 index");
+                }
+            };
+
+            // A database at 79 (S2 shipped) runs the block: dropped, the
+            // index comes back.
+            drop_s4_index().await;
+            assert_eq!(
+                super::run_migrations(&mongo, 79).await,
+                super::LATEST_REVISION
+            );
+            assert_has_the_s4_schema(&mongo).await;
+
+            // A database already at LATEST_REVISION runs nothing: with the
+            // index dropped, it stays gone.
+            drop_s4_index().await;
+            assert_eq!(
+                super::run_migrations(&mongo, super::LATEST_REVISION).await,
+                super::LATEST_REVISION
+            );
+            let mut names = mongo
+                .col::<Document>("mls_history_links")
+                .list_index_names()
+                .await
+                .expect("list indexes");
+            names.sort_unstable();
+            assert_eq!(names, vec!["_id_"], "mls_history_links indexes at LATEST");
+        }
+
+        db.drop_database().await;
+        guard.disarm();
+    }
+
+    /// An index that is not the S4 spec under the S4 name, or the S4 key
+    /// under another name, makes revision 80 panic from its index step, so
+    /// the revision is never advanced over it.
+    #[tokio::test]
+    async fn revision_80_refuses_a_conflicting_history_links_index() {
+        use futures::FutureExt;
+
+        let db = crate::DatabaseInfo::Test("migration_rev80_s4_conflict".to_string())
+            .connect()
+            .await
+            .expect("Database connection failed.");
+        db.drop_database().await;
+        let guard = crate::test_teardown::TestDatabaseGuard::arm(&db).await;
+
+        {
+            #[allow(irrefutable_let_patterns)]
+            let Database::MongoDb(mongo) = db.clone() else {
+                // The migration scripts are MongoDB-only.
+                db.drop_database().await;
+                guard.disarm();
+                return;
+            };
+
+            let create = |index: Document| {
+                let mongo = mongo.clone();
+                async move {
+                    mongo
+                        .db()
+                        .run_command(
+                            doc! { "createIndexes": "mls_history_links", "indexes": [index] },
+                        )
+                        .await
+                        .expect("create the conflicting index");
+                }
+            };
+            let drop = |name: &'static str| {
+                let mongo = mongo.clone();
+                async move {
+                    mongo
+                        .db()
+                        .run_command(doc! { "dropIndexes": "mls_history_links", "index": name })
+                        .await
+                        .expect("drop the conflicting index");
+                }
+            };
+            let refused = || {
+                let mongo = mongo.clone();
+                async move {
+                    let migration = std::panic::AssertUnwindSafe(super::run_migrations(&mongo, 80))
+                        .catch_unwind()
+                        .await;
+                    let Err(payload) = migration else {
+                        panic!("revision 80 must refuse a conflicting history-link index");
+                    };
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or_default()
+                        .to_string();
+                    assert!(
+                        message.starts_with(
+                            "Failed to create mls_history_links history_links_by_holder index."
+                        ),
+                        "the panic must come from the index step: {message}"
+                    );
+                }
+            };
+
+            // The S4 name over the wrong direction.
+            create(doc! { "key": { "group_id": 1_i32, "epoch": 1_i32 }, "name": "history_links_by_holder" })
+                .await;
+            refused().await;
+            drop("history_links_by_holder").await;
+
+            // The S4 key under another name.
+            create(
+                doc! { "key": { "group_id": 1_i32, "epoch": -1_i32 }, "name": "group_epoch_desc" },
+            )
+            .await;
+            refused().await;
+            drop("group_epoch_desc").await;
+
+            // With the conflicts gone, the block runs.
+            assert_eq!(
+                super::run_migrations(&mongo, 80).await,
+                super::LATEST_REVISION
+            );
+            assert_has_the_s4_schema(&mongo).await;
         }
 
         db.drop_database().await;
@@ -7475,13 +7973,24 @@ mod prot_migration_tests {
     /// The revision 81 guard carries the same nesting trap: nested inside
     /// the 79 block (or any earlier one), a database already at 80 or 81
     /// would skip the Prot store collections and the unique token index
-    /// forever. It names 79 and 81 only, so S4's revision 80 block can land
-    /// between them without touching this test.
+    /// forever. S4's revision 80 block landed between them, so the 81 guard
+    /// is also pinned after the 80 block closes.
     #[test]
     fn revision_81_guard_is_a_top_level_sibling() {
         let text = shipping(SOURCE);
         let (at_79, open_79) = guard(79);
+        let (at_80, open_80) = guard(80);
         let (at_81, _) = guard(81);
+
+        let block_80 = braced(text, open_80);
+        assert!(
+            !block_80.contains("if revision <= 81"),
+            "the revision 81 guard must not be nested inside the 80 block"
+        );
+        assert!(
+            at_81 > open_80 + block_80.len(),
+            "the revision 81 guard must come after the 80 block closes"
+        );
 
         let block_79 = braced(text, open_79);
         assert!(
@@ -7499,9 +8008,9 @@ mod prot_migration_tests {
         let body_open = body + text[body..].find(OPEN).expect("its body");
         let top_level = depth_at(body_open) + 1;
         assert_eq!(
-            (depth_at(at_79), depth_at(at_81)),
-            (top_level, top_level),
-            "the 79 and 81 guards must both sit at the top level of run_migrations"
+            (depth_at(at_79), depth_at(at_80), depth_at(at_81)),
+            (top_level, top_level, top_level),
+            "the 79, 80 and 81 guards must all sit at the top level of run_migrations"
         );
     }
 

@@ -1,22 +1,31 @@
 use iso8601_timestamp::Timestamp;
 use revolt_database::{
-    events::client::EventV1, seat_list_channel_server, util::reference::Reference, Database,
-    Session, User,
+    events::client::EventV1, seat_list_channel_server, util::reference::Reference, AuditLogAction,
+    AuditLogChange, AuditLogDraft, AuditLogEntry, AuditValue, Channel, Database, Poll,
+    ScheduledMessage, SeatListBody, SeatListPreHistory, Session, SoftResSheet, User,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, Error, ErrorType, Result};
 use rocket::{serde::json::Json, State};
 
+use super::poll_fetch::poll_is_servable;
 use super::protected_seat_validation::{after_seat_list_write, validate_protect};
 use crate::routes::mls::{
     require_channel_access, require_protected_available, require_protected_growth,
 };
+use crate::util::softres::publish_sheet_update;
 
 /// # Protect Channel
 ///
 /// Protect a server text channel with its genesis seat list
 /// (protected-channels design 7.2). Only the server owner may protect a
 /// channel, and never a privileged (staff) owner.
+///
+/// S4 (7.2 "S4"): a v2 genesis may carry a history boundary B, so a channel
+/// with messages can be protected; `wipe_history`, when present, must agree
+/// with the signed `pre_history` line. A `wiped` genesis is refused while
+/// the server has a legal hold (2.9). The answer, and the protect
+/// `ChannelUpdate`, carry the stored `protected_history`.
 ///
 /// A missing channel, and a channel the caller cannot view, get the same
 /// 404 before any other check (decision 18 (W2)), so a non-viewer learns
@@ -67,10 +76,26 @@ pub async fn protect_channel(
             return Err(create_error!(InvalidOperation));
         }
         require_protected_growth().await?;
+
+        // 4.3 "S4", 2.9: a `wiped` genesis (the SIGNED line, S4-PA-7) is
+        // refused while the server has a legal hold. Read after the owner
+        // check, so only the owner learns that a hold is set. A retry is
+        // not refused: its wipe is already written, and the job stops on
+        // the hold before each batch (7.5 "S4").
+        if signs_wiped(&validated.body) && db.fetch_server_legal_hold(&server.id).await?.is_some() {
+            return Err(create_error!(InvalidOperation));
+        }
     }
 
+    // 7.2 "S4": an absent `wipe_history` takes the signed line; a present
+    // one must agree with it (the driver's `FailedValidation`)
     let outcome = db
-        .protect_channel(channel.id(), &validated.submission, Timestamp::now_utc())
+        .protect_channel_with_wipe(
+            channel.id(),
+            &validated.submission,
+            data.wipe_history,
+            Timestamp::now_utc(),
+        )
         .await?;
     // Prot (S5b 6.7, BR2): a crowdfunded channel's Launching tank captures
     // its pledges once the protect has committed, a retry (`unchanged`)
@@ -93,14 +118,33 @@ pub async fn protect_channel(
     // way; the protect stays written.
     let after = after_seat_list_write(db, &server, &channel, &user, &outcome, None).await;
 
+    // 7.4 "S4": the state an existing channel carries over. Also on N3: a
+    // protect that landed but answered 5xx may have stopped before this,
+    // and every step only acts on what is still open.
+    close_carried_over_state(db, channel.id()).await;
+
+    // 7.5 "S4" (S4-D19): written only by the write that protected
+    if !outcome.unchanged {
+        AuditLogEntry::record(
+            db,
+            protect_audit(&server.id, channel.id(), &user.id, &validated.body),
+        )
+        .await;
+    }
+
     // Every connected client sets its protected pin (9.4) now, on the
     // SERVER topic, the one `Channel::update` uses (decision 19 (W2)).
     // Re-emitted on N3 (#134): a protect that landed but answered 5xx never
     // emitted it, and a repeated `protected: Some(true)` changes nothing.
+    // S4 (2.1 "S4"): it carries the stored `protected_history`, re-read
+    // after the commit; a failed read still sends the pin and is answered
+    // below.
+    let fresh = db.fetch_channel(channel.id()).await;
     EventV1::ChannelUpdate {
         id: channel.id().to_string(),
         data: v0::PartialChannel {
             protected: Some(true),
+            protected_history: fresh.as_ref().ok().and_then(wire_protected_history),
             ..Default::default()
         },
         clear: vec![],
@@ -109,8 +153,7 @@ pub async fn protect_channel(
     .await;
     after?;
 
-    let channel = db.fetch_channel(channel.id()).await?;
-    Ok(Json(channel.into()))
+    Ok(Json(fresh?.into()))
 }
 
 /// The one `NotFound` for a missing channel and a channel the caller cannot
@@ -119,18 +162,141 @@ fn no_channel() -> Error {
     create_error!(NotFound)
 }
 
+/// Whether the signed genesis asks for the wipe (`pre_history:wiped`)
+fn signs_wiped(body: &SeatListBody) -> bool {
+    body.v2
+        .as_ref()
+        .is_some_and(|lines| lines.pre_history == SeatListPreHistory::Wiped)
+}
+
+/// The stored `protected_history` of `channel`, in its wire form
+fn wire_protected_history(channel: &Channel) -> Option<Box<v0::ProtectedHistory>> {
+    match channel {
+        Channel::TextChannel {
+            protected_history: Some(history),
+            ..
+        } => Some(Box::new((**history).clone().into())),
+        _ => None,
+    }
+}
+
+/// 7.4 "S4", after the protect commit: pending scheduled messages are
+/// cancelled, open polls closed (one `PollClose` each) and open softres
+/// sheets locked (one sheet update each), except that nothing is published
+/// for a row a `wiped` genesis made unservable (S4-D21). Best effort: a
+/// failure is reported and the protect stays answered; the routes'
+/// `ChannelProtected` refusals (scheduling, voting, ending, reserving) are
+/// the backstop.
+async fn close_carried_over_state(db: &Database, channel_id: &str) {
+    if let Err(error) = ScheduledMessage::cancel_all_for_channel(db, channel_id).await {
+        revolt_config::capture_error(&error);
+    }
+
+    match Poll::close_open_for_channel(db, channel_id).await {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(ids) => match db.fetch_polls(&ids).await {
+            Ok(polls) => {
+                for poll in polls {
+                    // S4-D21: no event carries the state of a poll whose
+                    // parent message is not servable (after a `wiped`
+                    // genesis, every carried-over poll); the close stands
+                    match poll_is_publishable(db, &poll).await {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            revolt_config::capture_error(&error);
+                            continue;
+                        }
+                    }
+                    EventV1::PollClose {
+                        counts: poll.counts_vec(),
+                        id: poll.id,
+                        channel_id: poll.channel.clone(),
+                        message_id: poll.message,
+                        total_votes: poll.total_votes,
+                    }
+                    .p(poll.channel)
+                    .await;
+                }
+            }
+            Err(error) => {
+                revolt_config::capture_error(&error);
+            }
+        },
+        Err(error) => {
+            revolt_config::capture_error(&error);
+        }
+    }
+
+    match SoftResSheet::close_open_for_channel(db, channel_id).await {
+        Ok(ids) => {
+            for id in ids {
+                let published = match db.fetch_sheet(&id).await {
+                    Ok(sheet) => publish_sheet_update(db, sheet).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = published {
+                    revolt_config::capture_error(&error);
+                }
+            }
+        }
+        Err(error) => {
+            revolt_config::capture_error(&error);
+        }
+    }
+}
+
+/// Whether the closed `poll` may be broadcast: its parent message is
+/// servable under the read view of its channel (`poll_is_servable`)
+async fn poll_is_publishable(db: &Database, poll: &Poll) -> Result<bool> {
+    let channel = db.fetch_channel(&poll.channel).await?;
+    let permission_channel = channel.permission_target(db).await?.into_owned();
+    poll_is_servable(db, &channel, &permission_channel, poll).await
+}
+
+/// The `ChannelProtect` entry (7.5 "S4"; the mapping on
+/// `AuditLogAction::ChannelProtect`): the owner as the actor, the channel,
+/// the signed boundary (no `new` without one) and whether the genesis wipes
+fn protect_audit(
+    server_id: &str,
+    channel_id: &str,
+    actor_id: &str,
+    body: &SeatListBody,
+) -> AuditLogDraft {
+    let boundary = body
+        .v2
+        .as_ref()
+        .and_then(|lines| lines.history_boundary.clone());
+    AuditLogDraft {
+        server: server_id.to_string(),
+        actor: Some(actor_id.to_string()),
+        action: AuditLogAction::ChannelProtect,
+        target: None,
+        channel: Some(channel_id.to_string()),
+        changes: vec![
+            AuditLogChange::new("boundary", None, boundary.map(AuditValue::String)),
+            AuditLogChange::new("wiped", None, Some(AuditValue::Bool(signs_wiped(body)))),
+        ],
+        count: None,
+        reason: None,
+    }
+}
+
 #[cfg(test)]
 mod test {
     //! Run under nextest (one process per test; the flag variants call
     //! `overwrite_config`). Every refusal also asserts that nothing was
     //! written.
 
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashMap};
 
+    use iso8601_timestamp::Timestamp;
     use revolt_database::{
         events::client::EventV1, AuditLogAction, AuditLogEntry, AuditValue, BotInformation,
-        Channel, ChannelSeat, Message, PartialChannel, PartialUser, RemovalIntention, SeatList,
-        Session, User, PROTECTED_SCOPE_SEATS,
+        Channel, ChannelAuthority, ChannelSeat, Message, PartialChannel, PartialUser, Poll,
+        RemovalIntention, ScheduledMessage, ScheduledMessageStatus, SeatList, SeatListBody,
+        SeatListHistory, SeatListPreHistory, SeatListSubmission, SeatListV2Lines, ServerLegalHold,
+        Session, SoftResSheet, User, PROTECTED_SCOPE_SEATS,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -277,8 +443,295 @@ mod test {
                     authority,
                 }
                 .signed(),
+                wipe_history: None,
             }
         }
+
+        /// The owner device's v2 genesis with the history boundary
+        /// `boundary` and `pre_history`, seating the owner alone (4.3 "S4"),
+        /// with an honest first authority. Issued now, so `ulid_time(B) <=
+        /// issued_at` (4.1.1 "S4").
+        fn history_genesis(
+            &self,
+            boundary: &str,
+            pre_history: SeatListPreHistory,
+            wipe_history: Option<bool>,
+        ) -> v0::DataProtectChannel {
+            let key = &self.owner_device.signing_key;
+            let authority = self.first_authority(key, key);
+            let issued_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock")
+                .as_millis() as i64;
+            let body = SeatListBody {
+                channel_id: self.channel_id(),
+                version: 1,
+                device_cap: FIXTURE_DEVICE_CAP,
+                issued_at,
+                signer_user_id: self.owner.id.clone(),
+                signer_device_id: self.owner_device.device_id.clone(),
+                seats: vec![self.owner.id.clone()],
+                v2: Some(SeatListV2Lines {
+                    authority_sha256: Some(ChannelAuthority::sha256(&authority.body)),
+                    history: SeatListHistory::Hidden,
+                    history_boundary: Some(boundary.to_string()),
+                    pre_history,
+                    group_salt: SALT.to_string(),
+                }),
+            }
+            .build()
+            .expect("a canonical v2 genesis body");
+
+            v0::DataProtectChannel {
+                seat_list: v0::DataSeatList {
+                    signature: self.owner_device.sign(&body),
+                    body,
+                    signer_device_id: self.owner_device.device_id.clone(),
+                    handover: None,
+                    authority: Some(authority),
+                },
+                wipe_history,
+            }
+        }
+    }
+
+    async fn history_setting_on() {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.protected_channels.formats_v2 = true;
+            settings.features.protected_channels.history_setting = true;
+        })
+        .await;
+    }
+
+    /// The stored `protected_history` of `channel_id`, in its wire form
+    async fn stored_history(
+        harness: &TestHarness,
+        channel_id: &str,
+    ) -> Option<v0::ProtectedHistory> {
+        let channel: v0::Channel = harness
+            .db
+            .fetch_channel(channel_id)
+            .await
+            .expect("the channel")
+            .into();
+        match channel {
+            v0::Channel::TextChannel {
+                protected_history, ..
+            } => protected_history.map(|history| *history),
+            _ => None,
+        }
+    }
+
+    /// The protect event (7.2) carrying `history` (2.1 "S4") and nothing
+    /// else. A requested wipe's `at` is compared in milliseconds, the
+    /// precision the event keeps over the event bus (the Reference driver
+    /// stores nanoseconds); every other field exactly.
+    fn protect_update_carrying(
+        channel_id: &str,
+        history: Option<v0::ProtectedHistory>,
+    ) -> impl Fn(&EventV1) -> bool + '_ {
+        let expected = at_wire_precision(&v0::PartialChannel {
+            protected: Some(true),
+            protected_history: history.map(Box::new),
+            ..Default::default()
+        });
+        move |event| {
+            matches!(event, EventV1::ChannelUpdate { id, data, clear }
+                if id == channel_id && at_wire_precision(data) == expected && clear.is_empty())
+        }
+    }
+
+    /// `data` with a requested wipe's `at` taken out, and that `at` in
+    /// milliseconds since the epoch
+    fn at_wire_precision(data: &v0::PartialChannel) -> (v0::PartialChannel, Option<i128>) {
+        let mut data = data.clone();
+        let mut at_ms = None;
+        if let Some(history) = data.protected_history.as_mut() {
+            if let v0::HistoryWipe::Requested { at, .. } = &mut history.wipe {
+                at_ms = Some(
+                    at.duration_since(Timestamp::UNIX_EPOCH)
+                        .whole_milliseconds(),
+                );
+                *at = Timestamp::UNIX_EPOCH;
+            }
+        }
+        (data, at_ms)
+    }
+
+    /// Pre-protect state of a busy channel (7.4 "S4"): three plaintext
+    /// messages by the owner, oldest first, the last of them B; a closed
+    /// poll on the first, an open poll on the second, an open softres sheet
+    /// on B, and the member's pending scheduled message
+    struct Carried {
+        messages: Vec<Message>,
+        closed_poll: Poll,
+        open_poll: Poll,
+        open_sheet: SoftResSheet,
+        scheduled: ScheduledMessage,
+    }
+
+    impl Carried {
+        /// The newest message: the boundary B
+        fn boundary(&self) -> &str {
+            &self.messages[2].id
+        }
+    }
+
+    async fn carried(setup: &Setup) -> Carried {
+        let db = &setup.harness.db;
+        let channel_id = setup.channel_id();
+
+        // A minute ago, a second apart: ids in creation order
+        let base = Ulid::new().timestamp_ms() - 60_000;
+        let mut messages = Vec::new();
+        for k in 0..3 {
+            let message = Message {
+                id: Ulid::from_parts(base + k * 1_000, 0).to_string(),
+                channel: channel_id.clone(),
+                author: setup.owner.id.clone(),
+                content: Some("Before protect".to_string()),
+                ..Default::default()
+            };
+            db.insert_message(&message).await.expect("a message");
+            messages.push(message);
+        }
+
+        let poll = |message: &Message, closed: bool| Poll {
+            id: Ulid::new().to_string(),
+            message: message.id.clone(),
+            channel: channel_id.clone(),
+            server: Some(setup.server_id.clone()),
+            author: setup.owner.id.clone(),
+            question: "Raid night?".to_string(),
+            answers: vec![
+                v0::PollAnswer {
+                    id: 0,
+                    text: "Friday".to_string(),
+                    emoji: None,
+                },
+                v0::PollAnswer {
+                    id: 1,
+                    text: "Saturday".to_string(),
+                    emoji: None,
+                },
+            ],
+            allow_multiselect: false,
+            expires_at: 4_000_000_000_000,
+            closed,
+            counts: HashMap::new(),
+            total_votes: 0,
+        };
+        let closed_poll = poll(&messages[0], true);
+        let open_poll = poll(&messages[1], false);
+        for row in [&closed_poll, &open_poll] {
+            db.insert_poll(row).await.expect("a poll");
+        }
+
+        let open_sheet = SoftResSheet {
+            id: Ulid::new().to_string(),
+            message: messages[2].id.clone(),
+            channel: channel_id.clone(),
+            server: Some(setup.server_id.clone()),
+            event: None,
+            creator: setup.owner.id.clone(),
+            title: "Sunday MC".to_string(),
+            edition: "classic".to_string(),
+            raids: vec!["mc".to_string()],
+            reserves_per_user: 2,
+            per_item_cap: None,
+            allow_duplicates: false,
+            class_restriction: false,
+            hidden: false,
+            lock_at_event_start: false,
+            locks_at: None,
+            note: None,
+            hard_reserves: vec![],
+            locked: false,
+            created_at: 1_000_000,
+            edited_at: None,
+        };
+        db.insert_sheet(&open_sheet).await.expect("a sheet");
+
+        let scheduled = ScheduledMessage {
+            id: Ulid::new().to_string(),
+            author: setup.member.id.clone(),
+            channel: channel_id.clone(),
+            server: Some(setup.server_id.clone()),
+            scheduled_at: 4_000_000_000_000,
+            data: serde_json::from_value(json!({ "content": "Later" })).expect("a message payload"),
+            status: ScheduledMessageStatus::Pending,
+            failure_reason: None,
+        };
+        db.insert_scheduled_message(&scheduled)
+            .await
+            .expect("a scheduled message");
+
+        Carried {
+            messages,
+            closed_poll,
+            open_poll,
+            open_sheet,
+            scheduled,
+        }
+    }
+
+    /// 7.4 "S4", once the protect answered: the open poll is closed with one
+    /// `PollClose`, the closed poll publishes nothing, the open sheet is
+    /// locked with one sheet update, and the scheduled message is gone.
+    /// Every event is published before the protect update, and the
+    /// subscription is FIFO, so waiting on `update` first buffers them all.
+    async fn assert_carried_over(
+        setup: &mut Setup,
+        carried: &Carried,
+        update: impl Fn(&EventV1) -> bool,
+    ) {
+        let channel_id = setup.channel_id();
+        let server_id = setup.server_id.clone();
+        setup.harness.wait_for_event(&server_id, update).await;
+
+        let db = &setup.harness.db;
+        assert!(
+            db.fetch_poll(&carried.open_poll.id)
+                .await
+                .expect("the open poll")
+                .closed
+        );
+        assert!(
+            db.fetch_sheet(&carried.open_sheet.id)
+                .await
+                .expect("the open sheet")
+                .locked
+        );
+        assert!(db
+            .fetch_scheduled_message(&carried.scheduled.id)
+            .await
+            .is_err());
+
+        let open_poll = carried.open_poll.clone();
+        setup
+            .harness
+            .wait_for_event(&channel_id, move |event| {
+                matches!(event, EventV1::PollClose {
+                    id, channel_id, message_id, counts, total_votes
+                } if *id == open_poll.id
+                    && *channel_id == open_poll.channel
+                    && *message_id == open_poll.message
+                    && counts.len() == 2
+                    && *total_votes == 0)
+            })
+            .await;
+        let open_sheet = carried.open_sheet.id.clone();
+        setup
+            .harness
+            .wait_for_event(&channel_id, move |event| {
+                matches!(event, EventV1::SoftresSheetUpdate { id, .. } if *id == open_sheet)
+            })
+            .await;
+        let closed_poll = carried.closed_poll.id.clone();
+        setup.harness.assert_no_buffered_event(
+            &channel_id,
+            |event| matches!(event, EventV1::PollClose { id, .. } if *id == closed_poll),
+        );
     }
 
     /// Every `ProtectedSeatsUpdate` entry of `server_id`
@@ -294,6 +747,46 @@ mod test {
             )
             .await
             .expect("the audit log")
+    }
+
+    /// Every `ChannelProtect` entry of `server_id`
+    async fn protect_entries(harness: &TestHarness, server_id: &str) -> Vec<AuditLogEntry> {
+        harness
+            .db
+            .fetch_audit_log(
+                server_id,
+                None,
+                50,
+                Some(AuditLogAction::ChannelProtect),
+                None,
+            )
+            .await
+            .expect("the audit log")
+    }
+
+    /// The one `ChannelProtect` entry of `server_id`, by `owner` on
+    /// `channel_id` (7.5 "S4"): its changes as (key, new)
+    async fn protect_entry(
+        harness: &TestHarness,
+        server_id: &str,
+        owner: &User,
+        channel_id: &str,
+    ) -> Vec<(String, Option<AuditValue>)> {
+        let entries = protect_entries(harness, server_id).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.actor.as_deref(), Some(owner.id.as_str()));
+        assert_eq!(entry.channel.as_deref(), Some(channel_id));
+        assert_eq!(entry.target, None);
+        assert_eq!(entry.reason, None);
+        entry
+            .changes
+            .iter()
+            .map(|change| {
+                assert_eq!(change.old, None, "{entry:?}");
+                (change.key.clone(), change.new.clone())
+            })
+            .collect()
     }
 
     /// The 7.5 seat event for `channel_id`
@@ -486,6 +979,16 @@ mod test {
                 ("seated".to_string(), Some(AuditValue::StringList(seated))),
             ]
         );
+
+        // 7.5 "S4": the one `ChannelProtect` entry; a v1 genesis has no
+        // boundary and keeps nothing to wipe. Control: the entry dropped.
+        assert_eq!(
+            protect_entry(&setup.harness, &server_id, &setup.owner, &channel_id).await,
+            vec![
+                ("boundary".to_string(), None),
+                ("wiped".to_string(), Some(AuditValue::Bool(false))),
+            ]
+        );
     }
 
     /// N3 (#128, #134): the protect landed through the database, so no event
@@ -524,6 +1027,8 @@ mod test {
             });
         let entries = seats_updates(&setup.harness, &server_id).await;
         assert!(entries.is_empty(), "{entries:?}");
+        let entries = protect_entries(&setup.harness, &server_id).await;
+        assert!(entries.is_empty(), "{:?}", entries);
     }
 
     #[test]
@@ -1154,6 +1659,377 @@ mod test {
             );
         }
         println!("protect vs kick: {}/{} protects landed", landed, ROUNDS);
+    }
+
+    /// 7.2 "S4" (S4-PA-7): a present `wipe_history` must agree with the
+    /// signed `pre_history` (a v1 genesis keeps). `true` is refused and
+    /// writes nothing; `false` lands. Control: the route passes `None`.
+    #[test]
+    fn a_wipe_history_flag_must_agree_with_the_signed_line() {
+        crate::util::test::rt().block_on(Box::pin(a_wipe_history_flag_case()))
+    }
+
+    async fn a_wipe_history_flag_case() {
+        let setup = setup().await;
+        let channel_id = setup.channel_id();
+
+        let mut data = setup.genesis();
+        data.wipe_history = Some(true);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({
+                "type": "FailedValidation",
+                "error": "wipe_history disagrees with the signed pre_history"
+            }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+
+        data.wipe_history = Some(false);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_eq!(stored_history(&setup.harness, &channel_id).await, None);
+    }
+
+    /// 2.9, 7.1 "S4": a legal hold refuses only a `wiped` genesis; a genesis
+    /// that keeps its history (here a v1 one) still lands under a hold
+    #[test]
+    fn a_legal_hold_does_not_refuse_a_genesis_that_keeps_history() {
+        crate::util::test::rt().block_on(Box::pin(a_hold_keeps_case()))
+    }
+
+    async fn a_hold_keeps_case() {
+        let setup = setup().await;
+        let channel_id = setup.channel_id();
+        set_hold(&setup).await;
+
+        let answer = protect(
+            &setup.harness,
+            &setup.owner_session,
+            &channel_id,
+            &setup.genesis(),
+        )
+        .await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+    }
+
+    async fn set_hold(setup: &Setup) {
+        setup
+            .harness
+            .db
+            .set_server_legal_hold(&ServerLegalHold {
+                id: setup.server_id.clone(),
+                set_at: Timestamp::now_utc(),
+                set_by: Ulid::new().to_string(),
+                note: None,
+            })
+            .await
+            .expect("the legal hold");
+    }
+
+    /// 4.1.1 "S4" (fix round F1): with `history_setting` off a genesis that
+    /// would introduce a boundary is refused 400 and nothing is written
+    #[test]
+    fn with_history_setting_off_a_boundary_genesis_is_refused() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            formats_v2_on().await;
+            with_history_setting_off_case().await
+        }))
+    }
+
+    async fn with_history_setting_off_case() {
+        let setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+
+        let data = setup.history_genesis(carried.boundary(), SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({
+                "type": "FailedValidation",
+                "error": "history_boundary is refused until S4"
+            }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+    }
+
+    /// 7.2 "S4", 7.4 "S4": the owner protects a channel with messages, a
+    /// poll, a softres sheet and a scheduled message, with B its newest
+    /// message. The list seats the owner alone; the answer, the stored
+    /// channel and the protect update carry `protected_history { B, none }`;
+    /// the carried-over state is closed; the `ChannelProtect` entry names B.
+    #[test]
+    fn the_owner_protects_a_channel_with_history() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            the_owner_protects_with_history_case().await
+        }))
+    }
+
+    async fn the_owner_protects_with_history_case() {
+        let mut setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+        let boundary = carried.boundary().to_string();
+
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+
+        let history = v0::ProtectedHistory {
+            boundary: boundary.clone(),
+            wipe: v0::HistoryWipe::None,
+        };
+        assert_eq!(
+            stored_history(&setup.harness, &channel_id).await,
+            Some(history.clone())
+        );
+        let written = written(&setup.harness, &channel_id).await;
+        let seated: Vec<&str> = written
+            .seats
+            .iter()
+            .filter(|seat| seat.is_active())
+            .map(|seat| seat.user_id.as_str())
+            .collect();
+        assert_eq!(seated, vec![setup.owner.id.as_str()]);
+
+        assert_carried_over(
+            &mut setup,
+            &carried,
+            protect_update_carrying(&channel_id, Some(history)),
+        )
+        .await;
+        let server_id = setup.server_id.clone();
+        assert_eq!(
+            protect_entry(&setup.harness, &server_id, &setup.owner, &channel_id).await,
+            vec![
+                ("boundary".to_string(), Some(AuditValue::String(boundary))),
+                ("wiped".to_string(), Some(AuditValue::Bool(false))),
+            ]
+        );
+    }
+
+    /// N3 (#134) with a boundary: the protect landed through the database
+    /// and nothing after its commit ran. The same bytes again answer the
+    /// stored success carrying `protected_history`, re-emit the update with
+    /// it, and close the carried-over state; no second `ChannelProtect`
+    /// entry. Controls: the history dropped from the update; the poll close
+    /// dropped.
+    #[test]
+    fn an_identical_retry_with_history_sends_it_and_closes_what_was_carried_over() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            an_identical_retry_with_history_case().await
+        }))
+    }
+
+    async fn an_identical_retry_with_history_case() {
+        let mut setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+        let boundary = carried.boundary().to_string();
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Kept, None);
+        let landed = setup
+            .harness
+            .db
+            .protect_channel_with_wipe(
+                &channel_id,
+                &SeatListSubmission::from(data.seat_list.clone()),
+                None,
+                Timestamp::now_utc(),
+            )
+            .await
+            .expect("the protect lands through the database");
+        assert!(!landed.unchanged);
+        let before = written(&setup.harness, &channel_id).await;
+
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_eq!(written(&setup.harness, &channel_id).await, before);
+        let history = v0::ProtectedHistory {
+            boundary,
+            wipe: v0::HistoryWipe::None,
+        };
+        assert_eq!(body(&answer)["protected_history"], json!(history));
+
+        assert_carried_over(
+            &mut setup,
+            &carried,
+            protect_update_carrying(&channel_id, Some(history)),
+        )
+        .await;
+        let entries = protect_entries(&setup.harness, &setup.server_id).await;
+        assert!(entries.is_empty(), "{:?}", entries);
+    }
+
+    /// 4.3 "S4", 2.9: under a legal hold a `wiped` genesis is refused
+    /// `InvalidOperation` and nothing is written. With the hold cleared the
+    /// same request lands, its wipe `requested` by the owner. Control: the
+    /// legal-hold check dropped.
+    #[test]
+    fn a_wiped_genesis_is_refused_under_a_legal_hold() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            a_wiped_genesis_under_a_hold_case().await
+        }))
+    }
+
+    async fn a_wiped_genesis_under_a_hold_case() {
+        let mut setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+        let boundary = carried.boundary().to_string();
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Wiped, Some(true));
+        set_hold(&setup).await;
+
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::BadRequest,
+            json!({ "type": "InvalidOperation" }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+
+        setup
+            .harness
+            .db
+            .clear_server_legal_hold(&setup.server_id)
+            .await
+            .expect("clear the hold");
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        let history = stored_history(&setup.harness, &channel_id)
+            .await
+            .expect("the stored history");
+        assert_eq!(history.boundary, boundary);
+        assert!(
+            matches!(&history.wipe, v0::HistoryWipe::Requested { by, .. } if *by == setup.owner.id),
+            "{:?}",
+            history
+        );
+
+        let server_id = setup.server_id.clone();
+        setup
+            .harness
+            .wait_for_event(
+                &server_id,
+                protect_update_carrying(&channel_id, Some(history)),
+            )
+            .await;
+        assert_eq!(
+            protect_entry(&setup.harness, &server_id, &setup.owner, &channel_id).await,
+            vec![
+                ("boundary".to_string(), Some(AuditValue::String(boundary))),
+                ("wiped".to_string(), Some(AuditValue::Bool(true))),
+            ]
+        );
+    }
+
+    /// 7.2 "S4": a message newer than the signed boundary B (here B is the
+    /// second of three) answers 409 `ProtectHistoryMoved` and nothing is
+    /// written
+    #[test]
+    fn a_message_above_the_boundary_answers_protect_history_moved() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            protect_history_moved_case().await
+        }))
+    }
+
+    async fn protect_history_moved_case() {
+        let setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+
+        let data = setup.history_genesis(&carried.messages[1].id, SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::Conflict,
+            json!({ "type": "ProtectHistoryMoved" }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+    }
+
+    /// S4-D21: a `wiped` genesis still closes the open poll and locks the
+    /// open sheet, but publishes neither, since both ride pre-boundary rows
+    /// that are wipe-pending from the commit on. The protect update is
+    /// published after them on the one FIFO subscription, so once it is
+    /// observed nothing published before it can be missing from the
+    /// buffer. Controls: the `PollClose` gate dropped; the sheet-update gate
+    /// dropped.
+    #[test]
+    fn a_wiped_genesis_publishes_no_state_of_the_carried_over_rows() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            a_wiped_genesis_publishes_nothing_case().await
+        }))
+    }
+
+    async fn a_wiped_genesis_publishes_nothing_case() {
+        let mut setup = setup().await;
+        let channel_id = setup.channel_id();
+        let carried = carried(&setup).await;
+        let boundary = carried.boundary().to_string();
+
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Wiped, Some(true));
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        let history = stored_history(&setup.harness, &channel_id)
+            .await
+            .expect("the stored history");
+        assert!(
+            matches!(history.wipe, v0::HistoryWipe::Requested { .. }),
+            "{:?}",
+            history
+        );
+
+        let server_id = setup.server_id.clone();
+        setup
+            .harness
+            .wait_for_event(
+                &server_id,
+                protect_update_carrying(&channel_id, Some(history)),
+            )
+            .await;
+
+        let db = &setup.harness.db;
+        assert!(
+            db.fetch_poll(&carried.open_poll.id)
+                .await
+                .expect("the open poll")
+                .closed
+        );
+        assert!(
+            db.fetch_sheet(&carried.open_sheet.id)
+                .await
+                .expect("the open sheet")
+                .locked
+        );
+
+        let open_poll = carried.open_poll.id.clone();
+        let open_sheet = carried.open_sheet.id.clone();
+        setup
+            .harness
+            .assert_no_buffered_event(&channel_id, |event| {
+                matches!(event, EventV1::PollClose { id, .. } if *id == open_poll)
+                    || matches!(event, EventV1::SoftresSheetUpdate { id, .. } if *id == open_sheet)
+            });
     }
 
     /// The pledge that funds [`crowdfunded_setup`]'s launch goal

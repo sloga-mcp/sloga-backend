@@ -1,4 +1,5 @@
 use crate::{Channel, FieldsChannel, PartialChannel, revolt_result::Result, util::ChunkedDatabaseGenerator};
+use iso8601_timestamp::Timestamp;
 use revolt_permissions::OverrideField;
 
 #[cfg(feature = "mongodb")]
@@ -90,6 +91,41 @@ pub trait AbstractChannels: Sync + Send {
     /// flag under the `channels` lock, which protect holds throughout. A
     /// protected parent is `ChannelProtected`, a missing one `NotFound`.
     async fn hold_thread_parent_unprotected(&self, parent_id: &str) -> Result<()>;
+
+    /// Ids of the channels whose `protected_history.wipe` is `Requested`
+    /// (the `history_wipes` job, design 7.5 "S4"), ascending, strictly after
+    /// `after`, at most `limit` (none when `limit <= 0`). Ids only; a row
+    /// that cannot be read fails the page closed.
+    async fn fetch_channel_ids_with_requested_wipe(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>>;
+
+    /// Move a text channel's wipe to `Done { at, count }`, only while the
+    /// stored state is `requested`; returns whether this call wrote. A
+    /// missing channel, or a wipe that is `none` or already `done`, is
+    /// `Ok(false)` and nothing changes (design 2.1 "S4": the state only
+    /// moves forward).
+    async fn complete_history_wipe(
+        &self,
+        channel_id: &str,
+        at: Timestamp,
+        count: u64,
+    ) -> Result<bool>;
+
+    /// After a history wipe, set a text channel's `last_message_id` to
+    /// `newest_remaining` (unset on `None`), only while the stored id is
+    /// absent or at or below `boundary` (ULIDs compare as strings). A send
+    /// above the boundary therefore wins and is never moved back. Returns
+    /// whether the guard held; `Ok(false)` for a missing channel or one that
+    /// is not a text channel.
+    async fn reset_last_message_id_after_wipe(
+        &self,
+        channel_id: &str,
+        boundary: &str,
+        newest_remaining: Option<String>,
+    ) -> Result<bool>;
 }
 
 #[cfg(test)]
@@ -288,6 +324,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -525,6 +562,275 @@ mod tests {
                 ),
                 "a missing parent: {result:?}"
             );
+        });
+    }
+
+    /// Whole milliseconds: Mongo stores a `Timestamp` in milliseconds
+    fn wipe_at(ms: i64) -> iso8601_timestamp::Timestamp {
+        iso8601_timestamp::Timestamp::UNIX_EPOCH
+            .checked_add(iso8601_timestamp::Duration::milliseconds(ms))
+            .expect("timestamp")
+    }
+
+    fn requested() -> crate::HistoryWipe {
+        crate::HistoryWipe::Requested {
+            at: wipe_at(1_790_812_800_000),
+            by: "01WIPEOWNER".to_string(),
+        }
+    }
+
+    /// The boundary every wipe channel below carries
+    fn boundary() -> String {
+        id(5_000)
+    }
+
+    /// A protected text channel with `last_message_id`, carrying
+    /// `protected_history` with `wipe` when it is `Some`
+    fn wipe_channel(
+        channel_id: &str,
+        last: Option<&str>,
+        wipe: Option<crate::HistoryWipe>,
+    ) -> Channel {
+        let mut channel = tidbp_text_channel(channel_id);
+        if let Channel::TextChannel {
+            last_message_id,
+            protected,
+            protected_history,
+            ..
+        } = &mut channel
+        {
+            *last_message_id = last.map(str::to_string);
+            *protected = true;
+            *protected_history = wipe.map(|wipe| {
+                Box::new(crate::ProtectedHistory {
+                    boundary: boundary(),
+                    wipe,
+                })
+            });
+        }
+        channel
+    }
+
+    /// Whether the stored `protected_history.wipe.at` is a BSON Int64
+    /// (MongoDB); always `None` under REFERENCE, which stores the typed value
+    async fn stored_wipe_at_is_int64(db: &crate::Database, channel_id: &str) -> Option<bool> {
+        match db {
+            crate::Database::Reference(_) => None,
+            #[cfg(feature = "mongodb")]
+            crate::Database::MongoDb(mongo) => {
+                let row = mongo
+                    .col::<bson::Document>("channels")
+                    .find_one(doc! { "_id": channel_id })
+                    .await
+                    .unwrap()
+                    .expect("channel document");
+                let at = row
+                    .get_document("protected_history")
+                    .and_then(|history| history.get_document("wipe"))
+                    .expect("a stored wipe")
+                    .get("at")
+                    .expect("a stored wipe.at");
+                Some(matches!(at, bson::Bson::Int64(_)))
+            }
+        }
+    }
+
+    /// The `history_wipes` job's page: only channels whose wipe is
+    /// `requested`, ascending, strictly after `after`, at most `limit`.
+    ///
+    /// Control: the `requested` filter dropped (each driver).
+    #[tokio::test]
+    async fn requested_wipes_are_paged_in_id_order() {
+        database_test!(|db| async move {
+            use crate::HistoryWipe;
+
+            let ids: Vec<String> = (1..=6).map(|n| id(10_000 + n)).collect();
+            let done = HistoryWipe::Done {
+                at: wipe_at(1_790_900_000_000),
+                count: 4,
+            };
+            // Interleaved in id order, so a page that ignored the state
+            // would differ; inserted newest first
+            let rows = [
+                (0, Some(requested())),
+                (1, Some(HistoryWipe::None)),
+                (2, Some(requested())),
+                (3, Some(done)),
+                (4, None),
+                (5, Some(requested())),
+            ];
+            for (n, wipe) in rows.into_iter().rev() {
+                db.insert_channel(&wipe_channel(&ids[n], None, wipe))
+                    .await
+                    .unwrap();
+            }
+            let page = |after: Option<usize>, limit: i64| {
+                let db = db.clone();
+                let after = after.map(|n| ids[n].clone());
+                async move {
+                    db.fetch_channel_ids_with_requested_wipe(after.as_deref(), limit)
+                        .await
+                        .expect("the page must succeed")
+                }
+            };
+            let want = |ns: &[usize]| ns.iter().map(|n| ids[*n].clone()).collect::<Vec<_>>();
+
+            assert_eq!(page(None, 10).await, want(&[0, 2, 5]));
+            assert_eq!(page(None, 2).await, want(&[0, 2]));
+            assert_eq!(page(Some(2), 2).await, want(&[5]));
+            assert_eq!(page(Some(5), 2).await, want(&[]));
+            // After an id that is not itself requested
+            assert_eq!(page(Some(1), 1).await, want(&[2]));
+            assert_eq!(page(None, 0).await, want(&[]));
+        });
+    }
+
+    /// `complete_history_wipe` writes `Done { at, count }` once, only over a
+    /// stored `requested`: a second call, and a call on a channel whose wipe
+    /// is `none` or `done`, one with no `protected_history` or a missing
+    /// channel, is `false` and changes nothing. The row decodes as the typed
+    /// `Channel`; on MongoDB `at` stays Int64 unix ms, the encoding of the
+    /// `Requested` write it replaces.
+    ///
+    /// Control: the `requested` filter dropped (each driver).
+    #[tokio::test]
+    async fn a_requested_wipe_completes_once() {
+        database_test!(|db| async move {
+            use crate::HistoryWipe;
+
+            let mongo = !matches!(db, crate::Database::Reference(_));
+            let channel = id(20_001);
+            db.insert_channel(&wipe_channel(&channel, None, Some(requested())))
+                .await
+                .unwrap();
+            assert_eq!(
+                stored_wipe_at_is_int64(&db, &channel).await,
+                mongo.then_some(true),
+                "the Requested row stores Int64 unix ms"
+            );
+
+            let at = wipe_at(1_790_900_000_000);
+            assert!(db
+                .complete_history_wipe(&channel, at, 42)
+                .await
+                .expect("complete"));
+            let done = wipe_channel(&channel, None, Some(HistoryWipe::Done { at, count: 42 }));
+            assert_eq!(db.fetch_channel(&channel).await.unwrap(), done);
+            assert_eq!(
+                stored_wipe_at_is_int64(&db, &channel).await,
+                mongo.then_some(true),
+                "Done stores `at` as the Requested write does"
+            );
+
+            // Once only
+            assert!(!db
+                .complete_history_wipe(&channel, wipe_at(1_790_999_000_000), 99)
+                .await
+                .expect("complete again"));
+            assert_eq!(db.fetch_channel(&channel).await.unwrap(), done);
+
+            // Never over another state
+            let others = [
+                (2, Some(HistoryWipe::None)),
+                (
+                    3,
+                    Some(HistoryWipe::Done {
+                        at: wipe_at(1_790_000_000_000),
+                        count: 7,
+                    }),
+                ),
+                (4, None),
+            ];
+            for (n, wipe) in others {
+                let other = id(20_000 + n);
+                let row = wipe_channel(&other, None, wipe);
+                db.insert_channel(&row).await.unwrap();
+                assert!(
+                    !db.complete_history_wipe(&other, at, 1)
+                        .await
+                        .expect("complete other"),
+                    "{row:?}"
+                );
+                assert_eq!(db.fetch_channel(&other).await.unwrap(), row);
+            }
+            assert!(!db
+                .complete_history_wipe("01MISSINGWIPECHANNEL", at, 1)
+                .await
+                .expect("a missing channel is Ok(false)"));
+        });
+    }
+
+    /// `reset_last_message_id_after_wipe` resets the pointer while the stored
+    /// id is absent or at or below the boundary (to the newest remaining
+    /// row, or none), and refuses once a send above the boundary has moved
+    /// it there.
+    ///
+    /// Control: the `<= boundary` guard dropped (each driver).
+    #[tokio::test]
+    async fn last_message_id_resets_only_at_or_below_the_boundary() {
+        database_test!(|db| async move {
+            let b = boundary();
+            let (older, below) = (id(1_000), id(4_000));
+            let above = id(9_000);
+            let last = |db: crate::Database, channel: String| async move {
+                match db.fetch_channel(&channel).await.unwrap() {
+                    Channel::TextChannel {
+                        last_message_id, ..
+                    } => last_message_id,
+                    other => panic!("{other:?}"),
+                }
+            };
+
+            // Below B: reset to the newest remaining row
+            let a = id(30_001);
+            db.insert_channel(&wipe_channel(&a, Some(&below), Some(requested())))
+                .await
+                .unwrap();
+            assert!(db
+                .reset_last_message_id_after_wipe(&a, &b, Some(older.clone()))
+                .await
+                .unwrap());
+            assert_eq!(last(db.clone(), a.clone()).await, Some(older.clone()));
+
+            // At B, with no row left: unset
+            let c = id(30_002);
+            db.insert_channel(&wipe_channel(&c, Some(&b), Some(requested())))
+                .await
+                .unwrap();
+            assert!(db
+                .reset_last_message_id_after_wipe(&c, &b, None)
+                .await
+                .unwrap());
+            assert_eq!(last(db.clone(), c.clone()).await, None);
+
+            // Absent: set
+            let d = id(30_003);
+            db.insert_channel(&wipe_channel(&d, None, Some(requested())))
+                .await
+                .unwrap();
+            assert!(db
+                .reset_last_message_id_after_wipe(&d, &b, Some(older.clone()))
+                .await
+                .unwrap());
+            assert_eq!(last(db.clone(), d.clone()).await, Some(older.clone()));
+
+            // Above B: a send won; never moved back
+            let e = id(30_004);
+            db.insert_channel(&wipe_channel(&e, Some(&above), Some(requested())))
+                .await
+                .unwrap();
+            for newest in [Some(older.clone()), None] {
+                assert!(!db
+                    .reset_last_message_id_after_wipe(&e, &b, newest)
+                    .await
+                    .unwrap());
+                assert_eq!(last(db.clone(), e.clone()).await, Some(above.clone()));
+            }
+
+            assert!(!db
+                .reset_last_message_id_after_wipe("01MISSINGWIPECHANNEL", &b, None)
+                .await
+                .expect("a missing channel is Ok(false)"));
         });
     }
 }

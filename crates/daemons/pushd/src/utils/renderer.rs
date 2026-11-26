@@ -2,7 +2,7 @@ use redis_kiss::{get_connection as _get_conn, AsyncCommands, Conn};
 use regex::Regex;
 use revolt_config::config;
 use revolt_database::{Channel, Database};
-use revolt_models::v0::{self, PushNotification, PROTECTED_PUSH_BODY};
+use revolt_models::v0::{PushNotification, PROTECTED_PUSH_BODY};
 use revolt_parser::parse_message;
 use revolt_result::{create_error, Result, ToRevoltError};
 use std::{
@@ -10,6 +10,8 @@ use std::{
     collections::{HashMap, HashSet},
 };
 use tokio::join;
+
+use super::is_protected;
 
 async fn get_connection() -> Result<Conn> {
     _get_conn().await.map_err(|_| create_error!(InternalError))
@@ -265,19 +267,6 @@ async fn get_emoji_name(id: &str, _server: Option<&str>, db: &Database) -> Resul
 }
 
 // utility
-
-/// An encrypted message, or any message in a protected channel, even if the
-/// channel copy is stale and lacks the flag
-fn is_protected(notification: &PushNotification) -> bool {
-    notification.message.encrypted.is_some()
-        || matches!(
-            notification.channel,
-            v0::Channel::TextChannel {
-                protected: true,
-                ..
-            }
-        )
-}
 
 async fn get_channel_server_id(channel_id: &str, db: &Database) -> Result<String> {
     match db.fetch_channel(channel_id).await? {

@@ -26,6 +26,9 @@ enabled = true
 # the existing route tests protect with a v1 genesis. A v2 test turns it on
 # for itself with overwrite_config.
 formats_v2 = false
+# Off, as in production: the S1/S2 route tests protect with an empty
+# boundary. An S4 history test turns it on for itself with overwrite_config.
+history_setting = false
 
 [api.smtp]
 host = "localhost"

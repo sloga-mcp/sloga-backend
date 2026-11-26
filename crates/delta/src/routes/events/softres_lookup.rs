@@ -8,7 +8,7 @@ use rocket::serde::json::Json;
 use rocket::State;
 
 use crate::util::polls::now_ms;
-use crate::util::softres::can_see_full;
+use crate::util::softres::{can_see_full, sheet_is_servable};
 
 /// # Fetch Event's Soft-Reserve Sheet
 ///
@@ -43,6 +43,12 @@ pub async fn fetch_event_softres(
     let mut query = DatabasePermissionQuery::new(db, &user).channel(&permission_channel);
     let permissions = calculate_channel_permissions(&mut query).await;
     if !permissions.has_channel_permission(ChannelPermission::ViewChannel) {
+        return Err(create_error!(NotFound));
+    }
+
+    // The sheet of a wipe-pending row answers as "no sheet" does (design
+    // 7.4 "S4"), after the channel visibility check
+    if !sheet_is_servable(db, &channel, &permission_channel, &sheet).await? {
         return Err(create_error!(NotFound));
     }
 

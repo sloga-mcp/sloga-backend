@@ -96,6 +96,26 @@ pub(crate) fn e2ee_removed_devices_index() -> bson::Document {
     }
 }
 
+/// Name of the `mls_history_links` index the history-link routes read
+/// through
+pub(crate) const HISTORY_LINKS_INDEX_NAME: &str = "history_links_by_holder";
+
+/// Serves the history-link fetch (one holder group's links, newest holder
+/// epoch first, `before` an epoch bound) and the per-group delete and byte
+/// cap sums (docs/protected-channels-design.md 2.7 "S4 migration block",
+/// 2.8).
+///
+/// The one spec for this file, the S4 migration block and the tests.
+pub(crate) fn history_links_index() -> bson::Document {
+    doc! {
+        "key": {
+            "group_id": 1_i32,
+            "epoch": -1_i32
+        },
+        "name": HISTORY_LINKS_INDEX_NAME
+    }
+}
+
 pub async fn create_database(db: &MongoDb) {
     info!("Creating database.");
     let db = db.db();
@@ -246,6 +266,10 @@ pub async fn create_database(db: &MongoDb) {
         .await
         .expect("Failed to create mls_join_intents collection.");
 
+    db.create_collection("mls_history_links")
+        .await
+        .expect("Failed to create mls_history_links collection.");
+
     db.create_collection("thread_members")
         .await
         .expect("Failed to create thread_members collection.");
@@ -344,6 +368,16 @@ pub async fn create_database(db: &MongoDb) {
     db.create_collection("channel_seat_lists")
         .await
         .expect("Failed to create channel_seat_lists collection.");
+
+    // Keyed by `_id` (the server id) only (revision 80).
+    db.create_collection("server_legal_holds")
+        .await
+        .expect("Failed to create server_legal_holds collection.");
+
+    // Keyed by `_id` (the channel id) only (revision 80).
+    db.create_collection("history_wipe_leases")
+        .await
+        .expect("Failed to create history_wipe_leases collection.");
     // Prot wallet ledger (revision 76).
     for collection in PROT_COLLECTIONS {
         db.create_collection(collection)
@@ -1423,6 +1457,16 @@ pub async fn create_database(db: &MongoDb) {
     })
     .await
     .expect("Failed to create mls_join_intents index.");
+
+    db.run_command(doc! {
+        "createIndexes": "mls_history_links",
+        "indexes": [
+            // Serves the history-link fetch, delete and byte caps (S4).
+            history_links_index(),
+        ]
+    })
+    .await
+    .expect("Failed to create mls_history_links index.");
 
     db.run_command(doc! {
         "createIndexes": "remote_control_audit",

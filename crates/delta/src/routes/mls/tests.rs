@@ -223,6 +223,7 @@ async fn full_flow_create_join_commit_fanout_case() {
                 supersedes: None,
                 kind: None,
                 generation: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -243,6 +244,7 @@ async fn full_flow_create_join_commit_fanout_case() {
                 supersedes: None,
                 kind: None,
                 generation: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -274,6 +276,7 @@ async fn full_flow_create_join_commit_fanout_case() {
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -505,6 +508,7 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 supersedes: None,
                 kind: None,
                 generation: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -547,6 +551,7 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -590,6 +595,7 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 supersedes: None,
                 kind: None,
                 generation: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -607,6 +613,7 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -626,6 +633,7 @@ async fn rejoin_affordance_flags_and_solo_close_case() {
                 signature: device_a.join_signature(&user_a.id, &solo_gid, "a0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -660,6 +668,7 @@ fn rejoin_outstanding_policy_requires_every_member_fresh() {
             created_at: now.checked_sub(Duration::seconds(age_seconds)).unwrap(),
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 
@@ -741,6 +750,7 @@ async fn dual_reload_rejoin_closes_group_case() {
                 supersedes: None,
                 kind: None,
                 generation: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -760,6 +770,7 @@ async fn dual_reload_rejoin_closes_group_case() {
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -804,6 +815,7 @@ async fn dual_reload_rejoin_closes_group_case() {
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -829,6 +841,7 @@ async fn dual_reload_rejoin_closes_group_case() {
                 signature: device_b.join_signature(&user_b.id, &gid, "b0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -851,6 +864,7 @@ async fn dual_reload_rejoin_closes_group_case() {
                 signature: device_a.join_signature(&user_a.id, &gid, "a0"),
                 generation: None,
                 issued_at: None,
+                protocol: None,
             })
             .unwrap(),
         )
@@ -966,6 +980,7 @@ async fn strangers_without_shared_channel_cannot_claim_or_create_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -984,6 +999,7 @@ async fn strangers_without_shared_channel_cannot_claim_or_create_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1079,6 +1095,7 @@ async fn blocked_pair_in_shared_channel_cannot_claim_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1269,6 +1286,7 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1286,6 +1304,7 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             signature: STANDARD_NO_PAD.encode([0u8; 64]),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1318,6 +1337,7 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
             signature: second_device.join_signature(&user_a.id, &gid, "a20"),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1331,6 +1351,7 @@ async fn join_intent_signature_one_device_and_rate_limit_case() {
         signature: device_b.join_signature(&user_b.id, &gid, "b0"),
         generation: None,
         issued_at: None,
+        protocol: None,
     })
     .unwrap();
 
@@ -1396,6 +1417,7 @@ async fn commit_size_caps_and_welcome_pairing_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1545,6 +1567,7 @@ async fn fanout_skips_devices_over_queue_budget_case() {
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1642,6 +1665,7 @@ async fn seed_group_with_members(
             supersedes: None,
             kind: None,
             generation: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1962,6 +1986,7 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
             ),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -1993,6 +2018,7 @@ async fn join_intent_call_full_boundary_and_rejoin_exemption_case() {
             ),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -2197,6 +2223,7 @@ async fn flag_off_rejects_every_route_case() {
                 supersedes: None,
                 kind: Some(v0::MlsGroupKind::Text),
                 generation: Some(0),
+                protocol: None,
             })
             .unwrap(),
         ),
@@ -2252,6 +2279,7 @@ async fn flag_off_rejects_every_route_case() {
             signature: "a".to_string(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )
@@ -2286,6 +2314,7 @@ async fn flag_off_rejects_every_route_case() {
             signature: "a".to_string(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .unwrap(),
     )

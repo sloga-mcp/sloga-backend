@@ -64,24 +64,20 @@ const EXEMPT: &[(&str, &str)] = &[
         "server channels only: announcement source and follower targets are server text channels",
     ),
     (
-        "channels/message_fetch.rs",
-        "read only: the protected check decides what is served",
-    ),
-    (
         "channels/message_pin.rs",
         "pin flag and its server-written system row",
     ),
     (
-        "channels/message_query.rs",
-        "read only: the protected check decides what is served",
-    ),
-    (
-        "channels/message_search.rs",
-        "read only: the protected check decides what is served",
-    ),
-    (
         "channels/message_unpin.rs",
         "unpin flag and its server-written system row",
+    ),
+    (
+        "channels/poll_end.rs",
+        "closes a poll, writes no message; the protected check refuses a protected channel",
+    ),
+    (
+        "channels/poll_vote.rs",
+        "a ballot, writes no message; the protected check refuses a protected channel",
     ),
     (
         "channels/seats_put.rs",
@@ -164,7 +160,7 @@ pub(super) fn without_test_modules(code: &str) -> String {
             }
         }
 
-        let is_module = ["mod", "pubmod", "pub(crate)mod"]
+        let is_module = ["mod", "pubmod", "pub(crate)mod", "pub(super)mod"]
             .iter()
             .any(|prefix| item.starts_with(*prefix));
         let body = item
@@ -563,6 +559,8 @@ fn without_test_modules_cuts_test_modules_only() {
         "fn after() { w(e2ee_only: Some(false)); }\n",
         "#[cfg(test)]\n",
         "pub(crate) mod more { fn e() { v(e2ee_only: Some(true)); } }\n",
+        "#[cfg(test)]\n",
+        "pub(super) mod fixture { fn f() { u(e2ee_only: Some(true)); } }\n",
     ));
     let kept = without_test_modules(&code);
     assert_eq!(kept.matches("e2ee_only:Some(").count(), 2, "{}", kept);
@@ -571,4 +569,5 @@ fn without_test_modules_cuts_test_modules_only() {
     assert!(kept.contains("#[cfg(test)]usez;"), "{}", kept);
     assert!(!kept.contains("fnb()"), "{}", kept);
     assert!(!kept.contains("fne()"), "{}", kept);
+    assert!(!kept.contains("fnf()"), "{}", kept);
 }
