@@ -28,7 +28,7 @@ use crate::{
     events::client::EventV1, upload_hash_block_key, AuditLogAction, AuditLogChange, AuditLogDraft,
     AuditLogEntry, AuditValue, Database, EmojiParent, FieldsServer, FieldsUser, File,
     FileUsedForType, HeldFile, Message, PartialMessage, PartialServer, PartialUser,
-    TakedownRequest, TakedownTarget, UploadHashBlock,
+    ProtectedReadView, TakedownRequest, TakedownTarget, UploadHashBlock,
 };
 
 /// What a reviewer chose to remove
@@ -1013,6 +1013,18 @@ async fn record_system_delete(db: &Database, message_id: &str, channel_id: &str,
     .await;
 }
 
+/// Whether `message` is served by its channel's read view (design 7.5 "S4";
+/// a thread is judged by its parent). False when either channel read fails.
+async fn is_served(db: &Database, message: &Message) -> bool {
+    let Ok(channel) = db.fetch_channel(&message.channel).await else {
+        return false;
+    };
+    let Ok(target) = channel.permission_target(db).await else {
+        return false;
+    };
+    message.is_servable(&ProtectedReadView::of_read_target(&channel, &target))
+}
+
 /// After files left a message: delete it when asked to or when nothing is
 /// left of it, otherwise tell clients what it shows now. `lost_files` is
 /// false for a target message nothing was taken from. True when deleted.
@@ -1036,7 +1048,9 @@ async fn finish_message(db: &Database, id: &str, whole: bool, lost_files: bool) 
         return Ok(true);
     }
 
-    if lost_files {
+    // No update for a row its channel no longer serves (S4: a stray, or a
+    // row a requested wipe is deleting); clients must not see it again
+    if lost_files && is_served(db, &message).await {
         EventV1::MessageUpdate {
             id: message.id.clone(),
             channel: message.channel.clone(),
@@ -1304,6 +1318,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -1834,6 +1849,152 @@ mod tests {
             // Nothing was hidden or recorded
             assert_eq!(flags(&db, TARGET_FILE).await, (None, None));
             assert!(request.held_files.is_empty());
+        });
+    }
+
+    /// A fresh text channel holding one captioned message with one image,
+    /// as (channel, message, file). With a history from `protect` (given
+    /// the message id) the channel is then protected with it.
+    async fn captioned_image(
+        db: &Database,
+        hash: &str,
+        protect: impl FnOnce(&str) -> Option<crate::ProtectedHistory>,
+    ) -> (String, String, String) {
+        let channel_id = ulid::Ulid::new().to_string();
+        let message_id = ulid::Ulid::new().to_string();
+        let file_id = ulid::Ulid::new().to_string();
+
+        let mut channel = text_channel();
+        if let Channel::TextChannel { id, .. } = &mut channel {
+            *id = channel_id.clone();
+        }
+        db.insert_channel(&channel).await.unwrap();
+        db.insert_attachment_hash(&file_hash(hash, &format!("{hash}-proc")))
+            .await
+            .unwrap();
+        let image = file(
+            &file_id,
+            "attachments",
+            hash,
+            (FileUsedForType::Message, message_id.as_str()),
+            AUTHOR,
+        );
+        db.insert_attachment(&image).await.unwrap();
+        db.insert_message(&Message {
+            channel: channel_id.clone(),
+            ..message(&message_id, Some("caption"), vec![image])
+        })
+        .await
+        .unwrap();
+
+        if let Some(history) = protect(&message_id) {
+            db.update_channel(
+                &channel_id,
+                &crate::PartialChannel {
+                    protected: Some(true),
+                    protected_history: Some(Box::new(history)),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        (channel_id, message_id, file_id)
+    }
+
+    /// A removal from a row its channel's S4 read view does not serve (a
+    /// requested wipe; a stray above the boundary) still takes the file but
+    /// publishes no `MessageUpdate`. A served row's update is published as
+    /// before: that is the positive control, which also proves the
+    /// subscription receives. Needs Redis at `REDIS_URI`.
+    ///
+    /// Control: the `is_served` check dropped -> two extra updates.
+    #[tokio::test]
+    async fn removal_publishes_no_update_for_a_row_its_channel_does_not_serve() {
+        database_test!(|db| async move {
+            use crate::events::client::EventV1;
+            use futures::StreamExt;
+
+            let wiping = captioned_image(&db, "hash-unserved-wipe", |id: &str| {
+                Some(crate::ProtectedHistory {
+                    boundary: id.to_string(),
+                    wipe: crate::HistoryWipe::Requested {
+                        at: Timestamp::now_utc(),
+                        by: AUTHOR.to_string(),
+                    },
+                })
+            })
+            .await;
+            let stray = captioned_image(&db, "hash-unserved-stray", |_: &str| {
+                Some(crate::ProtectedHistory {
+                    boundary: ulid::Ulid::from_parts(0, 1).to_string(),
+                    wipe: crate::HistoryWipe::None,
+                })
+            })
+            .await;
+            let served = captioned_image(&db, "hash-served", |_: &str| None).await;
+
+            // Fresh channel ids, so nothing else publishes on these topics
+            let mut pubsub = redis_kiss::open_pubsub_connection()
+                .await
+                .expect("pubsub connection");
+            for (channel, _, _) in [&wiping, &stray, &served] {
+                pubsub.subscribe(channel).await.expect("subscribe");
+            }
+            let mut stream = pubsub.on_message();
+
+            // The served one last, so its event comes after any other
+            for (channel, message, file) in [&wiping, &stray, &served] {
+                let mut request = request(vec![TakedownTarget::Message {
+                    channel: channel.clone(),
+                    message: message.clone(),
+                }]);
+                let outcome = execute_removal(
+                    &db,
+                    &mut request,
+                    &plan(false, false, false),
+                    "01TDREVIEWER00000000000001",
+                )
+                .await
+                .unwrap();
+                assert_eq!(outcome.removed_files, vec![file.clone()], "{channel}");
+                assert!(outcome.deleted_messages.is_empty(), "{channel}");
+                assert_eq!(flags(&db, file).await, (Some(true), Some(true)), "{file}");
+                let row = db.fetch_message(message).await.unwrap();
+                assert!(attachment_ids(&row).is_empty(), "{message} keeps its file");
+            }
+
+            // Wait for the served update, then a second for anything after
+            let mut seen: Vec<(String, String)> = Vec::new();
+            let mut served_seen = false;
+            loop {
+                let wait = std::time::Duration::from_secs(if served_seen { 1 } else { 5 });
+                let msg = match tokio::time::timeout(wait, stream.next()).await {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => break,
+                    Err(_) if served_seen => break,
+                    Err(_) => panic!(
+                        "positive control: no MessageUpdate for the served row (is Redis at REDIS_URI up?)"
+                    ),
+                };
+                let topic = msg.get_channel_name().to_string();
+                let event = redis_kiss::decode_payload::<EventV1>(&msg)
+                    .expect("undecodable payload on a channel topic");
+                match event {
+                    EventV1::MessageUpdate { id, .. } => {
+                        served_seen |= id == served.1;
+                        seen.push((topic, id));
+                    }
+                    other => seen.push((topic, format!("{other:?}"))),
+                }
+            }
+            assert_eq!(
+                seen,
+                vec![(served.0.clone(), served.1.clone())],
+                "an update for an unserved row, or an unexpected event"
+            );
         });
     }
 }

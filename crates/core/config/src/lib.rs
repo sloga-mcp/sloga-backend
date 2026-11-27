@@ -913,6 +913,131 @@ impl std::fmt::Debug for ApiStripe {
     }
 }
 
+/// App Store Server API + notification verification (S6). Secrets only in Revolt.overrides.toml / env
+/// (REVOLT__API__APPSTORE__PRIVATE_KEY). Debug is hand-written: private_key never printed.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct ApiAppStore {
+    pub issuer_id: String,
+    pub key_id: String,
+    /// In-App Purchase key, PEM (PKCS#8 EC P-256)
+    pub private_key: String,
+    /// Default "gg.sloga.app"
+    pub bundle_id: String,
+    /// Default 6809989506
+    pub app_apple_id: u64,
+    /// "Production" | "Sandbox": the deployment's own environment
+    pub environment: String,
+    /// SHA-256 hex of Apple Root CA - G3 (DER). A literal here (config does
+    /// not depend on payments); the payments crate pins it equal to
+    /// `APPLE_ROOT_G3_SHA256_HEX`
+    pub root_ca_g3_sha256: String,
+}
+
+impl Default for ApiAppStore {
+    fn default() -> Self {
+        Self {
+            issuer_id: String::new(),
+            key_id: String::new(),
+            private_key: String::new(),
+            bundle_id: "gg.sloga.app".to_string(),
+            app_apple_id: 6809989506,
+            environment: "Production".to_string(),
+            root_ca_g3_sha256: "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179"
+                .to_string(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiAppStore {
+    /// Same output as the derive, except `private_key` prints as
+    /// `"<redacted>"` (or `"<unset>"` when empty)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiAppStore {
+            issuer_id,
+            key_id,
+            private_key,
+            bundle_id,
+            app_apple_id,
+            environment,
+            root_ca_g3_sha256,
+        } = self;
+
+        f.debug_struct("ApiAppStore")
+            .field("issuer_id", issuer_id)
+            .field("key_id", key_id)
+            .field("private_key", &redact_store_key(private_key))
+            .field("bundle_id", bundle_id)
+            .field("app_apple_id", app_apple_id)
+            .field("environment", environment)
+            .field("root_ca_g3_sha256", root_ca_g3_sha256)
+            .finish()
+    }
+}
+
+/// Google Play Developer API + RTDN (S6). Secrets only in Revolt.overrides.toml / env
+/// (REVOLT__API__GOOGLEPLAY__PRIVATE_KEY). Debug is hand-written: private_key never printed.
+#[derive(Deserialize, Clone)]
+#[serde(default)]
+pub struct ApiGooglePlay {
+    /// Default "gg.sloga.app"
+    pub package_name: String,
+    pub client_email: String,
+    /// Service-account key, PEM (PKCS#8 RSA)
+    pub private_key: String,
+    /// Default "https://oauth2.googleapis.com/token"
+    pub token_uri: String,
+    /// "projects/{p}/subscriptions/{s}"; empty = RTDN not pulled
+    pub pubsub_subscription: String,
+}
+
+impl Default for ApiGooglePlay {
+    fn default() -> Self {
+        Self {
+            package_name: "gg.sloga.app".to_string(),
+            client_email: String::new(),
+            private_key: String::new(),
+            token_uri: "https://oauth2.googleapis.com/token".to_string(),
+            pubsub_subscription: String::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiGooglePlay {
+    /// Same output as the derive, except `private_key` prints as
+    /// `"<redacted>"` (or `"<unset>"` when empty)
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Exhaustive destructure: a new field fails to compile until it is
+        // either printed or deliberately redacted here
+        let ApiGooglePlay {
+            package_name,
+            client_email,
+            private_key,
+            token_uri,
+            pubsub_subscription,
+        } = self;
+
+        f.debug_struct("ApiGooglePlay")
+            .field("package_name", package_name)
+            .field("client_email", client_email)
+            .field("private_key", &redact_store_key(private_key))
+            .field("token_uri", token_uri)
+            .field("pubsub_subscription", pubsub_subscription)
+            .finish()
+    }
+}
+
+/// What the store Debug impls print for a private key
+fn redact_store_key(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<unset>"
+    } else {
+        "<redacted>"
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 pub struct Api {
     pub registration: ApiRegistration,
@@ -937,6 +1062,10 @@ pub struct Api {
     pub gamedata: ApiGamedata,
     #[serde(default)]
     pub stripe: ApiStripe,
+    #[serde(default)]
+    pub appstore: ApiAppStore,
+    #[serde(default)]
+    pub googleplay: ApiGooglePlay,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1495,6 +1624,8 @@ pub struct ProtectionFeatures {
     pub contribute_hold_hours: u32,
     /// Most Prot one wallet may hold
     pub wallet_cap: i64,
+    /// Longest launch goal, in days (S5b; at most 3650)
+    pub max_launch_goal_days: u32,
 }
 
 impl Default for ProtectionFeatures {
@@ -1530,6 +1661,7 @@ impl Default for ProtectionFeatures {
             withdraw_cutoff_hours: 48,
             contribute_hold_hours: 72,
             wallet_cap: 100000,
+            max_launch_goal_days: 365,
         }
     }
 }
@@ -1803,6 +1935,23 @@ pub struct FeaturePayments {
     pub prot_cancel_url: String,
     /// Where Checkout returns a shell buyer of Prot, on success AND cancel
     pub prot_shell_return_url: String,
+    /// In-app Prot (S6). Each store's sales switch: new intents only (verify and refunds never read it)
+    pub prot_store_apple_open: bool,
+    pub prot_store_play_open: bool,
+    /// Emergency switch (E9): verified purchases are recorded Held and credited by crond when turned off
+    pub prot_store_credit_paused: bool,
+    /// Store product id -> Prot per unit (S6 design section 4); a Prot change is a NEW product id
+    pub prot_store_products: Vec<ProtStoreProductConfig>,
+    /// Accounts that see packs and are credited while a store is closed (E3)
+    pub prot_store_preview_user_ids: Vec<String>,
+    /// Accounts whose sandbox / test purchases are credited on this server (E4)
+    pub prot_store_test_user_ids: Vec<String>,
+    pub prot_store_test_max_prot: i64,
+    /// E8: the US iPhone app may link to web checkout (off at launch). S6 ships the flag and the advert field
+    /// ONLY; no client button or link code exists in S6 (owner Q5)
+    pub prot_store_us_web_link: bool,
+    /// Staff alert mailbox for store work items; empty = log only
+    pub ops_alert_email: String,
 }
 
 /// One Prot pack in `[features.payments] prot_packs`: `cents` is the price,
@@ -1819,6 +1968,26 @@ impl ProtPackConfig {
         Self {
             id: id.to_string(),
             cents,
+            prot,
+        }
+    }
+}
+
+/// One in-app product in `[features.payments] prot_store_products`: `store`
+/// is "apple" or "play", `prot` what one unit credits. Prices live in the
+/// store consoles only; the payments config validates the table
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProtStoreProductConfig {
+    pub store: String,
+    pub product_id: String,
+    pub prot: i64,
+}
+
+impl ProtStoreProductConfig {
+    fn new(store: &str, product_id: &str, prot: i64) -> Self {
+        Self {
+            store: store.to_string(),
+            product_id: product_id.to_string(),
             prot,
         }
     }
@@ -1886,6 +2055,26 @@ impl Default for FeaturePayments {
             prot_success_url: "https://app.sloga.gg/settings?prot=success".to_string(),
             prot_cancel_url: "https://app.sloga.gg/settings?prot=cancel".to_string(),
             prot_shell_return_url: "https://sloga.gg/prot/thanks/".to_string(),
+            prot_store_apple_open: false,
+            prot_store_play_open: false,
+            prot_store_credit_paused: false,
+            prot_store_products: vec![
+                ProtStoreProductConfig::new("apple", "gg.sloga.prot.p5", 500),
+                ProtStoreProductConfig::new("apple", "gg.sloga.prot.p10", 1000),
+                ProtStoreProductConfig::new("apple", "gg.sloga.prot.p25", 2600),
+                ProtStoreProductConfig::new("apple", "gg.sloga.prot.p50", 5300),
+                ProtStoreProductConfig::new("apple", "gg.sloga.prot.p100", 11000),
+                ProtStoreProductConfig::new("play", "gg.sloga.prot.p5", 500),
+                ProtStoreProductConfig::new("play", "gg.sloga.prot.p10", 1000),
+                ProtStoreProductConfig::new("play", "gg.sloga.prot.p25", 2600),
+                ProtStoreProductConfig::new("play", "gg.sloga.prot.p50", 5300),
+                ProtStoreProductConfig::new("play", "gg.sloga.prot.p100", 11000),
+            ],
+            prot_store_preview_user_ids: Vec::new(),
+            prot_store_test_user_ids: Vec::new(),
+            prot_store_test_max_prot: 25000,
+            prot_store_us_web_link: false,
+            ops_alert_email: String::new(),
         }
     }
 }
@@ -1944,6 +2133,32 @@ pub struct ProtectedChannelFeatures {
     /// one more is refused with `InSlowmode`
     #[serde(default = "ProtectedChannelFeatures::default_successor_rate_per_day")]
     pub successor_rate_per_day: u32,
+    /// Rollout gate for the S4 history setting (7.1 "S4", S4-PA-9): the
+    /// history-link PUT, a non-empty boundary at protect, a `wiped` list
+    /// and the wipe route all need it on. The history-link GET does not.
+    /// Flip it once every protected device runs S4. Carried in the root
+    /// advert
+    #[serde(default)]
+    pub history_setting: bool,
+    /// Per holder group cap on stored history links, in decoded ciphertext
+    /// bytes summed over the group's rows (S4-D6; 64 MiB)
+    #[serde(default = "ProtectedChannelFeatures::default_history_link_group_cap_bytes")]
+    pub history_link_group_cap_bytes: u64,
+    /// Per writer user cap within one holder group, in decoded ciphertext
+    /// bytes (S4-RR-1): the group cap over the five candidate slots
+    #[serde(default = "ProtectedChannelFeatures::default_history_link_user_cap_bytes")]
+    pub history_link_user_cap_bytes: u64,
+    /// Plaintext rows deleted per batch of the history wipe job (S4-D22).
+    /// Read it through `history_wipe_batch_size()`, which treats 0 as 1 so
+    /// a misconfigured batch still makes progress
+    #[serde(default = "ProtectedChannelFeatures::default_history_wipe_batch")]
+    pub history_wipe_batch: u32,
+    /// iPhone-only server off switch for protected channels (S8-O5). Off,
+    /// iPhone clients keep protected channels closed whatever `enabled`
+    /// says; the global flags still stop every platform. Enforced by the
+    /// client gate, not the server. Carried in the root advert
+    #[serde(default)]
+    pub ios: bool,
 }
 
 impl Default for ProtectedChannelFeatures {
@@ -1956,11 +2171,34 @@ impl Default for ProtectedChannelFeatures {
             reconcile_sweep_secs: Self::default_reconcile_sweep_secs(),
             text_rejoin_window_secs: Self::default_text_rejoin_window_secs(),
             successor_rate_per_day: Self::default_successor_rate_per_day(),
+            history_setting: false,
+            history_link_group_cap_bytes: Self::default_history_link_group_cap_bytes(),
+            history_link_user_cap_bytes: Self::default_history_link_user_cap_bytes(),
+            history_wipe_batch: Self::default_history_wipe_batch(),
+            ios: false,
         }
     }
 }
 
 impl ProtectedChannelFeatures {
+    /// Rows per history wipe batch, never below 1 (a batch of 0 would let
+    /// the job run forever deleting nothing)
+    pub fn history_wipe_batch_size(&self) -> u32 {
+        self.history_wipe_batch.max(1)
+    }
+
+    fn default_history_link_group_cap_bytes() -> u64 {
+        67108864
+    }
+
+    fn default_history_link_user_cap_bytes() -> u64 {
+        13421772
+    }
+
+    fn default_history_wipe_batch() -> u32 {
+        1000
+    }
+
     fn default_device_cap() -> u32 {
         5
     }
@@ -4181,6 +4419,16 @@ mod protected_channels_config_tests {
         assert_eq!(protected.successor_rate_per_day, 10);
     }
 
+    /// The S4 keys (and the S8-O5 switch) at their design 7.1 values
+    fn assert_s4_defaults(protected: &ProtectedChannelFeatures) {
+        assert!(!protected.history_setting);
+        assert_eq!(protected.history_link_group_cap_bytes, 67108864);
+        assert_eq!(protected.history_link_user_cap_bytes, 13421772);
+        assert_eq!(protected.history_wipe_batch, 1000);
+        assert_eq!(protected.history_wipe_batch_size(), 1000);
+        assert!(!protected.ios);
+    }
+
     #[test]
     fn hand_written_defaults_have_the_documented_values() {
         let protected = ProtectedChannelFeatures::default();
@@ -4188,6 +4436,19 @@ mod protected_channels_config_tests {
         assert_eq!(protected.default_device_cap, 5);
         assert_eq!(protected.commit_retention_days, 30);
         assert_s2_defaults(&protected);
+        assert_s4_defaults(&protected);
+    }
+
+    /// The per-user cap is the group cap over the five candidate slots
+    /// (7.1 "S4", #283 (d))
+    #[test]
+    fn the_history_link_user_cap_is_a_fifth_of_the_group_cap() {
+        let protected = ProtectedChannelFeatures::default();
+        assert_eq!(protected.history_link_user_cap_bytes, 67108864 / 5);
+        assert_eq!(
+            protected.history_link_user_cap_bytes,
+            protected.history_link_group_cap_bytes / 5
+        );
     }
 
     /// An S1 overrides block names none of the S2 keys: it still loads, and
@@ -4201,6 +4462,137 @@ mod protected_channels_config_tests {
         assert_eq!(protected.default_device_cap, 7);
         assert_eq!(protected.commit_retention_days, 14);
         assert_s2_defaults(&protected);
+        assert_s4_defaults(&protected);
+    }
+
+    /// An S2 overrides block names none of the S4 keys: each takes its own
+    /// default, so the history setting and the iPhone switch stay off
+    #[test]
+    fn an_s2_block_takes_the_s4_defaults() {
+        let protected = layered(
+            "[features.protected_channels]\nenabled = true\nformats_v2 = true\nsuccessor_rate_per_day = 3\n",
+        );
+        assert!(protected.enabled);
+        assert!(protected.formats_v2);
+        assert_eq!(protected.successor_rate_per_day, 3);
+        assert_s4_defaults(&protected);
+    }
+
+    #[test]
+    fn a_toml_override_sets_each_s4_key() {
+        let protected = layered(
+            "[features.protected_channels]\nhistory_setting = true\nhistory_link_group_cap_bytes = 1048576\nhistory_link_user_cap_bytes = 4096\nhistory_wipe_batch = 25\nios = true\n",
+        );
+        assert!(protected.history_setting);
+        assert_eq!(protected.history_link_group_cap_bytes, 1048576);
+        assert_eq!(protected.history_link_user_cap_bytes, 4096);
+        assert_eq!(protected.history_wipe_batch, 25);
+        assert_eq!(protected.history_wipe_batch_size(), 25);
+        assert!(protected.ios);
+        // The keys it does not name keep theirs
+        assert!(!protected.enabled);
+        assert_eq!(protected.default_device_cap, 5);
+        assert_eq!(protected.commit_retention_days, 30);
+        assert_s2_defaults(&protected);
+
+        // Each key alone moves only that key
+        type Moved = fn(&ProtectedChannelFeatures) -> bool;
+        let cases: [(&str, Moved); 5] = [
+            ("history_setting = true", |p| p.history_setting),
+            ("history_link_group_cap_bytes = 7", |p| {
+                p.history_link_group_cap_bytes == 7
+            }),
+            ("history_link_user_cap_bytes = 7", |p| {
+                p.history_link_user_cap_bytes == 7
+            }),
+            ("history_wipe_batch = 7", |p| p.history_wipe_batch == 7),
+            ("ios = true", |p| p.ios),
+        ];
+        for (line, moved) in cases {
+            let protected = layered(&format!("[features.protected_channels]\n{line}\n"));
+            assert!(moved(&protected), "{line} did not take");
+            let defaults = ProtectedChannelFeatures::default();
+            let unchanged = [
+                (
+                    "history_setting",
+                    protected.history_setting == defaults.history_setting,
+                ),
+                (
+                    "history_link_group_cap_bytes",
+                    protected.history_link_group_cap_bytes == defaults.history_link_group_cap_bytes,
+                ),
+                (
+                    "history_link_user_cap_bytes",
+                    protected.history_link_user_cap_bytes == defaults.history_link_user_cap_bytes,
+                ),
+                (
+                    "history_wipe_batch",
+                    protected.history_wipe_batch == defaults.history_wipe_batch,
+                ),
+                ("ios", protected.ios == defaults.ios),
+            ];
+            for (key, same) in unchanged {
+                assert!(same || line.starts_with(key), "{line} moved {key}");
+            }
+            assert!(!protected.enabled, "{line}");
+            assert_s2_defaults(&protected);
+        }
+    }
+
+    /// The wipe batch is read through `history_wipe_batch_size()`: 0 is
+    /// treated as 1 so the job still makes progress; any other value passes
+    /// through untouched
+    #[test]
+    fn the_wipe_batch_size_is_never_zero() {
+        let protected = layered("[features.protected_channels]\nhistory_wipe_batch = 0\n");
+        assert_eq!(protected.history_wipe_batch, 0);
+        assert_eq!(protected.history_wipe_batch_size(), 1);
+
+        for batch in [1, 2, 1000, u32::MAX] {
+            let protected = ProtectedChannelFeatures {
+                history_wipe_batch: batch,
+                ..Default::default()
+            };
+            assert_eq!(protected.history_wipe_batch_size(), batch);
+        }
+    }
+
+    /// The documented env form (double underscores) reaches the S4 keys
+    #[test]
+    fn environment_override_reaches_the_s4_keys() {
+        let vars: HashMap<String, String> = [
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_SETTING",
+                "true",
+            ),
+            ("REVOLT__FEATURES__PROTECTED_CHANNELS__IOS", "true"),
+            (
+                "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_WIPE_BATCH",
+                "50",
+            ),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(embedded())
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let protected = &settings.features.protected_channels;
+        assert!(protected.history_setting);
+        assert!(protected.ios);
+        assert_eq!(protected.history_wipe_batch, 50);
+        assert_eq!(protected.history_link_group_cap_bytes, 67108864);
+        assert_eq!(protected.history_link_user_cap_bytes, 13421772);
+        assert!(!protected.enabled);
     }
 
     #[test]
@@ -4216,6 +4608,7 @@ mod protected_channels_config_tests {
         assert!(!protected.enabled);
         assert_eq!(protected.default_device_cap, 5);
         assert_eq!(protected.commit_retention_days, 30);
+        assert_s4_defaults(&protected);
 
         // One key alone moves only that key
         let protected = layered("[features.protected_channels]\nformats_v2 = true\n");
@@ -4277,11 +4670,14 @@ mod protected_channels_config_tests {
             30
         );
         assert_s2_defaults(&settings.features.protected_channels);
+        assert_s4_defaults(&settings.features.protected_channels);
     }
 
     /// The test config turns growth on, on top of the E2EE plane it needs,
     /// so the W2 route tests run with the feature live. `formats_v2` stays
     /// off there: the existing route tests protect with a v1 genesis.
+    /// `history_setting` stays off too: an S4 test turns it on for itself
+    /// with `overwrite_config`.
     #[test]
     fn the_test_config_turns_growth_on() {
         let settings: Settings = Config::builder()
@@ -4303,6 +4699,7 @@ mod protected_channels_config_tests {
             30
         );
         assert_s2_defaults(&settings.features.protected_channels);
+        assert_s4_defaults(&settings.features.protected_channels);
     }
 }
 
@@ -5646,7 +6043,7 @@ mod prot_config_tests {
 
         // Every key is in the block, or the comparison below proves little
         let documented = block.lines().filter(|line| line.contains(" = ")).count();
-        assert_eq!(documented, 20, "the documented block lists every key");
+        assert_eq!(documented, 21, "the documented block lists every key");
 
         let protection = settings(&[block.as_str()]).features.boosts.protection;
         let expected = ProtectionFeatures::default();
@@ -5664,6 +6061,7 @@ mod prot_config_tests {
         assert!(!protection.cipher_grants_enabled);
         let expected = ProtectionFeatures {
             enabled: true,
+            self_serve_enabled: true,
             ..Default::default()
         };
         assert_eq!(format!("{protection:?}"), format!("{expected:?}"));
@@ -5858,6 +6256,532 @@ prot_shell_return_url = "https://example.test/prot/thanks/"
         assert_eq!(payments.prot_blocked_countries, ["DE", "FR"]);
         assert_eq!(payments.prot_packs, default_packs());
         assert!(!settings.features.boosts.enabled);
+    }
+}
+
+// In-app Prot (S6): `[api.appstore]`, `[api.googleplay]` and the
+// `prot_store_*` keys of `[features.payments]`. Built from in-process sources
+// only, like the modules above. The two store structs have no PartialEq, and
+// their Debug redacts the key, so whole values are compared through Debug
+// with the keys checked separately.
+#[cfg(test)]
+mod prot_store_config_tests {
+    use std::collections::HashMap;
+
+    use config::{Config, ConfigError, Environment, File, FileFormat};
+
+    use super::{ApiAppStore, ApiGooglePlay, FeaturePayments, ProtStoreProductConfig, Settings};
+
+    const APPSTORE_KEY: &str = concat!(
+        "-----BEGIN PRIVATE",
+        " KEY-----s6w1L1aFakeAppStoreKeyNotARealKey-----END PRIVATE KEY-----"
+    );
+    const GOOGLEPLAY_KEY: &str = concat!(
+        "-----BEGIN PRIVATE",
+        " KEY-----s6w1L1aFakeGooglePlayKeyNotARealKey-----END PRIVATE KEY-----"
+    );
+    /// The distinctive middle of each key: a derived Debug escapes nothing in
+    /// it, so its absence is the real proof
+    const APPSTORE_KEY_BODY: &str = "s6w1L1aFakeAppStoreKeyNotARealKey";
+    const GOOGLEPLAY_KEY_BODY: &str = "s6w1L1aFakeGooglePlayKeyNotARealKey";
+    const G3_SHA256: &str = "63343abfb89a6a03ebb57e9b3f5fa7be7c4f5c756f3017b3a8c488c3653e9179";
+
+    /// The embedded Revolt.toml with each overlay layered on top, in order
+    fn layered(overlays: &[&str]) -> Result<Settings, ConfigError> {
+        let embedded = File::from_str(include_str!("../Revolt.toml"), FileFormat::Toml);
+        let mut builder = Config::builder().add_source(embedded);
+        for overlay in overlays {
+            builder = builder.add_source(File::from_str(overlay, FileFormat::Toml));
+        }
+        builder.build()?.try_deserialize()
+    }
+
+    fn settings(overlays: &[&str]) -> Settings {
+        layered(overlays).expect("the layered config deserializes")
+    }
+
+    fn product(store: &str, product_id: &str, prot: i64) -> ProtStoreProductConfig {
+        ProtStoreProductConfig {
+            store: store.to_string(),
+            product_id: product_id.to_string(),
+            prot,
+        }
+    }
+
+    /// Section 4 of the S6 contracts: five products, the same ids on both
+    /// stores, crediting the web packs' Prot
+    fn default_store_products() -> Vec<ProtStoreProductConfig> {
+        let mut rows = Vec::new();
+        for store in ["apple", "play"] {
+            rows.push(product(store, "gg.sloga.prot.p5", 500));
+            rows.push(product(store, "gg.sloga.prot.p10", 1000));
+            rows.push(product(store, "gg.sloga.prot.p25", 2600));
+            rows.push(product(store, "gg.sloga.prot.p50", 5300));
+            rows.push(product(store, "gg.sloga.prot.p100", 11000));
+        }
+        rows
+    }
+
+    fn assert_appstore_defaults(appstore: &ApiAppStore) {
+        assert!(appstore.issuer_id.is_empty());
+        assert!(appstore.key_id.is_empty());
+        assert!(appstore.private_key.is_empty());
+        assert_eq!(appstore.bundle_id, "gg.sloga.app");
+        assert_eq!(appstore.app_apple_id, 6809989506);
+        assert_eq!(appstore.environment, "Production");
+        assert_eq!(appstore.root_ca_g3_sha256, G3_SHA256);
+    }
+
+    fn assert_googleplay_defaults(googleplay: &ApiGooglePlay) {
+        assert_eq!(googleplay.package_name, "gg.sloga.app");
+        assert!(googleplay.client_email.is_empty());
+        assert!(googleplay.private_key.is_empty());
+        assert_eq!(googleplay.token_uri, "https://oauth2.googleapis.com/token");
+        assert!(googleplay.pubsub_subscription.is_empty());
+    }
+
+    /// Both stores closed, crediting on, every list empty
+    fn assert_store_payments_defaults(payments: &FeaturePayments) {
+        assert!(!payments.prot_store_apple_open);
+        assert!(!payments.prot_store_play_open);
+        assert!(!payments.prot_store_credit_paused);
+        assert_eq!(payments.prot_store_products, default_store_products());
+        assert!(payments.prot_store_preview_user_ids.is_empty());
+        assert!(payments.prot_store_test_user_ids.is_empty());
+        assert_eq!(payments.prot_store_test_max_prot, 25000);
+        assert!(!payments.prot_store_us_web_link);
+        assert_eq!(payments.ops_alert_email, "");
+    }
+
+    /// The lines of one table of the embedded Revolt.toml, header excluded
+    fn embedded_table(header: &str) -> String {
+        let lines: Vec<&str> = include_str!("../Revolt.toml")
+            .lines()
+            .skip_while(|line| *line != header)
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .collect();
+        assert!(!lines.is_empty(), "{header} is missing from Revolt.toml");
+        lines.join("\n")
+    }
+
+    fn keys_in(block: &str) -> usize {
+        block
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#') && line.contains(" = "))
+            .filter(|line| !line.trim_start().starts_with('{'))
+            .count()
+    }
+
+    #[test]
+    fn hand_written_store_defaults_ship_dark() {
+        assert_appstore_defaults(&ApiAppStore::default());
+        assert_googleplay_defaults(&ApiGooglePlay::default());
+        assert_store_payments_defaults(&FeaturePayments::default());
+    }
+
+    /// The default table is the 10 rows of section 4: each (store, id) once,
+    /// both stores carrying the same five ids, every amount one of the web
+    /// packs and within 1..=100,000 (the bounds the payments config enforces)
+    #[test]
+    fn default_store_products_are_well_formed() {
+        let payments = FeaturePayments::default();
+        let rows = &payments.prot_store_products;
+        assert_eq!(rows.len(), 10);
+
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for row in rows {
+            let key = (row.store.as_str(), row.product_id.as_str());
+            assert!(!seen.contains(&key), "{key:?} repeats");
+            seen.push(key);
+
+            assert!(
+                row.store == "apple" || row.store == "play",
+                "{} is not a store",
+                row.store
+            );
+            assert!(
+                (1..=100_000).contains(&row.prot),
+                "{key:?} credits {}",
+                row.prot
+            );
+            let pack = row
+                .product_id
+                .strip_prefix("gg.sloga.prot.")
+                .expect("ids are gg.sloga.prot.<pack>");
+            let web = payments
+                .prot_packs
+                .iter()
+                .find(|p| p.id == pack)
+                .unwrap_or_else(|| panic!("{key:?} names no web pack"));
+            assert_eq!(row.prot, web.prot, "{key:?} differs from the web pack");
+        }
+
+        let apple: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.store == "apple")
+            .map(|row| row.product_id.as_str())
+            .collect();
+        let play: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.store == "play")
+            .map(|row| row.product_id.as_str())
+            .collect();
+        assert_eq!(apple, play);
+    }
+
+    /// The embedded tables ship the same dark defaults as the code
+    #[test]
+    fn embedded_store_tables_match_the_code_defaults() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .build()
+            .expect("the embedded Revolt.toml builds");
+        // The tables are really there, or this test only re-checks Default
+        assert!(config.get_table("api.appstore").is_ok());
+        assert!(config.get_table("api.googleplay").is_ok());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("the embedded Revolt.toml deserializes");
+        assert_appstore_defaults(&settings.api.appstore);
+        assert_googleplay_defaults(&settings.api.googleplay);
+        assert_store_payments_defaults(&settings.features.payments);
+    }
+
+    /// Each documented block, read on its own, parses to exactly the code
+    /// defaults, and lists every key (a key missing from the block would
+    /// silently take its default, so the count is what proves completeness)
+    #[test]
+    fn documented_store_blocks_match_the_code_defaults() {
+        let block = embedded_table("[api.appstore]");
+        assert_eq!(keys_in(&block), 7, "[api.appstore] lists every key");
+        let appstore: ApiAppStore = Config::builder()
+            .add_source(File::from_str(&block, FileFormat::Toml))
+            .build()
+            .expect("[api.appstore] builds")
+            .try_deserialize()
+            .expect("[api.appstore] deserializes");
+        assert!(appstore.private_key.is_empty());
+        assert_eq!(
+            format!("{appstore:?}"),
+            format!("{:?}", ApiAppStore::default())
+        );
+
+        let block = embedded_table("[api.googleplay]");
+        assert_eq!(keys_in(&block), 5, "[api.googleplay] lists every key");
+        let googleplay: ApiGooglePlay = Config::builder()
+            .add_source(File::from_str(&block, FileFormat::Toml))
+            .build()
+            .expect("[api.googleplay] builds")
+            .try_deserialize()
+            .expect("[api.googleplay] deserializes");
+        assert!(googleplay.private_key.is_empty());
+        assert_eq!(
+            format!("{googleplay:?}"),
+            format!("{:?}", ApiGooglePlay::default())
+        );
+
+        // The store keys of [features.payments], from the first to the last
+        let payments = embedded_table("[features.payments]");
+        let block = payments
+            .lines()
+            .skip_while(|line| !line.starts_with("prot_store_apple_open = "))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(keys_in(&block), 9, "the store keys are all documented");
+        let parsed: FeaturePayments = Config::builder()
+            .add_source(File::from_str(&block, FileFormat::Toml))
+            .build()
+            .expect("the store keys build")
+            .try_deserialize()
+            .expect("the store keys deserialize");
+        let expected = FeaturePayments::default();
+        assert_eq!(parsed.prot_store_apple_open, expected.prot_store_apple_open);
+        assert_eq!(parsed.prot_store_play_open, expected.prot_store_play_open);
+        assert_eq!(
+            parsed.prot_store_credit_paused,
+            expected.prot_store_credit_paused
+        );
+        assert_eq!(parsed.prot_store_products, expected.prot_store_products);
+        assert_eq!(
+            parsed.prot_store_preview_user_ids,
+            expected.prot_store_preview_user_ids
+        );
+        assert_eq!(
+            parsed.prot_store_test_user_ids,
+            expected.prot_store_test_user_ids
+        );
+        assert_eq!(
+            parsed.prot_store_test_max_prot,
+            expected.prot_store_test_max_prot
+        );
+        assert_eq!(
+            parsed.prot_store_us_web_link,
+            expected.prot_store_us_web_link
+        );
+        assert_eq!(parsed.ops_alert_email, expected.ops_alert_email);
+    }
+
+    /// A Revolt.toml without the two store tables still loads (`#[serde(default)]`
+    /// on `Api.appstore` / `Api.googleplay`), unconfigured
+    #[test]
+    fn missing_store_tables_take_the_defaults() {
+        let mut skipping = false;
+        let stripped = include_str!("../Revolt.toml")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start();
+                if line.starts_with('[') {
+                    skipping = line == "[api.appstore]" || line == "[api.googleplay]";
+                }
+                !skipping
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = Config::builder()
+            .add_source(File::from_str(&stripped, FileFormat::Toml))
+            .build()
+            .expect("the stripped config builds");
+        // Only the store tables are gone, or this test proves nothing
+        assert!(config.get_table("api.appstore").is_err());
+        assert!(config.get_table("api.googleplay").is_err());
+        assert!(config.get_table("api.stripe").is_ok());
+        assert!(config.get_table("features.payments").is_ok());
+
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("a config without the store tables must deserialize");
+        assert_appstore_defaults(&settings.api.appstore);
+        assert_googleplay_defaults(&settings.api.googleplay);
+    }
+
+    /// The test config opens both stores and sets no credentials (route tests
+    /// use the managed store mocks)
+    #[test]
+    fn test_config_opens_both_stores_without_credentials() {
+        let settings = settings(&[include_str!("../Revolt.test.toml")]);
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_store_apple_open);
+        assert!(payments.prot_store_play_open);
+        assert!(!payments.prot_store_credit_paused);
+        assert!(!payments.prot_store_us_web_link);
+        assert_eq!(payments.prot_store_products, default_store_products());
+        assert!(payments.prot_store_preview_user_ids.is_empty());
+        assert!(payments.prot_store_test_user_ids.is_empty());
+
+        assert_appstore_defaults(&settings.api.appstore);
+        assert_googleplay_defaults(&settings.api.googleplay);
+    }
+
+    /// An overrides file replaces the whole product table and sets the
+    /// lists; the other store keys keep their defaults
+    #[test]
+    fn overrides_set_the_store_keys() {
+        let overrides = r#"
+[features.payments]
+prot_store_play_open = true
+prot_store_products = [{ store = "play", product_id = "gg.sloga.prot.p7", prot = 750 }]
+prot_store_preview_user_ids = ["01PREVIEW"]
+prot_store_test_user_ids = ["01TESTER1", "01TESTER2"]
+ops_alert_email = "ops@example.test"
+
+[api.googleplay]
+pubsub_subscription = "projects/p/subscriptions/s"
+"#;
+        let settings = settings(&[overrides]);
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_store_play_open);
+        assert!(!payments.prot_store_apple_open);
+        assert_eq!(
+            payments.prot_store_products,
+            [product("play", "gg.sloga.prot.p7", 750)]
+        );
+        assert_eq!(payments.prot_store_preview_user_ids, ["01PREVIEW"]);
+        assert_eq!(
+            payments.prot_store_test_user_ids,
+            ["01TESTER1", "01TESTER2"]
+        );
+        assert_eq!(payments.prot_store_test_max_prot, 25000);
+        assert_eq!(payments.ops_alert_email, "ops@example.test");
+        // The web packs are untouched
+        assert_eq!(payments.prot_packs, FeaturePayments::default().prot_packs);
+
+        let googleplay = &settings.api.googleplay;
+        assert_eq!(googleplay.pubsub_subscription, "projects/p/subscriptions/s");
+        assert_eq!(googleplay.package_name, "gg.sloga.app");
+        assert_appstore_defaults(&settings.api.appstore);
+    }
+
+    /// A product row missing a field fails the config instead of crediting a
+    /// default; the table's rules (ids, amounts, duplicates) are the payments
+    /// config's to enforce
+    #[test]
+    fn partial_store_product_rows_fail_the_config() {
+        let overlays = [
+            "[features.payments]\nprot_store_products = [{ store = \"apple\", product_id = \"gg.sloga.prot.p5\" }]\n",
+            "[features.payments]\nprot_store_products = [{ store = \"apple\", prot = 500 }]\n",
+            "[features.payments]\nprot_store_products = [{ product_id = \"gg.sloga.prot.p5\", prot = 500 }]\n",
+        ];
+        for overlay in overlays {
+            assert!(layered(&[overlay]).is_err(), "accepted: {overlay}");
+        }
+    }
+
+    /// The documented env form (double underscores) reaches the store keys
+    #[test]
+    fn environment_override_reaches_the_store_keys() {
+        let vars: HashMap<String, String> = [
+            ("REVOLT__API__APPSTORE__KEY_ID", "S6W1L1AKEY"),
+            ("REVOLT__API__APPSTORE__ISSUER_ID", "s6w1-l1a-issuer"),
+            ("REVOLT__API__APPSTORE__PRIVATE_KEY", APPSTORE_KEY),
+            ("REVOLT__API__APPSTORE__ENVIRONMENT", "Sandbox"),
+            (
+                "REVOLT__API__GOOGLEPLAY__CLIENT_EMAIL",
+                "s6w1@example.iam.gserviceaccount.com",
+            ),
+            ("REVOLT__API__GOOGLEPLAY__PRIVATE_KEY", GOOGLEPLAY_KEY),
+            ("REVOLT__FEATURES__PAYMENTS__PROT_STORE_APPLE_OPEN", "true"),
+            (
+                "REVOLT__FEATURES__PAYMENTS__PROT_STORE_CREDIT_PAUSED",
+                "true",
+            ),
+            (
+                "REVOLT__FEATURES__PAYMENTS__PROT_STORE_TEST_MAX_PROT",
+                "1000",
+            ),
+            (
+                "REVOLT__FEATURES__PAYMENTS__OPS_ALERT_EMAIL",
+                "ops@example.test",
+            ),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .into();
+
+        let settings: Settings = Config::builder()
+            .add_source(File::from_str(
+                include_str!("../Revolt.toml"),
+                FileFormat::Toml,
+            ))
+            .add_source(
+                Environment::with_prefix("REVOLT")
+                    .separator("__")
+                    .source(Some(vars)),
+            )
+            .build()
+            .expect("the config builds")
+            .try_deserialize()
+            .expect("the config deserializes");
+
+        let appstore = &settings.api.appstore;
+        assert_eq!(appstore.key_id, "S6W1L1AKEY");
+        assert_eq!(appstore.issuer_id, "s6w1-l1a-issuer");
+        assert!(
+            appstore.private_key == APPSTORE_KEY,
+            "[api.appstore] private_key did not take the override"
+        );
+        assert_eq!(appstore.environment, "Sandbox");
+        assert_eq!(appstore.bundle_id, "gg.sloga.app");
+        assert_eq!(appstore.app_apple_id, 6809989506);
+
+        let googleplay = &settings.api.googleplay;
+        assert_eq!(
+            googleplay.client_email,
+            "s6w1@example.iam.gserviceaccount.com"
+        );
+        assert!(
+            googleplay.private_key == GOOGLEPLAY_KEY,
+            "[api.googleplay] private_key did not take the override"
+        );
+        assert!(googleplay.pubsub_subscription.is_empty());
+
+        let payments = &settings.features.payments;
+        assert!(payments.prot_store_apple_open);
+        assert!(!payments.prot_store_play_open);
+        assert!(payments.prot_store_credit_paused);
+        assert_eq!(payments.prot_store_test_max_prot, 1000);
+        assert_eq!(payments.ops_alert_email, "ops@example.test");
+        assert_eq!(payments.prot_store_products, default_store_products());
+    }
+
+    #[test]
+    fn appstore_and_googleplay_debug_redact_the_private_keys() {
+        let appstore = ApiAppStore {
+            issuer_id: "s6w1-l1a-issuer".to_string(),
+            key_id: "S6W1L1AKEY".to_string(),
+            private_key: APPSTORE_KEY.to_string(),
+            ..Default::default()
+        };
+        let debug = format!("{appstore:?}");
+        assert!(
+            !debug.contains(APPSTORE_KEY_BODY),
+            "ApiAppStore Debug leaks private_key"
+        );
+        assert_eq!(
+            debug,
+            format!(
+                r#"ApiAppStore {{ issuer_id: "s6w1-l1a-issuer", key_id: "S6W1L1AKEY", private_key: "<redacted>", bundle_id: "gg.sloga.app", app_apple_id: 6809989506, environment: "Production", root_ca_g3_sha256: "{G3_SHA256}" }}"#
+            )
+        );
+
+        let googleplay = ApiGooglePlay {
+            client_email: "s6w1@example.iam.gserviceaccount.com".to_string(),
+            private_key: GOOGLEPLAY_KEY.to_string(),
+            ..Default::default()
+        };
+        let debug = format!("{googleplay:?}");
+        assert!(
+            !debug.contains(GOOGLEPLAY_KEY_BODY),
+            "ApiGooglePlay Debug leaks private_key"
+        );
+        assert_eq!(
+            debug,
+            r#"ApiGooglePlay { package_name: "gg.sloga.app", client_email: "s6w1@example.iam.gserviceaccount.com", private_key: "<redacted>", token_uri: "https://oauth2.googleapis.com/token", pubsub_subscription: "" }"#
+        );
+
+        // Empty keys say so, so a missing override is visible in the dump
+        let debug = format!("{:?}", ApiAppStore::default());
+        assert!(debug.contains(r#"private_key: "<unset>""#));
+        let debug = format!("{:?}", ApiGooglePlay::default());
+        assert!(debug.contains(r#"private_key: "<unset>""#));
+    }
+
+    /// Nested in Settings, the way `init()` prints it
+    #[test]
+    fn settings_debug_never_prints_a_store_key() {
+        let overrides = format!(
+            "[api.appstore]\nprivate_key = \"{APPSTORE_KEY}\"\n\n[api.googleplay]\nprivate_key = \"{GOOGLEPLAY_KEY}\"\n"
+        );
+        let settings = settings(&[overrides.as_str()]);
+
+        // The keys really did deserialize, or the assertions below prove nothing
+        assert!(
+            settings.api.appstore.private_key == APPSTORE_KEY,
+            "[api.appstore] private_key not loaded"
+        );
+        assert!(
+            settings.api.googleplay.private_key == GOOGLEPLAY_KEY,
+            "[api.googleplay] private_key not loaded"
+        );
+
+        let debug = format!("{settings:?}");
+        assert!(
+            !debug.contains(APPSTORE_KEY_BODY),
+            "Settings Debug leaks the App Store key"
+        );
+        assert!(
+            !debug.contains(GOOGLEPLAY_KEY_BODY),
+            "Settings Debug leaks the Google Play key"
+        );
+        // Both structs are in the dump, through the redacting impls
+        assert!(debug.contains("ApiAppStore {"));
+        assert!(debug.contains("ApiGooglePlay {"));
     }
 }
 

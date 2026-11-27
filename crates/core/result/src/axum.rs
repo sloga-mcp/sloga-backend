@@ -190,6 +190,9 @@ impl IntoResponse for Error {
             ErrorType::SeatListNamesRemovedUsers { .. } => StatusCode::BAD_REQUEST,
             ErrorType::RemovalReasonRequired => StatusCode::BAD_REQUEST,
             ErrorType::ProtectedHandoverRequired { .. } => StatusCode::BAD_REQUEST,
+            ErrorType::ProtectHistoryMoved => StatusCode::CONFLICT,
+            ErrorType::HistoryLinkExists => StatusCode::CONFLICT,
+            ErrorType::ProtectedClientOutdated { .. } => StatusCode::BAD_REQUEST,
 
             ErrorType::InsufficientProt { .. } => StatusCode::CONFLICT,
             ErrorType::ProtDisabled => StatusCode::BAD_REQUEST,
@@ -204,6 +207,10 @@ impl IntoResponse for Error {
             ErrorType::ProtIdempotencyConflict => StatusCode::CONFLICT,
             ErrorType::ProtReplicaSetRequired => StatusCode::SERVICE_UNAVAILABLE,
             ErrorType::ProtRegionUnavailable => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreClosed => StatusCode::FORBIDDEN,
+            ErrorType::ProtStoreProductUnknown => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreVerifyFailed => StatusCode::BAD_REQUEST,
+            ErrorType::ProtStoreUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
 
         // The body no longer carries the location, so log it for server
@@ -412,6 +419,22 @@ mod tests {
         }
     }
 
+    /// Pins the Prot store errors' statuses; `rocket.rs` pins the same table
+    #[test]
+    fn prot_store_error_statuses() {
+        let cases: [(Error, u16); 4] = [
+            (create_error!(ProtStoreClosed), 403),
+            (create_error!(ProtStoreProductUnknown), 400),
+            (create_error!(ProtStoreVerifyFailed), 400),
+            (create_error!(ProtStoreUnavailable), 503),
+        ];
+
+        for (error, code) in cases {
+            let name = format!("{:?}", error.error_type);
+            assert_eq!(error.into_response().status().as_u16(), code, "{name}");
+        }
+    }
+
     /// S2-D20: 400 and a body that is the type alone; `rocket.rs` pins the
     /// same answer
     #[test]
@@ -458,6 +481,69 @@ mod tests {
                 "type": "ProtectedHandoverRequired",
                 "channel_ids": ["01HZXDDDDDDDDDDDDDDDDDDDDD"],
             })
+        );
+    }
+
+    /// S4 (#274): 409 and a body that is the type alone; `rocket.rs` pins
+    /// the same answer
+    #[test]
+    fn protect_history_moved_is_conflict_with_type_only_body() {
+        let response = crate::create_error!(ProtectHistoryMoved).into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "ProtectHistoryMoved" }));
+    }
+
+    /// S4 (#274): 409 and a body that is the type alone; `rocket.rs` pins
+    /// the same answer
+    #[test]
+    fn history_link_exists_is_conflict_with_type_only_body() {
+        let response = crate::create_error!(HistoryLinkExists).into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(body, serde_json::json!({ "type": "HistoryLinkExists" }));
+    }
+
+    /// S4 protocol floor: 400, the minimum in `min`, nothing else in the
+    /// body; `rocket.rs` pins the same answer
+    #[test]
+    fn protected_client_outdated_is_bad_request_with_min_in_body() {
+        let response = crate::create_error!(ProtectedClientOutdated { min: 2 }).into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .map(|value| value.as_bytes()),
+            Some(&b"application/json"[..])
+        );
+
+        let body = ready(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 })
         );
     }
 }

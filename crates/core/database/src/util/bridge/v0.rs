@@ -206,6 +206,7 @@ impl From<crate::Channel> for Channel {
                 slowmode,
                 announcement,
                 protected,
+                protected_history,
             } => Channel::TextChannel {
                 id,
                 server,
@@ -221,6 +222,7 @@ impl From<crate::Channel> for Channel {
                 slowmode,
                 announcement,
                 protected,
+                protected_history: protected_history.map(|history| Box::new((*history).into())),
             },
             crate::Channel::Thread {
                 id,
@@ -346,6 +348,7 @@ impl From<Channel> for crate::Channel {
                 slowmode,
                 announcement,
                 protected,
+                protected_history,
             } => crate::Channel::TextChannel {
                 id,
                 server,
@@ -361,6 +364,7 @@ impl From<Channel> for crate::Channel {
                 slowmode,
                 announcement,
                 protected,
+                protected_history: protected_history.map(|history| Box::new((*history).into())),
             },
             Channel::Thread {
                 id,
@@ -490,6 +494,44 @@ impl From<ForumLayout> for crate::ForumLayout {
     }
 }
 
+impl From<crate::ProtectedHistory> for ProtectedHistory {
+    fn from(value: crate::ProtectedHistory) -> Self {
+        ProtectedHistory {
+            boundary: value.boundary,
+            wipe: value.wipe.into(),
+        }
+    }
+}
+
+impl From<ProtectedHistory> for crate::ProtectedHistory {
+    fn from(value: ProtectedHistory) -> Self {
+        crate::ProtectedHistory {
+            boundary: value.boundary,
+            wipe: value.wipe.into(),
+        }
+    }
+}
+
+impl From<crate::HistoryWipe> for HistoryWipe {
+    fn from(value: crate::HistoryWipe) -> Self {
+        match value {
+            crate::HistoryWipe::None => HistoryWipe::None,
+            crate::HistoryWipe::Requested { at, by } => HistoryWipe::Requested { at, by },
+            crate::HistoryWipe::Done { at, count } => HistoryWipe::Done { at, count },
+        }
+    }
+}
+
+impl From<HistoryWipe> for crate::HistoryWipe {
+    fn from(value: HistoryWipe) -> Self {
+        match value {
+            HistoryWipe::None => crate::HistoryWipe::None,
+            HistoryWipe::Requested { at, by } => crate::HistoryWipe::Requested { at, by },
+            HistoryWipe::Done { at, count } => crate::HistoryWipe::Done { at, count },
+        }
+    }
+}
+
 impl From<crate::PartialChannel> for PartialChannel {
     fn from(value: crate::PartialChannel) -> Self {
         PartialChannel {
@@ -520,6 +562,9 @@ impl From<crate::PartialChannel> for PartialChannel {
             applied_tags: value.applied_tags,
             announcement: value.announcement,
             protected: value.protected,
+            protected_history: value
+                .protected_history
+                .map(|history| Box::new((*history).into())),
         }
     }
 }
@@ -554,6 +599,9 @@ impl From<PartialChannel> for crate::PartialChannel {
             applied_tags: value.applied_tags,
             announcement: value.announcement,
             protected: value.protected,
+            protected_history: value
+                .protected_history
+                .map(|history| Box::new((*history).into())),
         }
     }
 }
@@ -1136,6 +1184,8 @@ impl From<crate::AuditLogAction> for AuditLogAction {
             crate::AuditLogAction::ServerOwnerTransfer => AuditLogAction::ServerOwnerTransfer,
             crate::AuditLogAction::ProtectedSeatsUpdate => AuditLogAction::ProtectedSeatsUpdate,
             crate::AuditLogAction::ProtectedSeatRelease => AuditLogAction::ProtectedSeatRelease,
+            crate::AuditLogAction::ChannelProtect => AuditLogAction::ChannelProtect,
+            crate::AuditLogAction::ChannelHistoryWipe => AuditLogAction::ChannelHistoryWipe,
             crate::AuditLogAction::Unknown => AuditLogAction::Unknown,
         }
     }
@@ -1171,6 +1221,8 @@ impl From<AuditLogAction> for crate::AuditLogAction {
             AuditLogAction::ServerOwnerTransfer => crate::AuditLogAction::ServerOwnerTransfer,
             AuditLogAction::ProtectedSeatsUpdate => crate::AuditLogAction::ProtectedSeatsUpdate,
             AuditLogAction::ProtectedSeatRelease => crate::AuditLogAction::ProtectedSeatRelease,
+            AuditLogAction::ChannelProtect => crate::AuditLogAction::ChannelProtect,
+            AuditLogAction::ChannelHistoryWipe => crate::AuditLogAction::ChannelHistoryWipe,
             AuditLogAction::Unknown => crate::AuditLogAction::Unknown,
         }
     }
@@ -2587,9 +2639,24 @@ impl crate::MlsJoinIntent {
     }
 }
 
+/// Largest `created_at` a served commit carries: `2^53 - 1` ms, the largest
+/// integer every JSON reader holds exactly (the native reader refuses more)
+const MAX_COMMIT_CREATED_MS: i128 = (1 << 53) - 1;
+
+/// A stored commit's `created_at` as whole milliseconds since the Unix
+/// epoch (truncated: Mongo keeps milliseconds, the Reference driver keeps
+/// nanoseconds), held to `0 ..= 2^53 - 1`
+fn mls_commit_created_ms(at: &Timestamp) -> i64 {
+    at.duration_since(Timestamp::UNIX_EPOCH)
+        .whole_milliseconds()
+        .clamp(0, MAX_COMMIT_CREATED_MS) as i64
+}
+
 impl crate::MlsCommit {
     /// Wire form of a stored winning commit. `channel_id` is the commit's
     /// group's channel; it fills each rejoin intent's `channel_id`.
+    /// `created_at` is the row's server-stamped store time in milliseconds,
+    /// always set.
     pub fn into_commit_info(self, channel_id: &str) -> MlsCommitInfo {
         MlsCommitInfo {
             group_id: self.group_id,
@@ -2604,6 +2671,52 @@ impl crate::MlsCommit {
                 .map(|intent| intent.into_rejoin_intent_info(channel_id))
                 .collect(),
             removed_reasons: self.removed_reasons.into_iter().map(Into::into).collect(),
+            created_at: Some(mls_commit_created_ms(&self.created_at)),
+        }
+    }
+}
+
+impl From<crate::MlsHistoryLink> for HistoryLinkWire {
+    /// The GET row (design §3.14.5 "Wire"): `_id`, `size` and `created_at`
+    /// are not sent
+    fn from(value: crate::MlsHistoryLink) -> Self {
+        HistoryLinkWire {
+            group_id: value.group_id,
+            epoch: value.epoch,
+            prev_group_id: value.prev_group_id,
+            prev_epoch: value.prev_epoch,
+            nonce: value.nonce,
+            ciphertext: value.ciphertext,
+            writer_user_id: value.writer_user_id,
+            writer_device_id: value.writer_device_id,
+            signature: value.signature,
+        }
+    }
+}
+
+impl crate::MlsHistoryLink {
+    /// The row for a PUT body. The caller supplies what the wire does not
+    /// carry: `size` (the decoded ciphertext length it checked) and
+    /// `created_at` (server-stamped). `_id` is derived from the body's
+    /// holder and writer user. No validation happens here.
+    pub fn from_wire(wire: HistoryLinkWire, size: i64, created_at: Timestamp) -> Self {
+        crate::MlsHistoryLink {
+            id: crate::MlsHistoryLink::composite_id(
+                &wire.group_id,
+                wire.epoch,
+                &wire.writer_user_id,
+            ),
+            group_id: wire.group_id,
+            epoch: wire.epoch,
+            prev_group_id: wire.prev_group_id,
+            prev_epoch: wire.prev_epoch,
+            nonce: wire.nonce,
+            ciphertext: wire.ciphertext,
+            writer_user_id: wire.writer_user_id,
+            writer_device_id: wire.writer_device_id,
+            signature: wire.signature,
+            size,
+            created_at,
         }
     }
 }
@@ -2951,6 +3064,7 @@ mod protected_channel_bridge_tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         }
     }
 
@@ -2973,6 +3087,8 @@ mod protected_channel_bridge_tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: Some(welcome.clone()),
+            history_visible: None,
+            added_protocols: vec![],
         };
         assert!(serde_json::to_string(&commit).unwrap().contains(&welcome));
 
@@ -2988,6 +3104,192 @@ mod protected_channel_bridge_tests {
             info,
             without.into_commit_info("01JA0000000000000000CHANNEL")
         );
+    }
+
+    /// S4 (design §2.5 "S4", DECISION): a commit's `history_visible` is
+    /// never on the wire commit. The bridged `MlsCommitInfo` has no such key
+    /// and is the same whatever the row holds
+    ///
+    /// Control: an `MlsCommitInfo.history_visible` filled from the row.
+    #[test]
+    fn commit_info_never_carries_history_visible() {
+        let row = |history_visible| crate::MlsCommit {
+            id: crate::MlsCommit::composite_id(&format!("{}1", "0".repeat(63)), 8),
+            group_id: format!("{}1", "0".repeat(63)),
+            epoch: 8,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![],
+            created_at: Timestamp::UNIX_EPOCH,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+            welcome: None,
+            history_visible,
+            added_protocols: vec![],
+        };
+        assert!(serde_json::to_string(&row(Some(true)))
+            .unwrap()
+            .contains(r#""history_visible":true"#));
+
+        let unset = row(None).into_commit_info("01JA0000000000000000CHANNEL");
+        for history_visible in [Some(true), Some(false)] {
+            let info = row(history_visible).into_commit_info("01JA0000000000000000CHANNEL");
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(!json.contains("history_visible"), "{json}");
+            assert!(!json.contains("visible"), "{json}");
+            assert_eq!(info, unset);
+        }
+    }
+
+    /// S4 (R-W3-4): the wire commit carries the row's `created_at` as whole
+    /// milliseconds since the Unix epoch: always present, a JSON integer,
+    /// the LAST key. Sub-millisecond digits are dropped, the epoch itself
+    /// is `0` (present, not skipped) and a time before it is held to `0`
+    ///
+    /// Control: `created_at: None` in the bridge, or the field serialized
+    /// as a string.
+    #[test]
+    fn commit_info_carries_created_at_as_integer_ms() {
+        let row = |created_at: Timestamp| crate::MlsCommit {
+            id: crate::MlsCommit::composite_id(&format!("{}1", "0".repeat(63)), 8),
+            group_id: format!("{}1", "0".repeat(63)),
+            epoch: 8,
+            committer: device("01JA00000000000000000USERA", "a"),
+            commit: "Y29tbWl0".to_string(),
+            size: 6,
+            added: vec![device("01JA00000000000000000USERC", "c")],
+            removed: vec![],
+            created_at,
+            rejoin_intents: vec![],
+            removed_reasons: vec![],
+            welcome: None,
+            history_visible: None,
+            added_protocols: vec![],
+        };
+        let at = |text: &str| -> Timestamp {
+            serde_json::from_str(&format!("\"{text}\"")).expect("a timestamp")
+        };
+
+        for (stored, want) in [
+            ("2026-10-04T12:00:00.000Z", 1_791_115_200_000i64),
+            ("2026-10-04T12:00:00.123Z", 1_791_115_200_123),
+            // What the Reference driver can hold: nanoseconds, truncated
+            ("2026-10-04T12:00:00.123999999Z", 1_791_115_200_123),
+            ("1970-01-01T00:00:00.000Z", 0),
+            ("1969-12-31T23:59:59.000Z", 0),
+        ] {
+            let info = row(at(stored)).into_commit_info("01JA0000000000000000CHANNEL");
+            assert_eq!(info.created_at, Some(want), "{stored}");
+
+            let json = serde_json::to_string(&info).unwrap();
+            assert!(
+                json.ends_with(&format!(r#","created_at":{want}}}"#)),
+                "{stored}: {json}"
+            );
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert!(value["created_at"].is_i64(), "{stored}: {json}");
+            assert_eq!(value["created_at"].as_i64(), Some(want), "{stored}");
+            assert_eq!(
+                serde_json::from_str::<v0::MlsCommitInfo>(&json).unwrap(),
+                info
+            );
+        }
+    }
+
+    /// The 5.9 `link_wire_json` vector as a row and back (design §2.8,
+    /// §3.14.5): `from_wire` takes `size` and `created_at` from the caller
+    /// and derives `_id`; the row bridges back to the identical wire bytes,
+    /// without `_id`, `size` or `created_at`
+    #[test]
+    fn history_link_wire_and_row_convert_both_ways() {
+        const LINK_WIRE_JSON: &str = r#"{"group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","epoch":8,"prev_group_id":"6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3","prev_epoch":7,"nonce":"yMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f","ciphertext":"zi8Wt3tUkiiujR/wXPLhtV/pSalw6ozn2nhFJIiSbRQfB3+IOC7lOdWFA7MD2NBTe8KPi9QWSVllGFNAeWpSEXWtQ1MnL2dyEWkzN8ICC60inCX4ZCK0gT5KHCef9fWF1FFBd8futwVIqGdV0qOUGDW2j9odwMCYArWtSBT7ITs3xBK65CWr9vr/Z/qROyQfmZJdq8nTILrpv8CBE/t6S4BsQCy5rDxaSKigsK+q5hDNV85ngjdZFnUYyUAI7PAoslSfLKsEjDuO/O7q1LRRtIfpYAxnDor8WKNEaXPZxEuUmmr9XqgH1tl7fEdLNXMXn133bo6Ji9jeCi2eYQsJua3Ru+aMxOe80c6CV3rKr353Ubn7kg01fmzkSVkSxfEF/Lf8VAG17E31K+Qy3V4zMNd5MeFKMZjJAEliZW6sQFtWCFPjG6dsjX4mTlchItpMrTt9hvs4o1JI3Qv5f8U8U1YFVMgSMvYd6TaWOnNHGWHxHIZaBwLAO0JS7FeXSZ7rgSFc2+LS5jLNFZBKs9MiF5KJeshsOiLbMz9FdSlkl9ehWOHsmkG77lnf6EPZkgPzPBJqnAiJ+PWCeyiEVahWihUw38odspgrVk/13m5KmK3SBADUMg","writer_user_id":"01HZXBBBBBBBBBBBBBBBBBBBBB","writer_device_id":"ffeeddccbbaa99887766554433221100","signature":"axkfh3Uwi6uZMXT6C47i3SBEUCTvDwiqCcWGob94L3B8AmBtYWeyayKENT4QwPPuBy1QzP7aAg92tblg+E73BQ"}"#;
+
+        let wire: v0::HistoryLinkWire = serde_json::from_str(LINK_WIRE_JSON).unwrap();
+        let created_at: Timestamp = serde_json::from_str(r#""2026-10-04T12:00:00.000Z""#).unwrap();
+        let row = crate::MlsHistoryLink::from_wire(wire.clone(), 469, created_at);
+        assert_eq!(
+            row.id,
+            "6036022873e9088d763291333fd3aad4eed2efa4ad97edc74349494d0fa24ac3:8:01HZXBBBBBBBBBBBBBBBBBBBBB"
+        );
+        assert_eq!(row.size, 469);
+        assert_eq!(row.created_at, created_at);
+        assert_eq!(
+            (
+                row.group_id.as_str(),
+                row.epoch,
+                row.prev_group_id.as_str(),
+                row.prev_epoch,
+                row.writer_device_id.as_str()
+            ),
+            (
+                wire.group_id.as_str(),
+                8,
+                wire.prev_group_id.as_str(),
+                7,
+                "ffeeddccbbaa99887766554433221100"
+            )
+        );
+
+        let back = v0::HistoryLinkWire::from(row);
+        assert_eq!(back, wire);
+        assert_eq!(serde_json::to_string(&back).unwrap(), LINK_WIRE_JSON);
+    }
+
+    /// `protected_history` and the wipe state cross the bridge unchanged in
+    /// both directions, on the channel and on the partial
+    #[test]
+    fn protected_history_bridges_both_ways() {
+        let at: Timestamp = serde_json::from_str(r#""2026-10-04T12:00:00.000Z""#).unwrap();
+        for wipe in [
+            crate::HistoryWipe::None,
+            crate::HistoryWipe::Requested {
+                at,
+                by: "01JA00000000000000000USERA".to_string(),
+            },
+            crate::HistoryWipe::Done { at, count: 7 },
+        ] {
+            let history = crate::ProtectedHistory {
+                boundary: "01J9Z3K4M5N6P7Q8R9S0T1V2W0".to_string(),
+                wipe,
+            };
+            let channel = crate::Channel::TextChannel {
+                id: "T".to_string(),
+                server: "S".to_string(),
+                name: "text".to_string(),
+                description: None,
+                icon: None,
+                last_message_id: None,
+                default_permissions: None,
+                role_permissions: Default::default(),
+                nsfw: false,
+                spoiler: false,
+                voice: None,
+                slowmode: None,
+                announcement: None,
+                protected: true,
+                protected_history: Some(Box::new(history.clone())),
+            };
+            let wire = v0::Channel::from(channel.clone());
+            assert_eq!(
+                serde_json::to_value(&wire).unwrap(),
+                serde_json::to_value(&channel).unwrap(),
+                "the v0 channel serializes like the stored one"
+            );
+            assert_eq!(crate::Channel::from(wire), channel);
+
+            let partial = crate::PartialChannel {
+                protected_history: Some(Box::new(history.clone())),
+                ..Default::default()
+            };
+            let wire = v0::PartialChannel::from(partial.clone());
+            assert_eq!(
+                wire.protected_history,
+                Some(Box::new(v0::ProtectedHistory::from(history)))
+            );
+            assert_eq!(crate::PartialChannel::from(wire), partial);
+        }
     }
 
     /// New stored enum values map onto their v0 counterparts (W1-0 names)
@@ -3180,6 +3482,7 @@ mod protected_channel_bridge_tests {
             created_at: ms(created_ms),
             generation: text.then_some(2),
             issued_at: text.then_some(JOIN_ISSUED_AT),
+            protocol: None,
         }
     }
 
@@ -3237,6 +3540,8 @@ mod protected_channel_bridge_tests {
             rejoin_intents: vec![intent(&group_id(), USER_B, "b", 0, true)],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
+            added_protocols: vec![],
         };
         let info = commit.into_commit_info(CHANNEL);
         assert_eq!(
@@ -3341,6 +3646,7 @@ mod protected_channel_bridge_tests {
                 user_id: USER_B.to_string(),
                 device_id: "b".repeat(32),
                 at: ms(5),
+                protocol: None,
             }],
             ..text_group()
         }
@@ -3838,6 +4144,7 @@ mod seat_list_authority_driver_tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         })
         .await
         .unwrap();

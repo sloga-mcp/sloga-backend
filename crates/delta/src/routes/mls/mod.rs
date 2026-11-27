@@ -24,6 +24,7 @@ mod commits_fetch;
 mod commits_submit;
 mod group_open;
 mod groups_create;
+mod history_links;
 mod join_intent;
 mod key_packages_claim;
 mod key_packages_publish;
@@ -322,11 +323,10 @@ pub(crate) async fn require_text_gate_for(
     }
 }
 
-/// S5's `allows_text_traffic()` (§6.3 "Recovery gates": `Active` or
-/// `Grace`), which before S5 lands is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic` replaces this at its merge.
+/// S5b's `ChannelEntitlement::allows_text_traffic` (§6.3 "Recovery gates":
+/// `Active` or `Grace`, D14).
 pub(crate) fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
-    entitlement.is_active()
+    entitlement.allows_text_traffic()
 }
 
 /// The entitlement half of [`TextGate::Recovery`]: a missing entitlement,
@@ -462,6 +462,8 @@ pub fn routes() -> (Vec<Route>, OpenApi) {
         group_open::open_group,
         text_group::fetch_text_group,
         welcome_fetch::fetch_welcome,
+        history_links::put_history_link,
+        history_links::fetch_history_links,
     ]
 }
 
@@ -697,6 +699,7 @@ mod protected_gates {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             harness
@@ -1283,11 +1286,11 @@ mod protected_gates {
     }
 
     /// The recovery gate (S2-D32, §7.1 "Recovery gate"), every flag on: an
-    /// Active entitlement passes; a missing one, and every state that does
-    /// not allow text traffic, is `InvalidOperation` (Grace among them
-    /// until S5b's `allows_text_traffic` lands; its merge flips that row).
-    /// `require_text_gate` cannot read the entitlement and refuses Recovery;
-    /// the flag gates read no entitlement at all.
+    /// Active or a Grace entitlement passes (S5b's `allows_text_traffic`,
+    /// D14); a missing one, and every state that does not allow text
+    /// traffic, is `InvalidOperation`. `require_text_gate` cannot read the
+    /// entitlement and refuses Recovery; the flag gates read no entitlement
+    /// at all.
     #[test]
     fn recovery_gate_with_every_flag_on() {
         crate::util::test::rt().block_on(recovery_gate_with_every_flag_on_case())
@@ -1305,8 +1308,11 @@ mod protected_gates {
             ErrorType::InvalidOperation,
             "no entitlement",
         );
+        let grace = channel_with_entitlement(&fixture, ChannelEntitlementState::Grace).await;
+        require_text_gate_for(db, &grace, TextGate::Recovery)
+            .await
+            .expect("a Grace entitlement");
         for state in [
-            ChannelEntitlementState::Grace,
             ChannelEntitlementState::Frozen,
             ChannelEntitlementState::Deleted,
         ] {

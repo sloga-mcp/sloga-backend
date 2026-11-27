@@ -8,19 +8,21 @@ use crate::{
     AuditLogEntry, DiscordImportJob, Donation, DonationClaimCode,
     E2EEBackup, E2EEBlob, E2EEEnvelope, E2EEIdentity, E2EEOneTimeKey, Emoji, EventRsvp,
     E2EERemovedDevice,
-    EventRsvpKey, File, FileHash, Interaction, Invite, Member, MemberCompositeKey, Message,
-    MlsCommit, MlsGroup, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll, PollVote,
-    RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
+    EventRsvpKey, File, FileHash, HistoryWipeLease, Interaction, Invite, Member, MemberCompositeKey, Message,
+    MlsCommit, MlsGroup, MlsHistoryLink, MlsJoinIntent, MlsKeyPackage, PolicyChange, Poll,
+    PollVote, RatelimitEvent, Referral, ReferralCode, ReminderSent, RemoteControlAuditEntry,
     ReminderSentKey, Report, Respect, ScheduledMessage, SeatList, Server, ServerBan, ServerBoost,
-    Snapshot,
+    ServerLegalHold, Snapshot,
     SoftResReserveRow, SoftResSheet, SoundboardSound,
     Sticker, StreamConnection, ThreadMember,
     ThreadMemberCompositeKey, UploadSession, User, UserSettings, Webhook, Account, AccountInvite, Session,
     MFATicket, Passkey
 };
 use crate::{
-    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtLedgerEntry,
+    CipherMembership, CipherNumber, PaymentEvent, PaymentOrder, ProtAccount, ProtContributorPref,
+    ProtGoal, ProtLedgerEntry, ProtNotice, ProtPledge, ProtRuntime, ProtTank,
 };
+use crate::{ProtStoreCursor, ProtStoreIntent, ProtStorePurchase};
 use crate::{StaffAuditEntry, TakedownRequest, UploadHashBlock};
 
 database_derived!(
@@ -66,6 +68,12 @@ database_derived!(
         pub server_audit_log: Arc<Mutex<HashMap<String, AuditLogEntry>>>,
         pub server_bans: Arc<Mutex<HashMap<MemberCompositeKey, ServerBan>>>,
         pub server_boosts: Arc<Mutex<HashMap<String, ServerBoost>>>,
+        /// Keyed by server id; its own lock, never held with another
+        /// (design 2.9)
+        pub server_legal_holds: Arc<Mutex<HashMap<String, ServerLegalHold>>>,
+        /// Keyed by channel id; its own lock, never held with another (the
+        /// `history_wipes` job's lease, design 7.5 "S4")
+        pub history_wipe_leases: Arc<Mutex<HashMap<String, HistoryWipeLease>>>,
         pub channel_entitlements: Arc<Mutex<HashMap<String, ChannelEntitlement>>>,
         pub channel_seats: Arc<Mutex<HashMap<String, ChannelSeat>>>,
         pub channel_seat_lists: Arc<Mutex<HashMap<String, SeatList>>>,
@@ -91,6 +99,9 @@ database_derived!(
         pub mls_key_packages: Arc<Mutex<HashMap<String, MlsKeyPackage>>>,
         pub mls_groups: Arc<Mutex<HashMap<String, MlsGroup>>>,
         pub mls_commits: Arc<Mutex<HashMap<String, MlsCommit>>>,
+        /// Keyed by `MlsHistoryLink::composite_id`; locked right after
+        /// `mls_commits` (design 2.8)
+        pub mls_history_links: Arc<Mutex<HashMap<String, MlsHistoryLink>>>,
         pub mls_join_intents: Arc<Mutex<HashMap<String, MlsJoinIntent>>>,
         pub payment_events: Arc<Mutex<HashMap<String, PaymentEvent>>>,
         pub payment_orders: Arc<Mutex<HashMap<String, PaymentOrder>>>,
@@ -100,5 +111,25 @@ database_derived!(
         pub prot_ledger: Arc<Mutex<HashMap<String, ProtLedgerEntry>>>,
         /// Keyed by account id (`user:{id}`; S5b adds `tank:`/`hold:`)
         pub prot_accounts: Arc<Mutex<HashMap<String, ProtAccount>>>,
+        // S5b fuel tanks and goals; lock order: models/prot/mod.rs
+        /// Keyed by `_id` (pledge ULID)
+        pub prot_pledges: Arc<Mutex<HashMap<String, ProtPledge>>>,
+        /// Keyed by `_id` (goal ULID)
+        pub prot_goals: Arc<Mutex<HashMap<String, ProtGoal>>>,
+        /// Keyed by `_id` (tank ULID)
+        pub prot_tanks: Arc<Mutex<HashMap<String, ProtTank>>>,
+        /// The singleton under key "runtime"
+        pub prot_runtime: Arc<Mutex<HashMap<String, ProtRuntime>>>,
+        /// Keyed by the notice key (`_id`)
+        pub prot_notices: Arc<Mutex<HashMap<String, ProtNotice>>>,
+        /// Keyed by "{server_id}:{user_id}"
+        pub prot_contributor_prefs: Arc<Mutex<HashMap<String, ProtContributorPref>>>,
+        // S6 in-app purchases; lock order: models/prot/mod.rs
+        /// Keyed by `_id` (intent ULID)
+        pub prot_store_intents: Arc<Mutex<HashMap<String, ProtStoreIntent>>>,
+        /// Keyed by `_id` (`apple:{prod|sandbox}:{transactionId}` / `play:{sha256hex}`)
+        pub prot_store_purchases: Arc<Mutex<HashMap<String, ProtStorePurchase>>>,
+        /// Keyed by `_id` (`apple-history` / `play-voided`)
+        pub prot_store_cursors: Arc<Mutex<HashMap<String, ProtStoreCursor>>>,
     }
 );

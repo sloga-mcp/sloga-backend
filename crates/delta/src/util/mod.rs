@@ -5,6 +5,7 @@ pub mod interactions;
 pub mod passkey;
 pub mod passkey_signup;
 pub mod polls;
+pub mod prot_gate;
 pub mod ratelimits;
 pub mod slowmode;
 pub mod softres;

@@ -717,6 +717,7 @@ async fn protected_channel_with_group(db: &Database, members: Vec<MlsMemberDevic
         slowmode: None,
         announcement: None,
         protected: false,
+        protected_history: None,
     })
     .await
     .unwrap();
@@ -760,6 +761,7 @@ async fn protected_channel_with_group(db: &Database, members: Vec<MlsMemberDevic
         pending_device_removals: vec![],
         signer_lost: None,
         rejoin_readd: vec![],
+        history_visible_at_create: None,
     };
     db.create_text_mls_group(&group, None).await.unwrap();
     set_group_members(db, members).await;

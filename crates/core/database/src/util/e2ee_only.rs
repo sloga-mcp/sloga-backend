@@ -262,6 +262,7 @@ mod tests {
                 slowmode: None,
                 announcement: None,
                 protected: false,
+                protected_history: None,
             },
             Kind::Thread => Channel::Thread {
                 id,

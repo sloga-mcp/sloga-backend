@@ -1,6 +1,6 @@
 use revolt_database::{
     util::{permissions::DatabasePermissionQuery, reference::Reference},
-    Channel, Database, User,
+    Channel, Database, ProtectedReadView, User,
 };
 use revolt_models::v0;
 use revolt_permissions::{calculate_channel_permissions, ChannelPermission};
@@ -35,13 +35,18 @@ pub async fn fetch(
         permissions.throw_if_lacking_channel_permission(ChannelPermission::ReadMessageHistory)?;
     }
 
-    // A protected channel serves only encrypted rows; a stray plaintext row
-    // (R15, decision 9 (W2)) answers exactly as a message from another
-    // channel does, from this one site. A thread is judged by its parent
-    // (W2 audit B1).
+    // A protected channel serves encrypted rows and, while its history is
+    // kept, the plaintext rows at or below its boundary (design 7.5 "S4");
+    // any other plaintext row (a stray, R15, or a row a pending wipe is
+    // about to delete) answers exactly as a message from another channel
+    // does, from this one site. A thread is judged by its parent (W2 audit
+    // B1, #182).
     let message = msg.as_message(db).await?;
     if message.channel != channel.id()
-        || !message.is_servable(channel.is_protected() || permission_channel.is_protected())
+        || !message.is_servable(&ProtectedReadView::of_read_target(
+            &channel,
+            &permission_channel,
+        ))
     {
         return Err(create_error!(NotFound));
     }
@@ -346,5 +351,64 @@ mod test {
         assert_eq!(stray_answer.0, Status::NotFound, "{:?}", stray_answer);
         let foreign_answer = get(&harness, &session, thread.id(), &foreign.id).await;
         assert_eq!(stray_answer, foreign_answer);
+    }
+
+    /// Design 7.5 "S4" (S4-D15): on a channel protected with its history the
+    /// single fetch serves a pre-boundary plaintext row (B included) and
+    /// ciphertext, and answers a stray above B exactly as a foreign message;
+    /// from `Requested` on the pre-boundary rows answer `NotFound` too
+    ///
+    /// Controls: `<=` to `<` (B answers 404); the wipe arm dropped.
+    #[test]
+    fn a_pre_boundary_row_is_served_and_a_stray_above_it_is_not() {
+        crate::util::test::rt()
+            .block_on(a_pre_boundary_row_is_served_and_a_stray_above_it_is_not_case())
+    }
+
+    async fn a_pre_boundary_row_is_served_and_a_stray_above_it_is_not_case() {
+        use revolt_database::HistoryWipe;
+
+        let harness = TestHarness::new().await;
+        let (_, session, owner) = harness.new_user().await;
+        let (_, _, stray_author) = harness.new_user().await;
+        let fixture = harness
+            .new_history_channel(&owner, &session, &stray_author)
+            .await;
+        let channel_id = fixture.protected.channel.id();
+        let other = harness.new_channel(&fixture.protected.server).await;
+        let foreign = insert_plaintext(&harness.db, &other, &owner.id).await;
+        let foreign_answer = get(&harness, &session, channel_id, &foreign.id).await;
+        assert_eq!(foreign_answer.0, Status::NotFound, "{:?}", foreign_answer);
+
+        for row in &fixture.pre_boundary {
+            let answer = get(&harness, &session, channel_id, &row.id).await;
+            assert_eq!(answer.0, Status::Ok, "{}: {:?}", row.id, answer);
+            assert_eq!(body(&answer)["content"], "Before protect");
+        }
+        for row in &fixture.ciphertext {
+            let answer = get(&harness, &session, channel_id, &row.id).await;
+            assert_eq!(answer.0, Status::Ok, "{}: {:?}", row.id, answer);
+        }
+        for row in &fixture.strays {
+            let answer = get(&harness, &session, channel_id, &row.id).await;
+            assert_eq!(answer, foreign_answer, "{}", row.id);
+        }
+
+        harness
+            .protect_with_history_raw(
+                channel_id,
+                fixture.boundary(),
+                HistoryWipe::Requested {
+                    at: iso8601_timestamp::Timestamp::now_utc(),
+                    by: owner.id.clone(),
+                },
+            )
+            .await;
+        for row in &fixture.pre_boundary {
+            let answer = get(&harness, &session, channel_id, &row.id).await;
+            assert_eq!(answer, foreign_answer, "{} wipe pending", row.id);
+        }
+        let answer = get(&harness, &session, channel_id, &fixture.ciphertext[0].id).await;
+        assert_eq!(answer.0, Status::Ok, "{:?}", answer);
     }
 }

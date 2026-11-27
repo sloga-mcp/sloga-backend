@@ -934,6 +934,29 @@ impl PushNotification {
         }
     }
 
+    /// The channel a protected-channel notification carries. A text channel
+    /// copy is always flagged, even one that predates the protect, so pushd
+    /// still knows the message is protected once `encrypted` is stripped.
+    /// Its name, description and icon are blanked: pushd routes on the id
+    /// and the flag only. No other kind holds a protected message, so those
+    /// are kept as they are
+    fn protected_channel(mut channel: Channel) -> Channel {
+        if let Channel::TextChannel {
+            protected,
+            name,
+            description,
+            icon,
+            ..
+        } = &mut channel
+        {
+            *protected = true;
+            *name = String::new();
+            *description = None;
+            *icon = None;
+        }
+        channel
+    }
+
     fn from_with_hosts(
         msg: Message,
         author: Option<MessageAuthor<'_>>,
@@ -943,7 +966,9 @@ impl PushNotification {
         // Protected-channel messages never reach a push service (design
         // §7.5, decision 10, defense in depth): a generic body, no preview,
         // and neither the ciphertext nor any stray plaintext is copied into
-        // the notification's message
+        // the notification's message. The icon is the app logo, never the
+        // author's avatar, no attachment is linked, and neither the author
+        // nor the channel is named (S8-O4)
         let protected = msg.encrypted.is_some()
             || matches!(
                 channel,
@@ -952,13 +977,10 @@ impl PushNotification {
                     ..
                 }
             );
-        let msg = if protected {
-            Self::protected_message(msg)
-        } else {
-            msg
-        };
 
-        let icon = if let Some(author) = &author {
+        let icon = if protected {
+            format!("{}/assets/logo.png", hosts.app)
+        } else if let Some(author) = &author {
             if let Some(avatar) = author.avatar() {
                 format!("{}/avatars/{}", hosts.autumn, avatar)
             } else {
@@ -968,17 +990,29 @@ impl PushNotification {
             format!("{}/assets/logo.png", hosts.app)
         };
 
-        let image = msg
-            .attachments
-            .as_ref()
-            .and_then(|attachments| attachments.first())
-            .or_else(|| {
-                // Forward snapshots carry their attachments inline
-                msg.forwarded
-                    .as_ref()
-                    .and_then(|forwarded| forwarded.attachments.first())
-            })
-            .map(|v| format!("{}/attachments/{}", hosts.autumn, v.id));
+        let image = if protected {
+            None
+        } else {
+            msg.attachments
+                .as_ref()
+                .and_then(|attachments| attachments.first())
+                .or_else(|| {
+                    // Forward snapshots carry their attachments inline
+                    msg.forwarded
+                        .as_ref()
+                        .and_then(|forwarded| forwarded.attachments.first())
+                })
+                .map(|v| format!("{}/attachments/{}", hosts.autumn, v.id))
+        };
+
+        let (msg, channel) = if protected {
+            (
+                Self::protected_message(msg),
+                Self::protected_channel(channel),
+            )
+        } else {
+            (msg, channel)
+        };
 
         let body = if protected {
             PROTECTED_PUSH_BODY.to_string()
@@ -1018,10 +1052,20 @@ impl PushNotification {
             .expect("Time went backwards")
             .as_secs();
 
-        Self {
-            author: author
+        // A protected notification never names its author. This is pushd's
+        // `PROTECTED_PUSH_TITLE`, which this crate cannot reach. The author's
+        // id stays in the message: pushd's mass-mention fan-out skips the
+        // author by it
+        let author = if protected {
+            "New message".to_string()
+        } else {
+            author
                 .map(|x| x.username().to_string())
-                .unwrap_or_else(|| "Revolt".to_string()),
+                .unwrap_or_else(|| "Revolt".to_string())
+        };
+
+        Self {
+            author,
             icon,
             image,
             body,
@@ -1041,7 +1085,7 @@ mod push_redaction_tests {
 
     use revolt_config::Hosts;
 
-    use super::{Channel, Message, PushNotification, PROTECTED_PUSH_BODY};
+    use super::{Channel, Message, MessageAuthor, PushNotification, User, PROTECTED_PUSH_BODY};
 
     const CIPHERTEXT: &str = "Q0lQSEVSVEVYVF9DSVBIRVJURVhUX0NJUEhFUlRFWFQ";
     const SIG: &str =
@@ -1181,6 +1225,330 @@ mod push_redaction_tests {
         assert_eq!(
             push.url,
             "https://app.test/channel/01JA0000000000000000CHANNEL/01JA00000000000000000000MSG"
+        );
+    }
+
+    const LOGO: &str = "https://app.test/assets/logo.png";
+
+    /// An author with an avatar, so a copied avatar is visible
+    fn author() -> User {
+        serde_json::from_value(serde_json::json!({
+            "_id": "01JA00000000000000000USERA",
+            "username": "alice",
+            "discriminator": "0001",
+            "avatar": {
+                "_id": "AVATARFILEID",
+                "tag": "avatars",
+                "filename": "avatar.png",
+                "metadata": { "type": "File" },
+                "content_type": "image/png",
+                "size": 1,
+            },
+            "relationship": "None",
+            "online": false,
+        }))
+        .unwrap()
+    }
+
+    /// pushd's own protected check on the channel copy (pushd
+    /// `utils/protected.rs`), which is all it has once `encrypted` is gone
+    fn flagged(channel: &Channel) -> bool {
+        matches!(
+            channel,
+            Channel::TextChannel {
+                protected: true,
+                ..
+            }
+        )
+    }
+
+    /// Every way a notification becomes protected: ciphertext on a stale
+    /// (unflagged) channel copy, ciphertext on a flagged copy, and a stray
+    /// plaintext row on a flagged copy. Each carries an attachment
+    fn protected_cases() -> Vec<(Message, Channel)> {
+        vec![
+            (
+                message(serde_json::json!({
+                    "encrypted": encrypted(),
+                    "attachments": [attachment()],
+                })),
+                channel(false),
+            ),
+            (
+                message(serde_json::json!({
+                    "encrypted": encrypted(),
+                    "attachments": [attachment()],
+                })),
+                channel(true),
+            ),
+            (
+                message(serde_json::json!({
+                    "content": "stray plaintext",
+                    "attachments": [attachment()],
+                })),
+                channel(true),
+            ),
+        ]
+    }
+
+    /// S8-O4: the channel copy is flagged even when it predates the protect,
+    /// so pushd's check holds after `encrypted` is stripped
+    #[test]
+    fn protected_notification_flags_a_stale_channel_copy() {
+        let author = author();
+        for (msg, channel) in protected_cases() {
+            let push = PushNotification::from_with_hosts(
+                msg,
+                Some(MessageAuthor::User(&author)),
+                channel,
+                &hosts(),
+            );
+            assert_eq!(push.message.encrypted, None);
+            assert!(flagged(&push.channel), "unflagged: {:?}", push.channel);
+            assert_eq!(push.tag, "01JA0000000000000000CHANNEL");
+        }
+    }
+
+    /// S8-O4: the icon is the app logo, never the author's avatar
+    #[test]
+    fn protected_notification_icon_is_the_logo() {
+        let author = author();
+        for (msg, channel) in protected_cases() {
+            let push = PushNotification::from_with_hosts(
+                msg,
+                Some(MessageAuthor::User(&author)),
+                channel,
+                &hosts(),
+            );
+            assert_eq!(push.icon, LOGO);
+            let serialized = serde_json::to_string(&push).unwrap();
+            assert!(
+                !serialized.contains("AVATARFILEID"),
+                "avatar leaked into {serialized}"
+            );
+        }
+    }
+
+    /// S8-O4: no attachment is linked from a protected notification
+    #[test]
+    fn protected_notification_links_no_attachment() {
+        let author = author();
+        for (msg, channel) in protected_cases() {
+            let push = PushNotification::from_with_hosts(
+                msg,
+                Some(MessageAuthor::User(&author)),
+                channel,
+                &hosts(),
+            );
+            assert_eq!(push.image, None);
+            let serialized = serde_json::to_string(&push).unwrap();
+            assert!(
+                !serialized.contains("ATTACHMENTID"),
+                "attachment leaked into {serialized}"
+            );
+        }
+    }
+
+    /// Only a text channel copy is flagged; no other kind holds a protected
+    /// message, and one that somehow does is kept as it came
+    #[test]
+    fn protected_notification_keeps_other_channel_kinds() {
+        let dm: Channel = serde_json::from_value(serde_json::json!({
+            "channel_type": "DirectMessage",
+            "_id": "01JA0000000000000000CHANNEL",
+            "active": true,
+            "recipients": ["01JA00000000000000000USERA", "01JA00000000000000000USERB"],
+        }))
+        .unwrap();
+        let msg = message(serde_json::json!({ "encrypted": encrypted() }));
+        let push = PushNotification::from_with_hosts(msg, None, dm.clone(), &hosts());
+        assert_eq!(
+            serde_json::to_value(&push.channel).unwrap(),
+            serde_json::to_value(&dm).unwrap()
+        );
+        assert_eq!(push.body, PROTECTED_PUSH_BODY);
+        assert_eq!(push.icon, LOGO);
+    }
+
+    /// pushd's `PROTECTED_PUSH_TITLE`
+    const GENERIC_TITLE: &str = "New message";
+    const CHANNEL_NAME: &str = "LEAK_CHANNEL_NAME";
+    const CHANNEL_DESCRIPTION: &str = "LEAK_CHANNEL_DESCRIPTION";
+    const CHANNEL_ICON: &str = "LEAKCHANNELICON";
+
+    /// A text channel copy with a name, a description and an icon
+    fn described_channel(protected: bool) -> Channel {
+        serde_json::from_value(serde_json::json!({
+            "channel_type": "TextChannel",
+            "_id": "01JA0000000000000000CHANNEL",
+            "server": "01JA00000000000000000SERVER",
+            "name": CHANNEL_NAME,
+            "description": CHANNEL_DESCRIPTION,
+            "icon": {
+                "_id": CHANNEL_ICON,
+                "tag": "icons",
+                "filename": "icon.png",
+                "metadata": { "type": "File" },
+                "content_type": "image/png",
+                "size": 1,
+            },
+            "protected": protected,
+        }))
+        .unwrap()
+    }
+
+    /// `protected_cases`, each on a described channel copy
+    fn described_protected_cases() -> Vec<(Message, Channel)> {
+        protected_cases()
+            .into_iter()
+            .map(|(msg, channel)| {
+                let flagged = flagged(&channel);
+                (msg, described_channel(flagged))
+            })
+            .collect()
+    }
+
+    /// F6: a protected notification carries the generic title as its
+    /// author, never the username, with or without an author
+    #[test]
+    fn protected_notification_author_is_the_generic_title() {
+        let author = author();
+        for (msg, channel) in described_protected_cases() {
+            for with_author in [true, false] {
+                let push = PushNotification::from_with_hosts(
+                    msg.clone(),
+                    with_author.then_some(MessageAuthor::User(&author)),
+                    channel.clone(),
+                    &hosts(),
+                );
+                assert_eq!(push.author, GENERIC_TITLE);
+                let serialized = serde_json::to_string(&push).unwrap();
+                assert!(
+                    !serialized.contains("alice"),
+                    "username leaked into {serialized}"
+                );
+            }
+        }
+    }
+
+    /// F6: a protected notification's channel copy has a blank name and no
+    /// description or icon; the id, the server and the flag stay
+    #[test]
+    fn protected_notification_blanks_the_channel_copy() {
+        let author = author();
+        for (msg, channel) in described_protected_cases() {
+            let push = PushNotification::from_with_hosts(
+                msg,
+                Some(MessageAuthor::User(&author)),
+                channel,
+                &hosts(),
+            );
+            let Channel::TextChannel {
+                id,
+                server,
+                name,
+                description,
+                icon,
+                protected,
+                ..
+            } = &push.channel
+            else {
+                panic!("not a text channel: {:?}", push.channel);
+            };
+            assert_eq!(id, "01JA0000000000000000CHANNEL");
+            assert_eq!(server, "01JA00000000000000000SERVER");
+            assert!(*protected);
+            assert_eq!(name, "");
+            assert_eq!(description, &None);
+            assert!(icon.is_none(), "icon kept: {icon:?}");
+            let serialized = serde_json::to_string(&push).unwrap();
+            for leak in [CHANNEL_NAME, CHANNEL_DESCRIPTION, CHANNEL_ICON] {
+                assert!(
+                    !serialized.contains(leak),
+                    "{leak} leaked into {serialized}"
+                );
+            }
+        }
+    }
+
+    /// F6 (c): the author's id stays, because pushd's mass-mention fan-out
+    /// uses it to skip the author (`inbound/mass_mention.rs`)
+    #[test]
+    fn protected_notification_keeps_the_author_id() {
+        let author = author();
+        for (msg, channel) in described_protected_cases() {
+            let push = PushNotification::from_with_hosts(
+                msg,
+                Some(MessageAuthor::User(&author)),
+                channel,
+                &hosts(),
+            );
+            assert_eq!(push.message.author, "01JA00000000000000000USERA");
+        }
+    }
+
+    /// An unprotected notification keeps the username and the whole channel
+    /// copy, name, description and icon included
+    #[test]
+    fn unprotected_notification_keeps_the_author_and_channel_copy() {
+        let author = author();
+        let msg = message(serde_json::json!({ "content": "hello there" }));
+        let push = PushNotification::from_with_hosts(
+            msg.clone(),
+            Some(MessageAuthor::User(&author)),
+            described_channel(false),
+            &hosts(),
+        );
+        assert_eq!(push.author, "alice");
+        assert_eq!(push.message, msg);
+        assert_eq!(
+            serde_json::to_value(&push.channel).unwrap(),
+            serde_json::to_value(described_channel(false)).unwrap()
+        );
+        let serialized = serde_json::to_string(&push).unwrap();
+        for kept in [CHANNEL_NAME, CHANNEL_DESCRIPTION, CHANNEL_ICON] {
+            assert!(
+                serialized.contains(kept),
+                "{kept} missing from {serialized}"
+            );
+        }
+
+        let push = PushNotification::from_with_hosts(msg, None, described_channel(false), &hosts());
+        assert_eq!(push.author, "Revolt");
+    }
+
+    /// An unprotected notification with an author keeps the avatar, the
+    /// attachment and the channel copy exactly as before S8-O4
+    #[test]
+    fn unprotected_notification_with_an_author_is_unchanged() {
+        let author = author();
+        let msg = message(serde_json::json!({
+            "content": "hello there",
+            "attachments": [attachment()],
+        }));
+        let push = PushNotification::from_with_hosts(
+            msg.clone(),
+            Some(MessageAuthor::User(&author)),
+            channel(false),
+            &hosts(),
+        );
+        assert_eq!(push.author, "alice");
+        assert_eq!(push.icon, "https://autumn.test/avatars/AVATARFILEID");
+        assert_eq!(
+            push.image.as_deref(),
+            Some("https://autumn.test/attachments/ATTACHMENTID")
+        );
+        assert_eq!(push.body, "hello there");
+        assert_eq!(push.raw_body, None);
+        assert_eq!(push.tag, "01JA0000000000000000CHANNEL");
+        assert_eq!(
+            push.url,
+            "https://app.test/channel/01JA0000000000000000CHANNEL/01JA00000000000000000000MSG"
+        );
+        assert_eq!(push.message, msg);
+        assert_eq!(
+            serde_json::to_value(&push.channel).unwrap(),
+            serde_json::to_value(channel(false)).unwrap()
         );
     }
 

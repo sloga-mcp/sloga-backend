@@ -14,6 +14,8 @@ use rocket::State;
 
 use crate::util::softres::authorize_manage_sheet;
 
+use super::softres_fetch::sheet_is_servable;
+
 /// The shared JSON body of the Gargul and raidres flavors, built
 /// EXCLUSIVELY via serde_json — raider-controlled names/notes must never
 /// be string-formatted into a payload.
@@ -169,8 +171,12 @@ pub async fn softres_export(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // The sheet of a wipe-pending row answers like a sheet of another
+    // channel (design 7.4 "S4"), before the manage check
     let sheet = db.fetch_sheet(&sheet_id).await?;
-    if sheet.channel != channel.id() {
+    if sheet.channel != channel.id()
+        || !sheet_is_servable(db, &channel, &permission_channel, &sheet).await?
+    {
         return Err(create_error!(NotFound));
     }
 
@@ -352,6 +358,72 @@ mod unit {
         assert_eq!(
             value["metadata"]["url"],
             "https://app.sloga.gg/channel/01CHAN000000000000000000000/01MSG0000000000000000000000"
+        );
+    }
+}
+
+/// Protected channels (S4): the sheet of a wipe-pending row has no export
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::Value;
+
+    use crate::routes::channels::softres_fetch::protected_fixture::{
+        assert_refused, request, request_the_wipe, world, World,
+    };
+
+    /// The sheets' creator (the server owner) exports one as CSV
+    async fn export(world: &World, channel_id: &str, sheet_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.owner_session,
+            Method::Get,
+            format!("/channels/{channel_id}/softres/{sheet_id}/export?format=csv"),
+            None,
+        )
+        .await
+    }
+
+    /// The export carries the member's seeded row
+    #[track_caller]
+    fn assert_exports_the_row(answer: &(Status, Value), case: &str) {
+        assert_eq!(answer.0, Status::Ok, "{case}: {}", answer.1);
+        assert_eq!(answer.1["format"], "csv", "{case}: {}", answer.1);
+        assert_eq!(
+            answer.1["payload"], "ItemId,Name,Class,Note,Plus\r\n17204,Leeroy,paladin,,0\r\n",
+            "{case}: {}",
+            answer.1
+        );
+    }
+
+    /// Design 7.4 "S4": while the history is kept, the sheet of the
+    /// pre-boundary row B exports; from `Requested` on it answers exactly as
+    /// a sheet of another channel. The ordinary channel's sheet exports
+    /// throughout.
+    #[test]
+    fn a_wipe_pending_sheet_has_no_export() {
+        crate::util::test::rt().block_on(Box::pin(a_wipe_pending_sheet_has_no_export_case()))
+    }
+
+    async fn a_wipe_pending_sheet_has_no_export_case() {
+        let w = world().await;
+        let channel_id = w.protected.channel.id();
+
+        assert_exports_the_row(&export(&w, channel_id, &w.sheet.id).await, "kept");
+
+        request_the_wipe(&w).await;
+
+        let foreign = export(&w, channel_id, &w.ordinary_sheet.id).await;
+        assert_refused(&foreign, Status::NotFound, "NotFound", "a foreign sheet");
+        assert_eq!(
+            export(&w, channel_id, &w.sheet.id).await,
+            foreign,
+            "wipe pending"
+        );
+
+        assert_exports_the_row(
+            &export(&w, w.ordinary.id(), &w.ordinary_sheet.id).await,
+            "ordinary",
         );
     }
 }

@@ -27,6 +27,14 @@ pub async fn poll_end(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // A protected channel (or a thread under one) refuses, as voting does
+    // (design 7.4 "S4"); protect closes the open polls itself. After the
+    // ViewChannel check, so a non-viewer gets the pre-S4 answer (decision
+    // 18), and before the poll is read or closed.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let poll = db.fetch_poll(&poll_id).await?;
     if poll.channel != channel.id() {
         return Err(create_error!(NotFound));
@@ -165,5 +173,53 @@ mod test {
             poll.counts.is_some(),
             "closed poll results are public to non-voters"
         );
+    }
+}
+
+/// Protected channels (S4): a protected channel's poll cannot be ended
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::Value;
+
+    use crate::routes::channels::poll_fetch::protected_fixture::{
+        assert_refused, request, world, World,
+    };
+
+    /// The poll's author ends it
+    async fn end(world: &World, channel_id: &str, poll_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.owner_session,
+            Method::Post,
+            format!("/channels/{channel_id}/polls/{poll_id}/end"),
+            None,
+        )
+        .await
+    }
+
+    /// Design 7.4 "S4": the author ending an open poll of a protected
+    /// channel gets `ChannelProtected` and the poll stays open; the
+    /// ordinary channel's poll still ends
+    #[test]
+    fn a_protected_channel_refuses_to_end_a_poll() {
+        crate::util::test::rt().block_on(Box::pin(a_protected_channel_refuses_to_end_a_poll_case()))
+    }
+
+    async fn a_protected_channel_refuses_to_end_a_poll_case() {
+        let w = world().await;
+
+        assert_refused(
+            &end(&w, w.protected.channel.id(), &w.poll.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "the author ends a protected poll",
+        );
+        let stored = w.harness.db.fetch_poll(&w.poll.id).await.expect("poll");
+        assert!(!stored.closed, "the refusal closed the poll");
+
+        let ordinary = end(&w, w.ordinary.id(), &w.ordinary_poll.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary: {}", ordinary.1);
+        assert_eq!(ordinary.1["closed"], true, "ordinary: {}", ordinary.1);
     }
 }

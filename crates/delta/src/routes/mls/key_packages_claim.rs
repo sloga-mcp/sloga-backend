@@ -292,7 +292,9 @@ async fn claim_for_text_group(
     if !is_recovery_claim(db, &group, &data.targets).await? {
         super::require_text_gate(TextGate::Growth).await?;
     }
-    // A claim is for an Add, so it needs what the Add needs (#220)
+    // A claim is for an Add, so it needs what the Add needs (#220): Frozen
+    // and Deleted refuse it like the Add (S5b D14), and so does a missing
+    // entitlement
     let entitlement = db.fetch_channel_entitlement(&group.channel_id).await?;
     if !allows_text_traffic(entitlement.as_ref()) {
         return Err(create_error!(InvalidOperation));
@@ -449,13 +451,11 @@ async fn signer_recovery_open(
 }
 
 /// The entitlement predicate every Text claim needs, a growth claim and a
-/// recovery claim alike (design §6.3 "Recovery gates", #220): S5's
-/// `allows_text_traffic()`, which before S5 lands is `Active` only, and a
-/// missing entitlement refuses as on the Add. S5b's
-/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`) replaces
-/// this at its merge.
+/// recovery claim alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14),
+/// and a missing entitlement refuses as on the Add.
 fn allows_text_traffic(entitlement: Option<&ChannelEntitlement>) -> bool {
-    entitlement.is_some_and(|entitlement| entitlement.is_active())
+    entitlement.is_some_and(|entitlement| entitlement.allows_text_traffic())
 }
 
 /// Whether a Text group of `channel` may admit `target_user_id`: seated and
@@ -869,6 +869,7 @@ mod tests {
                 user_id: recovery_target.0.clone(),
                 device_id: recovery_target.1.clone(),
                 at: Timestamp::now_utc(),
+                protocol: None,
             });
             group.signer_lost = Some(MlsSignerLost {
                 user_id: owner.id.clone(),
@@ -1588,6 +1589,161 @@ mod tests {
         assert_eq!(packages_left(db, &member_device).await, 1);
     }
 
+    /// S5b D14: in Grace a member device still claims a seated member's
+    /// device, to add it
+    #[test]
+    fn grace_allows_a_key_package_claim() {
+        crate::util::test::rt().block_on(grace_allows_a_key_package_claim_case())
+    }
+
+    async fn grace_allows_a_key_package_claim_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        publish(db, &member_device, "member-0", false).await;
+
+        set_entitlement_state(db, protected.channel.id(), ChannelEntitlementState::Grace).await;
+        let (status, body) = claim_http(
+            &harness,
+            &owner_session,
+            &claim_body(
+                &protected.owner_device.device_id,
+                &group.id,
+                &[(&member.id, &member_device.device_id)],
+            ),
+        )
+        .await;
+        assert_eq!(tags(&served(status, &body, "grace")), ["Claimed"]);
+        assert_eq!(packages_left(db, &member_device).await, 0);
+    }
+
+    /// Frozen and Deleted refuse a claim before any package is consumed; the
+    /// entitlement is the only thing in the way
+    #[test]
+    fn frozen_refuses_a_key_package_claim() {
+        crate::util::test::rt().block_on(frozen_refuses_a_key_package_claim_case())
+    }
+
+    async fn frozen_refuses_a_key_package_claim_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        publish(db, &member_device, "member-0", false).await;
+        let body = claim_body(
+            &protected.owner_device.device_id,
+            &group.id,
+            &[(&member.id, &member_device.device_id)],
+        );
+
+        for state in [
+            ChannelEntitlementState::Frozen,
+            ChannelEntitlementState::Deleted,
+        ] {
+            let case = format!("{state:?}");
+            set_entitlement_state(db, protected.channel.id(), state).await;
+            let answer = claim_http(&harness, &owner_session, &body).await;
+            refused(&answer, Status::BadRequest, "InvalidOperation", &case);
+            assert_eq!(packages_left(db, &member_device).await, 1, "{}", case);
+        }
+
+        set_entitlement_state(db, protected.channel.id(), ChannelEntitlementState::Active).await;
+        let (status, response) = claim_http(&harness, &owner_session, &body).await;
+        assert_eq!(
+            tags(&served(status, &response, "active again")),
+            ["Claimed"]
+        );
+    }
+
+    /// Delete the channel's entitlement, raw (no route removes one)
+    async fn remove_entitlement(db: &Database, channel_id: &str) {
+        match db {
+            Database::Reference(reference) => {
+                let mut entitlements = reference.channel_entitlements.lock().await;
+                let before = entitlements.len();
+                entitlements.retain(|_, entitlement| entitlement.channel_id != channel_id);
+                assert_eq!(before - entitlements.len(), 1);
+            }
+            Database::MongoDb(mongo) => {
+                use revolt_database::mongodb::bson::{doc, Document};
+
+                let result = mongo
+                    .col::<Document>("channel_entitlements")
+                    .delete_one(doc! { "channel_id": channel_id })
+                    .await
+                    .expect("raw entitlement delete");
+                assert_eq!(result.deleted_count, 1);
+            }
+        }
+
+        assert!(db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .is_none());
+    }
+
+    /// #220 (S2), kept over S5b's S1 rule at the merge: a claim on a channel
+    /// whose entitlement is gone is refused like the Add it is for, before
+    /// any package is consumed. The same claim is served while the
+    /// entitlement is Active (`frozen_refuses_a_key_package_claim`).
+    /// Control: let a missing entitlement pass (`is_none_or`).
+    #[test]
+    fn a_removed_entitlement_refuses_a_key_package_claim() {
+        crate::util::test::rt().block_on(a_removed_entitlement_refuses_a_key_package_claim_case())
+    }
+
+    async fn a_removed_entitlement_refuses_a_key_package_claim_case() {
+        let harness = TestHarness::new().await;
+        let db = &harness.db;
+        let (_, owner_session, owner) = harness.new_user().await;
+        let (_, member_session, member) = harness.new_user().await;
+        let protected = harness
+            .new_protected_channel(&owner, &owner_session, &[&member])
+            .await;
+        let group = harness
+            .new_text_group(&protected.channel, &protected.owner_device, 0, None)
+            .await;
+        let member_device = harness
+            .new_e2ee_device(&member, &member_session.id, MEMBER_DEVICE_SEED)
+            .await;
+        publish(db, &member_device, "member-0", false).await;
+        let body = claim_body(
+            &protected.owner_device.device_id,
+            &group.id,
+            &[(&member.id, &member_device.device_id)],
+        );
+
+        remove_entitlement(db, protected.channel.id()).await;
+        let answer = claim_http(&harness, &owner_session, &body).await;
+        refused(
+            &answer,
+            Status::BadRequest,
+            "InvalidOperation",
+            "no entitlement",
+        );
+        assert_eq!(packages_left(db, &member_device).await, 1);
+    }
+
     /// A protected channel whose open Text group holds the owner's signer
     /// device (the genesis list's signer) and the seated member's device,
     /// a second seated user whose new device is a growth target, and a
@@ -1738,6 +1894,7 @@ mod tests {
             user_id: evicted.user_id.clone(),
             device_id: evicted.device_id.clone(),
             at: Timestamp::now_utc(),
+            protocol: None,
         };
         edit_group(db, &fixture.group_id, |group| {
             group.rejoin_readd.push(entry)
@@ -1959,7 +2116,7 @@ mod tests {
     }
 
     /// #220: a growth claim needs an entitlement that allows text traffic
-    /// (on this branch `Active` only), refused after the seat check and
+    /// (`Active` or `Grace`, S5b D14), refused after the seat check and
     /// before any package is consumed
     #[test]
     fn an_entitlement_refusal_consumes_no_key_package() {

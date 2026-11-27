@@ -26,6 +26,9 @@ enabled = true
 # the existing route tests protect with a v1 genesis. A v2 test turns it on
 # for itself with overwrite_config.
 formats_v2 = false
+# Off, as in production: the S1/S2 route tests protect with an empty
+# boundary. An S4 history test turns it on for itself with overwrite_config.
+history_setting = false
 
 [api.smtp]
 host = "localhost"
@@ -42,11 +45,14 @@ use_tls = false
 enabled = true
 cipher_sales_open = true
 prot_sales_open = true
+prot_store_apple_open = true
+prot_store_play_open = true
 
 # Prot on for the wallet and pack tests. cipher_grants_enabled stays off, so
 # the Cipher tests never post Prot; grant tests pass their own settings.
 [features.boosts.protection]
 enabled = true
+self_serve_enabled = true
 
 [api.stripe]
 secret_key = "sk_test_dummy"

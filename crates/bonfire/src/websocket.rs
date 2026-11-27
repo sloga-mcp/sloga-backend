@@ -1929,6 +1929,7 @@ mod tests {
                 slowmode: None,
                 announcement: None,
                 protected: false,
+                protected_history: None,
             },
         );
         state.cache.channels.insert(

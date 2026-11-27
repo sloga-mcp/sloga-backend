@@ -158,7 +158,13 @@ mod protected_tests {
             }
             .signed();
             harness
-                .protect_with_db(&channel, &v0::DataProtectChannel { seat_list: genesis })
+                .protect_with_db(
+                    &channel,
+                    &v0::DataProtectChannel {
+                        seat_list: genesis,
+                        wipe_history: None,
+                    },
+                )
                 .await;
             let channel = harness
                 .db
@@ -250,6 +256,8 @@ mod protected_tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
+            added_protocols: vec![],
         };
         let outcome = db
             .insert_mls_text_commit(&commit, &hash, 0)
@@ -474,6 +482,7 @@ mod protected_tests {
                 pending_device_removals: vec![],
                 signer_lost: None,
                 rejoin_readd: vec![],
+                history_visible_at_create: None,
             };
             mongo
                 .col::<MlsGroup>("mls_groups")

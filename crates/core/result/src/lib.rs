@@ -447,6 +447,22 @@ pub enum ErrorType {
     ProtectedHandoverRequired {
         channel_ids: Vec<String>,
     },
+    /// A protect genesis whose history boundary is older than a message
+    /// stored in the channel. Returned only after the byte-identical check,
+    /// with nothing written; the owner's client re-signs with a newer
+    /// boundary (docs/protected-channels-design.md 7.6 "S4")
+    ProtectHistoryMoved,
+    /// The same writer user already stored different bytes for this holder
+    /// epoch's history link, or five distinct writer users already did
+    /// (docs/protected-channels-design.md 7.6 "S4", 2.8)
+    HistoryLinkExists,
+    /// The client's advertised text protocol is below the server minimum
+    /// for a v2 protected channel; `min` is that minimum (the server half of
+    /// the protocol floor, docs/protected-channels-design.md 8.3 "As built";
+    /// not yet in the 7.6 table)
+    ProtectedClientOutdated {
+        min: u32,
+    },
 
     // ? Prot errors
     /// The Prot account holds less than the debit needs
@@ -483,6 +499,15 @@ pub enum ErrorType {
     ProtReplicaSetRequired,
     /// Prot is not sold in the caller's country
     ProtRegionUnavailable,
+    // ? Prot store (in-app purchase) errors
+    /// In-app Prot purchases are not open for this store (or the caller is not on the preview list)
+    ProtStoreClosed,
+    /// The store product is not on sale
+    ProtStoreProductUnknown,
+    /// The store purchase could not be verified (signature, chain, bundle, environment)
+    ProtStoreVerifyFailed,
+    /// In-app purchases are not configured on this server
+    ProtStoreUnavailable,
 }
 
 #[macro_export]
@@ -760,6 +785,32 @@ mod tests {
         );
     }
 
+    /// The types the client keys its store messages on; none carries a field
+    #[cfg(feature = "serde")]
+    #[test]
+    fn prot_store_errors_serialize_by_name() {
+        let cases = [
+            (create_error!(ProtStoreClosed), "ProtStoreClosed"),
+            (
+                create_error!(ProtStoreProductUnknown),
+                "ProtStoreProductUnknown",
+            ),
+            (
+                create_error!(ProtStoreVerifyFailed),
+                "ProtStoreVerifyFailed",
+            ),
+            (create_error!(ProtStoreUnavailable), "ProtStoreUnavailable"),
+        ];
+
+        for (error, name) in cases {
+            let value = serde_json::to_value(&error).unwrap();
+            assert_eq!(value, serde_json::json!({ "type": name }));
+
+            let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+            assert_eq!(format!("{:?}", decoded.error_type), name);
+        }
+    }
+
     /// S2-D20: the type the kick, ban and seat-list dialogs key on, with no
     /// fields
     #[cfg(feature = "serde")]
@@ -805,6 +856,47 @@ mod tests {
                 channel_ids,
                 ["01HZXDDDDDDDDDDDDDDDDDDDDD", "01HZXEEEEEEEEEEEEEEEEEEEEE"]
             ),
+            other => panic!("unexpected error type {other:?}"),
+        }
+    }
+
+    /// S4 (#274): the type the bridge's protect retry keys on, with no
+    /// fields
+    #[cfg(feature = "serde")]
+    #[test]
+    fn protect_history_moved_round_trips() {
+        let value = serde_json::to_value(create_error!(ProtectHistoryMoved)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "ProtectHistoryMoved" }));
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        assert!(matches!(decoded.error_type, ErrorType::ProtectHistoryMoved));
+    }
+
+    /// S4 (#274): a refused history link write, with no fields
+    #[cfg(feature = "serde")]
+    #[test]
+    fn history_link_exists_round_trips() {
+        let value = serde_json::to_value(create_error!(HistoryLinkExists)).unwrap();
+        assert_eq!(value, serde_json::json!({ "type": "HistoryLinkExists" }));
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        assert!(matches!(decoded.error_type, ErrorType::HistoryLinkExists));
+    }
+
+    /// S4 protocol floor: the minimum survives a round trip under `min`
+    #[cfg(feature = "serde")]
+    #[test]
+    fn protected_client_outdated_round_trips() {
+        let value =
+            serde_json::to_value(create_error!(ProtectedClientOutdated { min: 2 })).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 })
+        );
+
+        let decoded = serde_json::from_value::<crate::Error>(value).unwrap();
+        match decoded.error_type {
+            ErrorType::ProtectedClientOutdated { min } => assert_eq!(min, 2),
             other => panic!("unexpected error type {other:?}"),
         }
     }

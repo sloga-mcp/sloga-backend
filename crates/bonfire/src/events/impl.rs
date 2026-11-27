@@ -1147,6 +1147,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         };
         db.insert_channel(&hidden).await.expect("insert hidden");
 
@@ -1165,6 +1166,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         };
         db.insert_channel(&visible).await.expect("insert visible");
 
@@ -1267,6 +1269,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 
@@ -1511,6 +1514,7 @@ mod tests {
             slowmode: None,
             announcement: None,
             protected: false,
+            protected_history: None,
         }
     }
 

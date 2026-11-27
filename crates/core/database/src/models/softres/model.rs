@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
 use revolt_models::v0;
+use revolt_result::Result;
+
+use crate::Database;
 
 auto_derived!(
     /// The server-side record of a soft-reserve sheet.
@@ -201,6 +204,55 @@ impl SoftResSheet {
             item_counts,
             my_reserve,
         }
+    }
+
+    /// Close every open sheet of a channel, without publishing (protecting
+    /// an existing channel, 7.4 "S4"). Closing is the existing lock: each
+    /// sheet goes through `set_sheet_locked_if_unlocked`, the same atomic
+    /// flip as the lock route and the event-cancel hook, so the sheet update
+    /// stays exactly-once against them; the caller publishes it.
+    ///
+    /// "Open" is the stored `locked` flag. A sheet past its `locks_at` that
+    /// was never flagged already reads as locked, but it is flagged here
+    /// too (and returned), as the lock route does: the flag is what a later
+    /// settings edit cannot clear.
+    ///
+    /// Returns the SHEET ids this call locked, ascending. Sheet ids because
+    /// the sheet update is built from the fresh sheet (`fetch_sheet`), which
+    /// also carries the message and channel ids. A sheet that was already
+    /// locked, or that another locker flips first, is not returned. A
+    /// failure on one sheet is reported and skips that sheet only; the
+    /// reserve route's `ChannelProtected` refusal stays the backstop.
+    pub async fn close_open_for_channel(db: &Database, channel: &str) -> Result<Vec<String>> {
+        let open = db.fetch_open_sheet_ids_for_channel(channel).await?;
+        Ok(Self::close_listed(db, &open).await)
+    }
+
+    /// The per-sheet half of `close_open_for_channel`: the ids of the
+    /// listed sheets whose lock flip this call won, in list order.
+    pub(crate) async fn close_listed(db: &Database, ids: &[String]) -> Vec<String> {
+        let mut closed = Vec::new();
+        for id in ids {
+            match db.set_sheet_locked_if_unlocked(id).await {
+                Ok(true) => closed.push(id.clone()),
+                Ok(false) => {}
+                Err(err) => {
+                    revolt_config::capture_error(&err);
+                }
+            }
+        }
+        closed
+    }
+
+    /// Delete the sheets carried by the given messages and every reserve
+    /// on them (the history wipe, 7.2 "S4"). Every other sheet and reserve
+    /// is left alone. No event: the caller deletes the messages themselves.
+    pub async fn delete_for_messages(db: &Database, message_ids: &[String]) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        db.delete_softres_for_messages(message_ids).await
     }
 }
 

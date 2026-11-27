@@ -980,6 +980,112 @@ mod test {
             SnapshotContent::User(reported) if reported.id == author.id
         ));
     }
+
+    /// Design 7.5 "S4": a plaintext row at or below the boundary of a
+    /// channel protected with its history is truthful pre-protect history,
+    /// so its report carries the server copy; once the wipe is `Requested`
+    /// a report of the same row is filed on the reporter's snapshot alone
+    ///
+    /// Control: the wipe arm dropped from `is_servable` -> the second report
+    /// carries a server copy.
+    #[test]
+    fn report_of_a_pre_boundary_row_carries_a_server_copy_until_the_wipe() {
+        crate::util::test::rt()
+            .block_on(report_of_a_pre_boundary_row_carries_a_server_copy_until_the_wipe_case())
+    }
+
+    async fn report_of_a_pre_boundary_row_carries_a_server_copy_until_the_wipe_case() {
+        use revolt_database::HistoryWipe;
+
+        let harness = TestHarness::new().await;
+        let (_, _, author) = harness.new_user().await;
+        let (server, channels) = harness.new_server(&author).await;
+        let (channel, _, message) = harness.new_message(&author, &server, channels).await;
+        protect_under_stored_rows(&harness.db, channel.id()).await;
+        harness
+            .protect_with_history_raw(channel.id(), &message.id, HistoryWipe::None)
+            .await;
+
+        // The snapshots of one message report by a fresh reporter, who joins
+        // the server first: a reporter must be able to see the message
+        async fn report(
+            harness: &TestHarness,
+            server: &revolt_database::Server,
+            channel: &Channel,
+            author_id: &str,
+            message_id: &str,
+        ) -> Vec<revolt_database::Snapshot> {
+            let (_, session, reporter) = harness.new_user().await;
+            harness.join_server(server, &reporter).await;
+            let response = harness
+                .client
+                .post("/safety/report")
+                .header(ContentType::JSON)
+                .header(Header::new("x-session-token", session.token.to_string()))
+                .body(
+                    json!({
+                        "content": {
+                            "type": "Message",
+                            "id": message_id,
+                            "report_reason": "SpamAbuse"
+                        },
+                        "message_snapshot": {
+                            "message": {
+                                "id": message_id,
+                                "channel": channel.id(),
+                                "author": author_id,
+                                "content": "Test message"
+                            }
+                        }
+                    })
+                    .to_string(),
+                )
+                .dispatch()
+                .await;
+            assert_eq!(response.status(), Status::NoContent);
+
+            let reports = harness.db.fetch_reports(None).await.expect("reports");
+            let report = reports
+                .iter()
+                .find(|report| report.author_id == reporter.id)
+                .expect("report to be persisted");
+            harness
+                .db
+                .fetch_snapshots_by_report(&report.id)
+                .await
+                .expect("snapshots")
+        }
+
+        let snapshots = report(&harness, &server, &channel, &author.id, &message.id).await;
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "the reporter's snapshot and the server copy"
+        );
+        assert!(snapshots.iter().any(|snapshot| matches!(
+            &snapshot.content,
+            SnapshotContent::Message { message: server_copy, .. }
+                if server_copy.id == message.id
+                    && server_copy.content.as_deref() == Some("Test message")
+        )));
+
+        harness
+            .protect_with_history_raw(
+                channel.id(),
+                &message.id,
+                HistoryWipe::Requested {
+                    at: iso8601_timestamp::Timestamp::now_utc(),
+                    by: author.id.clone(),
+                },
+            )
+            .await;
+        let snapshots = report(&harness, &server, &channel, &author.id, &message.id).await;
+        assert_eq!(snapshots.len(), 1, "wipe pending: no server copy");
+        assert!(matches!(
+            &snapshots[0].content,
+            SnapshotContent::ReporterMessage { .. }
+        ));
+    }
 }
 
 #[cfg(test)]

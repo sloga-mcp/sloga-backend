@@ -3,7 +3,8 @@ use std::collections::hash_map::Entry;
 use super::AbstractChannels;
 use crate::ReferenceDb;
 use crate::util::ChunkedDatabaseGenerator;
-use crate::{Channel, FieldsChannel, PartialChannel};
+use crate::{Channel, FieldsChannel, HistoryWipe, PartialChannel};
+use iso8601_timestamp::Timestamp;
 use revolt_permissions::OverrideField;
 use revolt_result::Result;
 
@@ -318,5 +319,86 @@ impl AbstractChannels for ReferenceDb {
             Some(_) => Ok(()),
             None => Err(create_error!(NotFound)),
         }
+    }
+
+    /// Fetch the ids of channels with a requested wipe; see the trait.
+    async fn fetch_channel_ids_with_requested_wipe(
+        &self,
+        after: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        if limit <= 0 {
+            return Ok(vec![]);
+        }
+        let channels = self.channels.lock().await;
+        let mut ids: Vec<&str> = channels
+            .values()
+            .filter_map(|channel| match channel {
+                Channel::TextChannel {
+                    id,
+                    protected_history: Some(history),
+                    ..
+                } if matches!(history.wipe, HistoryWipe::Requested { .. })
+                    && after.is_none_or(|after| id.as_str() > after) =>
+                {
+                    Some(id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        Ok(ids
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(usize::MAX))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Checked and written under the `channels` lock.
+    async fn complete_history_wipe(
+        &self,
+        channel_id: &str,
+        at: Timestamp,
+        count: u64,
+    ) -> Result<bool> {
+        // The MongoDB driver stores the count as Int64
+        i64::try_from(count).map_err(|_| create_error!(InternalError))?;
+        let mut channels = self.channels.lock().await;
+        let Some(Channel::TextChannel {
+            protected_history: Some(history),
+            ..
+        }) = channels.get_mut(channel_id)
+        else {
+            return Ok(false);
+        };
+        if !matches!(history.wipe, HistoryWipe::Requested { .. }) {
+            return Ok(false);
+        }
+        history.wipe = HistoryWipe::Done { at, count };
+        Ok(true)
+    }
+
+    /// Checked and written under the `channels` lock.
+    async fn reset_last_message_id_after_wipe(
+        &self,
+        channel_id: &str,
+        boundary: &str,
+        newest_remaining: Option<String>,
+    ) -> Result<bool> {
+        let mut channels = self.channels.lock().await;
+        let Some(Channel::TextChannel {
+            last_message_id, ..
+        }) = channels.get_mut(channel_id)
+        else {
+            return Ok(false);
+        };
+        if last_message_id
+            .as_deref()
+            .is_some_and(|current| current > boundary)
+        {
+            return Ok(false);
+        }
+        *last_message_id = newest_remaining;
+        Ok(true)
     }
 }

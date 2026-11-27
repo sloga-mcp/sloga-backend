@@ -29,6 +29,14 @@ async fn resolve_open_poll(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // Polls are server-counted plaintext, so a protected channel (or a
+    // thread under one) takes no ballot and no retraction (design 7.4 "S4").
+    // After the ViewChannel check, so a non-viewer gets the pre-S4 answer
+    // (decision 18), and before the poll is read, lazily closed or written.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let poll = db.fetch_poll(poll_id).await?;
     if poll.channel != channel.id() {
         return Err(create_error!(NotFound));
@@ -372,5 +380,129 @@ mod test {
         assert_eq!(counts.iter().find(|c| c.answer_id == 1).unwrap().count, 1);
         // One ballot, two selections
         assert_eq!(poll.total_votes, Some(1));
+    }
+}
+
+/// Protected channels (S4): a protected channel takes no ballot
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    use crate::routes::channels::poll_fetch::protected_fixture::{
+        assert_refused, new_poll, request, thread_under, world, World,
+    };
+
+    async fn vote(world: &World, channel_id: &str, poll_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.member_session,
+            Method::Put,
+            format!("/channels/{channel_id}/polls/{poll_id}/vote"),
+            Some(json!({ "answer_ids": [1] })),
+        )
+        .await
+    }
+
+    async fn unvote(world: &World, channel_id: &str, poll_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.member_session,
+            Method::Delete,
+            format!("/channels/{channel_id}/polls/{poll_id}/vote"),
+            None,
+        )
+        .await
+    }
+
+    /// The member's stored ballot on `poll_id`
+    async fn ballot(world: &World, poll_id: &str) -> Option<Vec<u8>> {
+        world
+            .harness
+            .db
+            .fetch_poll_vote(poll_id, &world.member.id)
+            .await
+            .expect("ballot")
+            .map(|vote| vote.answer_ids)
+    }
+
+    /// Design 7.4 "S4": a vote and a retraction on an open poll of a
+    /// protected channel answer `ChannelProtected` and leave the ballot as
+    /// it was; the same vote on the ordinary channel's poll still lands
+    #[test]
+    fn a_protected_channel_refuses_a_vote_and_a_retraction() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_protected_channel_refuses_a_vote_and_a_retraction_case(),
+        ))
+    }
+
+    async fn a_protected_channel_refuses_a_vote_and_a_retraction_case() {
+        let w = world().await;
+        let channel_id = w.protected.channel.id();
+
+        assert_refused(
+            &vote(&w, channel_id, &w.poll.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a vote",
+        );
+        assert_refused(
+            &unvote(&w, channel_id, &w.poll.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a retraction",
+        );
+        assert_eq!(ballot(&w, &w.poll.id).await, Some(vec![0]), "the ballot");
+        let stored = w.harness.db.fetch_poll(&w.poll.id).await.expect("poll");
+        assert!(!stored.closed, "the refusal closed the poll");
+
+        let ordinary = vote(&w, w.ordinary.id(), &w.ordinary_poll.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary: {}", ordinary.1);
+        assert_eq!(ballot(&w, &w.ordinary_poll.id).await, Some(vec![1]));
+    }
+
+    /// A thread is judged by its parent (#182): a thread under the
+    /// protected channel refuses a vote, one under the ordinary channel
+    /// takes it
+    #[test]
+    fn a_thread_under_a_protected_parent_refuses_a_vote() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_thread_under_a_protected_parent_refuses_a_vote_case(),
+        ))
+    }
+
+    async fn a_thread_under_a_protected_parent_refuses_a_vote_case() {
+        let w = world().await;
+        let server_id = &w.protected.server.id;
+        let mut polls = Vec::new();
+        for parent in [&w.protected.channel, &w.ordinary] {
+            let thread = thread_under(parent, server_id, &w.owner);
+            w.harness.db.insert_channel(&thread).await.expect("thread");
+            let poll = new_poll(
+                &w.harness,
+                &thread,
+                server_id,
+                &w.owner,
+                &w.owner,
+                &Ulid::new().to_string(),
+            )
+            .await;
+            polls.push((thread, poll));
+        }
+
+        let (thread, poll) = &polls[0];
+        assert_refused(
+            &vote(&w, thread.id(), &poll.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a thread under a protected parent",
+        );
+        assert_eq!(ballot(&w, &poll.id).await, None, "the ballot");
+
+        let (thread, poll) = &polls[1];
+        let ordinary = vote(&w, thread.id(), &poll.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary thread: {}", ordinary.1);
+        assert_eq!(ballot(&w, &poll.id).await, Some(vec![1]));
     }
 }

@@ -12,7 +12,7 @@ use ulid::Ulid;
 use crate::models::admin_migrations::PROTECTED_NONCE_INDEX_NAME;
 use crate::{
     AbstractChannels, AppendMessage, Channel, DocumentId, FieldsMessage, IntoDocumentPath, Message,
-    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage,
+    MessageQuery, MessageTimePeriod, MongoDb, PartialMessage, ProtectedReadView,
 };
 
 use super::{AbstractMessages, ThreadStats, UnreadSummary, UNREAD_SCAN_WINDOW};
@@ -143,6 +143,25 @@ fn thread_stats_pipeline(channel_ids: &[String]) -> Vec<Document> {
     ]
 }
 
+/// The `$or` arms of the servable predicate of `view` (design 7.5 "S4"),
+/// None when `view` serves every row
+///
+/// `encrypted: { $ne: null }` matches only a present, non-null field: the
+/// rows that decode to `encrypted: Some(_)`, the exact complement of the wipe
+/// job's `encrypted: null`. The `_id <= B` arm exists only while the channel
+/// has a boundary and is not wiped.
+fn servable_arms(view: &ProtectedReadView) -> Option<Vec<Document>> {
+    if !view.protected {
+        return None;
+    }
+
+    let mut arms = vec![doc! { "encrypted": { "$ne": null } }];
+    if let (Some(boundary), false) = (&view.boundary, view.wiped) {
+        arms.push(doc! { "_id": { "$lte": boundary } });
+    }
+    Some(arms)
+}
+
 #[async_trait]
 impl AbstractMessages for MongoDb {
     /// Insert a new message into the database
@@ -216,6 +235,23 @@ impl AbstractMessages for MongoDb {
 
     /// Fetch multiple messages by given query
     async fn fetch_messages(&self, query: MessageQuery) -> Result<Vec<Message>> {
+        self.fetch_servable_messages(query, &ProtectedReadView::unprotected())
+            .await
+    }
+
+    /// Fetch the messages of `query` that `view` serves: `servable_arms`
+    /// joins the filter as a top-level `$or`, so both directions of a
+    /// `nearby` read and the limit see only servable rows
+    async fn fetch_servable_messages(
+        &self,
+        query: MessageQuery,
+        view: &ProtectedReadView,
+    ) -> Result<Vec<Message>> {
+        // A protected channel holds no text the server may search (O-12)
+        if view.protected && query.filter.query.is_some() {
+            return Ok(vec![]);
+        }
+
         let mut filter = doc! {};
 
         // 1. Apply message filters
@@ -243,6 +279,11 @@ impl AbstractMessages for MongoDb {
         if let Some(pinned) = query.filter.pinned {
             filter.insert("pinned", pinned);
         };
+
+        // 1.1. Keep only the rows `view` serves (design 7.5 "S4")
+        if let Some(arms) = servable_arms(view) {
+            filter.insert("$or", arms);
+        }
 
         // 2. Find query limit
         let limit = query.limit.unwrap_or(50);
@@ -816,6 +857,86 @@ impl AbstractMessages for MongoDb {
             .await
             .map(|_| ())
             .map_err(|_| create_database_error!("update_one", COL))
+    }
+
+    /// One batch of the `history_wipes` job, oldest first
+    ///
+    /// `channel` + `_id` lead, so the range is served off the `{channel, _id}`
+    /// index; `encrypted: null` then needs the document, which the caller
+    /// wants anyway (attachments). The cursor is read by hand rather than
+    /// through `find_with_options`: a release build there drops a row that
+    /// does not decode, and a batch that loses rows can come back empty while
+    /// plaintext is left, which would let the job mark the wipe done.
+    ///
+    /// A row that does not decode fails the call with a plain `DatabaseError`.
+    /// The decode error is dropped, neither reported nor logged: its text can
+    /// quote the stored plaintext, and the job already logs the failed channel
+    /// every tick and sends it to Sentry once, with a fixed message.
+    async fn fetch_history_wipe_batch(
+        &self,
+        channel: &str,
+        boundary: &str,
+        limit: i64,
+    ) -> Result<Vec<Message>> {
+        let mut cursor = self
+            .col::<Message>(COL)
+            .find(doc! {
+                "channel": channel,
+                "_id": { "$lte": boundary },
+                // Missing or null: the rows that decode to `encrypted: None`
+                "encrypted": null,
+            })
+            .sort(doc! { "_id": 1_i32 })
+            .limit(limit.max(1))
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+
+        let mut batch = Vec::new();
+        while let Some(message) = cursor.next().await {
+            let message = message.map_err(|_| create_database_error!("find", COL))?;
+            batch.push(message);
+        }
+
+        Ok(batch)
+    }
+
+    /// Delete the listed plaintext rows of a channel at or below the boundary;
+    /// returns how many went
+    ///
+    /// Still served by `{channel, _id}`: the `$in` and the `$lte` both bound
+    /// `_id`.
+    async fn delete_messages_by_ids(
+        &self,
+        channel: &str,
+        boundary: &str,
+        ids: &[String],
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        self.col::<Document>(COL)
+            .delete_many(doc! {
+                "channel": channel,
+                // Never a row above B, whatever the list says
+                "_id": { "$in": ids, "$lte": boundary },
+                // Never a row carrying `encrypted`, whatever the list says
+                "encrypted": null,
+            })
+            .await
+            .map(|result| result.deleted_count)
+            .map_err(|_| create_database_error!("delete_many", COL))
+    }
+
+    /// Id of the newest row of a channel, off the `{channel, _id}` index
+    async fn fetch_newest_message_id(&self, channel: &str) -> Result<Option<String>> {
+        self.col::<DocumentId>(COL)
+            .find_one(doc! { "channel": channel })
+            .sort(doc! { "_id": -1_i32 })
+            .projection(doc! { "_id": 1_i32 })
+            .await
+            .map(|row| row.map(|row| row.id))
+            .map_err(|_| create_database_error!("find_one", COL))
     }
 
     async fn remove_forwarded_attachment(&self, file_id: &str) -> Result<Vec<(String, String)>> {
@@ -1662,6 +1783,72 @@ mod nonce_index_tests {
                     .await,
             );
             assert_eq!(mongo.fetch_message(&stored.id).await.expect("kept"), stored);
+        });
+    }
+}
+
+/// `fetch_history_wipe_batch` over a row that does not decode. Mongo only:
+/// under `TEST_DB=REFERENCE` this returns early; the Reference driver stores
+/// typed rows.
+#[cfg(test)]
+mod history_wipe_batch_tests {
+    use bson::{doc, Document};
+    use revolt_result::ErrorType;
+
+    use crate::{AbstractMessages, Database, Message};
+
+    use super::COL;
+
+    /// The batch fails closed with a plain `DatabaseError` that never carries
+    /// the decode error, whose text quotes the stored row: the job logs this
+    /// error every tick
+    ///
+    /// Control: put the decode error into the returned error.
+    #[tokio::test]
+    async fn wipe_batch_error_never_quotes_the_row() {
+        database_test!(|db| async move {
+            let Database::MongoDb(mongo) = &db else {
+                eprintln!(
+                    "NOTE: wipe_batch_error_never_quotes_the_row runs on MONGODB only; skipped on REFERENCE"
+                );
+                return;
+            };
+            let channel = "01CHANWIPE0000000000000F01";
+            let id = ulid::Ulid::from_parts(1_000, 1).to_string();
+            let secret = "SECRET-WIPE-TEXT the crab recipe";
+            // A string where `attachments` holds a list
+            mongo
+                .col::<Document>(COL)
+                .insert_one(doc! {
+                    "_id": id.as_str(),
+                    "channel": channel,
+                    "author": "01AUTHOR0000000000000000000",
+                    "attachments": secret,
+                })
+                .await
+                .expect("insert the poisoned row");
+            // Proof of the fixture: the decode error quotes the row
+            let decode = mongo
+                .col::<Message>(COL)
+                .find_one(doc! { "_id": id.as_str() })
+                .await
+                .unwrap_err();
+            assert!(format!("{decode:?}").contains(secret), "{decode:?}");
+
+            let error = db
+                .fetch_history_wipe_batch(channel, &id, 10)
+                .await
+                .expect_err("an undecodable row must fail the batch");
+            assert!(
+                matches!(
+                    &error.error_type,
+                    ErrorType::DatabaseError { operation, collection }
+                        if operation == "find" && collection == COL
+                ),
+                "{error:?}"
+            );
+            assert!(!format!("{error:?}").contains("SECRET"), "{error:?}");
+            assert!(!format!("{error}").contains("SECRET"), "{error}");
         });
     }
 }

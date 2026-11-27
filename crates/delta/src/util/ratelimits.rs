@@ -465,11 +465,32 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
                 // shares the payments_me counter; checkout falls through to
                 // "payments" below.
                 ("payments", Some("prot"), _) if extra == Some("@me") => ("payments_me", None),
+                // In-app purchase verify (POST /payments/prot/store/verify): the app replays every
+                // unfinished store transaction at launch, so it gets its own counter. The 4th segment
+                // tells it from the intent (POST …/store/intent), which stays on the tight "payments" budget.
+                ("payments", Some("prot"), _)
+                    if extra == Some("store")
+                        && request.routed_segment(if versioned { 4 } else { 3 })
+                            == Some("verify") =>
+                {
+                    ("payments_store", None)
+                }
+                // App Store Server Notifications carry no session: keyed by the sender's address, like the
+                // Stripe webhook, so neither buyers nor "any" can spend it.
+                ("payments", Some("apple"), _) => ("payments_apple_webhook", None),
                 // Checkout, keyed per session. It creates a Stripe session,
                 // so the budget is tight; the engine's one live Pending
                 // order per user bounds a user with many sessions
                 // independently of this counter.
                 ("payments", _, _) => ("payments", None),
+                // Prot tank and goal writes (contribute, pledge, withdraw,
+                // goals, tier, contributor prefs) move Prot or open and
+                // close goals, so they share one tight counter keyed per
+                // session, NOT per channel or goal: spreading writes across
+                // tanks must spend the same budget. Reads (the tank, goals)
+                // stay on "any". The admin routes sit under /admin and the
+                // wallet under /payments, so neither reaches this arm.
+                ("prot", _, method) if method != Method::Get => ("prot_write", None),
                 _ => ("any", None),
             }
         } else {
@@ -638,6 +659,18 @@ impl<'a> RatelimitResolver<Request<'a>> for DeltaRatelimits {
             // Public sale counter: responses carry `max-age=30`, so a page
             // left open costs about one request per 30 s.
             "payments_stats" => 20,
+            // Prot tank and goal writes: a pledge, a hide-name toggle and one
+            // retry fit one window. The plan's 10 per 60 s can't be expressed
+            // in the fixed 10 s window; 3 per window (the checkout precedent)
+            // caps a script at 18 per minute.
+            "prot_write" => 3,
+            // In-app purchase verify: the app replays each unfinished store
+            // transaction at launch and on every transaction update, so a
+            // buyer with a small backlog needs more than checkout's 3
+            "payments_store" => 10,
+            // One delivery per App Store notification plus Apple's retries
+            // after a failed one, as the Stripe webhook
+            "payments_apple_webhook" => 60,
             // Take It Down, per address: a person files once and checks the
             // status now and then. 10 leaves room for a retry or two.
             "takedown" => 10,
@@ -1175,6 +1208,378 @@ mod tests {
         assert_eq!(
             client.get("/payments/prot/@me").dispatch().status(),
             Status::TooManyRequests
+        );
+    }
+
+    #[rocket::get("/channels/<_channel_id>/tank")]
+    fn prot_tank(_channel_id: &str) {}
+
+    #[rocket::post("/channels/<_channel_id>/contribute")]
+    fn prot_contribute(_channel_id: &str) {}
+
+    #[rocket::put("/channels/<_channel_id>/tier")]
+    fn prot_tier(_channel_id: &str) {}
+
+    #[rocket::post("/goals/<_goal_id>/pledges")]
+    fn prot_pledge(_goal_id: &str) {}
+
+    #[rocket::delete("/goals/<_goal_id>/pledges/<_pledge_id>")]
+    fn prot_withdraw(_goal_id: &str, _pledge_id: &str) {}
+
+    #[rocket::put("/servers/<_server_id>/contributor")]
+    fn prot_contributor(_server_id: &str) {}
+
+    #[rocket::post("/prot/tanks/<_tank_id>/terminate")]
+    fn admin_prot_terminate(_tank_id: &str) {}
+
+    /// The Prot tank and goal routes, on the same database-free Rocket as
+    /// `client()`
+    fn prot_tank_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount("/payments", rocket::routes![prot_checkout])
+            .mount("/admin", rocket::routes![admin_prot_terminate])
+            .mount(
+                "/prot",
+                rocket::routes![
+                    prot_tank,
+                    prot_contribute,
+                    prot_tier,
+                    prot_pledge,
+                    prot_withdraw,
+                    prot_contributor
+                ],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Every POST, PUT and DELETE under /prot resolves to `prot_write`
+    /// (limit 3, one counter per session whatever the channel, server or
+    /// goal), every GET stays on `any`, and the Prot admin and wallet routes
+    /// keep their buckets
+    #[test]
+    fn prot_routes_use_the_prot_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = prot_tank_client();
+
+        // The resolver, including the versioned prefix: every route of the
+        // Prot router
+        let writes = [
+            ("POST", "/channels/01CHN/contribute"),
+            ("PUT", "/channels/01CHN/tier"),
+            ("POST", "/channels/01CHN/goals"),
+            ("POST", "/servers/01SRV/goals"),
+            ("PUT", "/servers/01SRV/contributor"),
+            ("POST", "/goals/01GOL/pledges"),
+            ("DELETE", "/goals/01GOL/pledges/01PLG"),
+            ("POST", "/goals/01GOL/cancel"),
+            ("POST", "/goals/01GOL/launch"),
+        ];
+        let reads = [
+            "/channels/01CHN/tank",
+            "/servers/01SRV/goals",
+            "/goals/01GOL",
+        ];
+        for prefix in ["/prot", "/0.8/prot"] {
+            for (method, route) in writes {
+                let path = format!("{prefix}{route}");
+                let request = match method {
+                    "POST" => client.post(path.as_str()),
+                    "PUT" => client.put(path.as_str()),
+                    _ => client.delete(path.as_str()),
+                };
+                assert_eq!(
+                    DeltaRatelimits.resolve_bucket(&*request),
+                    ("prot_write", None),
+                    "{method} {path}"
+                );
+            }
+            for route in reads {
+                let path = format!("{prefix}{route}");
+                assert_eq!(
+                    DeltaRatelimits.resolve_bucket(&*client.get(path.as_str())),
+                    ("any", None),
+                    "GET {path}"
+                );
+            }
+        }
+        for (method, path, expected) in [
+            ("POST", "/admin/prot/tanks/01TNK/terminate", "any"),
+            ("POST", "/0.8/admin/prot/tanks/01TNK/terminate", "any"),
+            ("POST", "/payments/prot/checkout", "payments"),
+            ("GET", "/payments/prot/@me", "payments_me"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("prot_write"), 3);
+
+        // Through the fairing: limit 3, one counter for every write route
+        // and every target, distinct from the reads and from checkout
+        let contribute = client.post("/prot/channels/01AAA/contribute").dispatch();
+        assert_eq!(contribute.status(), Status::Ok);
+        assert_eq!(limit(&contribute), 3);
+        let tank = client.get("/prot/channels/01AAA/tank").dispatch();
+        assert_eq!(tank.status(), Status::Ok);
+        assert_eq!(limit(&tank), 20);
+        assert_ne!(
+            bucket(&tank),
+            bucket(&contribute),
+            "reading a tank must not spend the write budget"
+        );
+        let any = client.get("/sync/settings").dispatch();
+        assert_eq!(bucket(&tank), bucket(&any));
+
+        // A different channel, method and route (and the versioned prefix,
+        // which 404s here after the fairing has counted it) spend the same
+        // counter
+        let tier = client.put("/prot/channels/01BBB/tier").dispatch();
+        assert_eq!(tier.status(), Status::Ok);
+        assert_eq!(bucket(&tier), bucket(&contribute));
+        let versioned = client.post("/0.8/prot/goals/01GOL/pledges").dispatch();
+        assert_eq!(limit(&versioned), 3);
+        assert_eq!(bucket(&versioned), bucket(&contribute));
+
+        // Three writes fill the window; the fourth is refused, whatever the
+        // route
+        for request in [
+            client.delete("/prot/goals/01GOL/pledges/01PLG"),
+            client.put("/prot/servers/01SRV/contributor"),
+            client.post("/prot/goals/01OTHER/pledges"),
+        ] {
+            assert_eq!(request.dispatch().status(), Status::TooManyRequests);
+        }
+
+        // The reads, checkout and the admin route keep their own budgets
+        assert_eq!(
+            client.get("/prot/channels/01AAA/tank").dispatch().status(),
+            Status::Ok
+        );
+        let checkout = client.post("/payments/prot/checkout").dispatch();
+        assert_eq!(checkout.status(), Status::Ok);
+        assert_eq!(limit(&checkout), 3);
+        assert_ne!(bucket(&checkout), bucket(&contribute));
+        let terminate = client.post("/admin/prot/tanks/01TNK/terminate").dispatch();
+        assert_eq!(terminate.status(), Status::Ok);
+        assert_eq!(bucket(&terminate), bucket(&any));
+    }
+
+    #[rocket::post("/prot/store/intent")]
+    fn prot_store_intent() {}
+
+    #[rocket::post("/prot/store/intent/<_intent_id>/cancel")]
+    fn prot_store_intent_cancel(_intent_id: &str) {}
+
+    #[rocket::post("/prot/store/verify")]
+    fn prot_store_verify() {}
+
+    #[rocket::post("/apple/notifications")]
+    fn apple_notifications() {}
+
+    /// The in-app Prot routes and the App Store notification receiver, on
+    /// the same database-free Rocket as `client()`
+    fn prot_store_client() -> Client {
+        let rocket = rocket::build()
+            .manage(RatelimitStorage::new(DeltaRatelimits))
+            .attach(RatelimitFairing)
+            .mount("/", revolt_ratelimits::rocket::routes())
+            .mount("/sync", rocket::routes![sync_settings])
+            .mount(
+                "/payments",
+                rocket::routes![
+                    prot_store_intent,
+                    prot_store_intent_cancel,
+                    prot_store_verify,
+                    apple_notifications,
+                    prot_me,
+                    stripe_webhook
+                ],
+            );
+        Client::untracked(rocket).expect("rocket builds without a database")
+    }
+
+    /// Verify (POST /payments/prot/store/verify) resolves to `payments_store`
+    /// (limit 10) by its 4th segment, so the intent and its cancel stay on
+    /// the tight `payments` budget; the App Store notifications resolve to
+    /// `payments_apple_webhook` (limit 60), a counter apart from Stripe's
+    #[test]
+    fn prot_store_routes_split_into_their_own_buckets() {
+        use revolt_ratelimits::ratelimiter::RatelimitResolver;
+
+        let client = prot_store_client();
+
+        // The resolver, including the versioned prefix
+        for (method, path, expected) in [
+            ("POST", "/payments/prot/store/verify", "payments_store"),
+            ("POST", "/0.8/payments/prot/store/verify", "payments_store"),
+            ("POST", "/payments/prot/store/intent", "payments"),
+            ("POST", "/0.8/payments/prot/store/intent", "payments"),
+            (
+                "POST",
+                "/payments/prot/store/intent/01INTENT/cancel",
+                "payments",
+            ),
+            (
+                "POST",
+                "/0.8/payments/prot/store/intent/01INTENT/cancel",
+                "payments",
+            ),
+            (
+                "POST",
+                "/payments/apple/notifications",
+                "payments_apple_webhook",
+            ),
+            (
+                "POST",
+                "/0.8/payments/apple/notifications",
+                "payments_apple_webhook",
+            ),
+            ("GET", "/payments/prot/@me", "payments_me"),
+            ("GET", "/0.8/payments/prot/@me", "payments_me"),
+            ("POST", "/payments/prot/checkout", "payments"),
+            ("POST", "/payments/stripe/webhook", "payments_webhook"),
+            // Must NOT match: "verify" anywhere but the segment after
+            // payments/prot/store, or under another resource
+            ("POST", "/payments/prot/store", "payments"),
+            ("POST", "/payments/prot/verify", "payments"),
+            ("POST", "/payments/prot/checkout/verify", "payments"),
+            ("POST", "/payments/prot/store/intent/verify", "payments"),
+            ("POST", "/payments/prot/store/01INTENT/verify", "payments"),
+            (
+                "POST",
+                "/0.8/payments/prot/store/01INTENT/verify",
+                "payments",
+            ),
+            ("POST", "/payments/cipher/store/verify", "payments"),
+            ("POST", "/payments/applestore/notifications", "payments"),
+            ("POST", "/apple/notifications", "any"),
+            // S5b's /prot write arm keeps its paths and never sees /payments
+            ("POST", "/prot/store/verify", "prot_write"),
+            ("POST", "/0.8/prot/store/verify", "prot_write"),
+            ("GET", "/prot/store/verify", "any"),
+        ] {
+            let request = match method {
+                "POST" => client.post(path),
+                _ => client.get(path),
+            };
+            assert_eq!(
+                DeltaRatelimits.resolve_bucket(&*request),
+                (expected, None),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(DeltaRatelimits.resolve_bucket_limit("payments_store"), 10);
+        assert_eq!(
+            DeltaRatelimits.resolve_bucket_limit("payments_apple_webhook"),
+            60
+        );
+
+        // Through the fairing: verify 10 per window, the intent 3, Apple's
+        // notifications 60, each its own counter
+        let verify = client.post("/payments/prot/store/verify").dispatch();
+        assert_eq!(verify.status(), Status::Ok);
+        assert_eq!(limit(&verify), 10);
+        let intent = client.post("/payments/prot/store/intent").dispatch();
+        assert_eq!(intent.status(), Status::Ok);
+        assert_eq!(limit(&intent), 3);
+        let cancel = client
+            .post("/payments/prot/store/intent/01INTENT/cancel")
+            .dispatch();
+        assert_eq!(cancel.status(), Status::Ok);
+        assert_eq!(
+            bucket(&cancel),
+            bucket(&intent),
+            "a cancel spends the intent's counter"
+        );
+        let apple = client.post("/payments/apple/notifications").dispatch();
+        assert_eq!(apple.status(), Status::Ok);
+        assert_eq!(limit(&apple), 60);
+        let stripe = client.post("/payments/stripe/webhook").dispatch();
+        assert_eq!(stripe.status(), Status::Ok);
+        let me = client.get("/payments/prot/@me").dispatch();
+        assert_eq!(me.status(), Status::Ok);
+        let any = client.get("/sync/settings").dispatch();
+        let buckets = [
+            bucket(&verify),
+            bucket(&intent),
+            bucket(&apple),
+            bucket(&stripe),
+            bucket(&me),
+            bucket(&any),
+        ];
+        for (i, a) in buckets.iter().enumerate() {
+            for b in &buckets[i + 1..] {
+                assert_ne!(
+                    a, b,
+                    "verify, intent, both webhooks, the wallet and any must be distinct counters"
+                );
+            }
+        }
+
+        // The versioned prefix (which 404s here after the fairing has
+        // counted it) spends the same verify counter
+        let versioned = client.post("/0.8/payments/prot/store/verify").dispatch();
+        assert_eq!(limit(&versioned), 10);
+        assert_eq!(bucket(&versioned), bucket(&verify));
+
+        // Two verifies so far: 8 more fill the window of 10, the 11th is
+        // refused
+        for _ in 0..8 {
+            assert_eq!(
+                client
+                    .post("/payments/prot/store/verify")
+                    .dispatch()
+                    .status(),
+                Status::Ok
+            );
+        }
+        assert_eq!(
+            client
+                .post("/payments/prot/store/verify")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // The intent still answers: an intent and a cancel so far, one more
+        // fills the window of 3 and the next is refused
+        assert_eq!(
+            client
+                .post("/payments/prot/store/intent")
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client
+                .post("/payments/prot/store/intent/01INTENT/cancel")
+                .dispatch()
+                .status(),
+            Status::TooManyRequests
+        );
+
+        // Apple's and Stripe's deliveries are spent by neither
+        assert_eq!(
+            client
+                .post("/payments/apple/notifications")
+                .dispatch()
+                .status(),
+            Status::Ok
+        );
+        assert_eq!(
+            client.post("/payments/stripe/webhook").dispatch().status(),
+            Status::Ok
         );
     }
 

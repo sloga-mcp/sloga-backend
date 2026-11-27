@@ -30,6 +30,15 @@ async fn resolve_managed_sheet(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // A protected channel (or a thread under one) takes no sheet edit, lock
+    // or unlock (design 7.4 "S4"): protect locks the open sheets itself, and
+    // an unlock would reopen one. After the ViewChannel check, so a
+    // non-viewer gets the pre-S4 answer (decision 18), and before the sheet
+    // is read or the manage check runs.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let sheet = db.fetch_sheet(sheet_id).await?;
     if sheet.channel != channel.id() {
         return Err(create_error!(NotFound));
@@ -478,6 +487,127 @@ mod test {
                 .expect("sheet")
                 .title,
             "Moved"
+        );
+    }
+}
+
+/// Protected channels (S4): a protected channel's sheet cannot be edited,
+/// locked or unlocked
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    use crate::routes::channels::softres_fetch::protected_fixture::{
+        assert_refused, new_sheet, request, thread_under, world, World,
+    };
+
+    /// The sheets' creator (the server owner) edits (`PATCH`), locks
+    /// (`POST /lock`) or unlocks (`DELETE /lock`) one
+    async fn manage(
+        world: &World,
+        method: Method,
+        channel_id: &str,
+        sheet_id: &str,
+        suffix: &str,
+    ) -> (Status, Value) {
+        let body = match method {
+            Method::Patch => Some(json!({ "title": "Moved" })),
+            _ => None,
+        };
+        request(
+            &world.harness,
+            &world.owner_session,
+            method,
+            format!("/channels/{channel_id}/softres/{sheet_id}{suffix}"),
+            body,
+        )
+        .await
+    }
+
+    /// Design 7.4 "S4": the creator's edit, lock and unlock of a sheet of a
+    /// protected channel answer `ChannelProtected` and change nothing (an
+    /// unlock would reopen a sheet protect locked); the same three on the
+    /// ordinary channel's sheet still land. A thread under the protected
+    /// channel is judged by its parent (#182).
+    #[test]
+    fn a_protected_channel_refuses_to_edit_lock_or_unlock_a_sheet() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_protected_channel_refuses_to_edit_lock_or_unlock_a_sheet_case(),
+        ))
+    }
+
+    async fn a_protected_channel_refuses_to_edit_lock_or_unlock_a_sheet_case() {
+        let w = world().await;
+        let channel_id = w.protected.channel.id();
+
+        for (method, suffix, case) in [
+            (Method::Patch, "", "an edit"),
+            (Method::Post, "/lock", "a lock"),
+        ] {
+            assert_refused(
+                &manage(&w, method, channel_id, &w.sheet.id, suffix).await,
+                Status::BadRequest,
+                "ChannelProtected",
+                case,
+            );
+        }
+        let stored = w.harness.db.fetch_sheet(&w.sheet.id).await.expect("sheet");
+        assert_eq!(stored.title, w.sheet.title, "the refusal edited the sheet");
+        assert!(!stored.locked, "the refusal locked the sheet");
+
+        // As protect leaves it: locked
+        assert!(w
+            .harness
+            .db
+            .set_sheet_locked_if_unlocked(&w.sheet.id)
+            .await
+            .expect("lock"));
+        assert_refused(
+            &manage(&w, Method::Delete, channel_id, &w.sheet.id, "/lock").await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "an unlock",
+        );
+        let stored = w.harness.db.fetch_sheet(&w.sheet.id).await.expect("sheet");
+        assert!(stored.locked, "the refusal unlocked the sheet");
+
+        for (method, suffix, case) in [
+            (Method::Patch, "", "an edit"),
+            (Method::Post, "/lock", "a lock"),
+            (Method::Delete, "/lock", "an unlock"),
+        ] {
+            let ordinary = manage(&w, method, w.ordinary.id(), &w.ordinary_sheet.id, suffix).await;
+            assert_eq!(ordinary.0, Status::Ok, "ordinary {case}: {}", ordinary.1);
+        }
+        let stored = w
+            .harness
+            .db
+            .fetch_sheet(&w.ordinary_sheet.id)
+            .await
+            .expect("sheet");
+        assert_eq!(stored.title, "Moved");
+        assert!(!stored.locked);
+
+        // A thread is judged by its parent (#182)
+        let server_id = &w.protected.server.id;
+        let thread = thread_under(&w.protected.channel, server_id, &w.owner);
+        w.harness.db.insert_channel(&thread).await.expect("thread");
+        let sheet = new_sheet(
+            &w.harness,
+            &thread,
+            server_id,
+            &w.owner,
+            &w.owner,
+            &Ulid::new().to_string(),
+        )
+        .await;
+        assert_refused(
+            &manage(&w, Method::Post, thread.id(), &sheet.id, "/lock").await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a lock in a thread under a protected parent",
         );
     }
 }

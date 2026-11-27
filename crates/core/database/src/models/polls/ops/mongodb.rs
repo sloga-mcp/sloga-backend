@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bson::Document;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 use revolt_result::Result;
 
@@ -12,6 +12,39 @@ use super::AbstractPolls;
 
 static COL: &str = "polls";
 static COL_VOTES: &str = "poll_votes";
+
+/// The `_id` of every row, as a string. Polls are only ever written with
+/// string ids, so a non-string `_id` is a corrupt row: skipping it would
+/// leave it behind unreported, so the call fails closed instead.
+fn string_ids(rows: &[Document]) -> Result<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.get_str("_id").map(str::to_string).map_err(|error| {
+                revolt_config::capture_internal_error!(error);
+                create_database_error!("find", COL)
+            })
+        })
+        .collect()
+}
+
+/// The Sentry messages `open_poll_scan_error` sent, in this process
+/// (test-only evidence)
+#[cfg(test)]
+static OPEN_POLL_SCAN_REPORTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The open-poll scan failed on a row: report a fixed message and the
+/// channel id only. The decode error is never reported, since its text can
+/// quote the stored poll (the question or an answer).
+fn open_poll_scan_error(channel: &str) -> revolt_result::Error {
+    let report = format!("open poll scan failed to read a row in channel {channel}");
+    #[cfg(test)]
+    OPEN_POLL_SCAN_REPORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(report.clone());
+    revolt_config::capture_internal_error!(report);
+    create_database_error!("find", COL)
+}
 
 #[async_trait]
 impl AbstractPolls for MongoDb {
@@ -244,26 +277,52 @@ impl AbstractPolls for MongoDb {
             .await)
     }
 
+    /// Fetch every open poll of a channel, ordered by poll id.
+    async fn fetch_open_polls_for_channel(&self, channel: &str) -> Result<Vec<Poll>> {
+        // `closed: false` is a missing key, as in `close_poll_if_open`.
+        //
+        // Fails closed: an open row that does not decode as a `Poll`, or a
+        // cursor error, fails the scan instead of being skipped. Closing
+        // works on decoded polls (`Poll::close_listed`), and the caller's
+        // `PollClose` needs the message id and the answers, so a skipped
+        // row would stay open, unreported, on a channel being protected.
+        self.col::<Poll>(COL)
+            .find(doc! {
+                "channel": channel,
+                "closed": { "$ne": true }
+            })
+            .sort(doc! { "_id": 1_i32 })
+            .await
+            .map_err(|_| create_database_error!("find", COL))?
+            .try_collect()
+            .await
+            .map_err(|_| open_poll_scan_error(channel))
+    }
+
     /// Delete the polls carried by the given messages, and their ballots.
     async fn delete_polls_for_messages(&self, message_ids: &[String]) -> Result<()> {
-        let polls: Vec<Poll> = self
-            .col::<Poll>(COL)
+        // Ids only, read as plain documents: a row that no longer decodes as
+        // a `Poll` is still deleted (the history wipe must not leave poll
+        // text behind), and a cursor error or a non-string `_id` fails the
+        // call instead of silently skipping a row.
+        let rows: Vec<Document> = self
+            .col::<Document>(COL)
             .find(doc! {
                 "message": {
                     "$in": message_ids
                 }
             })
+            .projection(doc! { "_id": 1_i32 })
             .await
             .map_err(|_| create_database_error!("find", COL))?
-            .filter_map(|s| async { s.ok() })
-            .collect()
-            .await;
+            .try_collect()
+            .await
+            .map_err(|_| create_database_error!("find", COL))?;
+        let poll_ids = string_ids(&rows)?;
 
-        if polls.is_empty() {
+        if poll_ids.is_empty() {
             return Ok(());
         }
-
-        let poll_ids: Vec<&str> = polls.iter().map(|poll| poll.id.as_str()).collect();
 
         self.col::<Document>(COL_VOTES)
             .delete_many(doc! {
@@ -301,5 +360,70 @@ impl AbstractPolls for MongoDb {
             .await
             .map(|_| ())
             .map_err(|_| create_database_error!("delete_many", COL))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OPEN_POLL_SCAN_REPORTS;
+    use crate::{Database, Poll};
+
+    /// An open poll row that does not decode fails the open-poll scan, and
+    /// its Sentry message is the fixed text and the channel id, never the
+    /// decode error, which quotes the stored poll. MongoDB only (the
+    /// Reference driver stores typed rows)
+    ///
+    /// Control: put the decode error back into the message.
+    #[tokio::test]
+    async fn open_poll_scan_report_never_carries_poll_text() {
+        database_test!(|db| async move {
+            if let Database::MongoDb(mongo) = &db {
+                let channel = "01CHANR1000000000000000000";
+                let id = "01POLLR1000000000000000000";
+                let secret = "SECRET-POLL-TEXT which crab";
+                mongo
+                    .col::<bson::Document>("polls")
+                    .insert_one(bson::doc! {
+                        "_id": id,
+                        "message": "01MSGR10000000000000000000",
+                        "channel": channel,
+                        "question": secret,
+                        "answers": secret
+                    })
+                    .await
+                    .unwrap();
+                // Proof of the fixture: the decode error quotes the poll
+                let decode = mongo
+                    .col::<Poll>("polls")
+                    .find_one(bson::doc! { "_id": id })
+                    .await
+                    .unwrap_err();
+                assert!(format!("{decode:?}").contains(secret), "{decode:?}");
+
+                let error = db.fetch_open_polls_for_channel(channel).await.unwrap_err();
+                assert!(
+                    matches!(
+                        error.error_type,
+                        revolt_result::ErrorType::DatabaseError { .. }
+                    ),
+                    "{error:?}"
+                );
+
+                let reports: Vec<String> = OPEN_POLL_SCAN_REPORTS
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|report| report.contains(channel))
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    reports,
+                    vec![format!(
+                        "open poll scan failed to read a row in channel {channel}"
+                    )]
+                );
+                assert!(!reports[0].contains("SECRET"));
+            }
+        });
     }
 }

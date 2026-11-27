@@ -3,10 +3,11 @@ use std::collections::HashSet;
 use iso8601_timestamp::{Duration, Timestamp};
 use revolt_database::{
     events::client::EventV1, is_valid_device_id, mls_text_enforced_device_cap,
-    mls_text_rejoin_window_seconds, retain_member_pending_device_removals, Channel,
-    ChannelEntitlement, Database, E2EEContentType, E2EEEnvelope, MlsCommit, MlsCommitOutcome,
-    MlsEnvelopeRejoinIntent, MlsGroup, MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody,
-    Session, User, E2EE_PROTOCOL_VERSION, MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, retain_member_pending_device_removals,
+    seat_list_history_visible, Channel, ChannelEntitlement, Database, E2EEContentType,
+    E2EEEnvelope, MlsAddedProtocol, MlsCommit, MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup,
+    MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody, Session, User, E2EE_PROTOCOL_VERSION,
+    MAX_MLS_GROUP_MEMBERS, MAX_MLS_TEXT_GROUP_MEMBERS, MIN_TEXT_PROTOCOL_V2,
     PROTECTED_SCOPE_TEXT_GROUP,
 };
 use revolt_models::v0;
@@ -41,8 +42,12 @@ use super::{
 /// the epoch answers before any validity check; the commit's
 /// `authenticated_data` must be the channel's newest stored seat list;
 /// Adds need the growth flag (recovery Adds do not), an entitlement that
-/// allows text traffic and eligible, seated targets within the device and
-/// leaf caps; Removes follow the Remove rule.
+/// allows text traffic (Active or Grace) and eligible, seated targets within
+/// the device and leaf caps; Removes follow the Remove rule. On a channel
+/// whose stored list is v2, every added device must have joined with a text
+/// protocol of at least 2: its join intent's, or for a rejoin re-Add the
+/// protocol its eviction recorded (`ProtectedClientOutdated`). Every Text
+/// Add stores each added device's protocol on the row for the Welcome route.
 /// Its commit envelopes carry the declarations (`committer`, `added`,
 /// `removed`, `rejoin_intents`) receivers bind the commit to.
 #[openapi(tag = "MLS")]
@@ -255,6 +260,8 @@ async fn submit_call_commit(
         // Nor removal reasons (Text-only, B48): never serialized for Call
         removed_reasons: vec![],
         welcome: None,
+        history_visible: None,
+        added_protocols: vec![],
     };
 
     // The CAS — one winner per epoch; membership, epoch monotonicity, the
@@ -338,10 +345,18 @@ async fn submit_call_commit(
 ///    idempotent after the group, the seat list or the growth flag moved on
 ///    (W0-fix8, §11);
 /// 5. validity: open; the AD binding; for Adds the growth gate (unless every
-///    Add is a recovery Add), an entitlement that allows text traffic and
-///    Add-clears-pending; the Remove rule; the Add targets and caps. The
-///    commit transaction checks them again on its own read, and that check
-///    is the one that binds.
+///    Add is a recovery Add), an entitlement that allows text traffic
+///    (Active or Grace) and Add-clears-pending; the Remove rule; the Add
+///    targets and caps; on a v2 list, the minimum text protocol of every
+///    added device, from its join intent or else its `rejoin_readd` entry
+///    (S4, last). The commit transaction checks them again on its own read,
+///    and that check is the one that binds, except for the growth gate, the
+///    entitlement state and the protocol: the transaction is handed only the
+///    entitlement's device cap, so the state is checked here and nowhere
+///    else, and it does not check the protocol. Residual (S5b BR7): an Add
+///    checked in Grace can still commit right after the clock writes Frozen.
+///    It only adds a seated member's device, so it costs policy, not
+///    confidentiality.
 async fn submit_text_commit(
     db: &Database,
     user: User,
@@ -448,10 +463,11 @@ async fn submit_text_commit(
         .collect();
 
     // Growth is Adds only: Remove and Update commits go on with the flag
-    // off (decision 5 (W2)) and in every entitlement state. A recovery Add
-    // passes without the flag (S2-D32): the available gate above and the
-    // entitlement check here are its gate. Every Add needs an entitlement
-    // that allows text traffic (decision 7, #220), and Add-clears-pending
+    // off (decision 5 (W2)) and in every entitlement state, Frozen and
+    // Deleted included (S5b). A recovery Add passes without the flag
+    // (S2-D32): the available gate above and the entitlement check here are
+    // its gate. Every Add needs an entitlement that allows text traffic,
+    // Active or Grace (decision 7, #220, S5b D14), and Add-clears-pending
     // (S2-D17b).
     if !added.is_empty() {
         if !is_recovery_add(db, &group, &stored, &added).await? {
@@ -518,6 +534,47 @@ async fn submit_text_commit(
         }
     }
 
+    // Each added device's text protocol, read for every Text Add on a v1
+    // and a v2 list alike and stored on the row (ruling R-WELCOME): the Add
+    // consumes the intent, so the Welcome route's floor reads the row
+    let added_protocols = if added.is_empty() {
+        vec![]
+    } else {
+        protocols_of_added(db, &group, &added).await?
+    };
+
+    // Minimum text protocol (S4 plan appendix (2) item 3, design 8.3
+    // "Text protocol"): on a v2 list an S1-only device must never be
+    // pulled into a group whose v2 commits it cannot read. The last
+    // validity check, so every earlier answer is unchanged; a v1 list is
+    // never refused for it. A commit that took this epoch meanwhile has
+    // consumed the intents it added, so a row now at the epoch answers
+    // `Lost` with that row, as the existing-row check would have.
+    if stored.is_v2()
+        && !added_protocols.iter().all(|added| {
+            added
+                .protocol
+                .is_some_and(|protocol| protocol >= MIN_TEXT_PROTOCOL_V2)
+        })
+    {
+        if let Some(winning) = db
+            .fetch_mls_text_commits_from(&group.id, epoch, 1)
+            .await?
+            .into_iter()
+            .find(|row| row.epoch == epoch)
+        {
+            return Ok(Arbitrated {
+                conflict: true,
+                body: Json(v0::ResponseSubmitMlsCommit::Lost {
+                    winning: winning.into_commit_info(&group.channel_id),
+                }),
+            });
+        }
+        return Err(create_error!(ProtectedClientOutdated {
+            min: MIN_TEXT_PROTOCOL_V2
+        }));
+    }
+
     // Raw (decoded) size from the unpadded-base64 length
     let commit_raw_size = (commit_ciphertext.len() * 3) / 4;
 
@@ -539,6 +596,12 @@ async fn submit_text_commit(
         // Stored on the row for the Welcome route (S2-D29); never part of
         // a commit fetch or a 409 body
         welcome: welcome.clone(),
+        // The visibility of the transition into `epoch` (2.5 "S4"), from the
+        // list the AD binding matched: `false` for a v2 `hidden` list and
+        // for every v1 list (O-2). Never served (`MlsCommitInfo` omits it)
+        history_visible: Some(seat_list_history_visible(&signed)),
+        // For the Welcome route's floor (R-WELCOME); never served
+        added_protocols,
     };
 
     match db
@@ -646,12 +709,11 @@ async fn submit_text_commit(
 }
 
 /// The entitlement predicate every Text Add needs, a new device and a
-/// recovery Add alike (design §6.3 "Recovery gates", #220): S5's
-/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`) replaces
-/// this at its merge. Remove and Update commits never read it.
+/// recovery Add alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14), and
+/// a missing entitlement refuses. Remove and Update commits never read it.
 fn allows_text_traffic(entitlement: Option<&ChannelEntitlement>) -> bool {
-    entitlement.is_some_and(|entitlement| entitlement.is_active())
+    entitlement.is_some_and(|entitlement| entitlement.allows_text_traffic())
 }
 
 /// Whether every added device is a recovery Add (design §6.1 "S2
@@ -934,6 +996,53 @@ async fn check_add_target(
     super::require_seated(db, channel.id(), &user.id).await
 }
 
+/// Each added device's text protocol, in `added` order, from what
+/// authorises its Add (S4 plan appendix (2) item 3, rulings R-REJOIN and
+/// R-WELCOME): its stored join intent for `group`; with no intent, the
+/// group's `rejoin_readd` entry for it, which keeps the `protocol` of the
+/// rejoin intent its rule-6 eviction consumed. `None` when the source has
+/// none (stored before S4 or sent by an S1 client) or there is no source.
+/// An intent without `protocol` is never topped up from `rejoin_readd`.
+/// `protocol` is CLIENT-CLAIMED: it turns away an honest S1 client cleanly
+/// and protects nothing against a dishonest one. The commit transaction
+/// consumes the intent and the entry and does not read `protocol`, so this
+/// runs on the route's reads only.
+async fn protocols_of_added(
+    db: &Database,
+    group: &MlsGroup,
+    added: &[MlsMemberDevice],
+) -> Result<Vec<MlsAddedProtocol>> {
+    let intents = db.fetch_mls_join_intents_for_group(&group.id).await?;
+    Ok(added
+        .iter()
+        .map(|target| {
+            let intent_id =
+                MlsJoinIntent::composite_id(&group.id, &target.user_id, &target.device_id);
+            let intent = intents.iter().find(|intent| {
+                intent.id == intent_id
+                    && intent.group_id == group.id
+                    && intent.user_id == target.user_id
+                    && intent.device_id == target.device_id
+            });
+            let protocol = match intent {
+                Some(intent) => intent.protocol,
+                None => group
+                    .rejoin_readd
+                    .iter()
+                    .find(|entry| {
+                        entry.user_id == target.user_id && entry.device_id == target.device_id
+                    })
+                    .and_then(|entry| entry.protocol),
+            };
+            MlsAddedProtocol {
+                user_id: target.user_id.clone(),
+                device_id: target.device_id.clone(),
+                protocol,
+            }
+        })
+        .collect())
+}
+
 /// An MLS envelope from the committing device, with no declarations (the
 /// Text path sets them on its commit envelopes)
 fn envelope(
@@ -1037,10 +1146,12 @@ mod tests {
     use iso8601_timestamp::{Duration, Timestamp};
     use revolt_database::{
         events::client::EventV1, Account, BotInformation, ChannelEntitlementState, Database,
-        E2EEContentType, E2EEEnvelope, MemberCompositeKey, MlsCommit, MlsCommitOutcome,
-        MlsEnvelopeRejoinIntent, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent,
-        MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, PartialChannel, PartialMember,
-        PartialUser, RelationshipStatus, SeatList, Session, User, PROTECTED_SCOPE_TEXT_GROUP,
+        E2EEContentType, E2EEEnvelope, MemberCompositeKey, MlsAddedProtocol, MlsCommit,
+        MlsCommitOutcome, MlsEnvelopeRejoinIntent, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind,
+        MlsJoinIntent, MlsMemberDevice, MlsRemovalReason, MlsRemovedReason, PartialChannel,
+        PartialMember, PartialUser, RelationshipStatus, SeatList, SeatListBody, SeatListHistory,
+        SeatListPreHistory, SeatListV2Lines, Session, TextJoinPayload, User, MIN_TEXT_PROTOCOL_V2,
+        PROTECTED_SCOPE_TEXT_GROUP,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
@@ -1051,7 +1162,8 @@ mod tests {
     use super::super::{dispatch_group, require_channel_access, Arbitrated, GroupDispatch};
     use super::submit_commit;
     use crate::util::test::{
-        ProtectedChannel, TestHarness, FIXTURE_DEVICE_CAP, MEMBER_DEVICE_SEED,
+        ProtectedChannel, TestE2EEDevice, TestHarness, FIXTURE_DEVICE_CAP, FIXTURE_ISSUED_AT,
+        FIXTURE_SLOT_CAP, MEMBER_DEVICE_SEED, OWNER_DEVICE_SEED,
     };
 
     type Submitted = Result<Arbitrated<v0::ResponseSubmitMlsCommit>>;
@@ -1113,6 +1225,118 @@ mod tests {
         let protected = harness
             .new_protected_channel(&owner, &owner_session, &seated)
             .await;
+        finish_setup(
+            harness,
+            owner_account,
+            owner_session,
+            owner,
+            users,
+            protected,
+        )
+        .await
+    }
+
+    /// As [`setup`], but the genesis list is a v2 list (design 4.1.1) with
+    /// the `history:` line `history`, no authority, no boundary and
+    /// `pre_history: kept`. Needs `formats_v2` on: protect takes a v2
+    /// genesis only then (#218), and no v1 genesis while it is on
+    async fn setup_v2(count: usize, history: SeatListHistory) -> Setup {
+        let harness = TestHarness::new().await;
+        let (owner_account, owner_session, owner) = harness.new_user().await;
+        let mut users = Vec::new();
+        for _ in 0..count {
+            let (_, session, user) = harness.new_user().await;
+            users.push((user, session));
+        }
+        let (server, channel) = harness.new_protectable_channel(&owner).await;
+        let entitlement = harness
+            .grant_entitlement(&channel, FIXTURE_SLOT_CAP, None)
+            .await;
+        let owner_device = harness
+            .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
+            .await;
+        let mut seats = vec![owner.id.clone()];
+        for (user, _) in &users {
+            harness.join_server(&server, user).await;
+            seats.push(user.id.clone());
+        }
+        seats.sort();
+
+        let body = SeatListBody {
+            channel_id: channel.id().to_string(),
+            version: 1,
+            device_cap: FIXTURE_DEVICE_CAP,
+            issued_at: FIXTURE_ISSUED_AT,
+            signer_user_id: owner.id.clone(),
+            signer_device_id: owner_device.device_id.clone(),
+            seats,
+            v2: Some(SeatListV2Lines {
+                authority_sha256: None,
+                history,
+                history_boundary: None,
+                pre_history: SeatListPreHistory::Kept,
+                group_salt: "cd".repeat(32),
+            }),
+        }
+        .build()
+        .expect("a canonical v2 seat list body");
+        let seat_list = v0::DataSeatList {
+            signature: owner_device.sign(&body),
+            body,
+            signer_device_id: owner_device.device_id.clone(),
+            handover: None,
+            authority: None,
+        };
+        harness
+            .protect_with_db(
+                &channel,
+                &v0::DataProtectChannel {
+                    seat_list: seat_list.clone(),
+                    wipe_history: None,
+                },
+            )
+            .await;
+        let channel = harness
+            .db
+            .fetch_channel(channel.id())
+            .await
+            .expect("the protected channel");
+        assert!(harness
+            .db
+            .fetch_seat_list(channel.id())
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .is_v2());
+
+        let protected = ProtectedChannel {
+            server,
+            channel,
+            entitlement,
+            owner_device,
+            seat_list,
+        };
+        finish_setup(
+            harness,
+            owner_account,
+            owner_session,
+            owner,
+            users,
+            protected,
+        )
+        .await
+    }
+
+    /// The common tail of [`setup`] and [`setup_v2`]: the generation-0 Text
+    /// group and a device bound to each member's session
+    async fn finish_setup(
+        harness: TestHarness,
+        owner_account: Account,
+        owner_session: Session,
+        owner: User,
+        users: Vec<(User, Session)>,
+        protected: ProtectedChannel,
+    ) -> Setup {
         let group = harness
             .new_text_group(&protected.channel, &protected.owner_device, 0, None)
             .await;
@@ -1794,6 +2018,8 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: None,
+                    history_visible: None,
+                    added_protocols: vec![],
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -1942,6 +2168,8 @@ mod tests {
             rejoin_intents: vec![],
             removed_reasons: vec![],
             welcome: None,
+            history_visible: None,
+            added_protocols: vec![],
         };
         let ad = current_ad(&setup.harness, setup.channel_id()).await;
         let at = |epoch: i64| {
@@ -2795,6 +3023,29 @@ mod tests {
         );
     }
 
+    /// S5b D14: in Grace a seated member's new device is still added
+    #[test]
+    fn grace_allows_adds_of_seated_devices() {
+        crate::util::test::rt().block_on(grace_allows_adds_of_seated_devices_case())
+    }
+
+    async fn grace_allows_adds_of_seated_devices_case() {
+        let setup = setup(1).await;
+        let db = setup.db();
+        set_entitlement(db, setup.channel_id(), Some(ChannelEntitlementState::Grace)).await;
+
+        let member = &setup.members[0];
+        assert_won(
+            commit_next(&setup, &setup.owner, vec![member.device()], vec![]).await,
+            "an Add in Grace",
+        );
+        assert!(db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .has_member(&member.user.id, &member.device_id));
+    }
+
     /// Never-plaintext and removal safety (S5b): Remove and Update commits
     /// are never gated on the entitlement, in Frozen and Deleted too, while
     /// an Add in the same state is refused
@@ -2906,6 +3157,8 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: Some(STANDARD_NO_PAD.encode(b"opaque welcome")),
+                    history_visible: None,
+                    added_protocols: vec![],
                 },
                 &stored.commit_ad_sha256().expect("hash"),
                 FIXTURE_DEVICE_CAP,
@@ -3319,6 +3572,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         };
         db.upsert_mls_join_intent(&intent)
             .await
@@ -3504,6 +3758,7 @@ mod tests {
             created_at,
             generation: None,
             issued_at: None,
+            protocol: None,
         };
         db.upsert_mls_join_intent(&intent(before_add))
             .await
@@ -3958,6 +4213,7 @@ mod tests {
             created_at,
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 
@@ -4317,6 +4573,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .await
         .expect("the rejoin intent");
@@ -4463,6 +4720,7 @@ mod tests {
             created_at: Timestamp::now_utc(),
             generation: None,
             issued_at: None,
+            protocol: None,
         })
         .await
         .expect("the rejoin intent");
@@ -4696,6 +4954,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -4865,6 +5124,7 @@ mod tests {
             pending_device_removals: vec![],
             signer_lost: None,
             rejoin_readd: vec![],
+            history_visible_at_create: None,
         };
         assert!(matches!(
             db.create_mls_group(&group, None).await.expect("call group"),
@@ -4901,6 +5161,47 @@ mod tests {
         assert!(envelopes[0].added.is_empty());
         assert!(envelopes[0].removed.is_empty());
         assert!(envelopes[0].rejoin_intents.is_empty());
+
+        // Nor a history visibility on its row (design 2.5 "S4": Text-only)
+        let row = db
+            .fetch_mls_commits_from(&group.id, 1, 1)
+            .await
+            .expect("commit read")
+            .into_iter()
+            .find(|row| row.epoch == 1)
+            .expect("the Call row");
+        assert_eq!(row.history_visible, None);
+
+        // Nor added protocols, a Call Add included (R-WELCOME: Text-only)
+        let (_, session_c, user_c) = harness.new_user().await;
+        harness.join_server(&server, &user_c).await;
+        let device_c = harness.new_e2ee_device(&user_c, &session_c.id, 0x72).await;
+        assert_won(
+            submit(
+                &harness,
+                &user_a,
+                &session_a,
+                &group.id,
+                v0::DataSubmitMlsCommit {
+                    device_id: device_a.device_id.clone(),
+                    epoch: 2,
+                    commit: STANDARD_NO_PAD.encode(b"opaque call add"),
+                    welcome: Some(STANDARD_NO_PAD.encode(b"opaque call welcome")),
+                    added: vec![device_of(&user_c, &device_c.device_id)],
+                    removed: vec![],
+                },
+            )
+            .await,
+            "a Call Add",
+        );
+        let rows = db
+            .fetch_mls_commits_from(&group.id, 1, 10)
+            .await
+            .expect("commit read");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert!(row.added_protocols.is_empty(), "epoch {}", row.epoch);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -4995,5 +5296,494 @@ mod tests {
         let wire = serde_json::to_value(&winning).expect("JSON");
         assert!(wire.get("welcome").is_none(), "{}", wire);
         assert!(!wire.to_string().contains(&welcome), "{}", wire);
+    }
+
+    // ---------------------------------------------------------------------
+    // S4: the history visibility (2.5 "S4") and the minimum text protocol
+    // (S4 plan appendix (2) item 3)
+    // ---------------------------------------------------------------------
+
+    /// `party`'s stored join intent for the group, claiming `protocol`
+    async fn store_intent(setup: &Setup, party: &Party, protocol: Option<u32>) {
+        setup
+            .db()
+            .upsert_mls_join_intent(&MlsJoinIntent {
+                protocol,
+                ..rejoin_intent(setup, party, Timestamp::now_utc())
+            })
+            .await
+            .expect("the join intent");
+    }
+
+    /// `party`'s expected `added_protocols` entry
+    fn added_protocol(party: &Party, protocol: Option<u32>) -> MlsAddedProtocol {
+        MlsAddedProtocol {
+            user_id: party.user.id.clone(),
+            device_id: party.device_id.clone(),
+            protocol,
+        }
+    }
+
+    #[track_caller]
+    fn assert_outdated(error: &Error, case: &str) {
+        assert!(
+            matches!(
+                error.error_type,
+                ErrorType::ProtectedClientOutdated { min: 2 }
+            ),
+            "{}: {:?}",
+            case,
+            error
+        );
+        assert_route_refusal(error, case);
+    }
+
+    /// The `formats_v2` the v2 fixture needs
+    async fn with_formats_v2() {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.protected_channels.formats_v2 = true;
+        })
+        .await;
+    }
+
+    /// On a v2 list the Add of a device with no stored intent, with an
+    /// intent without `protocol` or with protocol 1 is refused with
+    /// `ProtectedClientOutdated { min: 2 }`, alone or after a protocol-2
+    /// device, and nothing is written. Protocol 2 passes and the row records
+    /// the `hidden` list. The identical resubmit gets its own row back
+    /// although the Add consumed both intents: the existing row answers
+    /// before the floor
+    #[test]
+    fn a_v2_list_refuses_the_add_of_an_older_client() {
+        crate::util::test::rt().block_on(async {
+            with_formats_v2().await;
+            a_v2_list_refuses_the_add_of_an_older_client_case().await
+        })
+    }
+
+    async fn a_v2_list_refuses_the_add_of_an_older_client_case() {
+        let setup = setup_v2(2, SeatListHistory::Hidden).await;
+        let db = setup.db();
+        let owner = &setup.owner;
+        let (older, current) = (&setup.members[0], &setup.members[1]);
+        store_intent(&setup, current, Some(MIN_TEXT_PROTOCOL_V2 + 1)).await;
+
+        for (case, intent) in [
+            ("no intent", None),
+            ("no protocol", Some(None)),
+            ("protocol 1", Some(Some(1))),
+        ] {
+            if let Some(protocol) = intent {
+                store_intent(&setup, older, protocol).await;
+            }
+            for (shape, added) in [
+                ("alone", vec![older.device()]),
+                ("after protocol 3", vec![current.device(), older.device()]),
+            ] {
+                let case = format!("{case}, {shape}");
+                let error = refusal(commit_next(&setup, owner, added, vec![]).await, &case);
+                assert_outdated(&error, &case);
+            }
+        }
+
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        assert_eq!(group.current_epoch, 0);
+        assert_eq!(group.members.len(), 1);
+        assert!(db
+            .fetch_mls_commits_from(&setup.group_id, 0, 10)
+            .await
+            .expect("commit read")
+            .is_empty());
+        for party in [older, current] {
+            assert!(
+                envelopes_of(&setup.harness, &party.user.id, &party.device_id)
+                    .await
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            db.fetch_mls_join_intents_for_group(&setup.group_id)
+                .await
+                .expect("intents")
+                .len(),
+            2
+        );
+
+        store_intent(&setup, older, Some(MIN_TEXT_PROTOCOL_V2)).await;
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let add = || {
+            request(
+                &owner.device_id,
+                &setup.group_id,
+                1,
+                &ad,
+                vec![older.device(), current.device()],
+                vec![],
+            )
+        };
+        assert_won(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                add(),
+            )
+            .await,
+            "protocol 2",
+        );
+        let row = stored_commit(&setup, 1).await;
+        assert_eq!(row.history_visible, Some(false));
+        // R-WELCOME: each added device's protocol, from its intent
+        assert_eq!(
+            row.added_protocols,
+            vec![
+                added_protocol(older, Some(MIN_TEXT_PROTOCOL_V2)),
+                added_protocol(current, Some(MIN_TEXT_PROTOCOL_V2 + 1)),
+            ]
+        );
+        assert!(
+            db.fetch_mls_join_intents_for_group(&setup.group_id)
+                .await
+                .expect("intents")
+                .is_empty(),
+            "the Add consumed both intents"
+        );
+
+        let winning = assert_lost(
+            submit(
+                &setup.harness,
+                &owner.user,
+                &owner.session,
+                &setup.group_id,
+                add(),
+            )
+            .await,
+            "an identical resubmit",
+        );
+        assert_eq!(winning.epoch, 1);
+        assert_eq!(winning.commit, add().commit);
+    }
+
+    /// 2.5 "S4": on a v2 `history: visible` list a Text row records
+    /// `history_visible: true`, an Update and an Add alike
+    #[test]
+    fn a_v2_visible_list_stores_history_visible() {
+        crate::util::test::rt().block_on(async {
+            with_formats_v2().await;
+            a_v2_visible_list_stores_history_visible_case().await
+        })
+    }
+
+    async fn a_v2_visible_list_stores_history_visible_case() {
+        let setup = setup_v2(1, SeatListHistory::Visible).await;
+        let owner = &setup.owner;
+        let member = &setup.members[0];
+        assert_won(
+            commit_next(&setup, owner, vec![], vec![]).await,
+            "an Update",
+        );
+        store_intent(&setup, member, Some(MIN_TEXT_PROTOCOL_V2)).await;
+        assert_won(
+            commit_next(&setup, owner, vec![member.device()], vec![]).await,
+            "an Add",
+        );
+        for epoch in [1, 2] {
+            assert_eq!(
+                stored_commit(&setup, epoch).await.history_visible,
+                Some(true),
+                "epoch {epoch}"
+            );
+        }
+    }
+
+    /// A v1 list is unchanged by the floor: the Adds of a device whose
+    /// intent has no `protocol`, of one with no intent and of one claiming
+    /// protocol 1 go through. The row records `history_visible: false` (a
+    /// v1 list promised nothing, O-2) and each device's protocol as found
+    /// (R-WELCOME: every Text Add)
+    #[test]
+    fn a_v1_list_adds_without_a_protocol() {
+        crate::util::test::rt().block_on(a_v1_list_adds_without_a_protocol_case())
+    }
+
+    async fn a_v1_list_adds_without_a_protocol_case() {
+        let setup = setup(3).await;
+        assert!(!setup
+            .db()
+            .fetch_seat_list(setup.channel_id())
+            .await
+            .expect("seat list read")
+            .expect("a seat list")
+            .is_v2());
+        let (no_protocol, no_intent, protocol_1) =
+            (&setup.members[0], &setup.members[1], &setup.members[2]);
+        store_intent(&setup, no_protocol, None).await;
+        store_intent(&setup, protocol_1, Some(1)).await;
+        assert_won(
+            commit_next(
+                &setup,
+                &setup.owner,
+                vec![
+                    no_protocol.device(),
+                    no_intent.device(),
+                    protocol_1.device(),
+                ],
+                vec![],
+            )
+            .await,
+            "S1 Adds on a v1 list",
+        );
+        let row = stored_commit(&setup, 1).await;
+        assert_eq!(row.history_visible, Some(false));
+        assert_eq!(
+            row.added_protocols,
+            vec![
+                added_protocol(no_protocol, None),
+                added_protocol(no_intent, None),
+                added_protocol(protocol_1, Some(1)),
+            ]
+        );
+    }
+
+    /// The floor runs after access (6.1): a seated, bound member who cannot
+    /// view the v2 channel gets the unknown-group answer for an Add the
+    /// floor refuses a viewer
+    #[test]
+    fn a_non_viewer_gets_the_unknown_answer_before_the_protocol_floor() {
+        crate::util::test::rt().block_on(async {
+            with_formats_v2().await;
+            a_non_viewer_gets_the_unknown_answer_before_the_protocol_floor_case().await
+        })
+    }
+
+    async fn a_non_viewer_gets_the_unknown_answer_before_the_protocol_floor_case() {
+        let setup = setup_v2(2, SeatListHistory::Hidden).await;
+        let (hidden_from, older) = (&setup.members[0], &setup.members[1]);
+        let error = refusal(
+            commit_next(&setup, &setup.owner, vec![older.device()], vec![]).await,
+            "the owner",
+        );
+        assert_outdated(&error, "the owner");
+
+        deny_view(&setup, &hidden_from.user).await;
+        let ad = current_ad(&setup.harness, setup.channel_id()).await;
+        let unknown_group_id = format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0);
+        let mut answers = Vec::new();
+        for group_id in [&unknown_group_id, &setup.group_id] {
+            let error = refusal(
+                submit(
+                    &setup.harness,
+                    &hidden_from.user,
+                    &hidden_from.session,
+                    group_id,
+                    request(
+                        &hidden_from.device_id,
+                        group_id,
+                        1,
+                        &ad,
+                        vec![older.device()],
+                        vec![],
+                    ),
+                )
+                .await,
+                group_id,
+            );
+            answers.push(serde_json::to_string(&error).expect("an error body"));
+        }
+        assert_eq!(answers[1], answers[0]);
+        assert!(
+            !answers[1].contains("ProtectedClientOutdated"),
+            "{}",
+            answers[1]
+        );
+    }
+
+    /// The re-Add of an evicted device on a v2 list (S2-D32, ruling
+    /// R-REJOIN): the rule-6 eviction consumes the device's rejoin intent
+    /// (2.5 step 5) and records its `protocol` on the `rejoin_readd` entry,
+    /// which the floor reads when the device has no intent. Protocol 2 is
+    /// re-Added and recorded on the row from the entry; none and 1 are
+    /// refused. A fresh intent wins over the entry: one without `protocol`
+    /// is refused although the entry says 2, one claiming 3 re-Adds a
+    /// device whose entry says none
+    #[test]
+    fn a_v2_rejoin_readd_takes_the_evicted_intents_protocol() {
+        crate::util::test::rt().block_on(async {
+            with_formats_v2().await;
+            a_v2_rejoin_readd_takes_the_evicted_intents_protocol_case().await
+        })
+    }
+
+    async fn a_v2_rejoin_readd_takes_the_evicted_intents_protocol_case() {
+        let setup = setup_v2(5, SeatListHistory::Hidden).await;
+        let db = setup.db();
+        let committer = &setup.members[0];
+        let (none, one, two, fresh) = (
+            &setup.members[1],
+            &setup.members[2],
+            &setup.members[3],
+            &setup.members[4],
+        );
+        add_through_the_transaction(&setup, &[committer, none, one, two, fresh]).await;
+
+        for (party, protocol) in [
+            (none, None),
+            (one, Some(1)),
+            (two, Some(MIN_TEXT_PROTOCOL_V2)),
+            (fresh, Some(MIN_TEXT_PROTOCOL_V2)),
+        ] {
+            store_intent(&setup, party, protocol).await;
+            assert_won(
+                commit_next(&setup, committer, vec![], vec![party.device()]).await,
+                "a rule-6 eviction",
+            );
+            let group = db
+                .fetch_mls_group(&setup.group_id)
+                .await
+                .expect("the group");
+            let entry = group
+                .rejoin_readd
+                .iter()
+                .find(|entry| entry.user_id == party.user.id && entry.device_id == party.device_id)
+                .expect("the eviction records the re-Add");
+            assert_eq!(entry.protocol, protocol, "the entry keeps the protocol");
+        }
+        assert!(db
+            .fetch_mls_join_intents_for_group(&setup.group_id)
+            .await
+            .expect("intents")
+            .is_empty());
+
+        store_intent(&setup, fresh, None).await;
+        for (case, party) in [
+            ("an entry without protocol", none),
+            ("an entry with protocol 1", one),
+            (
+                "a fresh intent without protocol over an entry with 2",
+                fresh,
+            ),
+        ] {
+            let error = refusal(
+                commit_next(&setup, committer, vec![party.device()], vec![]).await,
+                case,
+            );
+            assert_outdated(&error, case);
+        }
+
+        let epoch = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group")
+            .current_epoch;
+        assert_won(
+            commit_next(&setup, committer, vec![two.device()], vec![]).await,
+            "an entry with protocol 2",
+        );
+        assert_eq!(
+            stored_commit(&setup, epoch + 1).await.added_protocols,
+            vec![added_protocol(two, Some(MIN_TEXT_PROTOCOL_V2))]
+        );
+
+        store_intent(&setup, none, Some(MIN_TEXT_PROTOCOL_V2 + 1)).await;
+        assert_won(
+            commit_next(&setup, committer, vec![none.device()], vec![]).await,
+            "a fresh intent with protocol 3 over an entry without one",
+        );
+        assert_eq!(
+            stored_commit(&setup, epoch + 2).await.added_protocols,
+            vec![added_protocol(none, Some(MIN_TEXT_PROTOCOL_V2 + 1))]
+        );
+    }
+
+    /// End to end with the join intent route (W2-JI): a member's v2 intent
+    /// sent through the route with protocol 2 is stored with it, and the
+    /// owner's Add of that device is accepted and records 2. An intent
+    /// without `protocol` is refused by the route, stores nothing, and the
+    /// Add of that device is then refused by the floor
+    #[test]
+    fn the_join_intent_routes_protocol_reaches_the_add() {
+        crate::util::test::rt().block_on(async {
+            with_formats_v2().await;
+            the_join_intent_routes_protocol_reaches_the_add_case().await
+        })
+    }
+
+    async fn the_join_intent_routes_protocol_reaches_the_add_case() {
+        let setup = setup_v2(2, SeatListHistory::Hidden).await;
+        let db = setup.db();
+        let group = db
+            .fetch_mls_group(&setup.group_id)
+            .await
+            .expect("the group");
+        let generation = group.generation.expect("a Text group generation");
+        let intent = |index: usize, protocol: Option<u32>| {
+            let party = &setup.members[index];
+            let signer = TestE2EEDevice::new(
+                &party.user.id,
+                &party.device_id,
+                MEMBER_DEVICE_SEED + index as u8,
+                &party.session.id,
+            );
+            let payload = TextJoinPayload {
+                user_id: party.user.id.clone(),
+                device_id: party.device_id.clone(),
+                channel_id: group.channel_id.clone(),
+                generation,
+                group_id: group.id.clone(),
+                key_package_ref: "kp".to_string(),
+                issued_at: FIXTURE_ISSUED_AT,
+            }
+            .build()
+            .expect("a text join payload");
+            v0::DataMlsJoinIntent {
+                device_id: party.device_id.clone(),
+                key_package_ref: "kp".to_string(),
+                signature: signer.sign(&payload),
+                generation: Some(generation),
+                issued_at: Some(FIXTURE_ISSUED_AT),
+                protocol,
+            }
+        };
+        // No SFU nodes: the Text path never lists
+        let voice_client =
+            revolt_database::voice::VoiceClient::new(std::collections::HashMap::new());
+        let join = |index: usize, protocol: Option<u32>| {
+            let party = &setup.members[index];
+            super::super::join_intent::join_intent(
+                State::from(db),
+                State::from(&voice_client),
+                party.user.clone(),
+                party.session.clone(),
+                setup.group_id.clone(),
+                Json(intent(index, protocol)),
+            )
+        };
+        let (current, older) = (&setup.members[0], &setup.members[1]);
+
+        if let Err(error) = join(0, Some(MIN_TEXT_PROTOCOL_V2)).await {
+            panic!("the protocol-2 intent: {:?}", error);
+        }
+        match join(1, None).await {
+            Ok(_) => panic!("the intent without protocol was stored"),
+            Err(error) => assert_outdated(&error, "the intent without protocol"),
+        }
+
+        assert_won(
+            commit_next(&setup, &setup.owner, vec![current.device()], vec![]).await,
+            "the Add after the route's protocol-2 intent",
+        );
+        assert_eq!(
+            stored_commit(&setup, 1).await.added_protocols,
+            vec![added_protocol(current, Some(MIN_TEXT_PROTOCOL_V2))]
+        );
+        let error = refusal(
+            commit_next(&setup, &setup.owner, vec![older.device()], vec![]).await,
+            "the Add after the refused intent",
+        );
+        assert_outdated(&error, "the Add after the refused intent");
     }
 }

@@ -273,4 +273,27 @@ impl AbstractChannelUnreads for MongoDb {
             }
         )
     }
+
+    /// Pull the ids from the mentions of the channel's unread rows; see the
+    /// trait.
+    async fn remove_mentions_of_messages(
+        &self,
+        channel_id: &str,
+        message_ids: &[String],
+    ) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        self.col::<Document>(COL)
+            .update_many(
+                doc! {
+                    "_id.channel": channel_id,
+                    "mentions": { "$in": message_ids }
+                },
+                doc! { "$pull": { "mentions": { "$in": message_ids } } },
+            )
+            .await
+            .map(|_| ())
+            .map_err(|_| create_database_error!("update_many", COL))
+    }
 }

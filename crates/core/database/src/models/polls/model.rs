@@ -162,11 +162,9 @@ impl Poll {
     /// counters cannot survive into the final results) and publishes the
     /// event. Losers get `Ok(None)` and publish nothing.
     pub async fn close(&self, db: &Database) -> Result<Option<(Vec<v0::PollAnswerCount>, i64)>> {
-        if !db.close_poll_if_open(&self.id).await? {
+        let Some((final_counts, total_votes)) = self.close_quietly(db).await? else {
             return Ok(None);
-        }
-
-        let (final_counts, total_votes) = self.recount(db).await?;
+        };
 
         EventV1::PollClose {
             id: self.id.clone(),
@@ -179,5 +177,62 @@ impl Poll {
         .await;
 
         Ok(Some((final_counts, total_votes)))
+    }
+
+    /// The flip and recount of `close`, without the event. `None` when the
+    /// poll was already closed or another closer won the flip.
+    async fn close_quietly(
+        &self,
+        db: &Database,
+    ) -> Result<Option<(Vec<v0::PollAnswerCount>, i64)>> {
+        if !db.close_poll_if_open(&self.id).await? {
+            return Ok(None);
+        }
+
+        self.recount(db).await.map(Some)
+    }
+
+    /// Close every open poll of a channel, without publishing (protecting
+    /// an existing channel, 7.4 "S4"). Each poll goes through the same flip
+    /// and recount as `close`, so `PollClose` stays exactly-once against the
+    /// expiry daemon and `/end`; the caller publishes it.
+    ///
+    /// Returns the POLL ids this call closed, ascending. Poll ids rather than
+    /// message ids because `PollClose` needs the poll id, the message id and
+    /// the final counts, and only the poll id leads back to all three
+    /// (`fetch_polls`; the stored counts are the recount). A poll that was
+    /// already closed, or that another closer flips first, is not returned.
+    /// A failure on one poll is reported and skips that poll only, as in the
+    /// expiry daemon.
+    pub async fn close_open_for_channel(db: &Database, channel: &str) -> Result<Vec<String>> {
+        let open = db.fetch_open_polls_for_channel(channel).await?;
+        Ok(Self::close_listed(db, &open).await)
+    }
+
+    /// The per-poll half of `close_open_for_channel`: the ids of the listed
+    /// polls whose flip this call won, in list order.
+    pub(crate) async fn close_listed(db: &Database, polls: &[Poll]) -> Vec<String> {
+        let mut closed = Vec::new();
+        for poll in polls {
+            match poll.close_quietly(db).await {
+                Ok(Some(_)) => closed.push(poll.id.clone()),
+                Ok(None) => {}
+                Err(err) => {
+                    revolt_config::capture_error(&err);
+                }
+            }
+        }
+        closed
+    }
+
+    /// Delete the polls carried by the given messages and every ballot on
+    /// them (the history wipe, 7.2 "S4"). Every other poll and ballot is
+    /// left alone. No event: the caller deletes the messages themselves.
+    pub async fn delete_for_messages(db: &Database, message_ids: &[String]) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        db.delete_polls_for_messages(message_ids).await
     }
 }

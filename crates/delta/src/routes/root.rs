@@ -1,10 +1,12 @@
-use revolt_config::{config, Settings};
+use revolt_config::{config, ProtectionFeatures, Settings};
+use revolt_database::{ProtTankRules, PROT_SLOT_TIERS};
 use revolt_models::v0;
+use revolt_payments::settings::ProtStoreSettings;
 use revolt_payments::settings::{PaymentsSettings, ProtSalesSettings};
 use revolt_result::Result;
 use rocket::serde::json::Json;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
@@ -76,6 +78,126 @@ pub struct ProtFeature {
     pub exact_min_cents: i64,
     pub exact_max_cents: i64,
     pub wallet_cap: i64,
+    /// Tank rules the client previews prices with (the server computes every price)
+    pub tank: ProtTankFeature,
+    /// In-app Prot packs (S6). Per-user preview access is NOT here (GET /payments/prot/@me store_preview)
+    pub store: ProtStoreFeature,
+}
+
+/// # In-App Prot Packs
+///
+/// `[features.payments] prot_store_*` as validated by `ProtStoreSettings`. A
+/// config the engine would refuse is advertised closed with no products.
+#[derive(Serialize, JsonSchema, Debug, Clone)]
+pub struct ProtStoreFeature {
+    /// prot_store_apple_open AND App Store credentials configured
+    pub apple_open: bool,
+    /// prot_store_play_open AND Play credentials configured
+    pub play_open: bool,
+    pub products: Vec<v0::ProtStoreProductView>,
+    pub us_web_link: bool,
+}
+
+/// # Prot Tank Rules
+///
+/// `[features.boosts.protection]` as validated by `ProtTankRules`. A config
+/// the engine would refuse is advertised as zeros and false with no tier
+/// costs, so `min_contribution: 0` makes the client hide contribute.
+#[derive(Serialize, JsonSchema, Debug, Clone)]
+pub struct ProtTankFeature {
+    /// Prot per day for a protected channel, keyed by slot tier ("10".."100")
+    pub channel_daily_cost: BTreeMap<String, i64>,
+    /// Smallest contribution or pledge, in Prot
+    pub min_contribution: i64,
+    pub min_launch_goal_days: u32,
+    pub max_launch_goal_days: u32,
+    pub launch_goal_deadline_days: u32,
+    pub withdraw_cutoff_hours: u32,
+    /// Prot bought in the last this many hours can't go into a tank or a pledge
+    pub contribute_hold_hours: u32,
+    pub grace_days: u32,
+    pub freeze_days: u32,
+    /// Whether a channel whose tank stays empty past its freeze is deleted
+    pub deletion_enabled: bool,
+}
+
+/// The tank rules to advertise, from the same `ProtTankRules::from_config`
+/// the engine validates with
+pub fn prot_tank_feature_from(protection: &ProtectionFeatures) -> ProtTankFeature {
+    let Ok(rules) = ProtTankRules::from_config(protection) else {
+        return ProtTankFeature {
+            channel_daily_cost: BTreeMap::new(),
+            min_contribution: 0,
+            min_launch_goal_days: 0,
+            max_launch_goal_days: 0,
+            launch_goal_deadline_days: 0,
+            withdraw_cutoff_hours: 0,
+            contribute_hold_hours: 0,
+            grace_days: 0,
+            freeze_days: 0,
+            deletion_enabled: false,
+        };
+    };
+
+    ProtTankFeature {
+        channel_daily_cost: PROT_SLOT_TIERS
+            .iter()
+            .filter_map(|&slots| Some((slots.to_string(), rules.daily_cost(slots)?)))
+            .collect(),
+        min_contribution: rules.min_contribution,
+        min_launch_goal_days: rules.min_launch_goal_days,
+        max_launch_goal_days: rules.max_launch_goal_days,
+        launch_goal_deadline_days: rules.launch_goal_deadline_days,
+        withdraw_cutoff_hours: rules.withdraw_cutoff_hours,
+        contribute_hold_hours: rules.contribute_hold_hours,
+        grace_days: rules.grace_days,
+        freeze_days: rules.freeze_days,
+        deletion_enabled: rules.deletion_enabled,
+    }
+}
+
+/// The in-app Prot packs to advertise, from the same
+/// `ProtStoreSettings::from_config` the engine validates with. A store is
+/// open only while payments and Prot are both enabled (R54; the intent
+/// route refuses otherwise), with its flag on AND its credentials in the
+/// config (Play also needs the Pub/Sub subscription its intents require):
+/// the advert can't see the managed store clients, and in production those
+/// are built from the same credentials. Every configured product is listed
+/// even while both stores are closed, since preview accounts buy them.
+pub fn prot_store_feature_from(config: &Settings) -> ProtStoreFeature {
+    let Ok(st) = ProtStoreSettings::from_config(config) else {
+        return ProtStoreFeature {
+            apple_open: false,
+            play_open: false,
+            products: Vec::new(),
+            us_web_link: false,
+        };
+    };
+
+    // The intent route's first gates, from the same validated settings: a
+    // config that fails either is a 500 there, so it is closed here too
+    let selling = PaymentsSettings::from_config(config).is_ok_and(|s| s.enabled)
+        && ProtSalesSettings::from_config(config).is_ok_and(|ps| ps.enabled);
+
+    ProtStoreFeature {
+        apple_open: selling && st.apple_open && st.apple.is_some(),
+        play_open: selling
+            && st.play_open
+            && st
+                .play
+                .as_ref()
+                .is_some_and(|play| !play.pubsub_subscription.is_empty()),
+        products: st
+            .products
+            .iter()
+            .map(|product| v0::ProtStoreProductView {
+                store: product.store,
+                product_id: product.product_id.clone(),
+                prot: product.prot,
+            })
+            .collect(),
+        us_web_link: st.us_web_link,
+    }
 }
 
 /// # Bot-Based Import Source
@@ -180,6 +302,11 @@ pub fn import_sources_feature(config: &Settings) -> ImportSourcesFeature {
 /// is advertised closed: no packs, sales and grants off.
 pub fn prot_feature_from(config: &Settings) -> ProtFeature {
     let protection = &config.features.boosts.protection;
+    // Independent of the sale config: a broken pack list still advertises
+    // the tank rules, and a broken tank config the sale
+    let tank = prot_tank_feature_from(protection);
+    // Independent of both: the store packs validate on their own
+    let store = prot_store_feature_from(config);
     let Ok(prot) = ProtSalesSettings::from_config(config) else {
         return ProtFeature {
             enabled: protection.enabled,
@@ -190,6 +317,8 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
             exact_min_cents: config.features.payments.prot_exact_min_cents,
             exact_max_cents: config.features.payments.prot_exact_max_cents,
             wallet_cap: protection.wallet_cap,
+            tank,
+            store,
         };
     };
 
@@ -213,6 +342,8 @@ pub fn prot_feature_from(config: &Settings) -> ProtFeature {
         exact_min_cents: prot.exact_min_cents,
         exact_max_cents: prot.exact_max_cents,
         wallet_cap: prot.wallet_cap,
+        tank,
+        store,
     }
 }
 
@@ -239,6 +370,13 @@ pub struct ProtectedChannelsFeature {
     /// Whether channels may enter the S2 (v2) formats (design 7.2 "Root
     /// advert"); the bridge passes it to native when signing a list
     pub formats_v2: bool,
+    /// Whether the server accepts the S4 history setting (design 7.1 "S4"
+    /// root advert): history-link writes, a boundary or `wiped` at protect,
+    /// and the wipe. The bridge offers them only while this is true
+    pub history_setting: bool,
+    /// iPhone-only server off switch for protected channels (S8-O5): while
+    /// false, iPhone clients keep protected channels closed
+    pub ios: bool,
 }
 
 /// # E2EE Capabilities
@@ -632,6 +770,12 @@ pub fn root_config(config: Settings, passkeys_usable: bool) -> RevoltConfig {
                 default_device_cap: config.features.protected_channels.default_device_cap,
                 // As configured: protect and the seat PUT read the same key
                 formats_v2: config.features.protected_channels.formats_v2,
+                // As configured: the history-link PUT, protect and the wipe
+                // read the same key
+                history_setting: config.features.protected_channels.history_setting,
+                // As configured: the iPhone client gate combines it with
+                // `enabled` itself
+                ios: config.features.protected_channels.ios,
             },
             e2ee: E2EEFeature {
                 // A capability of this build, not a setting
@@ -920,36 +1064,46 @@ mod test {
     /// the test proves the configured value is the one advertised
     const ADVERT_DEVICE_CAP: u32 = 7;
 
-    /// Sets both flags, `formats_v2` (and the device cap) explicitly, then
-    /// fetches the root and checks the protected channels advert. Every case
-    /// is its own `#[test]`: `overwrite_config` runs once per process
-    /// (nextest)
+    /// The protected channels advert of `GET /` as raw JSON, so the
+    /// assertions cover the wire shape, not the typed struct
+    async fn fetch_protected_channels_advert() -> serde_json::Map<String, serde_json::Value> {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
+        body["features"]["protected_channels"]
+            .as_object()
+            .expect("protected_channels object")
+            .clone()
+    }
+
+    /// Sets both flags, `formats_v2`, `history_setting`, `ios` (and the
+    /// device cap) explicitly, then fetches the root and checks the
+    /// protected channels advert. Every case is its own `#[test]`:
+    /// `overwrite_config` runs once per process (nextest)
     async fn protected_channels_advert_case(
         e2ee: bool,
         enabled: bool,
         advertised: bool,
         formats_v2: bool,
+        history_setting: bool,
+        ios: bool,
     ) {
         revolt_config::overwrite_config(|settings| {
             settings.features.e2ee_enabled = e2ee;
             settings.features.protected_channels.enabled = enabled;
             settings.features.protected_channels.default_device_cap = ADVERT_DEVICE_CAP;
             settings.features.protected_channels.formats_v2 = formats_v2;
+            settings.features.protected_channels.history_setting = history_setting;
+            settings.features.protected_channels.ios = ios;
         })
         .await;
 
-        let harness = crate::util::test::TestHarness::new().await;
-        let response = harness.client.get("/").dispatch().await;
-        assert_eq!(response.status(), Status::Ok);
+        let advert = fetch_protected_channels_advert().await;
 
-        // Raw JSON so the assertions cover the wire shape, not the typed struct
-        let body: serde_json::Value =
-            serde_json::from_str(&response.into_string().await.expect("body")).expect("json");
-        let advert = body["features"]["protected_channels"]
-            .as_object()
-            .expect("protected_channels object");
-
-        assert_eq!(advert.len(), 3, "advert fields: {advert:?}");
+        assert_eq!(advert.len(), 5, "advert fields: {advert:?}");
         assert_eq!(
             advert["formats_v2"].as_bool(),
             Some(formats_v2),
@@ -961,39 +1115,100 @@ mod test {
             advert["default_device_cap"].as_u64(),
             Some(ADVERT_DEVICE_CAP as u64)
         );
+        assert_eq!(
+            advert["history_setting"].as_bool(),
+            Some(history_setting),
+            "advert: {advert:?}"
+        );
+        assert_eq!(advert["ios"].as_bool(), Some(ios), "advert: {advert:?}");
+    }
+
+    /// The test config sets neither S4 key on (and names no `ios` at all),
+    /// so both advertise false: the advert defaults to off
+    #[test]
+    fn protected_channels_advert_defaults_history_setting_and_ios_off() {
+        crate::util::test::rt().block_on(async {
+            let advert = fetch_protected_channels_advert().await;
+            assert_eq!(advert.len(), 5, "advert fields: {advert:?}");
+            assert_eq!(
+                advert["history_setting"].as_bool(),
+                Some(false),
+                "advert: {advert:?}"
+            );
+            assert_eq!(advert["ios"].as_bool(), Some(false), "advert: {advert:?}");
+        })
+    }
+
+    /// 7.1 "S4" root advert: `history_setting` is the configured flag, and
+    /// it does not move `ios`
+    #[test]
+    fn protected_channels_advert_carries_history_setting() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, true, false,
+        ))
+    }
+
+    /// S8-O5: `ios` is the configured flag, and it does not move
+    /// `history_setting`
+    #[test]
+    fn protected_channels_advert_carries_ios() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, false, true,
+        ))
+    }
+
+    /// Both are advertised as configured, not ANDed with growth or E2EE:
+    /// the clients combine them with `enabled` themselves
+    #[test]
+    fn protected_channels_advert_carries_history_setting_and_ios_with_growth_off() {
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, false, true, true,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_on_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, false, false, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_on() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, true, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, true, false, false, false, false,
+        ))
     }
 
     #[test]
     fn protected_channels_advert_with_e2ee_off_and_enabled_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, false))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, false, false, false,
+        ))
     }
 
     /// 7.2 "Root advert" (#206): `formats_v2` is the configured flag
     #[test]
     fn protected_channels_advert_carries_formats_v2() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(true, true, true, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            true, true, true, true, false, false,
+        ))
     }
 
     /// `formats_v2` is advertised as configured even with growth off: it
     /// also governs the revocation hook, which runs with growth off (#219)
     #[test]
     fn protected_channels_advert_carries_formats_v2_with_growth_off() {
-        crate::util::test::rt().block_on(protected_channels_advert_case(false, false, false, true))
+        crate::util::test::rt().block_on(protected_channels_advert_case(
+            false, false, false, true, false, false,
+        ))
     }
 
     /// The node's own config with every Prot switch on and a valid sale
@@ -1052,6 +1267,35 @@ mod test {
                 "exact_min_cents": 50,
                 "exact_max_cents": 50000,
                 "wallet_cap": 100000,
+                "tank": {
+                    "channel_daily_cost": { "10": 40, "25": 90, "50": 160, "100": 280 },
+                    "min_contribution": 50,
+                    "min_launch_goal_days": 30,
+                    "max_launch_goal_days": 365,
+                    "launch_goal_deadline_days": 30,
+                    "withdraw_cutoff_hours": 48,
+                    "contribute_hold_hours": 72,
+                    "grace_days": 5,
+                    "freeze_days": 25,
+                    "deletion_enabled": false,
+                },
+                "store": {
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": [
+                        { "store": "apple", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+                        { "store": "apple", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+                        { "store": "play", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+                    ],
+                    "us_web_link": false,
+                },
             })
         );
 
@@ -1180,6 +1424,462 @@ mod test {
             body["features"]["boosts"]["purchases_enabled"],
             config.features.boosts.purchases_enabled
         );
+    }
+
+    /// `prot_settings()` with every advertised tank key set explicitly, each
+    /// different from its default, so the advert is proved to carry the
+    /// configured values
+    fn prot_tank_settings() -> revolt_config::Settings {
+        let mut config = prot_settings();
+        let protection = &mut config.features.boosts.protection;
+        protection.channel_daily_cost = revolt_config::ProtTierCosts {
+            t10: 41,
+            t25: 91,
+            t50: 161,
+            t100: 281,
+        };
+        protection.grace_days = 4;
+        protection.freeze_days = 20;
+        protection.final_warning_day = 15;
+        protection.warn_days = vec![5, 2];
+        protection.min_reactivation_days = 2;
+        protection.launch_goal_deadline_days = 21;
+        protection.launch_window_days = 5;
+        protection.launch_seat_window_days = 5;
+        protection.min_contribution = 75;
+        protection.min_launch_goal_days = 14;
+        protection.max_launch_goal_days = 180;
+        protection.withdraw_cutoff_hours = 36;
+        protection.contribute_hold_hours = 48;
+        protection.deletion_enabled = true;
+        config
+    }
+
+    fn prot_tank_json() -> serde_json::Value {
+        serde_json::json!({
+            "channel_daily_cost": { "10": 41, "25": 91, "50": 161, "100": 281 },
+            "min_contribution": 75,
+            "min_launch_goal_days": 14,
+            "max_launch_goal_days": 180,
+            "launch_goal_deadline_days": 21,
+            "withdraw_cutoff_hours": 36,
+            "contribute_hold_hours": 48,
+            "grace_days": 4,
+            "freeze_days": 20,
+            "deletion_enabled": true,
+        })
+    }
+
+    /// The tank rules ride in both of the builder's literals: beside a valid
+    /// sale and beside a sale config that fails to validate
+    #[test]
+    fn prot_feature_advertises_the_tank_rules() {
+        assert_eq!(prot_json(&prot_tank_settings())["tank"], prot_tank_json());
+
+        let mut config = prot_tank_settings();
+        config.features.payments.prot_exact_min_cents = 10;
+        let json = prot_json(&config);
+        assert_eq!(json["packs"], serde_json::json!([]));
+        assert_eq!(json["tank"], prot_tank_json());
+    }
+
+    /// A tank config the engine would refuse is advertised as zeros and false
+    /// with no tier costs, and leaves the sale advert alone
+    #[test]
+    fn prot_feature_tank_is_zeroed_when_the_tank_config_is_invalid() {
+        type Break = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Break); 6] = [
+            ("tier costs not increasing", |c| {
+                c.features.boosts.protection.channel_daily_cost.t25 = 41
+            }),
+            ("zero grace days", |c| {
+                c.features.boosts.protection.grace_days = 0
+            }),
+            ("final warning after the freeze", |c| {
+                c.features.boosts.protection.final_warning_day = 24
+            }),
+            ("zero minimum contribution", |c| {
+                c.features.boosts.protection.min_contribution = 0
+            }),
+            ("launch goal over ten years", |c| {
+                c.features.boosts.protection.max_launch_goal_days = 3651
+            }),
+            ("withdraw cutoff past the goal deadline", |c| {
+                c.features.boosts.protection.withdraw_cutoff_hours = 21 * 24
+            }),
+        ];
+        for (name, break_config) in cases {
+            let mut config = prot_tank_settings();
+            break_config(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(
+                json["tank"],
+                serde_json::json!({
+                    "channel_daily_cost": {},
+                    "min_contribution": 0,
+                    "min_launch_goal_days": 0,
+                    "max_launch_goal_days": 0,
+                    "launch_goal_deadline_days": 0,
+                    "withdraw_cutoff_hours": 0,
+                    "contribute_hold_hours": 0,
+                    "grace_days": 0,
+                    "freeze_days": 0,
+                    "deletion_enabled": false,
+                }),
+                "{name}"
+            );
+            assert_eq!(json["sales_open"], true, "{name}");
+            assert_eq!(json["packs"].as_array().map(Vec::len), Some(2), "{name}");
+        }
+    }
+
+    /// `GET /` carries the tank rules of the node's config, and the test
+    /// node's tank config validates (the S5b tests rely on it)
+    #[test]
+    fn root_serves_the_prot_tank_rules() {
+        crate::util::test::rt().block_on(root_serves_the_prot_tank_rules_case())
+    }
+
+    async fn root_serves_the_prot_tank_rules_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let config = revolt_config::config().await;
+        let tank = &body["features"]["prot"]["tank"];
+        assert_eq!(
+            *tank,
+            serde_json::to_value(super::prot_tank_feature_from(
+                &config.features.boosts.protection
+            ))
+            .unwrap()
+        );
+        assert!(tank["min_contribution"].as_i64() >= Some(1), "{}", tank);
+        assert_eq!(
+            tank["channel_daily_cost"]
+                .as_object()
+                .map(serde_json::Map::len),
+            Some(4)
+        );
+    }
+
+    /// `prot_settings()` with both stores open, the US web link on, the
+    /// default product table, and App Store and Play credentials plus the
+    /// Pub/Sub subscription, all set explicitly so a local override file
+    /// can't change them. The keys are placeholders: the advert only checks
+    /// that they are present
+    fn prot_store_settings() -> revolt_config::Settings {
+        let mut config = prot_settings();
+        let defaults = revolt_config::FeaturePayments::default();
+        let payments = &mut config.features.payments;
+        payments.prot_store_apple_open = true;
+        payments.prot_store_play_open = true;
+        payments.prot_store_products = defaults.prot_store_products;
+        payments.prot_store_preview_user_ids = Vec::new();
+        payments.prot_store_test_user_ids = Vec::new();
+        payments.prot_store_test_max_prot = defaults.prot_store_test_max_prot;
+        payments.prot_store_us_web_link = true;
+        payments.ops_alert_email = String::new();
+        config.api.appstore = revolt_config::ApiAppStore {
+            issuer_id: "issuer".to_string(),
+            key_id: "KEYID".to_string(),
+            private_key: "placeholder".to_string(),
+            ..Default::default()
+        };
+        config.api.googleplay = revolt_config::ApiGooglePlay {
+            client_email: "rtdn@sloga-test.iam.gserviceaccount.com".to_string(),
+            private_key: "placeholder".to_string(),
+            pubsub_subscription: "projects/sloga-test/subscriptions/play-rtdn".to_string(),
+            ..Default::default()
+        };
+        config
+    }
+
+    fn store_product(
+        store: &str,
+        product_id: &str,
+        prot: i64,
+    ) -> revolt_config::ProtStoreProductConfig {
+        revolt_config::ProtStoreProductConfig {
+            store: store.to_string(),
+            product_id: product_id.to_string(),
+            prot,
+        }
+    }
+
+    /// The default product table (prot-s6-contracts section 4): 5 Apple
+    /// rows, then the same 5 on Play
+    fn default_store_products_json() -> serde_json::Value {
+        serde_json::json!([
+            { "store": "apple", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+            { "store": "apple", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+            { "store": "play", "product_id": "gg.sloga.prot.p5", "prot": 500 },
+            { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "play", "product_id": "gg.sloga.prot.p25", "prot": 2600 },
+            { "store": "play", "product_id": "gg.sloga.prot.p50", "prot": 5300 },
+            { "store": "play", "product_id": "gg.sloga.prot.p100", "prot": 11000 },
+        ])
+    }
+
+    /// A store is advertised open only with its flag on AND its credentials
+    /// in the config, and Play only with the Pub/Sub subscription as well
+    /// (its intents refuse without one). Closing one store leaves the other
+    /// and the product list alone
+    #[test]
+    fn store_advert_is_closed_without_credentials() {
+        assert_eq!(
+            prot_json(&prot_store_settings())["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": default_store_products_json(),
+                "us_web_link": true,
+            })
+        );
+
+        type Darken = fn(&mut revolt_config::Settings);
+        let apple: [(&str, Darken); 4] = [
+            ("no issuer id", |c| c.api.appstore.issuer_id.clear()),
+            ("no key id", |c| c.api.appstore.key_id.clear()),
+            ("no private key", |c| c.api.appstore.private_key.clear()),
+            ("apple closed", |c| {
+                c.features.payments.prot_store_apple_open = false
+            }),
+        ];
+        for (name, darken) in apple {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(json["store"]["apple_open"], false, "{name}");
+            assert_eq!(json["store"]["play_open"], true, "{name}");
+            assert_eq!(
+                json["store"]["products"],
+                default_store_products_json(),
+                "{name}"
+            );
+        }
+
+        let play: [(&str, Darken); 4] = [
+            ("no client email", |c| c.api.googleplay.client_email.clear()),
+            ("no private key", |c| c.api.googleplay.private_key.clear()),
+            ("no Pub/Sub subscription", |c| {
+                c.api.googleplay.pubsub_subscription.clear()
+            }),
+            ("play closed", |c| {
+                c.features.payments.prot_store_play_open = false
+            }),
+        ];
+        for (name, darken) in play {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(json["store"]["play_open"], false, "{name}");
+            assert_eq!(json["store"]["apple_open"], true, "{name}");
+            assert_eq!(
+                json["store"]["products"],
+                default_store_products_json(),
+                "{name}"
+            );
+        }
+
+        // Both flags on (as Revolt.test.toml has them) and no credentials
+        // at all: both closed, the products still listed
+        let mut config = prot_store_settings();
+        config.api.appstore = revolt_config::ApiAppStore::default();
+        config.api.googleplay = revolt_config::ApiGooglePlay::default();
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": false,
+                "play_open": false,
+                "products": default_store_products_json(),
+                "us_web_link": true,
+            })
+        );
+    }
+
+    /// The products are the configured rows in config order, listed whether
+    /// or not a store is open (preview accounts buy them), and the US web
+    /// link flag is carried as configured
+    #[test]
+    fn store_advert_lists_the_products() {
+        let mut config = prot_store_settings();
+        config.features.payments.prot_store_products = vec![
+            store_product("play", "gg.sloga.prot.p10", 1000),
+            store_product("apple", "gg.sloga.prot.x_1", 7),
+            store_product("play", "gg.sloga.prot.x_1", 9),
+        ];
+        let products = serde_json::json!([
+            { "store": "play", "product_id": "gg.sloga.prot.p10", "prot": 1000 },
+            { "store": "apple", "product_id": "gg.sloga.prot.x_1", "prot": 7 },
+            { "store": "play", "product_id": "gg.sloga.prot.x_1", "prot": 9 },
+        ]);
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": products,
+                "us_web_link": true,
+            })
+        );
+
+        let payments = &mut config.features.payments;
+        payments.prot_store_apple_open = false;
+        payments.prot_store_play_open = false;
+        payments.prot_store_us_web_link = false;
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": false,
+                "play_open": false,
+                "products": products,
+                "us_web_link": false,
+            })
+        );
+
+        // An empty table is valid: nothing listed, the stores as configured
+        let mut config = prot_store_settings();
+        config.features.payments.prot_store_products = Vec::new();
+        assert_eq!(
+            prot_json(&config)["store"],
+            serde_json::json!({
+                "apple_open": true,
+                "play_open": true,
+                "products": [],
+                "us_web_link": true,
+            })
+        );
+    }
+
+    /// A store config the engine would refuse is advertised closed with no
+    /// products and no web link, however the flags and credentials are set,
+    /// and leaves the rest of the Prot advert alone
+    #[test]
+    fn store_advert_is_closed_when_the_store_config_is_invalid() {
+        type Break = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Break); 9] = [
+            ("zero-Prot product", |c| {
+                c.features.payments.prot_store_products[0].prot = 0
+            }),
+            ("duplicate product", |c| {
+                c.features.payments.prot_store_products[1].product_id =
+                    "gg.sloga.prot.p5".to_string()
+            }),
+            ("unknown store", |c| {
+                c.features.payments.prot_store_products[0].store = "steam".to_string()
+            }),
+            ("product id with a dash", |c| {
+                c.features.payments.prot_store_products[0].product_id =
+                    "gg-sloga-prot-p5".to_string()
+            }),
+            ("preview id that is not a user id", |c| {
+                c.features.payments.prot_store_preview_user_ids = vec!["01ABC-".to_string()]
+            }),
+            ("negative tester cap", |c| {
+                c.features.payments.prot_store_test_max_prot = -1
+            }),
+            ("alert mailbox without an @", |c| {
+                c.features.payments.ops_alert_email = "ops".to_string()
+            }),
+            ("unknown App Store environment", |c| {
+                c.api.appstore.environment = "Xcode".to_string()
+            }),
+            ("root pin that is not a SHA-256", |c| {
+                c.api.appstore.root_ca_g3_sha256 = "abc".to_string()
+            }),
+        ];
+        let valid = prot_json(&prot_store_settings());
+        for (name, break_config) in cases {
+            let mut config = prot_store_settings();
+            break_config(&mut config);
+            let json = prot_json(&config);
+            assert_eq!(
+                json["store"],
+                serde_json::json!({
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": [],
+                    "us_web_link": false,
+                }),
+                "{name}"
+            );
+            assert_eq!(json["sales_open"], true, "{name}");
+            assert_eq!(json["packs"], valid["packs"], "{name}");
+            assert_eq!(json["tank"], valid["tank"], "{name}");
+        }
+    }
+
+    /// Both stores are advertised closed unless payments and Prot are both
+    /// enabled and their configs validate, the intent route's first gates
+    /// (R54); the products and the web link stay as configured, in both of
+    /// the builder's literals
+    #[test]
+    fn store_advert_is_closed_while_payments_or_prot_are_off() {
+        type Darken = fn(&mut revolt_config::Settings);
+        let cases: [(&str, Darken); 4] = [
+            ("payments off", |c| c.features.payments.enabled = false),
+            ("Prot off", |c| c.features.boosts.protection.enabled = false),
+            ("payments config invalid", |c| {
+                c.features.payments.cipher_cap = 0
+            }),
+            ("Prot sale config invalid", |c| {
+                c.features.payments.prot_exact_min_cents = 10
+            }),
+        ];
+        for (name, darken) in cases {
+            let mut config = prot_store_settings();
+            darken(&mut config);
+            assert_eq!(
+                prot_json(&config)["store"],
+                serde_json::json!({
+                    "apple_open": false,
+                    "play_open": false,
+                    "products": default_store_products_json(),
+                    "us_web_link": true,
+                }),
+                "{name}"
+            );
+        }
+
+        // Prot's own sale switch is not a store gate: both stay open
+        let mut config = prot_store_settings();
+        config.features.payments.prot_sales_open = false;
+        let store = &prot_json(&config)["store"];
+        assert_eq!(store["apple_open"], true);
+        assert_eq!(store["play_open"], true);
+    }
+
+    /// `GET /` carries the store advert of the node's config. The test node
+    /// turns both store flags on but has no store credentials, so both
+    /// stores are advertised closed with the default products listed
+    #[test]
+    fn root_serves_the_store_advert() {
+        crate::util::test::rt().block_on(root_serves_the_store_advert_case())
+    }
+
+    async fn root_serves_the_store_advert_case() {
+        let harness = crate::util::test::TestHarness::new().await;
+        let response = harness.client.get("/").dispatch().await;
+        assert_eq!(response.status(), Status::Ok);
+        let body: serde_json::Value =
+            serde_json::from_str(&response.into_string().await.unwrap()).unwrap();
+        let config = revolt_config::config().await;
+        let store = &body["features"]["prot"]["store"];
+        assert_eq!(
+            *store,
+            serde_json::to_value(super::prot_store_feature_from(&config)).unwrap()
+        );
+        assert!(config.features.payments.prot_store_apple_open);
+        assert!(config.features.payments.prot_store_play_open);
+        assert_eq!(store["apple_open"], false, "{}", store);
+        assert_eq!(store["play_open"], false, "{}", store);
+        assert_eq!(store["products"].as_array().map(Vec::len), Some(10));
+        assert_eq!(store["us_web_link"], false);
     }
 
     fn ios_call_e2ee_json(config: revolt_config::Settings) -> serde_json::Value {

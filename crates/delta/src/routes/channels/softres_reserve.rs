@@ -33,6 +33,15 @@ async fn resolve_open_sheet(
     let permissions = calculate_channel_permissions(&mut query).await;
     permissions.throw_if_lacking_channel_permission(ChannelPermission::ViewChannel)?;
 
+    // A reserve row is server-validated plaintext, so a protected channel
+    // (or a thread under one) takes no row and no retraction (design 7.4
+    // "S4"); protect locks the open sheets itself. After the ViewChannel
+    // check, so a non-viewer gets the pre-S4 answer (decision 18), and
+    // before the sheet is read or a row is written.
+    if channel.is_protected() || permission_channel.is_protected() {
+        return Err(create_error!(ChannelProtected));
+    }
+
     let sheet = db.fetch_sheet(sheet_id).await?;
     if sheet.channel != channel.id() {
         return Err(create_error!(NotFound));
@@ -784,5 +793,142 @@ pub mod test {
             .await
             .expect("reserves");
         assert_eq!(rows.len(), 2);
+    }
+}
+
+/// Protected channels (S4): a protected channel takes no reserve row
+#[cfg(test)]
+mod protected_test {
+    use rocket::http::{Method, Status};
+    use serde_json::{json, Value};
+    use ulid::Ulid;
+
+    use crate::routes::channels::softres_fetch::protected_fixture::{
+        assert_refused, new_sheet, request, reserved_items, thread_under, world, World,
+        SEEDED_ITEMS,
+    };
+
+    async fn reserve(world: &World, channel_id: &str, sheet_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.member_session,
+            Method::Put,
+            format!("/channels/{channel_id}/softres/{sheet_id}/reserve"),
+            Some(json!({
+                "character_name": "Jenkins",
+                "class": "paladin",
+                "items": [18563]
+            })),
+        )
+        .await
+    }
+
+    async fn unreserve(world: &World, channel_id: &str, sheet_id: &str) -> (Status, Value) {
+        request(
+            &world.harness,
+            &world.member_session,
+            Method::Delete,
+            format!("/channels/{channel_id}/softres/{sheet_id}/reserve"),
+            None,
+        )
+        .await
+    }
+
+    /// Design 7.4 "S4": a reserve and a retraction on an open sheet of a
+    /// protected channel answer `ChannelProtected` and leave the member's
+    /// row as it was; the same reserve and retraction on the ordinary
+    /// channel's sheet still land
+    #[test]
+    fn a_protected_channel_refuses_a_reserve_and_a_retraction() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_protected_channel_refuses_a_reserve_and_a_retraction_case(),
+        ))
+    }
+
+    async fn a_protected_channel_refuses_a_reserve_and_a_retraction_case() {
+        let w = world().await;
+        let channel_id = w.protected.channel.id();
+
+        assert_refused(
+            &reserve(&w, channel_id, &w.sheet.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a reserve",
+        );
+        assert_refused(
+            &unreserve(&w, channel_id, &w.sheet.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a retraction",
+        );
+        assert_eq!(
+            reserved_items(&w, &w.sheet.id, &w.member.id).await,
+            Some(SEEDED_ITEMS.to_vec()),
+            "the reserve row"
+        );
+
+        let ordinary = reserve(&w, w.ordinary.id(), &w.ordinary_sheet.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary: {}", ordinary.1);
+        assert_eq!(
+            reserved_items(&w, &w.ordinary_sheet.id, &w.member.id).await,
+            Some(vec![18563])
+        );
+        let ordinary = unreserve(&w, w.ordinary.id(), &w.ordinary_sheet.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary: {}", ordinary.1);
+        assert_eq!(
+            reserved_items(&w, &w.ordinary_sheet.id, &w.member.id).await,
+            None
+        );
+    }
+
+    /// A thread is judged by its parent (#182): a thread under the
+    /// protected channel refuses a reserve, one under the ordinary channel
+    /// takes it
+    #[test]
+    fn a_thread_under_a_protected_parent_refuses_a_reserve() {
+        crate::util::test::rt().block_on(Box::pin(
+            a_thread_under_a_protected_parent_refuses_a_reserve_case(),
+        ))
+    }
+
+    async fn a_thread_under_a_protected_parent_refuses_a_reserve_case() {
+        let w = world().await;
+        let server_id = &w.protected.server.id;
+        let mut sheets = Vec::new();
+        for parent in [&w.protected.channel, &w.ordinary] {
+            let thread = thread_under(parent, server_id, &w.owner);
+            w.harness.db.insert_channel(&thread).await.expect("thread");
+            let sheet = new_sheet(
+                &w.harness,
+                &thread,
+                server_id,
+                &w.owner,
+                &w.owner,
+                &Ulid::new().to_string(),
+            )
+            .await;
+            sheets.push((thread, sheet));
+        }
+
+        let (thread, sheet) = &sheets[0];
+        assert_refused(
+            &reserve(&w, thread.id(), &sheet.id).await,
+            Status::BadRequest,
+            "ChannelProtected",
+            "a thread under a protected parent",
+        );
+        assert_eq!(
+            reserved_items(&w, &sheet.id, &w.member.id).await,
+            None,
+            "the reserve row"
+        );
+
+        let (thread, sheet) = &sheets[1];
+        let ordinary = reserve(&w, thread.id(), &sheet.id).await;
+        assert_eq!(ordinary.0, Status::Ok, "ordinary thread: {}", ordinary.1);
+        assert_eq!(
+            reserved_items(&w, &sheet.id, &w.member.id).await,
+            Some(vec![18563])
+        );
     }
 }

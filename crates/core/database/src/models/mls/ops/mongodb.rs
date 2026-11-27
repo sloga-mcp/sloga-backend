@@ -4,7 +4,7 @@ use bson::{Bson, Document};
 use iso8601_timestamp::Timestamp;
 use mongodb::{
     error::{TRANSIENT_TRANSACTION_ERROR, UNKNOWN_TRANSACTION_COMMIT_RESULT},
-    options::{FindOptions, ReadConcern, WriteConcern},
+    options::{FindOptions, ReadConcern, ReturnDocument, WriteConcern},
     ClientSession,
 };
 use revolt_result::Result;
@@ -12,12 +12,17 @@ use revolt_result::Result;
 use futures::StreamExt;
 
 use crate::{
-    mls_text_rejoin_window_seconds, AbstractMls, ChannelSeat, E2EEIdentity, MlsCommit,
-    MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsJoinIntent, MlsKeyPackage,
-    MlsMemberAdded, MlsRejoinReadd, MongoDb, SeatList, MAX_MLS_GROUP_MEMBERS,
+    mls_text_rejoin_window_seconds, AbstractMls, ChannelSeat, E2EEIdentity, InsertOutcome,
+    MlsCommit, MlsCommitOutcome, MlsGroup, MlsGroupCreateOutcome, MlsGroupKind, MlsHistoryLink,
+    MlsJoinIntent, MlsKeyPackage, MlsMemberAdded, MlsRejoinReadd, MongoDb, SeatList,
+    MAX_MLS_GROUP_MEMBERS,
 };
 
-use super::plan_mls_text_commit;
+use super::{
+    check_history_link_room, history_link_created_ms, history_link_existing_outcome,
+    history_link_page_limit, plan_mls_text_commit, prepare_history_link_row,
+    trim_history_link_page, HistoryLinkCaps, HistoryLinkUsage,
+};
 
 const COL_KEY_PACKAGES: &str = "mls_key_packages";
 const COL_GROUPS: &str = "mls_groups";
@@ -35,15 +40,70 @@ const COL_SEATS: &str = "channel_seats";
 /// an ADDED device's identity document only gets a `txn_serial` bump (the
 /// S2-D17c claim; no identity field is changed)
 const COL_E2EE_IDENTITY: &str = "e2ee_identity";
+/// History links (design 2.8)
+const COL_HISTORY_LINKS: &str = "mls_history_links";
+/// The holder group's running history-link byte sums: Mongo-only fields on
+/// the `mls_groups` document, `$inc`ed in the insert's claimed transaction,
+/// so the caps never aggregate the group's rows. `MlsGroup` has no field
+/// for them (a typed read ignores them, and no path replaces a group
+/// document whole); a missing field reads as 0.
+const GROUP_LINK_BYTES: &str = "history_link_bytes";
+/// Per writer user: `history_link_user_bytes.<user_id>`. The id is a ULID
+/// (`check_shape`), so it is one plain field name, never a `.` path or `$`
+const GROUP_LINK_USER_BYTES: &str = "history_link_user_bytes";
 
 /// Whole-transaction attempts for a Text commit (design §2.5 (a))
 const TEXT_COMMIT_ATTEMPTS: usize = 5;
+
+/// How long one history-link insert keeps retrying its transaction. Racing
+/// inserts on one holder group write-conflict on the group claim, so a
+/// burst of writers (every member's duty run, design 3.14.6) needs more
+/// than the Text commit's five attempts; the budget is the bound.
+const HISTORY_LINK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Backstop on history-link attempts inside the budget
+const HISTORY_LINK_MAX_ATTEMPTS: usize = 100;
 
 /// How many times a Text commit transaction was retried as a whole, in this
 /// process. Test-only evidence that the retry branch actually ran.
 #[cfg(test)]
 pub(crate) static TEXT_COMMIT_RETRIES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// How many times a history-link transaction was retried as a whole, in
+/// this process (test-only evidence, as `TEXT_COMMIT_RETRIES`)
+#[cfg(test)]
+pub(crate) static HISTORY_LINK_RETRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only fault injection for `history_link_precheck`: each entry is
+/// (holder group id, read, times fired), where read 0 is the holder, 1 the
+/// epoch count, 2 the slot. An armed read fails with a driver error
+#[cfg(test)]
+pub(crate) static HISTORY_LINK_PRECHECK_FAULTS: std::sync::Mutex<Vec<(String, usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Fail precheck read `read` of `group_id` if a test armed it; always `Ok`
+/// outside tests
+fn precheck_fault(group_id: &str, read: usize) -> mongodb::error::Result<()> {
+    #[cfg(test)]
+    {
+        let mut faults = HISTORY_LINK_PRECHECK_FAULTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(fault) = faults
+            .iter_mut()
+            .find(|(group, armed, _)| group == group_id && *armed == read)
+        {
+            fault.2 += 1;
+            return Err(mongodb::error::Error::custom(
+                "injected precheck read error",
+            ));
+        }
+    }
+    let _ = (group_id, read);
+    Ok(())
+}
 
 /// Back off before retrying a whole Text commit transaction (same shape as
 /// the protected-channels `retry_backoff`): a write conflict fails fast
@@ -99,6 +159,59 @@ enum TextAttemptOutcome {
     Staged { replaced_stray: bool },
 }
 
+/// What one attempt of the history-link transaction decided
+enum LinkAttemptOutcome {
+    /// The slot already holds an identical row: abort (nothing written)
+    Identical,
+    /// The row is staged: commit, then report `Inserted`
+    Staged,
+}
+
+/// A database error of the stored history-link byte sums
+fn link_sum_error() -> revolt_result::Error {
+    create_database_error!("history_link_sums", COL_GROUPS)
+}
+
+/// One stored byte sum: a missing field is 0; another type or a negative
+/// value can only be corruption, and fails closed
+fn link_sum(value: Option<&Bson>) -> Result<u64> {
+    let value = match value {
+        None => return Ok(0),
+        Some(Bson::Int64(value)) => *value,
+        Some(Bson::Int32(value)) => i64::from(*value),
+        Some(_) => return Err(link_sum_error()),
+    };
+    u64::try_from(value).map_err(|_| link_sum_error())
+}
+
+/// The holder group fields `link_usage` reads
+fn link_sums_projection(user_id: &str) -> Document {
+    let mut projection = doc! { "_id": 1_i32 };
+    projection.insert(GROUP_LINK_BYTES, 1_i32);
+    projection.insert(format!("{GROUP_LINK_USER_BYTES}.{user_id}"), 1_i32);
+    projection
+}
+
+/// What `check_history_link_room` judges: the holder epoch's row count and
+/// both byte sums of the (projected) holder group document
+fn link_usage(group: &Document, user_id: &str, epoch_writers: u64) -> Result<HistoryLinkUsage> {
+    let user_bytes = match group.get(GROUP_LINK_USER_BYTES) {
+        None => 0,
+        Some(Bson::Document(users)) => link_sum(users.get(user_id))?,
+        Some(_) => return Err(link_sum_error()),
+    };
+    Ok(HistoryLinkUsage {
+        epoch_writers,
+        group_bytes: link_sum(group.get(GROUP_LINK_BYTES))?,
+        user_bytes,
+    })
+}
+
+/// The rows at a link's holder epoch (`history_links_by_holder`)
+fn link_epoch_filter(row: &MlsHistoryLink) -> Document {
+    doc! { "group_id": &row.group_id, "epoch": row.epoch }
+}
+
 fn mongo_error(
     operation: &'static str,
     collection: &'static str,
@@ -129,6 +242,22 @@ fn timestamp_bson(at: &Timestamp) -> Bson {
         at.duration_since(Timestamp::UNIX_EPOCH)
             .whole_milliseconds() as i64,
     )
+}
+
+/// One `rejoin_readd` entry as the Text commit transaction `$set`s it:
+/// `at` in the typed path's encoding (`timestamp_bson`), `protocol` as the
+/// typed path writes a `u32` (Int64) and absent when `None`, as the serde
+/// skip
+fn rejoin_readd_bson(entry: &MlsRejoinReadd) -> Bson {
+    let mut stored = doc! {
+        "user_id": &entry.user_id,
+        "device_id": &entry.device_id,
+        "at": timestamp_bson(&entry.at)
+    };
+    if let Some(protocol) = entry.protocol {
+        stored.insert("protocol", i64::from(protocol));
+    }
+    Bson::Document(stored)
 }
 
 impl MongoDb {
@@ -395,18 +524,10 @@ impl MongoDb {
                 })
             })
             .collect();
-        let rejoin_readd: Option<Vec<Bson>> = plan.rejoin_readd.as_ref().map(|entries| {
-            entries
-                .iter()
-                .map(|entry: &MlsRejoinReadd| {
-                    Bson::Document(doc! {
-                        "user_id": &entry.user_id,
-                        "device_id": &entry.device_id,
-                        "at": timestamp_bson(&entry.at)
-                    })
-                })
-                .collect()
-        });
+        let rejoin_readd: Option<Vec<Bson>> = plan
+            .rejoin_readd
+            .as_ref()
+            .map(|entries| entries.iter().map(rejoin_readd_bson).collect());
 
         // Step 3: an unmarked row at the id goes first (R22: a Call-plane
         // stray must never win a Text epoch), in this transaction, so a
@@ -544,6 +665,278 @@ impl MongoDb {
         }
 
         Ok(TextAttemptOutcome::Staged { replaced_stray })
+    }
+
+    /// One attempt of the history-link transaction (design 2.8). Every read
+    /// and write runs in `session`'s transaction; the caller commits or
+    /// aborts.
+    async fn history_link_attempt(
+        &self,
+        session: &mut ClientSession,
+        row: &MlsHistoryLink,
+        caps: HistoryLinkCaps,
+    ) -> std::result::Result<LinkAttemptOutcome, TextAttemptError> {
+        // Claim the holder group FIRST (the #143 pattern; `claim_groups_first`
+        // in the protected-channels driver): the count and the sums below are
+        // reads, and two transactions conflict only when both write a common
+        // document, so without this write two racing inserts could both pass
+        // the fifth slot or a cap. As the first operation it also fixes the
+        // snapshot, so a racer that commits after it write-conflicts this
+        // attempt, which retries and reads the racer's row. The claim returns
+        // the group's byte sums as of that snapshot. A closed Text group
+        // still takes late links (design 3.14.4)
+        let group = self
+            .col::<Document>(COL_GROUPS)
+            .find_one_and_update(
+                doc! {
+                    "_id": &row.group_id,
+                    "kind": kind_filter(MlsGroupKind::Text)
+                },
+                doc! { "$inc": { "txn_serial": 1_i64 } },
+            )
+            .projection(link_sums_projection(&row.writer_user_id))
+            .return_document(ReturnDocument::After)
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("find_one_and_update", COL_GROUPS))?
+            .ok_or_else(|| TextAttemptError::Refused(create_error!(NotFound)))?;
+
+        // The writer user's slot: first write wins
+        let stored = self
+            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
+            .find_one(doc! { "_id": &row.id })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("find_one", COL_HISTORY_LINKS))?;
+        if let Some(stored) = stored {
+            return history_link_existing_outcome(&stored, row)
+                .map(|_| LinkAttemptOutcome::Identical)
+                .map_err(TextAttemptError::Refused);
+        }
+
+        // The candidates at the holder epoch (an indexed count) and the
+        // group's running byte sums (from the claim)
+        let epoch_writers = self
+            .col::<Document>(COL_HISTORY_LINKS)
+            .count_documents(link_epoch_filter(row))
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("count_documents", COL_HISTORY_LINKS))?;
+        let usage = link_usage(&group, &row.writer_user_id, epoch_writers)
+            .map_err(TextAttemptError::Refused)?;
+        check_history_link_room(row, &usage, caps).map_err(TextAttemptError::Refused)?;
+
+        match self
+            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
+            .insert_one(row)
+            .session(&mut *session)
+            .await
+        {
+            Ok(_) => {}
+            // A racer's row in the slot: the retry reads it
+            Err(error) if is_duplicate_key(&error) => return Err(TextAttemptError::Retry),
+            Err(error) => {
+                return Err(TextAttemptError::Mongo(
+                    error,
+                    "insert_one",
+                    COL_HISTORY_LINKS,
+                ))
+            }
+        }
+
+        // The row's bytes join both sums in the same transaction
+        let mut sums = Document::new();
+        sums.insert(GROUP_LINK_BYTES, row.size);
+        sums.insert(
+            format!("{GROUP_LINK_USER_BYTES}.{}", row.writer_user_id),
+            row.size,
+        );
+        let matched = self
+            .col::<Document>(COL_GROUPS)
+            .update_one(doc! { "_id": &row.group_id }, doc! { "$inc": sums })
+            .session(&mut *session)
+            .await
+            .map_err(mongo_error("update_one", COL_GROUPS))?
+            .matched_count;
+        if matched == 0 {
+            // Claimed above in this transaction: it cannot be gone
+            return Err(TextAttemptError::Refused(link_sum_error()));
+        }
+
+        Ok(LinkAttemptOutcome::Staged)
+    }
+
+    /// The insert outcomes that never change, answered BEFORE any
+    /// transaction and without claiming the holder group (so a refusal never
+    /// write-conflicts with a Text commit or another link in flight). Rows
+    /// are never updated and leave only with their whole group, and the
+    /// epoch count and both sums only grow, so an `Identical`, a taken
+    /// slot, a full epoch or a reached cap is final. Same answers, in the
+    /// same order, as `history_link_attempt` (holder, slot, count, caps),
+    /// which re-checks everything under the claim for an insert that gets
+    /// past this. `None`: the row fits now.
+    ///
+    /// These reads share no snapshot, so the growing facts (sums, count)
+    /// are read BEFORE the slot: a row that lands in the slot meanwhile is
+    /// still seen, and every answer holds as of the slot read (a racing
+    /// identical twin is `Identical`, never the full epoch it completed).
+    ///
+    /// A failed read is no early answer: the insert falls through to the
+    /// transaction, which re-reads and re-checks everything and retries a
+    /// transient error, so a read error here is never the insert's answer.
+    async fn history_link_precheck(
+        &self,
+        row: &MlsHistoryLink,
+        caps: HistoryLinkCaps,
+    ) -> Result<Option<InsertOutcome>> {
+        let Ok(reads) = self.history_link_precheck_reads(row).await else {
+            return Ok(None);
+        };
+        let Some((group, epoch_writers, stored)) = reads else {
+            return Err(create_error!(NotFound));
+        };
+        if let Some(stored) = stored {
+            return history_link_existing_outcome(&stored, row).map(Some);
+        }
+
+        check_history_link_room(
+            row,
+            &link_usage(&group, &row.writer_user_id, epoch_writers)?,
+            caps,
+        )?;
+        Ok(None)
+    }
+
+    /// The precheck's reads, in its order: the holder group's sums
+    /// (`None` when it is not a Text group), the holder epoch's row count,
+    /// then the slot
+    #[allow(clippy::type_complexity)]
+    async fn history_link_precheck_reads(
+        &self,
+        row: &MlsHistoryLink,
+    ) -> mongodb::error::Result<Option<(Document, u64, Option<MlsHistoryLink>)>> {
+        precheck_fault(&row.group_id, 0)?;
+        let Some(group) = self
+            .col::<Document>(COL_GROUPS)
+            .find_one(doc! {
+                "_id": &row.group_id,
+                "kind": kind_filter(MlsGroupKind::Text)
+            })
+            .projection(link_sums_projection(&row.writer_user_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        precheck_fault(&row.group_id, 1)?;
+        let epoch_writers = self
+            .col::<Document>(COL_HISTORY_LINKS)
+            .count_documents(link_epoch_filter(row))
+            .await?;
+
+        precheck_fault(&row.group_id, 2)?;
+        let stored = self
+            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
+            .find_one(doc! { "_id": &row.id })
+            .await?;
+        Ok(Some((group, epoch_writers, stored)))
+    }
+
+    /// `insert_mls_history_link` with explicit caps (the trait fn passes
+    /// the configured ones). The final answers come from
+    /// `history_link_precheck` (from the transaction when a precheck read
+    /// fails); an insert that fits runs one transaction,
+    /// retried as a whole on a transient error or a lost race within
+    /// `HISTORY_LINK_RETRY_BUDGET`.
+    pub(crate) async fn insert_mls_history_link_capped(
+        &self,
+        link: &MlsHistoryLink,
+        caps: HistoryLinkCaps,
+    ) -> Result<InsertOutcome> {
+        let row = prepare_history_link_row(link)?;
+        if let Some(outcome) = self.history_link_precheck(&row, caps).await? {
+            return Ok(outcome);
+        }
+        let started = std::time::Instant::now();
+
+        for attempt in 0..HISTORY_LINK_MAX_ATTEMPTS {
+            if attempt > 0 {
+                if started.elapsed() >= HISTORY_LINK_RETRY_BUDGET {
+                    break;
+                }
+                #[cfg(test)]
+                HISTORY_LINK_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                text_commit_backoff(attempt).await;
+            }
+
+            let mut session = self
+                .start_session()
+                .await
+                .map_err(|_| create_database_error!("start_session", COL_HISTORY_LINKS))?;
+
+            session
+                .start_transaction()
+                .read_concern(ReadConcern::snapshot())
+                .write_concern(WriteConcern::majority())
+                .await
+                .map_err(|_| create_database_error!("start_transaction", COL_HISTORY_LINKS))?;
+
+            match self.history_link_attempt(&mut session, &row, caps).await {
+                Ok(LinkAttemptOutcome::Identical) => {
+                    // Nothing was written but the claim; drop it
+                    let _ = session.abort_transaction().await;
+                    return Ok(InsertOutcome::Identical);
+                }
+                Ok(LinkAttemptOutcome::Staged) => {
+                    // As the Text commit: retry the commit itself on
+                    // UnknownTransactionCommitResult, the whole transaction
+                    // on a transient error
+                    let mut retry_whole = false;
+                    for _ in 0..TEXT_COMMIT_ATTEMPTS {
+                        match session.commit_transaction().await {
+                            Ok(()) => return Ok(InsertOutcome::Inserted),
+                            Err(error)
+                                if error.contains_label(UNKNOWN_TRANSACTION_COMMIT_RESULT) =>
+                            {
+                                continue;
+                            }
+                            Err(error) if error.contains_label(TRANSIENT_TRANSACTION_ERROR) => {
+                                retry_whole = true;
+                                break;
+                            }
+                            Err(_) => {
+                                return Err(create_database_error!(
+                                    "commit_transaction",
+                                    COL_HISTORY_LINKS
+                                ))
+                            }
+                        }
+                    }
+
+                    if !retry_whole {
+                        return Err(create_database_error!(
+                            "commit_transaction",
+                            COL_HISTORY_LINKS
+                        ));
+                    }
+                }
+                Err(TextAttemptError::Refused(error)) => {
+                    let _ = session.abort_transaction().await;
+                    return Err(error);
+                }
+                Err(TextAttemptError::Retry) => {
+                    let _ = session.abort_transaction().await;
+                }
+                Err(TextAttemptError::Mongo(error, operation, collection)) => {
+                    let _ = session.abort_transaction().await;
+                    if !error.contains_label(TRANSIENT_TRANSACTION_ERROR) {
+                        return Err(create_database_error!(operation, collection));
+                    }
+                }
+            }
+        }
+
+        Err(create_database_error!("transaction", COL_HISTORY_LINKS))
     }
 }
 
@@ -1297,5 +1690,80 @@ impl AbstractMls for MongoDb {
             .await
             .map_err(|_| create_database_error!("delete_many", COL_COMMITS))
             .map(|result| result.deleted_count)
+    }
+
+    async fn insert_mls_history_link(&self, link: &MlsHistoryLink) -> Result<InsertOutcome> {
+        self.insert_mls_history_link_capped(link, HistoryLinkCaps::configured().await)
+            .await
+    }
+
+    async fn fetch_mls_history_links(
+        &self,
+        group_id: &str,
+        before: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<MlsHistoryLink>> {
+        let limit = history_link_page_limit(limit);
+        let mut filter = doc! { "group_id": group_id };
+        if let Some(before) = before {
+            filter.insert("epoch", doc! { "$lt": before });
+        }
+
+        // The server sorts on `epoch` only, which `history_links_by_holder`
+        // serves; one row past the page tells `trim_history_link_page`
+        // whether the last epoch continues
+        let mut cursor = self
+            .col::<MlsHistoryLink>(COL_HISTORY_LINKS)
+            .find(filter)
+            .with_options(
+                FindOptions::builder()
+                    .sort(doc! { "epoch": -1 })
+                    .limit(limit as i64 + 1)
+                    .build(),
+            )
+            .await
+            .map_err(|_| create_database_error!("find", COL_HISTORY_LINKS))?;
+
+        // An undecodable row fails the page closed: silently skipping one
+        // could hide a candidate or split its epoch
+        let mut rows = Vec::new();
+        while let Some(row) = cursor.next().await {
+            rows.push(row.map_err(|_| create_database_error!("find", COL_HISTORY_LINKS))?);
+        }
+
+        // Within an epoch: `created_at` (Int64 unix-ms on typed writes, so
+        // millisecond precision, as the Reference driver), then the writer
+        // user. Epochs arrive whole and in order up to the last one, so this
+        // moves no row across an epoch and the trim cuts the same rows a
+        // full server-side sort would
+        rows.sort_by(|a, b| {
+            b.epoch
+                .cmp(&a.epoch)
+                .then_with(|| {
+                    history_link_created_ms(&a.created_at)
+                        .cmp(&history_link_created_ms(&b.created_at))
+                })
+                .then_with(|| a.writer_user_id.cmp(&b.writer_user_id))
+        });
+        Ok(trim_history_link_page(rows, limit))
+    }
+
+    async fn delete_mls_history_links_for_group(&self, group_id: &str) -> Result<()> {
+        // The byte sums go with the rows, and first: a link racing the
+        // delete can only leave the sums above its rows (refusing early),
+        // never below them
+        let mut sums = Document::new();
+        sums.insert(GROUP_LINK_BYTES, "");
+        sums.insert(GROUP_LINK_USER_BYTES, "");
+        self.col::<Document>(COL_GROUPS)
+            .update_one(doc! { "_id": group_id }, doc! { "$unset": sums })
+            .await
+            .map_err(|_| create_database_error!("update_one", COL_GROUPS))?;
+
+        self.col::<Document>(COL_HISTORY_LINKS)
+            .delete_many(doc! { "group_id": group_id })
+            .await
+            .map_err(|_| create_database_error!("delete_many", COL_HISTORY_LINKS))
+            .map(|_| ())
     }
 }

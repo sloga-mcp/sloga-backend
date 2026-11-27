@@ -6,7 +6,7 @@ use revolt_database::{
     events::client::EventV1, is_valid_device_id, is_valid_key_package_ref, mls_join_intent_payload,
     mls_text_enforced_device_cap, ChannelEntitlement, Database, E2EEIdentity, MlsGroup,
     MlsJoinIntent, MlsMemberDevice, SeatList, SeatListBody, Session, TextJoinPayload, User,
-    MAX_MLS_GROUP_MEMBERS,
+    MAX_MLS_GROUP_MEMBERS, MIN_TEXT_PROTOCOL_V2,
 };
 use revolt_models::v0;
 use revolt_result::{create_error, ErrorType, Result};
@@ -271,7 +271,7 @@ async fn call_join_intent(
         }));
     }
 
-    let intent = join_intent_row(&group, &user.id, &data, None, None);
+    let intent = join_intent_row(&group, &user.id, &data, None, None, None);
     store_join_intent(db, &intent).await?;
 
     // Dual-reload deadlock (rejoin plan §5): a rejoin is only ever served
@@ -313,6 +313,11 @@ async fn call_join_intent(
 /// On a channel whose stored list is v2 the intent is signed over the Text
 /// join payload and its `generation` and `issued_at` are stored and fanned
 /// out (§3.13, #218); a v1 channel keeps the S1 payload and S1 rows.
+///
+/// On a v2 channel the intent, a rejoin included, also needs the minimum
+/// text protocol ([`check_text_protocol`]), checked once the session is
+/// bound to the device and before the signature. The client-claimed
+/// `protocol` is stored on every Text intent, v1 and v2 alike.
 ///
 /// A Text intent stays outstanding for `text_rejoin_window_secs` (24 h),
 /// measured from the row's server-stamped `created_at` by the driver's rule
@@ -368,6 +373,10 @@ async fn text_join_intent(
     // takes no intent at all
     let identity = bound_identity(db, &user.id, session, &data.device_id).await?;
     let seat_list = seat_list.ok_or_else(|| create_error!(InvalidOperation))?;
+    // After every access check above, so a non-viewer's answer never
+    // depends on the list's format, and before the signature, which an S1
+    // client fails on a v2 channel: it gets the clean refusal instead
+    check_text_protocol(&seat_list, data.protocol)?;
     let (generation, issued_at) =
         verify_text_join_signature(&identity, &user.id, &group, &seat_list, &data)?;
 
@@ -386,12 +395,35 @@ async fn text_join_intent(
         }
     }
 
-    let intent = join_intent_row(&group, &user.id, &data, generation, issued_at);
+    let intent = join_intent_row(
+        &group,
+        &user.id,
+        &data,
+        generation,
+        issued_at,
+        data.protocol,
+    );
     store_join_intent(db, &intent).await?;
 
     fan_out_join_requested(&group, &intent, rejoin).await;
 
     Ok(EmptyResponse)
+}
+
+/// The minimum text protocol (S4 plan appendix (2) item 1, design 8.3
+/// "Text protocol"): on a channel whose stored list is v2, a Text join
+/// intent needs a `protocol` of at least [`MIN_TEXT_PROTOCOL_V2`], else
+/// `ProtectedClientOutdated`. A rejoin intent too: the rule-6 eviction it
+/// justifies hands its `protocol` to the re-Add (`rejoin_readd`). A v1 list
+/// is never read for it. `protocol` is CLIENT-CLAIMED: it turns an honest
+/// S1 client away cleanly and protects nothing against a dishonest one.
+fn check_text_protocol(list: &SeatList, protocol: Option<u32>) -> Result<()> {
+    if list.is_v2() && !protocol.is_some_and(|protocol| protocol >= MIN_TEXT_PROTOCOL_V2) {
+        return Err(create_error!(ProtectedClientOutdated {
+            min: MIN_TEXT_PROTOCOL_V2
+        }));
+    }
+    Ok(())
 }
 
 /// Whether a NEW device of `user_id` is the signer user's replacement
@@ -428,12 +460,11 @@ async fn signer_replacement(
 }
 
 /// The entitlement predicate every Text join needs, a new device and a
-/// recovery intent alike (design §6.3 "Recovery gates", #220): S5's
-/// `allows_text_traffic()`, which before S5 lands is `Active` only. S5b's
-/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, S2-D32
-/// amended) replaces this at its merge.
+/// recovery intent alike (design §6.3 "Recovery gates", #220): S5b's
+/// `ChannelEntitlement::allows_text_traffic` (`Active` or `Grace`, D14,
+/// S2-D32 amended).
 fn allows_text_traffic(entitlement: &ChannelEntitlement) -> bool {
-    entitlement.is_active()
+    entitlement.allows_text_traffic()
 }
 
 /// The entitlement half of the recovery gate for a rejoin (§6.3 "Recovery
@@ -473,10 +504,10 @@ fn capped_device_count(group: &MlsGroup, user_id: &str) -> usize {
 ///
 /// A new device is an Add to come, and an Add of a seated member's new
 /// device needs an entitlement that allows text traffic
-/// ([`allows_text_traffic`]; §6.1 errors, §6.3 "Recovery gates"), so a
-/// missing or inactive one refuses the new device here rather than at the
-/// admitter's commit. The signer user's replacement device meets the same
-/// check under the recovery gate.
+/// ([`allows_text_traffic`]: Active or Grace, S5b D14; §6.1 errors, §6.3
+/// "Recovery gates"), so a missing, Frozen or Deleted one refuses the new
+/// device here rather than at the admitter's commit. The signer user's
+/// replacement device meets the same check under the recovery gate.
 async fn enforced_device_cap(db: &Database, channel_id: &str) -> Result<u32> {
     let entitlement = db
         .fetch_channel_entitlement(channel_id)
@@ -616,13 +647,15 @@ fn verify_text_join_signature(
 }
 
 /// The stored intent row, stamped now. `generation` and `issued_at` are
-/// the verified Text join payload fields (`None` on Call and v1 intents).
+/// the verified Text join payload fields (`None` on Call and v1 intents);
+/// `protocol` is the request's on every Text intent (`None` on Call).
 fn join_intent_row(
     group: &MlsGroup,
     user_id: &str,
     data: &v0::DataMlsJoinIntent,
     generation: Option<u32>,
     issued_at: Option<i64>,
+    protocol: Option<u32>,
 ) -> MlsJoinIntent {
     MlsJoinIntent {
         id: MlsJoinIntent::composite_id(&group.id, user_id, &data.device_id),
@@ -634,6 +667,7 @@ fn join_intent_row(
         created_at: Timestamp::now_utc(),
         generation,
         issued_at,
+        protocol,
     }
 }
 
@@ -706,12 +740,16 @@ mod tests {
         events::client::EventV1, mls_join_intent_payload, Account, BotInformation,
         ChannelEntitlementState, Database, MlsCommit, MlsCommitOutcome, MlsGroup, MlsMemberDevice,
         PartialChannel, SeatListBody, SeatListHistory, SeatListPreHistory, SeatListV2Lines,
-        Session, TextJoinPayload, User,
+        Session, TextJoinPayload, User, MIN_TEXT_PROTOCOL_V2,
     };
     use revolt_models::v0;
     use revolt_permissions::{ChannelPermission, OverrideField};
     use revolt_result::Result;
-    use rocket::{serde::json::Json, State};
+    use rocket::{
+        http::{ContentType, Header, Status},
+        serde::json::Json,
+        State,
+    };
     use rocket_empty::EmptyResponse;
     use ulid::Ulid;
 
@@ -765,6 +803,7 @@ mod tests {
             signature: device.sign(&payload),
             generation: None,
             issued_at: None,
+            protocol: None,
         }
     }
 
@@ -791,6 +830,7 @@ mod tests {
 
     /// A v2 join intent by `device` for `group`: the Text join payload at
     /// the group's generation, signed by it, carrying both signed fields
+    /// and the minimum text protocol
     fn signed_text_intent(
         device: &TestE2EEDevice,
         group: &MlsGroup,
@@ -810,6 +850,7 @@ mod tests {
             )),
             generation: Some(generation),
             issued_at: Some(issued_at),
+            protocol: Some(MIN_TEXT_PROTOCOL_V2),
         }
     }
 
@@ -880,6 +921,8 @@ mod tests {
                     rejoin_intents: vec![],
                     removed_reasons: vec![],
                     welcome: None,
+                    history_visible: None,
+                    added_protocols: vec![],
                 },
                 &hash,
                 0,
@@ -933,6 +976,8 @@ mod tests {
                 rejoin_intents: vec![],
                 removed_reasons: vec![],
                 welcome: None,
+                history_visible: None,
+                added_protocols: vec![],
             },
             &hash,
             0,
@@ -1069,6 +1114,7 @@ mod tests {
                 handover: None,
                 authority: None,
             },
+            wipe_history: None,
         };
         harness.protect_with_db(&channel, &protect).await;
         let channel = harness
@@ -1531,8 +1577,9 @@ mod tests {
     }
 
     /// Deleted refuses a new device as Frozen does, and a rejoin with it.
-    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` takes the
-    /// rejoin, under the S1 rule that S2-D32 replaces.)
+    /// (S5b's `a_deleted_entitlement_refuses_new_devices_only` took the
+    /// rejoin, under the S1 rule that S2-D32 replaces; it was dropped at
+    /// the merge, this test covering all it would now assert.)
     #[test]
     fn a_deleted_entitlement_refuses_new_devices_and_rejoins() {
         crate::util::test::rt().block_on(inactive_entitlement_refuses_joins(Some(
@@ -1620,6 +1667,39 @@ mod tests {
             .expect("entitlement read")
             .expect("an entitlement");
         assert_eq!(entitlement.state, state);
+    }
+
+    /// S5b D14 (the cross-branch pin against S2-D32): in Grace a seated
+    /// member's NEW device may still ask to join, so it can be added
+    #[test]
+    fn grace_allows_a_join_intent() {
+        crate::util::test::rt().block_on(grace_allows_a_join_intent_case())
+    }
+
+    async fn grace_allows_a_join_intent_case() {
+        let text = text_fixture().await;
+        let db = &text.harness.db;
+        let group_id = &text.group.id;
+
+        set_entitlement_state(
+            db,
+            text.protected.channel.id(),
+            ChannelEntitlementState::Grace,
+        )
+        .await;
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            group_id,
+            signed_intent(&text.member_device, group_id, "m1"),
+        )
+        .await
+        .expect("a new device's intent in Grace");
+        assert_eq!(
+            stored_intents(db, group_id).await,
+            vec![(text.member.id.clone(), text.member_device.device_id.clone())]
+        );
     }
 
     #[test]
@@ -1950,8 +2030,12 @@ mod tests {
         no_generation.generation = None;
         let mut no_issued_at = good();
         no_issued_at.issued_at = None;
-        let s1 = signed_intent(device, group_id, "m1");
+        // The S1 payloads carry protocol 2, so the signature refuses them,
+        // not the protocol floor
+        let mut s1 = signed_intent(device, group_id, "m1");
+        s1.protocol = Some(MIN_TEXT_PROTOCOL_V2);
         let mut s1_with_fields = signed_intent(device, group_id, "m1");
+        s1_with_fields.protocol = Some(MIN_TEXT_PROTOCOL_V2);
         s1_with_fields.generation = Some(0);
         s1_with_fields.issued_at = Some(FIXTURE_ISSUED_AT);
         let mut other_generation = good();
@@ -2046,6 +2130,352 @@ mod tests {
             "FailedValidation",
             "the Text payload on a v1 channel",
         );
+    }
+
+    /// The route over HTTP: the status and the raw response body
+    async fn post_http(
+        harness: &TestHarness,
+        session: &Session,
+        group_id: &str,
+        data: &v0::DataMlsJoinIntent,
+    ) -> (Status, String) {
+        let response = harness
+            .client
+            .post(format!("/mls/groups/{group_id}/join_intent"))
+            .header(ContentType::JSON)
+            .header(Header::new("x-session-token", session.token.clone()))
+            .body(serde_json::to_string(data).expect("a JSON body"))
+            .dispatch()
+            .await;
+        let status = response.status();
+        (status, response.into_string().await.unwrap_or_default())
+    }
+
+    /// The stored `protocol` of `device`'s intent for `group_id`, read back
+    /// from the database
+    async fn stored_protocol(
+        db: &Database,
+        group_id: &str,
+        device: &TestE2EEDevice,
+    ) -> Option<u32> {
+        db.fetch_mls_join_intents_for_group(group_id)
+            .await
+            .expect("intents")
+            .into_iter()
+            .find(|intent| intent.user_id == device.user_id && intent.device_id == device.device_id)
+            .expect("the stored intent")
+            .protocol
+    }
+
+    /// The refusal is exactly `ProtectedClientOutdated { min: 2 }`
+    #[track_caller]
+    fn outdated<T>(result: Result<T>, case: &str) {
+        let body = refused(result, "ProtectedClientOutdated", case);
+        assert_eq!(
+            body,
+            serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 }),
+            "{}",
+            case
+        );
+    }
+
+    #[test]
+    fn a_v2_join_intent_needs_text_protocol_2() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_join_intent_needs_text_protocol_2_case().await
+        })
+    }
+
+    /// S4 plan appendix (2) item 1: on a channel whose stored list is v2, a
+    /// new device's intent without `protocol`, or below 2, is
+    /// `ProtectedClientOutdated { min: 2 }` and nothing is stored; at 2 it
+    /// is stored with the intent. Over HTTP too, so the `protocol` key
+    /// reaches the route.
+    async fn a_v2_join_intent_needs_text_protocol_2_case() {
+        let text = text_v2_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = &text.group.id;
+        let device = &text.member_device;
+        let intent = |protocol: Option<u32>| v0::DataMlsJoinIntent {
+            protocol,
+            ..signed_text_intent(device, &text.group, "m1", FIXTURE_ISSUED_AT)
+        };
+
+        for protocol in [None, Some(0), Some(1)] {
+            let case = format!("protocol {protocol:?}");
+            outdated(
+                post(
+                    db,
+                    &text.member,
+                    &text.member_session,
+                    group_id,
+                    intent(protocol),
+                )
+                .await,
+                &case,
+            );
+            let (status, body) =
+                post_http(harness, &text.member_session, group_id, &intent(protocol)).await;
+            assert_eq!(status, Status::BadRequest, "{} over HTTP: {}", case, body);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body).expect("JSON"),
+                serde_json::json!({ "type": "ProtectedClientOutdated", "min": 2 }),
+                "{} over HTTP",
+                case
+            );
+        }
+        assert!(stored_intents(db, group_id).await.is_empty());
+
+        let (status, body) = post_http(
+            harness,
+            &text.member_session,
+            group_id,
+            &intent(Some(MIN_TEXT_PROTOCOL_V2)),
+        )
+        .await;
+        assert!(
+            status.class().is_success(),
+            "protocol 2 over HTTP: {} {}",
+            status,
+            body
+        );
+        assert_eq!(
+            stored_protocol(db, group_id, device).await,
+            Some(MIN_TEXT_PROTOCOL_V2)
+        );
+    }
+
+    #[test]
+    fn a_v2_rejoin_intent_needs_text_protocol_2() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_rejoin_intent_needs_text_protocol_2_case().await
+        })
+    }
+
+    /// The same floor binds a rejoin intent, whose `protocol` the rule-6
+    /// eviction hands to the re-Add (R-REJOIN). The owner's device holds
+    /// the group's leaf, so its intent is a rejoin: without `protocol` or
+    /// at 1 it is refused and nothing is stored; at 2 it is stored with it
+    /// and fanned out as a rejoin
+    async fn a_v2_rejoin_intent_needs_text_protocol_2_case() {
+        let mut text = text_v2_fixture().await;
+        let group_id = text.group.id.clone();
+        let owner_id = text.owner.id.clone();
+        let owner_device = &text.protected.owner_device;
+        assert!(text
+            .group
+            .has_member(&owner_device.user_id, &owner_device.device_id));
+        let intent = |protocol: Option<u32>| v0::DataMlsJoinIntent {
+            protocol,
+            ..signed_text_intent(owner_device, &text.group, "o1", FIXTURE_ISSUED_AT)
+        };
+
+        for protocol in [None, Some(1)] {
+            outdated(
+                post(
+                    &text.harness.db,
+                    &text.owner,
+                    &text.owner_session,
+                    &group_id,
+                    intent(protocol),
+                )
+                .await,
+                &format!("rejoin, protocol {protocol:?}"),
+            );
+        }
+        assert!(stored_intents(&text.harness.db, &group_id).await.is_empty());
+
+        post(
+            &text.harness.db,
+            &text.owner,
+            &text.owner_session,
+            &group_id,
+            intent(Some(MIN_TEXT_PROTOCOL_V2)),
+        )
+        .await
+        .expect("the rejoin at protocol 2");
+        assert_eq!(
+            stored_protocol(&text.harness.db, &group_id, owner_device).await,
+            Some(MIN_TEXT_PROTOCOL_V2)
+        );
+        assert_eq!(
+            join_request_carriers(&mut text.harness, &owner_id, &group_id, owner_device, "o1")
+                .await,
+            (Some(0), Some(FIXTURE_ISSUED_AT), true)
+        );
+    }
+
+    #[test]
+    fn a_v1_join_intent_stores_the_protocol_it_carries() {
+        crate::util::test::rt().block_on(a_v1_join_intent_stores_the_protocol_it_carries_case())
+    }
+
+    /// v1 has no floor: a new device's intent without `protocol` is accepted
+    /// and stored `None`, and protocol 1 and 2 are stored as sent. A
+    /// re-broadcast refused by the rate limit restores the stored row, its
+    /// `protocol` included.
+    async fn a_v1_join_intent_stores_the_protocol_it_carries_case() {
+        let text = text_fixture().await;
+        let harness = &text.harness;
+        let db = &harness.db;
+        let group_id = text.group.id.clone();
+
+        post(
+            db,
+            &text.member,
+            &text.member_session,
+            &group_id,
+            signed_intent(&text.member_device, &group_id, "m1"),
+        )
+        .await
+        .expect("no protocol on a v1 channel");
+        assert_eq!(
+            stored_protocol(db, &group_id, &text.member_device).await,
+            None
+        );
+
+        for (seed, protocol) in [(0x31, 1), (0x32, MIN_TEXT_PROTOCOL_V2)] {
+            let case = format!("protocol {protocol}");
+            let (session, device) =
+                new_bound_device(harness, &text.member_account, &text.member, seed).await;
+            let intent = |protocol: Option<u32>| v0::DataMlsJoinIntent {
+                protocol,
+                ..signed_intent(&device, &group_id, "m2")
+            };
+            post(
+                db,
+                &text.member,
+                &session,
+                &group_id,
+                intent(Some(protocol)),
+            )
+            .await
+            .expect(&case);
+            assert_eq!(
+                stored_protocol(db, &group_id, &device).await,
+                Some(protocol),
+                "{}",
+                case
+            );
+
+            refused(
+                post(db, &text.member, &session, &group_id, intent(None)).await,
+                "InSlowmode",
+                &format!("{case}, re-broadcast"),
+            );
+            assert_eq!(
+                stored_protocol(db, &group_id, &device).await,
+                Some(protocol),
+                "{} after the refused re-broadcast",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn a_v2_non_viewer_gets_the_unknown_answer_before_the_protocol_floor() {
+        crate::util::test::rt().block_on(async {
+            revolt_config::overwrite_config(|settings| {
+                settings.features.protected_channels.formats_v2 = true;
+            })
+            .await;
+            a_v2_non_viewer_gets_the_unknown_answer_before_the_protocol_floor_case().await
+        })
+    }
+
+    /// Oracle parity before the floor (6.1 order): on a v2 channel the
+    /// member can no longer view, its intent without `protocol` or at 1
+    /// answers EXACTLY as a group id the server does not know, never
+    /// `ProtectedClientOutdated`. The owner still views it and meets the
+    /// floor there, so the floor is live on that group.
+    async fn a_v2_non_viewer_gets_the_unknown_answer_before_the_protocol_floor_case() {
+        let text = text_v2_fixture().await;
+        let db = &text.harness.db;
+        let group = &text.group;
+        let mut channel = text.protected.channel.clone();
+        channel
+            .update(
+                db,
+                PartialChannel {
+                    default_permissions: Some(OverrideField {
+                        a: 0,
+                        d: ChannelPermission::ViewChannel as i64,
+                    }),
+                    ..Default::default()
+                },
+                vec![],
+            )
+            .await
+            .expect("deny view");
+        assert!(require_channel_access(db, &text.member, &channel)
+            .await
+            .is_err());
+        let unknown_id = format!("{:032x}{:032x}", Ulid::new().0, Ulid::new().0);
+
+        for protocol in [None, Some(1)] {
+            let case = format!("protocol {protocol:?}");
+            let intent = || v0::DataMlsJoinIntent {
+                protocol,
+                ..signed_text_intent(&text.member_device, group, "m1", FIXTURE_ISSUED_AT)
+            };
+            let unknown = refusal_body(
+                post(
+                    db,
+                    &text.member,
+                    &text.member_session,
+                    &unknown_id,
+                    intent(),
+                )
+                .await,
+                &format!("unknown, {case}"),
+            );
+            let value: serde_json::Value = serde_json::from_str(&unknown).expect("JSON");
+            assert_eq!(value["type"], "NotFound", "{}: {}", case, unknown);
+            let hidden = refusal_body(
+                post(db, &text.member, &text.member_session, &group.id, intent()).await,
+                &format!("hidden, {case}"),
+            );
+            assert_eq!(hidden, unknown, "{}", case);
+        }
+
+        let owner_device = &text.protected.owner_device;
+        let owner_intent = |protocol: Option<u32>| v0::DataMlsJoinIntent {
+            protocol,
+            ..signed_text_intent(owner_device, group, "o1", FIXTURE_ISSUED_AT)
+        };
+        assert!(require_channel_access(db, &text.owner, &channel)
+            .await
+            .is_ok());
+        outdated(
+            post(
+                db,
+                &text.owner,
+                &text.owner_session,
+                &group.id,
+                owner_intent(None),
+            )
+            .await,
+            "the owner, no protocol",
+        );
+        assert!(stored_intents(db, &group.id).await.is_empty());
+        post(
+            db,
+            &text.owner,
+            &text.owner_session,
+            &group.id,
+            owner_intent(Some(MIN_TEXT_PROTOCOL_V2)),
+        )
+        .await
+        .expect("the owner at protocol 2");
     }
 
     /// S2-D28: a Text intent the route stored stays outstanding for
@@ -2360,6 +2790,7 @@ mod tests {
                     signature: STANDARD_NO_PAD.encode([1u8; 64]),
                     generation: None,
                     issued_at: None,
+                    protocol: None,
                 },
             };
             if malformed {
@@ -2936,6 +3367,7 @@ mod tests {
                 pending_device_removals: vec![],
                 signer_lost: None,
                 rejoin_readd: vec![],
+                history_visible_at_create: None,
             };
             assert!(matches!(
                 db.create_mls_group(&group, None).await.expect("call group"),
