@@ -7884,12 +7884,12 @@ dependencies = [
  "chrono",
  "const-oid 0.9.6",
  "der 0.7.10",
- "ecdsa",
+ "ecdsa 0.16.9",
  "hmac 0.12.1",
  "jsonwebtoken",
  "log",
- "p256",
- "p384",
+ "p256 0.13.2",
+ "p384 0.13.1",
  "rand 0.8.6",
  "reqwest 0.13.4",
  "revolt-config",
@@ -7904,7 +7904,7 @@ dependencies = [
  "tokio",
  "ulid",
  "uuid",
- "x509-cert",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]

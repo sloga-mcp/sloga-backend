@@ -450,6 +450,8 @@ mod tests {
             mfa: Default::default(),
             google_id: None,
             apple_id: None,
+            email_absent: false,
+            password_absent: false,
         }
     }
 
