@@ -1254,8 +1254,9 @@ pub async fn launch_prot_goal(
         return Err(create_error!(ProtGoalClosed));
     }
     // Another server's channel looks absent (IDOR); the driver repeats every
-    // check (protectable, no message, no entitlement, no tank) in its
-    // transaction
+    // check (launchable, no entitlement, no tank) in its transaction. A
+    // channel with history is fine while history_setting is on, as for a
+    // direct protect (owner 2026-11-26).
     let channel = match db.fetch_channel(&data.channel_id).await {
         Ok(channel) => channel,
         Err(err) if is_not_found(&err) => return Err(create_error!(NotFound)),

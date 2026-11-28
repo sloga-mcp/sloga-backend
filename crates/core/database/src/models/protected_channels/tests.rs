@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 
 use super::ops::SeatListFlags;
 use crate::{
-    channel_seats_used, check_channel_protectable, check_channel_wipeable,
-    check_protect_genesis_history, check_removal_reason, check_seat_list_authority,
-    check_seat_list_history_lines, check_seat_list_v2_lines, seat_list_history_visible, ulid_time,
-    HistoryWipe, Message, MlsHistoryLink, PartialChannel, ProtectedHistory,
-    MAX_BOUNDARY_CLOCK_SKEW_MS,
+    channel_seats_used, check_channel_launchable, check_channel_protectable,
+    check_channel_wipeable, check_protect_genesis_history, check_removal_reason,
+    check_seat_list_authority, check_seat_list_history_lines, check_seat_list_v2_lines,
+    seat_list_history_visible, ulid_time, HistoryWipe, Message, MlsHistoryLink, PartialChannel,
+    ProtectedHistory, MAX_BOUNDARY_CLOCK_SKEW_MS,
 };
 use crate::{
     plan_seat_list_write, prepare_text_group, resolve_signer_lost,
@@ -8520,6 +8520,72 @@ fn a_boundary_lifts_only_the_last_message_id_rule() {
     assert!(is_invalid_operation(
         &check_channel_wipeable(Some(&busy), b).unwrap_err()
     ));
+}
+
+/// 8.6 (owner decision 2026-11-26): a launch keeps every protect refusal but
+/// the emptiness rule, so a channel with history launches
+#[test]
+fn a_launch_takes_a_channel_with_history() {
+    assert!(matches!(
+        check_channel_launchable(None).unwrap_err().error_type,
+        ErrorType::NotFound
+    ));
+    let busy = text_channel(Some(TV4_BOUNDARY_MESSAGE_ID.to_string()));
+    assert!(check_channel_launchable(Some(&busy)).is_ok());
+    assert!(check_channel_launchable(Some(&text_channel(None))).is_ok());
+
+    let mut protected = text_channel(None);
+    if let Channel::TextChannel {
+        protected: flag, ..
+    } = &mut protected
+    {
+        *flag = true;
+    }
+    assert!(is_invalid_operation(
+        &check_channel_launchable(Some(&protected)).unwrap_err()
+    ));
+
+    let mut voice_channel = text_channel(None);
+    if let Channel::TextChannel { voice, .. } = &mut voice_channel {
+        *voice = Some(Default::default());
+    }
+    assert!(is_invalid_operation(
+        &check_channel_launchable(Some(&voice_channel)).unwrap_err()
+    ));
+
+    for (flag, launchable) in [(Some(true), false), (Some(false), true), (None, true)] {
+        let mut channel = text_channel(None);
+        if let Channel::TextChannel { announcement, .. } = &mut channel {
+            *announcement = flag;
+        }
+        assert_eq!(
+            check_channel_launchable(Some(&channel)).is_ok(),
+            launchable,
+            "announcement {flag:?}"
+        );
+        if !launchable {
+            assert!(is_invalid_operation(
+                &check_channel_launchable(Some(&channel)).unwrap_err()
+            ));
+        }
+    }
+
+    for channel in [
+        Channel::SavedMessages {
+            id: CHANNEL.to_string(),
+            user: USER_A.to_string(),
+        },
+        Channel::DirectMessage {
+            id: CHANNEL.to_string(),
+            active: true,
+            recipients: vec![USER_A.to_string(), USER_B.to_string()],
+            last_message_id: None,
+        },
+    ] {
+        assert!(is_invalid_operation(
+            &check_channel_launchable(Some(&channel)).unwrap_err()
+        ));
+    }
 }
 
 // --- drivers (REFERENCE and MONGODB) ------------------------------------------

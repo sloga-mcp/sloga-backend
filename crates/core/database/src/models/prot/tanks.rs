@@ -204,11 +204,12 @@ mod tests {
         prot_key_tier, prot_key_writeoff, prot_next_day, prot_tank_account,
         prot_upgrade_goal_price, prot_user_account, prot_utc_day, Channel, Database,
         E2EEContentType, E2EEEnvelope, EncryptedPayload, Member, MemberCompositeKey, Message,
-        MlsCommit, MlsGroup, MlsGroupKind, MlsJoinIntent, MlsMemberDevice, ProtAmount,
-        ProtBurnOutcome, ProtContributeInput, ProtContributeOutcome, ProtGoal, ProtLaunchInput,
-        ProtLedgerEntry, ProtNoticeKind, ProtPledgeInput, ProtPledgeOutcome, ProtPosting, ProtRef,
-        ProtSettleCause, ProtTank, ProtTankRules, ProtTankTarget, ProtTierChangeInput, ReferenceDb,
-        SeatListBody, SeatListSubmission, Server, User, E2EE_PROTOCOL_VERSION, PROT_ACTOR_PAYMENTS,
+        MessageFilter, MessageQuery, MessageTimePeriod, MlsCommit, MlsGroup, MlsGroupKind,
+        MlsJoinIntent, MlsMemberDevice, ProtAmount, ProtBurnOutcome, ProtContributeInput,
+        ProtContributeOutcome, ProtGoal, ProtLaunchInput, ProtLedgerEntry, ProtNoticeKind,
+        ProtPledgeInput, ProtPledgeOutcome, ProtPosting, ProtRef, ProtSettleCause, ProtTank,
+        ProtTankRules, ProtTankTarget, ProtTierChangeInput, ReferenceDb, SeatListBody,
+        SeatListSubmission, Server, User, E2EE_PROTOCOL_VERSION, PROT_ACTOR_PAYMENTS,
         PROT_OPEN_GOAL_STATES, PROT_SLOT_TIERS, PROT_SYS_ADJUST, PROT_SYS_BURNED, PROT_SYS_CLAWED,
         PROT_SYS_FORFEITED, PROT_SYS_ISSUED, PROT_SYS_WRITEOFF,
     };
@@ -358,9 +359,10 @@ mod tests {
         }
     }
 
-    #[allow(clippy::disallowed_methods)]
-    async fn insert_channel(db: &Database, channel_id: &str, server_id: &str) {
-        db.insert_channel(&Channel::TextChannel {
+    /// A server `TextChannel`: unprotected, no `voice`, no announcement
+    /// flag, no `last_message_id`
+    fn text_channel(channel_id: &str, server_id: &str) -> Channel {
+        Channel::TextChannel {
             id: channel_id.to_string(),
             server: server_id.to_string(),
             name: "tank".to_string(),
@@ -376,9 +378,68 @@ mod tests {
             announcement: None,
             protected: false,
             protected_history: None,
-        })
-        .await
-        .unwrap();
+        }
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    async fn insert_channel(db: &Database, channel_id: &str, server_id: &str) {
+        db.insert_channel(&text_channel(channel_id, server_id))
+            .await
+            .unwrap();
+    }
+
+    /// S4's `history_setting` on for THIS test's process (a launch follows
+    /// it like a direct protect, 8.6; the test configuration has it off).
+    /// The environment form reaches the configuration only when nothing in
+    /// the process has read it yet, so this runs first, before
+    /// `database_test!`, and only under nextest (one process per test): under
+    /// a plain `cargo test` it refuses instead of turning the flag on for
+    /// every other test of the binary. The assertion proves the override
+    /// landed (crond's `prune_upload_sessions` precedent; lifecycle.rs has
+    /// the same helper, which also turns `formats_v2` on for its protects).
+    async fn history_setting_on() {
+        assert_eq!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test"),
+            "run this test under cargo nextest: it turns history_setting on for its own process"
+        );
+        std::env::set_var(
+            "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_SETTING",
+            "true",
+        );
+        assert!(
+            revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .history_setting,
+            "history_setting never reached the configuration"
+        );
+    }
+
+    /// The ids of every message stored in `channel_id`, oldest first,
+    /// through the normal history fetch
+    async fn channel_message_ids(db: &Database, channel_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .fetch_messages(MessageQuery {
+                limit: Some(100),
+                filter: MessageFilter {
+                    channel: Some(channel_id.to_string()),
+                    ..Default::default()
+                },
+                time_period: MessageTimePeriod::Absolute {
+                    before: None,
+                    after: None,
+                    sort: None,
+                },
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        ids.sort();
+        ids
     }
 
     #[allow(clippy::disallowed_methods)]
@@ -2038,9 +2099,154 @@ mod tests {
     // 8.6 launch, capture, 7-day returns
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    /// The channels of the 8.6 launch refusal table, the table itself and
+    /// its write-nothing checks, for the flag-off and the flag-on test: with
+    /// the goal of `goal_id` (Funded, on SERVER) each launch below is refused
+    /// with the expected error, writes no tank and no entitlement and leaves
+    /// the goal Funded. Two protected channels: one protected through an
+    /// admin grant (also refused by the entitlement check) and one whose row
+    /// carries `protected: true` with NO entitlement, so only the
+    /// `protected` guard refuses it. Returns the clean channel the non-owner
+    /// case used, still unlaunched.
     #[allow(clippy::disallowed_methods)]
-    async fn launch_refuses_another_servers_channel_a_protected_channel_a_non_owner_and_a_channel_with_a_message(
+    async fn assert_launch_refusals(
+        db: &Database,
+        goal_id: &str,
+        rules: &ProtTankRules,
+        now: i64,
+    ) -> String {
+        let launch = |channel_id: &str, owner_id: &str| ProtLaunchInput {
+            goal_id: goal_id.to_string(),
+            channel_id: channel_id.to_string(),
+            owner_id: owner_id.to_string(),
+            rules: rules.clone(),
+            now: now + 10,
+        };
+
+        let foreign = channel_id(3_001);
+        insert_channel(db, &foreign, OTHER_SERVER).await;
+        let voice_channel = channel_id(3_002);
+        let mut channel = text_channel(&voice_channel, SERVER);
+        if let Channel::TextChannel { voice, .. } = &mut channel {
+            *voice = Some(Default::default());
+        }
+        db.insert_channel(&channel).await.unwrap();
+        let announcement_channel = channel_id(3_005);
+        let mut channel = text_channel(&announcement_channel, SERVER);
+        if let Channel::TextChannel { announcement, .. } = &mut channel {
+            *announcement = Some(true);
+        }
+        db.insert_channel(&channel).await.unwrap();
+        let granted = channel_id(3_003);
+        insert_channel(db, &granted, SERVER).await;
+        db.upsert_channel_entitlement(
+            &crate::ChannelEntitlement {
+                id: nonce(),
+                channel_id: granted.clone(),
+                server_id: SERVER.to_string(),
+                source: crate::ChannelEntitlementSource::AdminGrant,
+                slot_cap: 10,
+                device_cap: None,
+                state: crate::ChannelEntitlementState::Active,
+                granted_by: ADMIN.to_string(),
+                created_at: timestamp(now),
+            },
+            timestamp(now),
+        )
+        .await
+        .unwrap();
+        db.protect_channel(
+            &granted,
+            &seat_list(&granted, 1, &[OWNER], now),
+            timestamp(now),
+        )
+        .await
+        .unwrap();
+        let bare_protected = channel_id(3_006);
+        let mut channel = text_channel(&bare_protected, SERVER);
+        if let Channel::TextChannel { protected, .. } = &mut channel {
+            *protected = true;
+        }
+        db.insert_channel(&channel).await.unwrap();
+        let clean = channel_id(3_004);
+        insert_channel(db, &clean, SERVER).await;
+        let missing = channel_id(3_999);
+
+        for (input, case, expected) in [
+            (
+                launch(&foreign, OWNER),
+                "another server's channel",
+                "NotFound",
+            ),
+            (
+                launch(&granted, OWNER),
+                "a protected channel with an entitlement",
+                "InvalidOperation",
+            ),
+            (
+                launch(&bare_protected, OWNER),
+                "a protected channel without an entitlement",
+                "InvalidOperation",
+            ),
+            (
+                launch(&voice_channel, OWNER),
+                "a voice channel",
+                "InvalidOperation",
+            ),
+            (
+                launch(&announcement_channel, OWNER),
+                "an announcement channel",
+                "InvalidOperation",
+            ),
+            (launch(&clean, A), "a non-owner", "NotOwner"),
+            (launch(&missing, OWNER), "a missing channel", "NotFound"),
+        ] {
+            let refused = db.launch_prot_goal(&input).await;
+            assert!(is_error(&refused, expected), "{case}: {refused:?}");
+            assert!(
+                db.fetch_prot_tank_by_channel(&input.channel_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{case}"
+            );
+            assert_eq!(
+                self::goal(db, goal_id).await.state,
+                v0::ProtGoalState::Funded,
+                "{case}"
+            );
+        }
+        for unentitled in [
+            &foreign,
+            &bare_protected,
+            &voice_channel,
+            &announcement_channel,
+            &clean,
+            &missing,
+        ] {
+            assert!(
+                db.fetch_channel_entitlement(unentitled)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{unentitled}"
+            );
+        }
+        assert_eq!(balance(db, &prot_hold_account(goal_id)).await, 1_200);
+        clean
+    }
+
+    /// 8.6 with S4's `history_setting` OFF (the test configuration): the
+    /// launch runs the protect check (`check_channel_protectable(.., None)`)
+    /// and every refusal of `assert_launch_refusals` holds; then the clean
+    /// channel launches. Control: the `protected`, `voice` or announcement
+    /// guard dropped from `check_channel_protectable` (the flag-off branch's
+    /// check; that channel launches), or the server filter dropped from
+    /// either driver's channel read (another server's channel launches). The
+    /// same guards of `check_channel_launchable` are pinned by the flag-on
+    /// twin, `launch_refuses_the_same_channels_with_history_setting_on`.
+    #[tokio::test]
+    async fn launch_refuses_a_foreign_protected_voice_announcement_or_missing_channel_and_a_non_owner(
     ) {
         database_test!(|db| async move {
             setup(&db).await;
@@ -2063,76 +2269,7 @@ mod tests {
                 now: now + 10,
             };
 
-            let foreign = channel_id(3_001);
-            insert_channel(&db, &foreign, OTHER_SERVER).await;
-            let with_message = channel_id(3_002);
-            insert_channel(&db, &with_message, SERVER).await;
-            db.insert_message(&Message {
-                id: nonce(),
-                channel: with_message.clone(),
-                author: A.to_string(),
-                content: Some("hello".to_string()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-            let granted = channel_id(3_003);
-            insert_channel(&db, &granted, SERVER).await;
-            db.upsert_channel_entitlement(
-                &crate::ChannelEntitlement {
-                    id: nonce(),
-                    channel_id: granted.clone(),
-                    server_id: SERVER.to_string(),
-                    source: crate::ChannelEntitlementSource::AdminGrant,
-                    slot_cap: 10,
-                    device_cap: None,
-                    state: crate::ChannelEntitlementState::Active,
-                    granted_by: ADMIN.to_string(),
-                    created_at: timestamp(now),
-                },
-                timestamp(now),
-            )
-            .await
-            .unwrap();
-            db.protect_channel(
-                &granted,
-                &seat_list(&granted, 1, &[OWNER], now),
-                timestamp(now),
-            )
-            .await
-            .unwrap();
-            let clean = channel_id(3_004);
-            insert_channel(&db, &clean, SERVER).await;
-
-            for (input, case) in [
-                (launch(foreign.clone(), OWNER), "another server's channel"),
-                (
-                    launch(with_message.clone(), OWNER),
-                    "a channel with a message",
-                ),
-                (launch(granted.clone(), OWNER), "a protected channel"),
-                (launch(clean.clone(), A), "a non-owner"),
-                (launch(channel_id(3_999), OWNER), "a missing channel"),
-            ] {
-                let refused = db.launch_prot_goal(&input).await;
-                assert!(refused.is_err(), "{case} was launched");
-                assert!(
-                    db.fetch_prot_tank_by_channel(&input.channel_id)
-                        .await
-                        .unwrap()
-                        .is_none(),
-                    "{case}"
-                );
-                assert_eq!(
-                    self::goal(&db, &goal.id).await.state,
-                    v0::ProtGoalState::Funded
-                );
-            }
-            assert!(db
-                .fetch_channel_entitlement(&clean)
-                .await
-                .unwrap()
-                .is_none());
+            let clean = assert_launch_refusals(&db, &goal.id, &rules, now).await;
 
             let (started, tank) = db
                 .launch_prot_goal(&launch(clean.clone(), OWNER))
@@ -2161,6 +2298,322 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+        });
+    }
+
+    /// 8.6 with S4's `history_setting` ON: the launch runs
+    /// `check_channel_launchable`, and every refusal of
+    /// `assert_launch_refusals` still holds (only the emptiness rule is
+    /// lifted). Then the clean channel launches, and a channel with history
+    /// launches on the other server's goal (one open launch goal per
+    /// server) with its message untouched. Control: the flag-on
+    /// `check_channel_launchable(..)` call replaced by `Ok(())` in either
+    /// driver (the voice, announcement and entitlement-less protected
+    /// channels launch); or its `protected`, `voice` or announcement guard
+    /// dropped (that channel launches); or the server filter dropped from
+    /// either driver's channel read (another server's channel launches).
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn launch_refuses_the_same_channels_with_history_setting_on() {
+        history_setting_on().await;
+        database_test!(|db| async move {
+            setup(&db).await;
+            let rules = rules();
+            insert_server(&db, SERVER).await;
+            insert_server(&db, OTHER_SERVER).await;
+            fund(&db, A, 2_400).await;
+            let now = at(0, 10);
+            let goal = db
+                .create_prot_goal(&launch_goal(SERVER, 10, 1_200, now))
+                .await
+                .unwrap();
+            pledge(&db, A, &goal.id, 1_200, now + 1).await.unwrap();
+
+            let clean = assert_launch_refusals(&db, &goal.id, &rules, now).await;
+
+            let (started, launched) = db
+                .launch_prot_goal(&ProtLaunchInput {
+                    goal_id: goal.id.clone(),
+                    channel_id: clean.clone(),
+                    owner_id: OWNER.to_string(),
+                    rules: rules.clone(),
+                    now: now + 10,
+                })
+                .await
+                .unwrap();
+            assert_eq!(started.state, v0::ProtGoalState::Launching);
+            assert_eq!(started.channel_id.as_deref(), Some(clean.as_str()));
+            assert_eq!(launched.stage, v0::ProtTankStage::Launching);
+
+            // A channel with history, on the other server's own goal
+            let busy = channel_id(3_201);
+            let message = ulid::Ulid::from_parts((now - 1_000) as u64, 1).to_string();
+            let mut channel = text_channel(&busy, OTHER_SERVER);
+            if let Channel::TextChannel {
+                last_message_id, ..
+            } = &mut channel
+            {
+                *last_message_id = Some(message.clone());
+            }
+            db.insert_channel(&channel).await.unwrap();
+            db.insert_message(&Message {
+                id: message.clone(),
+                channel: busy.clone(),
+                author: B.to_string(),
+                content: Some("before the launch".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let other = db
+                .create_prot_goal(&launch_goal(OTHER_SERVER, 10, 1_200, now))
+                .await
+                .unwrap();
+            pledge(&db, A, &other.id, 1_200, now + 1).await.unwrap();
+            let (started, launched) = db
+                .launch_prot_goal(&ProtLaunchInput {
+                    goal_id: other.id.clone(),
+                    channel_id: busy.clone(),
+                    owner_id: OWNER.to_string(),
+                    rules: rules.clone(),
+                    now: now + 10,
+                })
+                .await
+                .unwrap();
+            assert_eq!(started.state, v0::ProtGoalState::Launching);
+            assert_eq!(started.channel_id.as_deref(), Some(busy.as_str()));
+            assert_eq!(launched.stage, v0::ProtTankStage::Launching);
+            assert_eq!(channel_message_ids(&db, &busy).await, vec![message]);
+        });
+    }
+
+    /// 8.6 (owner decision 2026-11-26), with S4's `history_setting` ON: a
+    /// crowdfunded launch takes a text channel that already has history, as
+    /// a direct S4 protect does; the boundary B and the keep/delete line
+    /// come from the later protect (7.2 "S4"). The channel holds stored
+    /// messages AND a `last_message_id`, so both old rules would have
+    /// refused it: the S1 field rule (`check_channel_protectable(.., None)`,
+    /// asserted below) and the stored-message probe. The launch writes the
+    /// Launching goal and tank and the Crowdfund entitlement, keeps the
+    /// pledges held and touches no message and no channel field. Control:
+    /// restore the launch's empty-channel rule in both drivers whatever the
+    /// flag (the stored-message probe, or `check_channel_protectable(..,
+    /// None)` in place of `check_channel_launchable`): this test goes red.
+    /// The flag-off rule is
+    /// `launch_refuses_a_channel_with_history_while_history_setting_is_off`.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn launch_takes_a_channel_with_stored_messages_and_a_last_message_id() {
+        history_setting_on().await;
+        database_test!(|db| async move {
+            setup(&db).await;
+            let rules = rules();
+            insert_server(&db, SERVER).await;
+            fund(&db, A, 1_200).await;
+            let now = at(0, 10);
+
+            let ids: Vec<String> = (1..=3u64)
+                .map(|n| ulid::Ulid::from_parts((now - 4_000) as u64 + n * 1_000, n.into()))
+                .map(|id| id.to_string())
+                .collect();
+            let newest = ids.last().cloned();
+            let mut channel = text_channel(CHANNEL, SERVER);
+            if let Channel::TextChannel {
+                last_message_id, ..
+            } = &mut channel
+            {
+                *last_message_id = newest.clone();
+            }
+            db.insert_channel(&channel).await.unwrap();
+            for id in &ids {
+                db.insert_message(&Message {
+                    id: id.clone(),
+                    channel: CHANNEL.to_string(),
+                    author: B.to_string(),
+                    content: Some("before the launch".to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            }
+            let before = db.fetch_channel(CHANNEL).await.unwrap();
+            assert!(
+                matches!(&before, Channel::TextChannel { last_message_id, .. } if *last_message_id == newest),
+                "{before:?}"
+            );
+            // The S1 rule the launch used to apply refuses this channel
+            assert!(crate::check_channel_protectable(Some(&before), None).is_err());
+            assert_eq!(channel_message_ids(&db, CHANNEL).await, ids);
+
+            let goal = db
+                .create_prot_goal(&launch_goal(SERVER, 10, 1_200, now))
+                .await
+                .unwrap();
+            pledge(&db, A, &goal.id, 1_200, now + 1).await.unwrap();
+            let (started, launched) = db
+                .launch_prot_goal(&ProtLaunchInput {
+                    goal_id: goal.id.clone(),
+                    channel_id: CHANNEL.to_string(),
+                    owner_id: OWNER.to_string(),
+                    rules: rules.clone(),
+                    now: now + 10,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(started.state, v0::ProtGoalState::Launching);
+            assert_eq!(started.channel_id.as_deref(), Some(CHANNEL));
+            assert_eq!(started.tank_id.as_deref(), Some(launched.id.as_str()));
+            assert_eq!(launched.stage, v0::ProtTankStage::Launching);
+            assert_eq!(
+                self::goal(&db, &goal.id).await.state,
+                v0::ProtGoalState::Launching
+            );
+            assert_eq!(
+                tank(&db, &launched.id).await.stage,
+                v0::ProtTankStage::Launching
+            );
+            assert_eq!(
+                db.fetch_prot_tank_by_channel(CHANNEL)
+                    .await
+                    .unwrap()
+                    .map(|stored| stored.id),
+                Some(launched.id.clone())
+            );
+            let entitlement = db
+                .fetch_channel_entitlement(CHANNEL)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                entitlement.source,
+                crate::ChannelEntitlementSource::Crowdfund
+            );
+            assert_eq!(entitlement.state, crate::ChannelEntitlementState::Active);
+            assert_eq!(entitlement.slot_cap, 10);
+            // Pledges stay held until the capture
+            assert_eq!(balance(&db, &prot_hold_account(&goal.id)).await, 1_200);
+            assert_eq!(balance(&db, &prot_tank_account(&launched.id)).await, 0);
+
+            // Every message is still there, and the channel row is untouched
+            assert_eq!(channel_message_ids(&db, CHANNEL).await, ids);
+            for id in &ids {
+                assert_eq!(db.fetch_message(id).await.unwrap().channel, CHANNEL);
+            }
+            assert_eq!(db.fetch_channel(CHANNEL).await.unwrap(), before);
+        });
+    }
+
+    /// 8.6 with S4's `history_setting` OFF (the test configuration, as in
+    /// production until S4 ships): a launch keeps S1's empty-channel rule,
+    /// exactly as a direct protect does. A channel with a stored message but
+    /// no `last_message_id` (it lags) is refused by the stored-message probe,
+    /// and a channel whose row carries a `last_message_id` with no stored
+    /// row by the field rule (`check_channel_protectable(.., None)`); each is
+    /// `InvalidOperation` and writes nothing (goal Funded, no tank, no
+    /// entitlement, no message touched). An empty channel then launches, so
+    /// the refusals are about history and nothing else. Runs under a plain
+    /// `cargo test` too. Control: launch ignores history_setting (always
+    /// launchable): this goes red.
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn launch_refuses_a_channel_with_history_while_history_setting_is_off() {
+        database_test!(|db| async move {
+            assert!(
+                !revolt_config::config()
+                    .await
+                    .features
+                    .protected_channels
+                    .history_setting,
+                "the test configuration has history_setting off"
+            );
+            setup(&db).await;
+            let rules = rules();
+            insert_server(&db, SERVER).await;
+            fund(&db, A, 1_200).await;
+            let now = at(0, 10);
+            let goal = db
+                .create_prot_goal(&launch_goal(SERVER, 10, 1_200, now))
+                .await
+                .unwrap();
+            pledge(&db, A, &goal.id, 1_200, now + 1).await.unwrap();
+            let launch = |channel_id: &str| ProtLaunchInput {
+                goal_id: goal.id.clone(),
+                channel_id: channel_id.to_string(),
+                owner_id: OWNER.to_string(),
+                rules: rules.clone(),
+                now: now + 10,
+            };
+
+            // A stored message, `last_message_id` not written yet
+            let with_message = channel_id(3_101);
+            insert_channel(&db, &with_message, SERVER).await;
+            let message = ulid::Ulid::from_parts((now - 1_000) as u64, 1).to_string();
+            db.insert_message(&Message {
+                id: message.clone(),
+                channel: with_message.clone(),
+                author: B.to_string(),
+                content: Some("before the launch".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            // A `last_message_id` and no stored row
+            let with_field = channel_id(3_102);
+            let mut channel = text_channel(&with_field, SERVER);
+            if let Channel::TextChannel {
+                last_message_id, ..
+            } = &mut channel
+            {
+                *last_message_id =
+                    Some(ulid::Ulid::from_parts((now - 1_000) as u64, 2).to_string());
+            }
+            db.insert_channel(&channel).await.unwrap();
+            assert!(channel_message_ids(&db, &with_field).await.is_empty());
+
+            for (channel_id, case) in [
+                (&with_message, "a stored message"),
+                (&with_field, "a last_message_id"),
+            ] {
+                let before = db.fetch_channel(channel_id).await.unwrap();
+                let refused = db.launch_prot_goal(&launch(channel_id)).await;
+                assert!(
+                    is_error(&refused, "InvalidOperation"),
+                    "{case}: {refused:?}"
+                );
+                assert!(
+                    db.fetch_prot_tank_by_channel(channel_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{case}"
+                );
+                assert!(
+                    db.fetch_channel_entitlement(channel_id)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "{case}"
+                );
+                assert_eq!(
+                    self::goal(&db, &goal.id).await.state,
+                    v0::ProtGoalState::Funded,
+                    "{case}"
+                );
+                assert_eq!(
+                    db.fetch_channel(channel_id).await.unwrap(),
+                    before,
+                    "{case}"
+                );
+            }
+            assert_eq!(channel_message_ids(&db, &with_message).await, vec![message]);
+            assert_eq!(balance(&db, &prot_hold_account(&goal.id)).await, 1_200);
+
+            let empty = channel_id(3_103);
+            insert_channel(&db, &empty, SERVER).await;
+            let (started, launched) = db.launch_prot_goal(&launch(&empty)).await.unwrap();
+            assert_eq!(started.state, v0::ProtGoalState::Launching);
+            assert_eq!(launched.stage, v0::ProtTankStage::Launching);
         });
     }
 

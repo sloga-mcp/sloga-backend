@@ -664,11 +664,14 @@ seat; the owner chooses members."
   snapshot; deadline 30 days. Pledges are held (`pledge:`) and capped at what the goal still needs; the goal is
   Funded when they reach the target. Withdrawal is allowed while Funding until 48 hours before the deadline (D10).
   Expiry or cancel returns every Held pledge (`pledge-return:`).
-- **Launch:** once Funded, the owner creates an empty text channel and launches the goal on it (owner only; the
-  channel must be in the goal's server, unprotected, empty and without a tank). Pledges stay Held. Only when the
-  owner's device has protected the channel are they captured into the tank (`pledge-capture:`), the tank becomes
-  Active and burning starts. Not protected within 7 days of Funded -> Cancelled, and the still-held pledges are
-  returned.
+- **Launch:** once Funded, the owner launches the goal on a text channel (owner only; the channel must be in the
+  goal's server, unprotected, not voice, not an announcement channel and without a tank or entitlement). While
+  `history_setting` is on the channel may already hold messages (owner decision 2026-11-26); while it is off the
+  channel must be empty, as for a direct protect. The protect step then works as a direct protect does, with the
+  history boundary and the keep/delete choice (keep by default), so earlier messages stay unless the owner deletes
+  them. Pledges stay Held. Only when the owner's device has protected the channel are they captured into the tank
+  (`pledge-capture:`), the tank becomes Active and burning starts. Not protected within 7 days of Funded ->
+  Cancelled, and the still-held pledges are returned.
 - **7-day unseated return (D8):** at `launched_at + 7 days`, once, every launch contributor without an active seat
   gets their full pledge back from the tank (`launch-return:`). If the tank cannot cover everyone, each return is
   scaled by tank / due, rounded down with the largest remainder, so the sum never exceeds the tank, and the channel

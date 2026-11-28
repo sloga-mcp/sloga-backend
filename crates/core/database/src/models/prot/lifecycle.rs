@@ -501,11 +501,14 @@ mod tests {
         FAIL_WALLET_PASS_FOR_TESTS,
     };
     use crate::{
-        prot_key_admin, prot_key_forfeit, prot_key_pledge_capture, prot_key_pledge_return,
-        prot_key_settle, prot_tank_account, prot_user_account, Channel, Database, Member,
-        MemberCompositeKey, ProtAmount, ProtGoal, ProtLaunchInput, ProtLedgerEntry,
-        ProtPledgeInput, ProtPosting, ProtRef, ProtSettleCause, ProtTank, ProtTankRules,
-        SeatListBody, SeatListSubmission, Server, User, PROT_SYS_ADJUST, PROT_SYS_FORFEITED,
+        prot_hold_account, prot_key_admin, prot_key_forfeit, prot_key_pledge_capture,
+        prot_key_pledge_return, prot_key_settle, prot_tank_account, prot_user_account, Channel,
+        Database, HistoryWipe, Member, MemberCompositeKey, Message, MessageFilter, MessageQuery,
+        MessageTimePeriod, PartialChannel, Poll, ProtAmount, ProtGoal, ProtLaunchInput,
+        ProtLedgerEntry, ProtPledgeInput, ProtPosting, ProtRef, ProtSettleCause, ProtTank,
+        ProtTankRules, ProtectedHistory, ProtectedReadView, SeatListBody, SeatListHistory,
+        SeatListPreHistory, SeatListSubmission, SeatListV2Lines, Server, SoftResSheet, User,
+        PROT_SYS_ADJUST, PROT_SYS_FORFEITED,
     };
 
     const DAY: i64 = 86_400_000;
@@ -1553,5 +1556,601 @@ mod tests {
             "{user_delete}"
         );
         assert!(!USERS.contains("prot_settle_"));
+    }
+
+    // -----------------------------------------------------------------------
+    // 8.6 launch on a channel with history, 7.2 "S4" protect, 6.7 capture
+    // (owner decision 2026-11-26)
+    // -----------------------------------------------------------------------
+
+    /// The signed `group_salt` line of every history genesis below
+    const GROUP_SALT: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf";
+
+    /// S2's `formats_v2` and S4's `history_setting` on for THIS test's
+    /// process: a protect with a history boundary needs both (7.2 "S4"), the
+    /// test configuration has both off, and the drivers' flag override
+    /// (`protected_channels::tests::with_flags`) is private to that module.
+    /// The environment form reaches the configuration only when nothing in
+    /// the process has read it yet, so this runs first, before
+    /// `database_test!`, and only under nextest (one process per test): under
+    /// a plain `cargo test` it refuses instead of turning the flags on for
+    /// every other test of the binary. The assertion proves the override
+    /// landed (crond's `prune_upload_sessions` precedent).
+    async fn history_flags_on() {
+        assert_eq!(
+            std::env::var("NEXTEST_EXECUTION_MODE").as_deref(),
+            Ok("process-per-test"),
+            "run this test under cargo nextest: it turns the S4 flags on for its own process"
+        );
+        std::env::set_var("REVOLT__FEATURES__PROTECTED_CHANNELS__FORMATS_V2", "true");
+        std::env::set_var(
+            "REVOLT__FEATURES__PROTECTED_CHANNELS__HISTORY_SETTING",
+            "true",
+        );
+        let config = revolt_config::config().await;
+        let flags = &config.features.protected_channels;
+        assert!(
+            flags.formats_v2 && flags.history_setting,
+            "the S4 flags never reached the configuration"
+        );
+    }
+
+    /// A plaintext message of `channel_id` by `author`, its id a ULID of the
+    /// millisecond `ms` (ids order by time, as the boundary B compares them)
+    fn plaintext(channel_id: &str, author: &str, ms: i64, salt: u128) -> Message {
+        Message {
+            id: Ulid::from_parts(ms as u64, salt).to_string(),
+            channel: channel_id.to_string(),
+            author: author.to_string(),
+            content: Some("before protect".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// `count` plaintext messages on `channel_id`, one a second, the newest
+    /// two seconds before `now`, and the channel's `last_message_id` on the
+    /// newest, as sends write them. Their ids, oldest first.
+    async fn history(
+        db: &Database,
+        channel_id: &str,
+        author: &str,
+        count: i64,
+        now: i64,
+    ) -> Vec<String> {
+        let mut ids = vec![];
+        for n in 0..count {
+            let message = plaintext(
+                channel_id,
+                author,
+                now - 2_000 - (count - 1 - n) * 1_000,
+                n as u128 + 1,
+            );
+            db.insert_message(&message).await.expect("a send");
+            ids.push(message.id);
+        }
+        db.update_channel(
+            channel_id,
+            &PartialChannel {
+                last_message_id: ids.last().cloned(),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await
+        .expect("last_message_id");
+        ids
+    }
+
+    /// The v2 genesis list of `channel_id` seating only `owner`, signed over
+    /// the history boundary `boundary` and the keep/delete line
+    /// `pre_history` (7.2 "S4"; the database layer checks the signature's
+    /// encoding only)
+    fn history_genesis(
+        channel_id: &str,
+        owner: &str,
+        now: i64,
+        boundary: &str,
+        pre_history: SeatListPreHistory,
+    ) -> SeatListSubmission {
+        SeatListSubmission {
+            body: SeatListBody {
+                channel_id: channel_id.to_string(),
+                version: 1,
+                device_cap: 5,
+                issued_at: now,
+                signer_user_id: owner.to_string(),
+                signer_device_id: DEVICE.to_string(),
+                seats: vec![owner.to_string()],
+                v2: Some(SeatListV2Lines {
+                    authority_sha256: None,
+                    history: SeatListHistory::Visible,
+                    history_boundary: Some(boundary.to_string()),
+                    pre_history,
+                    group_salt: GROUP_SALT.to_string(),
+                }),
+            }
+            .build()
+            .unwrap(),
+            signature: format!("B{}", "A".repeat(85)),
+            signer_device_id: DEVICE.to_string(),
+            handover: None,
+            authority: None,
+        }
+    }
+
+    async fn protected_history_of(db: &Database, channel_id: &str) -> Option<ProtectedHistory> {
+        match db.fetch_channel(channel_id).await.expect("channel") {
+            Channel::TextChannel {
+                protected_history, ..
+            } => protected_history.map(|history| *history),
+            other => panic!("not a text channel: {other:?}"),
+        }
+    }
+
+    fn history_query(channel_id: &str) -> MessageQuery {
+        MessageQuery {
+            limit: Some(100),
+            filter: MessageFilter {
+                channel: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            time_period: MessageTimePeriod::Absolute {
+                before: None,
+                after: None,
+                sort: None,
+            },
+        }
+    }
+
+    /// The ids of every message stored in `channel_id`, oldest first
+    async fn stored_ids(db: &Database, channel_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .fetch_messages(history_query(channel_id))
+            .await
+            .expect("messages")
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The ids a history read of `channel_id` serves right now, judged by
+    /// the channel's own view (7.5 "S4"), oldest first
+    async fn served_ids(db: &Database, channel_id: &str) -> Vec<String> {
+        let view = ProtectedReadView::of(&db.fetch_channel(channel_id).await.expect("channel"));
+        let mut ids: Vec<String> = db
+            .fetch_servable_messages(history_query(channel_id), &view)
+            .await
+            .expect("servable messages")
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    async fn requested_wipes(db: &Database) -> Vec<String> {
+        db.fetch_channel_ids_with_requested_wipe(None, 100)
+            .await
+            .expect("requested wipes")
+    }
+
+    /// crond's `history_wipes` job (7.5 "S4") on one channel, through the
+    /// same database calls in the same order (`wipe_channel`, `wipe_batch`,
+    /// `wipe_rows`, `complete`; the lease scheduling and the events are
+    /// crond's own tests), in batches of two: the STORED boundary B, the
+    /// lease, the legal hold before every batch, the rows' polls, softres
+    /// sheets and mentions, then the rows; `Done` once a batch comes back
+    /// empty, then the `last_message_id` reset. The rows deleted.
+    async fn run_history_wipe(db: &Database, channel_id: &str, server_id: &str, now: i64) -> u64 {
+        const HOLDER: &str = "lifecycle-test";
+        const TTL_MS: i64 = 5 * 60 * 1000;
+        let boundary = protected_history_of(db, channel_id)
+            .await
+            .expect("a protected history")
+            .boundary;
+        let mut count = db
+            .claim_history_wipe_lease(channel_id, HOLDER, now, TTL_MS)
+            .await
+            .expect("claim")
+            .expect("no other holder");
+        loop {
+            assert!(db
+                .fetch_server_legal_hold(server_id)
+                .await
+                .expect("legal hold")
+                .is_none());
+            let rows = db
+                .fetch_history_wipe_batch(channel_id, &boundary, 2)
+                .await
+                .expect("batch");
+            if rows.is_empty() {
+                break;
+            }
+            let ids: Vec<String> = rows.iter().map(|row| row.id.clone()).collect();
+            Poll::delete_for_messages(db, &ids).await.expect("polls");
+            SoftResSheet::delete_for_messages(db, &ids)
+                .await
+                .expect("softres");
+            db.remove_mentions_of_messages(channel_id, &ids)
+                .await
+                .expect("mentions");
+            let deleted = db
+                .delete_messages_by_ids(channel_id, &boundary, &ids)
+                .await
+                .expect("delete");
+            assert_eq!(deleted, ids.len() as u64);
+            assert!(db
+                .advance_history_wipe_lease(channel_id, HOLDER, deleted, now, TTL_MS)
+                .await
+                .expect("advance"));
+            count += deleted;
+        }
+        assert!(db
+            .complete_history_wipe(channel_id, timestamp(now), count)
+            .await
+            .expect("complete"));
+        let newest = db
+            .fetch_newest_message_id(channel_id)
+            .await
+            .expect("newest");
+        assert!(db
+            .reset_last_message_id_after_wipe(channel_id, &boundary, newest)
+            .await
+            .expect("reset"));
+        db.delete_history_wipe_lease(channel_id)
+            .await
+            .expect("lease");
+        count
+    }
+
+    /// The launch capture landed (8.6, 6.7): the tank Active and holding
+    /// every pledge, the goal Launched, each pledge Captured in full
+    async fn assert_captured(
+        db: &Database,
+        goal_id: &str,
+        tank_id: &str,
+        pledges: &[(&String, i64)],
+    ) {
+        assert_eq!(tank(db, tank_id).await.stage, v0::ProtTankStage::Active);
+        assert_eq!(
+            balance(db, &prot_tank_account(tank_id)).await,
+            pledges.iter().map(|(_, amount)| amount).sum::<i64>()
+        );
+        assert_eq!(balance(db, &prot_hold_account(goal_id)).await, 0);
+        let goal = db
+            .fetch_prot_goal(goal_id)
+            .await
+            .expect("goal")
+            .expect("the goal row");
+        assert_eq!(goal.state, v0::ProtGoalState::Launched);
+        let stored = db
+            .fetch_prot_pledges_by_goal(goal_id)
+            .await
+            .expect("pledges");
+        assert_eq!(stored.len(), pledges.len());
+        for (pledge_id, amount) in pledges {
+            let pledge = stored
+                .iter()
+                .find(|pledge| &pledge.id == *pledge_id)
+                .expect("the pledge row");
+            assert_eq!(pledge.state, v0::ProtPledgeState::Captured);
+            assert_eq!(
+                row(db, &prot_key_pledge_capture(pledge_id)).await.amount,
+                *amount
+            );
+        }
+    }
+
+    /// 8.6 with 7.2 "S4", keep: a crowdfunded launch on a channel that
+    /// already has messages, then the protect with a v2 genesis whose
+    /// `history_boundary` B is the newest message and whose `pre_history` is
+    /// kept. `protected_history` is `{ B, wipe: none }`, every old message is
+    /// still stored and still served by the history read, no wipe is
+    /// requested, and the capture lands (tank Active, goal Launched, every
+    /// pledge captured in full) without touching a message. Control: restore
+    /// the launch's empty-channel rule in both drivers (the launch is
+    /// refused); or the protect writing no `protected_history` (the old
+    /// messages are no longer served).
+    #[tokio::test]
+    async fn a_launch_on_a_channel_with_history_keeps_it_through_protect_and_capture() {
+        history_flags_on().await;
+        database_test!(|db| async move {
+            install_prot(&db).await;
+            let now = seeded_at();
+            let (a, b) = (user(&db, false).await, user(&db, false).await);
+            let f = fixture(&db, 1, &[&a, &b]).await;
+            let channel_id = f.channels[0].clone();
+            let ids = history(&db, &channel_id, &a, 3, now).await;
+            let newest = ids.last().cloned().unwrap();
+
+            let (goal, launching, pledge_ids) =
+                launch(&db, &f, &channel_id, &[(&a, 700), (&b, 500)], false, now).await;
+            assert_eq!(stored_ids(&db, &channel_id).await, ids);
+
+            db.protect_channel(
+                &channel_id,
+                &history_genesis(
+                    &channel_id,
+                    &f.owner,
+                    now,
+                    &newest,
+                    SeatListPreHistory::Kept,
+                ),
+                timestamp(now),
+            )
+            .await
+            .expect("protect");
+
+            assert!(db
+                .fetch_channel(&channel_id)
+                .await
+                .expect("channel")
+                .is_protected());
+            assert_eq!(
+                protected_history_of(&db, &channel_id).await,
+                Some(ProtectedHistory {
+                    boundary: newest.clone(),
+                    wipe: HistoryWipe::None,
+                })
+            );
+            assert_eq!(stored_ids(&db, &channel_id).await, ids);
+            assert_eq!(served_ids(&db, &channel_id).await, ids);
+            for id in &ids {
+                assert_eq!(
+                    db.fetch_message(id).await.expect("an old message").channel,
+                    channel_id
+                );
+            }
+            assert!(!requested_wipes(&db).await.contains(&channel_id));
+
+            let captured = db
+                .capture_launch_pledges(&channel_id, now, &rules())
+                .await
+                .expect("capture")
+                .expect("a protected Launching tank is captured");
+            assert_eq!(captured.id, launching.id);
+            assert_captured(
+                &db,
+                &goal.id,
+                &launching.id,
+                &[(&pledge_ids[0], 700), (&pledge_ids[1], 500)],
+            )
+            .await;
+            assert_eq!(stored_ids(&db, &channel_id).await, ids);
+            assert_eq!(served_ids(&db, &channel_id).await, ids);
+        });
+    }
+
+    /// 8.6 with 7.2 "S4" and 7.5 "S4", delete: the same launch, then the
+    /// protect with the genesis's `pre_history` wiped and the route's
+    /// `wipe_history` flag. `protected_history` is `{ B, wipe: requested by
+    /// the signer }` and from that moment the old messages are no longer
+    /// served (still stored until the job runs); the capture lands; then
+    /// crond's wipe deletes every message at or below B, `Done` carries the
+    /// count, `last_message_id` is reset, and the tank, the goal and the
+    /// captured pledges are as the capture left them. Control: restore the
+    /// launch's empty-channel rule in both drivers (the launch is refused);
+    /// or the protect dropping the signed wipe (`wipe` stays none and no wipe
+    /// is requested).
+    #[tokio::test]
+    async fn a_launch_on_a_channel_with_history_wipes_it_through_protect_and_capture() {
+        history_flags_on().await;
+        database_test!(|db| async move {
+            install_prot(&db).await;
+            let now = seeded_at();
+            let (a, b) = (user(&db, false).await, user(&db, false).await);
+            let f = fixture(&db, 1, &[&a, &b]).await;
+            let channel_id = f.channels[0].clone();
+            let ids = history(&db, &channel_id, &a, 3, now).await;
+            let newest = ids.last().cloned().unwrap();
+
+            let (goal, launching, pledge_ids) =
+                launch(&db, &f, &channel_id, &[(&a, 700), (&b, 500)], false, now).await;
+            assert_eq!(stored_ids(&db, &channel_id).await, ids);
+
+            db.protect_channel_with_wipe(
+                &channel_id,
+                &history_genesis(
+                    &channel_id,
+                    &f.owner,
+                    now,
+                    &newest,
+                    SeatListPreHistory::Wiped,
+                ),
+                Some(true),
+                timestamp(now),
+            )
+            .await
+            .expect("protect");
+
+            assert_eq!(
+                protected_history_of(&db, &channel_id).await,
+                Some(ProtectedHistory {
+                    boundary: newest.clone(),
+                    wipe: HistoryWipe::Requested {
+                        at: timestamp(now),
+                        by: f.owner.clone(),
+                    },
+                })
+            );
+            assert_eq!(requested_wipes(&db).await, vec![channel_id.clone()]);
+            assert_eq!(stored_ids(&db, &channel_id).await, ids);
+            assert!(served_ids(&db, &channel_id).await.is_empty());
+
+            // 6.7: the route captures right after the protect lands
+            let captured = db
+                .capture_launch_pledges(&channel_id, now, &rules())
+                .await
+                .expect("capture")
+                .expect("a protected Launching tank is captured");
+            assert_eq!(captured.id, launching.id);
+            let pledges = [(&pledge_ids[0], 700), (&pledge_ids[1], 500)];
+            assert_captured(&db, &goal.id, &launching.id, &pledges).await;
+
+            let wiped = run_history_wipe(&db, &channel_id, &f.server, now + 1_000).await;
+            assert_eq!(wiped, ids.len() as u64);
+            assert!(stored_ids(&db, &channel_id).await.is_empty());
+            for id in &ids {
+                let gone = db.fetch_message(id).await;
+                assert!(
+                    matches!(&gone, Err(error) if matches!(error.error_type, ErrorType::NotFound)),
+                    "{gone:?}"
+                );
+            }
+            assert_eq!(
+                protected_history_of(&db, &channel_id).await,
+                Some(ProtectedHistory {
+                    boundary: newest.clone(),
+                    wipe: HistoryWipe::Done {
+                        at: timestamp(now + 1_000),
+                        count: ids.len() as u64,
+                    },
+                })
+            );
+            assert!(requested_wipes(&db).await.is_empty());
+            assert!(matches!(
+                db.fetch_channel(&channel_id).await.expect("channel"),
+                Channel::TextChannel {
+                    protected: true,
+                    last_message_id: None,
+                    ..
+                }
+            ));
+            assert_captured(&db, &goal.id, &launching.id, &pledges).await;
+        });
+    }
+
+    /// 7.2 "S4" between a launch and its protect: a message posted after the
+    /// launch makes a genesis signed over the older B stale. The driver's
+    /// in-transaction probe refuses it with `ProtectHistoryMoved` and writes
+    /// nothing (the channel unprotected, no `protected_history`, no list, no
+    /// seat, no wipe requested); the tank and the goal stay Launching, a
+    /// capture finds nothing and the pledges stay held. A genesis over the
+    /// fresh B then lands, every message is served, and the capture lands.
+    /// Control: the protect's probe for a message newer than B dropped in
+    /// either driver (the stale genesis protects), or the launch's
+    /// empty-channel rule restored in both drivers (the launch is refused).
+    #[tokio::test]
+    async fn a_message_after_the_launch_refuses_the_stale_boundary_then_the_fresh_one_lands() {
+        history_flags_on().await;
+        database_test!(|db| async move {
+            install_prot(&db).await;
+            let now = seeded_at();
+            let (a, b) = (user(&db, false).await, user(&db, false).await);
+            let f = fixture(&db, 1, &[&a, &b]).await;
+            let channel_id = f.channels[0].clone();
+            let ids = history(&db, &channel_id, &a, 2, now).await;
+            let stale = ids.last().cloned().unwrap();
+
+            let (goal, launching, pledge_ids) =
+                launch(&db, &f, &channel_id, &[(&a, 700), (&b, 500)], false, now).await;
+
+            // Posted after the launch, before the protect
+            let later = plaintext(&channel_id, &b, now - 1_000, 9);
+            db.insert_message(&later).await.expect("a send");
+            assert!(later.id > stale);
+            let all: Vec<String> = ids.iter().cloned().chain([later.id.clone()]).collect();
+            assert_eq!(stored_ids(&db, &channel_id).await, all);
+
+            let error = db
+                .protect_channel(
+                    &channel_id,
+                    &history_genesis(
+                        &channel_id,
+                        &f.owner,
+                        now,
+                        &stale,
+                        SeatListPreHistory::Wiped,
+                    ),
+                    timestamp(now),
+                )
+                .await
+                .expect_err("a stale boundary");
+            assert!(
+                matches!(error.error_type, ErrorType::ProtectHistoryMoved),
+                "{error:?}"
+            );
+            assert!(!db
+                .fetch_channel(&channel_id)
+                .await
+                .expect("channel")
+                .is_protected());
+            assert_eq!(protected_history_of(&db, &channel_id).await, None);
+            assert!(db
+                .fetch_seat_list(&channel_id)
+                .await
+                .expect("list")
+                .is_none());
+            assert!(db
+                .fetch_channel_seats(&channel_id)
+                .await
+                .expect("seats")
+                .is_empty());
+            assert!(requested_wipes(&db).await.is_empty());
+            assert_eq!(stored_ids(&db, &channel_id).await, all);
+            assert_eq!(
+                tank(&db, &launching.id).await.stage,
+                v0::ProtTankStage::Launching
+            );
+            assert_eq!(
+                db.fetch_prot_goal(&goal.id)
+                    .await
+                    .expect("goal")
+                    .expect("the goal row")
+                    .state,
+                v0::ProtGoalState::Launching
+            );
+            assert!(db
+                .capture_launch_pledges(&channel_id, now, &rules())
+                .await
+                .expect("capture")
+                .is_none());
+            assert_eq!(balance(&db, &prot_hold_account(&goal.id)).await, TARGET);
+            for pledge in db
+                .fetch_prot_pledges_by_goal(&goal.id)
+                .await
+                .expect("pledges")
+            {
+                assert_eq!(pledge.state, v0::ProtPledgeState::Held);
+            }
+
+            db.protect_channel(
+                &channel_id,
+                &history_genesis(
+                    &channel_id,
+                    &f.owner,
+                    now,
+                    &later.id,
+                    SeatListPreHistory::Kept,
+                ),
+                timestamp(now),
+            )
+            .await
+            .expect("protect over the fresh boundary");
+            assert_eq!(
+                protected_history_of(&db, &channel_id).await,
+                Some(ProtectedHistory {
+                    boundary: later.id.clone(),
+                    wipe: HistoryWipe::None,
+                })
+            );
+            assert_eq!(served_ids(&db, &channel_id).await, all);
+
+            let captured = db
+                .capture_launch_pledges(&channel_id, now, &rules())
+                .await
+                .expect("capture")
+                .expect("a protected Launching tank is captured");
+            assert_eq!(captured.id, launching.id);
+            assert_captured(
+                &db,
+                &goal.id,
+                &launching.id,
+                &[(&pledge_ids[0], 700), (&pledge_ids[1], 500)],
+            )
+            .await;
+        });
     }
 }

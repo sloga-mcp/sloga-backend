@@ -2040,6 +2040,23 @@ mod test {
     /// so the channel holds a Crowdfund entitlement and a Launching tank and
     /// the pledge is still Held. The goal's id and the pledge's id.
     async fn crowdfunded_setup() -> (Setup, String, String) {
+        let (setup, history, goal, pledge) = crowdfund(false).await;
+        assert!(history.is_none());
+        (setup, goal, pledge)
+    }
+
+    /// [`crowdfunded_setup`] on a channel that already has history:
+    /// [`carried`] is written BEFORE the launch, so the launch itself takes
+    /// a channel with messages (owner decision 2026-11-26; S5b 8.6 refused
+    /// it). Needs [`history_setting_on`] first: with `history_setting` off
+    /// a launch keeps the empty-channel rule, as a direct protect does. The
+    /// carried-over state, the goal's id and the pledge's id.
+    async fn crowdfunded_setup_with_history() -> (Setup, Carried, String, String) {
+        let (setup, history, goal, pledge) = crowdfund(true).await;
+        (setup, history.expect("the history"), goal, pledge)
+    }
+
+    async fn crowdfund(with_history: bool) -> (Setup, Option<Carried>, String, String) {
         use revolt_config::ProtectionFeatures;
         use revolt_database::{
             prot_key_admin, prot_user_account, ProtAmount, ProtGoal, ProtLaunchInput,
@@ -2054,8 +2071,23 @@ mod test {
         let owner_device = harness
             .new_e2ee_device(&owner, &owner_session.id, OWNER_DEVICE_SEED)
             .await;
+        let setup = Setup {
+            harness,
+            owner,
+            owner_session,
+            owner_device,
+            member,
+            member_session,
+            server_id: server.id,
+            channel,
+        };
+        let history = if with_history {
+            Some(carried(&setup).await)
+        } else {
+            None
+        };
 
-        let db = &harness.db;
+        let db = &setup.harness.db;
         let rules = ProtTankRules::from_config(&ProtectionFeatures::default())
             .expect("the default Prot config is valid");
         let now = revolt_database::now_ms();
@@ -2063,10 +2095,10 @@ mod test {
             .create_prot_goal(&ProtGoal {
                 id: Ulid::new().to_string(),
                 kind: v0::ProtGoalKind::Launch,
-                server_id: server.id.clone(),
+                server_id: setup.server_id.clone(),
                 channel_id: None,
                 tank_id: None,
-                created_by: owner.id.clone(),
+                created_by: setup.owner.id.clone(),
                 create_nonce: Ulid::new().to_string(),
                 slots: FIXTURE_SLOT_CAP,
                 days: Some(30),
@@ -2081,7 +2113,7 @@ mod test {
                 launched_at: None,
                 closed_at: None,
                 refund7_done: false,
-                open_key: Some(format!("launch:{}", server.id)),
+                open_key: Some(format!("launch:{}", setup.server_id)),
                 version: 0,
                 created_at: now,
                 updated_at: now,
@@ -2094,7 +2126,7 @@ mod test {
             key: prot_key_admin("01ADMIN0000000000000000000", &Ulid::new().to_string()),
             kind: v0::ProtEntryKind::AdminAdjust,
             debit: PROT_SYS_ADJUST.to_string(),
-            credit: prot_user_account(&owner.id),
+            credit: prot_user_account(&setup.owner.id),
             amount: ProtAmount::Exact(PLEDGED),
             debit_floor: 0,
             actor: "01ADMIN0000000000000000000".to_string(),
@@ -2106,7 +2138,7 @@ mod test {
         .expect("the owner's Prot");
         let pledged = db
             .pledge_prot(&ProtPledgeInput {
-                user_id: owner.id.clone(),
+                user_id: setup.owner.id.clone(),
                 goal_id: goal.id.clone(),
                 amount: PLEDGED,
                 nonce: Ulid::new().to_string(),
@@ -2120,8 +2152,8 @@ mod test {
         let (launched, tank) = db
             .launch_prot_goal(&ProtLaunchInput {
                 goal_id: goal.id.clone(),
-                channel_id: channel.id().to_string(),
-                owner_id: owner.id.clone(),
+                channel_id: setup.channel_id(),
+                owner_id: setup.owner.id.clone(),
                 rules,
                 now,
             })
@@ -2130,17 +2162,7 @@ mod test {
         assert_eq!(launched.state, v0::ProtGoalState::Launching);
         assert_eq!(tank.stage, v0::ProtTankStage::Launching);
 
-        let setup = Setup {
-            harness,
-            owner,
-            owner_session,
-            owner_device,
-            member,
-            member_session,
-            server_id: server.id,
-            channel,
-        };
-        (setup, goal.id, pledged.pledge.id)
+        (setup, history, goal.id, pledged.pledge.id)
     }
 
     /// Whether the launch has been captured: the goal Launched, the tank
@@ -2221,6 +2243,220 @@ mod test {
 
         let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
         assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
+    }
+
+    /// The ids of `channel_id`'s history as `session` reads it through
+    /// `GET /channels/:id/messages`, sorted
+    async fn served(harness: &TestHarness, session: &Session, channel_id: &str) -> Vec<String> {
+        let response = harness
+            .client
+            .get(format!("/channels/{channel_id}/messages?limit=100"))
+            .header(Header::new("x-session-token", session.token.clone()))
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let messages: serde_json::Value = response.into_json().await.expect("JSON");
+        let mut ids: Vec<String> = messages
+            .as_array()
+            .unwrap_or_else(|| panic!("not a list: {}", messages))
+            .iter()
+            .map(|message| message["_id"].as_str().expect("an id").to_string())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// The ids of `carried`'s messages, sorted
+    fn carried_ids(carried: &Carried) -> Vec<String> {
+        let mut ids: Vec<String> = carried.messages.iter().map(|m| m.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    /// Owner decision 2026-11-26, 7.2 "S4": a crowdfunded launch onto a
+    /// channel that already has messages, then the protect keeps them. The
+    /// genesis with B its newest message and `kept` lands, stores
+    /// `protected_history { B, none }`, captures the launch pledges, and the
+    /// old messages are still served to the seated owner. Control: restore
+    /// the launch's empty-channel rule in both drivers (`launch_prot_goal`
+    /// refuses a channel with a stored message): the fixture's launch fails.
+    #[test]
+    fn a_crowdfunded_channel_with_history_protects_keeping_it() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            a_crowdfunded_channel_with_history_keeps_case().await
+        }))
+    }
+
+    async fn a_crowdfunded_channel_with_history_keeps_case() {
+        let (setup, carried, goal, pledge) = crowdfunded_setup_with_history().await;
+        let channel_id = setup.channel_id();
+        let boundary = carried.boundary().to_string();
+        assert_eq!(
+            served(&setup.harness, &setup.owner_session, &channel_id).await,
+            carried_ids(&carried),
+            "served before the protect"
+        );
+
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_eq!(
+            stored_history(&setup.harness, &channel_id).await,
+            Some(v0::ProtectedHistory {
+                boundary,
+                wipe: v0::HistoryWipe::None,
+            })
+        );
+        assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
+
+        let written = written(&setup.harness, &channel_id).await;
+        assert!(written
+            .seats
+            .iter()
+            .any(|seat| seat.is_active() && seat.user_id == setup.owner.id));
+        assert_eq!(
+            served(&setup.harness, &setup.owner_session, &channel_id).await,
+            carried_ids(&carried),
+            "the kept history is still served"
+        );
+    }
+
+    /// Owner decision 2026-11-26, 7.2 "S4": a crowdfunded launch onto a
+    /// channel with messages, then the protect deletes them: a `wiped`
+    /// genesis with `wipe_history: true` lands with the wipe `requested` by
+    /// the owner, and the launch pledges are still captured. From the
+    /// request on, the pre-boundary rows are no longer served (the wipe job
+    /// itself is the database lane's). Control: restore the launch's
+    /// empty-channel rule in both drivers: the fixture's launch fails.
+    #[test]
+    fn a_crowdfunded_channel_with_history_protects_deleting_it() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            a_crowdfunded_channel_with_history_wipes_case().await
+        }))
+    }
+
+    async fn a_crowdfunded_channel_with_history_wipes_case() {
+        let (setup, carried, goal, pledge) = crowdfunded_setup_with_history().await;
+        let channel_id = setup.channel_id();
+        let boundary = carried.boundary().to_string();
+
+        let data = setup.history_genesis(&boundary, SeatListPreHistory::Wiped, Some(true));
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        let history = stored_history(&setup.harness, &channel_id)
+            .await
+            .expect("the stored history");
+        assert_eq!(history.boundary, boundary);
+        assert!(
+            matches!(&history.wipe, v0::HistoryWipe::Requested { by, .. } if *by == setup.owner.id),
+            "{:?}",
+            history
+        );
+        assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
+        assert_eq!(
+            served(&setup.harness, &setup.owner_session, &channel_id).await,
+            Vec::<String>::new(),
+            "wipe pending"
+        );
+    }
+
+    /// The launch is still waiting on its protect: the tank and the goal
+    /// Launching, the pledge Held and nothing captured
+    async fn assert_still_launching(
+        harness: &TestHarness,
+        channel_id: &str,
+        goal: &str,
+        pledge: &str,
+    ) {
+        let db = &harness.db;
+        let tank = db
+            .fetch_prot_tank_by_channel(channel_id)
+            .await
+            .expect("read the tank")
+            .expect("the tank");
+        assert_eq!(tank.stage, v0::ProtTankStage::Launching, "{:?}", tank);
+        let goal = db
+            .fetch_prot_goal(goal)
+            .await
+            .expect("read the goal")
+            .expect("the goal");
+        assert_eq!(goal.state, v0::ProtGoalState::Launching, "{:?}", goal);
+        let pledge = db
+            .fetch_prot_pledge(pledge)
+            .await
+            .expect("read the pledge")
+            .expect("the pledge");
+        assert_eq!(
+            (pledge.state, pledge.captured),
+            (v0::ProtPledgeState::Held, 0),
+            "{:?}",
+            pledge
+        );
+    }
+
+    /// Owner decision 2026-11-26, 7.2 "S4": a message posted (through the
+    /// send route) between the launch and the protect moves the history. The
+    /// genesis signed over the stale B answers 409 `ProtectHistoryMoved`,
+    /// writes nothing and captures nothing (the tank still Launching, the
+    /// pledge still Held); a genesis over the fresh B lands and captures.
+    /// Control: restore the launch's empty-channel rule in both drivers: the
+    /// fixture's launch fails.
+    #[test]
+    fn a_message_after_the_launch_moves_the_boundary_of_the_protect() {
+        crate::util::test::rt().block_on(Box::pin(async {
+            history_setting_on().await;
+            a_message_after_the_launch_case().await
+        }))
+    }
+
+    async fn a_message_after_the_launch_case() {
+        let (setup, carried, goal, pledge) = crowdfunded_setup_with_history().await;
+        let channel_id = setup.channel_id();
+        let stale = carried.boundary().to_string();
+
+        let response = setup
+            .harness
+            .client
+            .post(format!("/channels/{channel_id}/messages"))
+            .header(Header::new(
+                "x-session-token",
+                setup.owner_session.token.clone(),
+            ))
+            .header(ContentType::JSON)
+            .body(json!({ "content": "After the launch" }).to_string())
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok, "send to {channel_id}");
+        let fresh: v0::Message = response.into_json().await.expect("`Message`");
+        assert!(fresh.id > stale, "{} <= {}", fresh.id, stale);
+
+        let data = setup.history_genesis(&stale, SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_refused(
+            &answer,
+            Status::Conflict,
+            json!({ "type": "ProtectHistoryMoved" }),
+        );
+        assert_eq!(
+            written(&setup.harness, &channel_id).await,
+            Written::nothing()
+        );
+        assert_eq!(stored_history(&setup.harness, &channel_id).await, None);
+        assert_still_launching(&setup.harness, &channel_id, &goal, &pledge).await;
+
+        let data = setup.history_genesis(&fresh.id, SeatListPreHistory::Kept, None);
+        let answer = protect(&setup.harness, &setup.owner_session, &channel_id, &data).await;
+        assert_protected_answer(&setup.harness, &answer, &channel_id).await;
+        assert_eq!(
+            stored_history(&setup.harness, &channel_id).await,
+            Some(v0::ProtectedHistory {
+                boundary: fresh.id.clone(),
+                wipe: v0::HistoryWipe::None,
+            })
+        );
         assert_captured(&setup.harness, &channel_id, &goal, &pledge).await;
     }
 }

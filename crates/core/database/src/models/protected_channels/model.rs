@@ -2889,6 +2889,25 @@ pub fn check_channel_protectable(channel: Option<&Channel>, boundary: Option<&st
     }
 }
 
+/// The launch precondition (S5b 8.6): a server `TextChannel`, not yet
+/// protected, no `voice`, not an announcement channel. The protect check
+/// minus the emptiness rule: a launch may sit on a channel with history
+/// (owner decision 2026-11-26), so `last_message_id` is never read; the
+/// boundary and the keep/delete choice come from the later protect step
+/// (7.2 "S4").
+pub fn check_channel_launchable(channel: Option<&Channel>) -> Result<()> {
+    match channel {
+        None => Err(create_error!(NotFound)),
+        Some(Channel::TextChannel {
+            protected: false,
+            voice: None,
+            announcement,
+            ..
+        }) if *announcement != Some(true) => Ok(()),
+        Some(_) => Err(create_error!(InvalidOperation)),
+    }
+}
+
 /// 4.3 "S4", the wipe write's channel, re-read inside its transaction: a
 /// protected server `TextChannel` whose `protected_history` carries the
 /// list's boundary `boundary`, else `InvalidOperation` (the route's answer

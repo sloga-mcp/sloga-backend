@@ -32,21 +32,21 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::{
-    channel_seats_used, check_channel_protectable, plan_prot_settlement, plan_tank_day,
-    plan_unseated_returns, prot_burn_amount, prot_day_start_ms, prot_hold_account, prot_hours_left,
-    prot_key_burn, prot_key_contrib, prot_key_forfeit_tank, prot_key_launch_return,
-    prot_key_pledge, prot_key_pledge_capture, prot_key_pledge_return, prot_key_pledge_withdraw,
-    prot_key_settle, prot_key_tier, prot_key_writeoff, prot_next_day, prot_notice_key,
-    prot_payload_hash, prot_pro_rata, prot_tank_account, prot_tank_target_key, prot_user_account,
-    prot_utc_day, seat_list_channel_server, AbstractProtLedger, Channel, ChannelEntitlement,
-    ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, MongoDb, ProtAccount,
-    ProtAmount, ProtBurnOutcome, ProtContributeInput, ProtContributeOutcome, ProtContributorPref,
-    ProtDayPlan, ProtGoal, ProtGoalCloseOutcome, ProtLaunchInput, ProtLedgerEntry, ProtLot,
-    ProtNotice, ProtNoticeKind, ProtPledge, ProtPledgeInput, ProtPledgeOutcome, ProtPosting,
-    ProtPurgeCounts, ProtRef, ProtRuntime, ProtSettleCause, ProtSettlement, ProtTank,
-    ProtTankRules, ProtTankTarget, ProtTermination, ProtTierChangeInput, PROT_ACTOR_CLOCK,
-    PROT_ACTOR_GOALS, PROT_ACTOR_SETTLEMENT, PROT_OPEN_GOAL_STATES, PROT_RUNTIME_ID,
-    PROT_SLOT_TIERS, PROT_SYS_BURNED, PROT_SYS_FORFEITED, PROT_SYS_WRITEOFF,
+    channel_seats_used, check_channel_launchable, check_channel_protectable, plan_prot_settlement,
+    plan_tank_day, plan_unseated_returns, prot_burn_amount, prot_day_start_ms, prot_hold_account,
+    prot_hours_left, prot_key_burn, prot_key_contrib, prot_key_forfeit_tank,
+    prot_key_launch_return, prot_key_pledge, prot_key_pledge_capture, prot_key_pledge_return,
+    prot_key_pledge_withdraw, prot_key_settle, prot_key_tier, prot_key_writeoff, prot_next_day,
+    prot_notice_key, prot_payload_hash, prot_pro_rata, prot_tank_account, prot_tank_target_key,
+    prot_user_account, prot_utc_day, seat_list_channel_server, AbstractProtLedger, Channel,
+    ChannelEntitlement, ChannelEntitlementSource, ChannelEntitlementState, ChannelSeat, MongoDb,
+    ProtAccount, ProtAmount, ProtBurnOutcome, ProtContributeInput, ProtContributeOutcome,
+    ProtContributorPref, ProtDayPlan, ProtGoal, ProtGoalCloseOutcome, ProtLaunchInput,
+    ProtLedgerEntry, ProtLot, ProtNotice, ProtNoticeKind, ProtPledge, ProtPledgeInput,
+    ProtPledgeOutcome, ProtPosting, ProtPurgeCounts, ProtRef, ProtRuntime, ProtSettleCause,
+    ProtSettlement, ProtTank, ProtTankRules, ProtTankTarget, ProtTermination, ProtTierChangeInput,
+    PROT_ACTOR_CLOCK, PROT_ACTOR_GOALS, PROT_ACTOR_SETTLEMENT, PROT_OPEN_GOAL_STATES,
+    PROT_RUNTIME_ID, PROT_SLOT_TIERS, PROT_SYS_BURNED, PROT_SYS_FORFEITED, PROT_SYS_WRITEOFF,
 };
 
 use super::super::ops::mongodb::{
@@ -1201,6 +1201,8 @@ struct LaunchBody {
     /// Fixed for every re-run of this call
     tank_id: String,
     entitlement_id: String,
+    /// S4's `history_setting`, read once per call, before the transaction
+    history_setting: bool,
 }
 
 #[async_trait]
@@ -1246,14 +1248,19 @@ impl ProtTxnBody for LaunchBody {
                     seat_list_channel_server(channel) == Some(goal.server_id.as_str())
                 })
                 .ok_or_else(|| refuse(create_error!(NotFound)))?;
-        // No boundary: a launch needs an empty channel (S1), whatever S4
-        // allows a protect with history.
-        check_channel_protectable(Some(&channel), None).map_err(refuse)?;
-        // `last_message_id` lags stored messages: ask the messages themselves
-        let message: Option<Document> =
-            find_one_in(db, session, MESSAGES, doc! { "channel": &input.channel_id }).await?;
-        if message.is_some() {
-            return Err(refuse(create_error!(InvalidOperation)));
+        // With `history_setting` off a launch needs an empty channel, as a
+        // direct protect does (S1); on, history is fine (owner 2026-11-26) and
+        // the protect step writes B and the keep/delete line (7.2 "S4")
+        if self.history_setting {
+            check_channel_launchable(Some(&channel)).map_err(refuse)?;
+        } else {
+            check_channel_protectable(Some(&channel), None).map_err(refuse)?;
+            // `last_message_id` lags stored messages: ask the messages themselves
+            let message: Option<Document> =
+                find_one_in(db, session, MESSAGES, doc! { "channel": &input.channel_id }).await?;
+            if message.is_some() {
+                return Err(refuse(create_error!(InvalidOperation)));
+            }
         }
         let entitlement: Option<Document> = find_one_in(
             db,
@@ -3273,6 +3280,11 @@ impl AbstractProtTanks for MongoDb {
             input: input.clone(),
             tank_id: ulid::Ulid::new().to_string(),
             entitlement_id: ulid::Ulid::new().to_string(),
+            history_setting: revolt_config::config()
+                .await
+                .features
+                .protected_channels
+                .history_setting,
         };
         run_rerunning(self, &body, "launch_prot_goal", &input.goal_id).await
     }

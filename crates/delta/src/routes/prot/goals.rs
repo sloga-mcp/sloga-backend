@@ -165,9 +165,11 @@ pub async fn cancel_prot_goal(
 
 /// # Launch Goal
 ///
-/// The server owner puts a funded launch goal onto an empty text channel of
-/// the same server. The channel gets its tank; the pledges move into it
-/// once the owner's device protects the channel.
+/// The server owner puts a funded launch goal onto an unprotected text
+/// channel of the same server. The channel may already have messages while
+/// the server's history setting is on, as for a direct protect. The channel
+/// gets its tank; the pledges move into it once the owner's device protects
+/// the channel.
 #[openapi(tag = "Prot")]
 #[post("/goals/<goal_id>/launch", data = "<data>")]
 pub async fn launch_prot_goal(
@@ -182,7 +184,7 @@ pub async fn launch_prot_goal(
     validate(&data)?;
 
     // Visibility, self-serve, the owner, the goal's state and the channel
-    // (an empty, unprotected text channel of the goal's server): engine
+    // (an unprotected text channel of the goal's server): engine
     Ok(Json(
         engine::tank::launch_prot_goal(db, &user, goal_id, data, &rules, now_ms()).await?,
     ))
@@ -197,7 +199,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::super::tests::{
-        balance, call, goal, ok_json, refused, tank, wallet, Caller, World, FUNDS, TARGET,
+        balance, call, db_pledge, goal, new_launch_goal, ok_json, refused, tank, wallet, Caller,
+        World, FUNDS, TARGET,
     };
 
     fn goal_view(body: Value) -> v0::ProtGoalView {
@@ -209,8 +212,10 @@ mod tests {
     /// the configured days; the same nonce is a retry and a second open goal
     /// is refused. Members list it, pledge (capped at the target, the notice
     /// on every answer), read it and withdraw their own pledge only. The
-    /// owner launches it only onto an empty text channel of the same server
-    /// and can cancel it again, which returns every pledge.
+    /// owner launches it only onto an unprotected text channel of the same
+    /// server (one with history too: see
+    /// `a_launch_takes_a_text_channel_with_history`) and can cancel it
+    /// again, which returns every pledge.
     #[test]
     fn launch_goal_through_the_routes() {
         crate::util::test::rt().block_on(launch_goal_through_the_routes_case())
@@ -362,6 +367,121 @@ mod tests {
         let path = format!("/prot/channels/{}/tank", w.empty.id());
         let response = call(h, &w.member, Method::Get, &path, None).await;
         refused(response, Status::NotFound, "NotFound").await;
+    }
+
+    /// S4's `history_setting`, which a launch onto a channel with history
+    /// follows exactly like a direct protect. Once per test process
+    /// (`overwrite_config`, nextest only).
+    async fn history_setting(on: bool) {
+        revolt_config::overwrite_config(|settings| {
+            settings.features.protected_channels.history_setting = on;
+        })
+        .await;
+    }
+
+    /// A server text channel of `w` with one message, posted by the owner
+    /// through the send route; a launch goal of the server funded in full
+    /// (Funded). The channel, the message's id and the goal's id.
+    async fn busy_channel_and_funded_goal(w: &World) -> (revolt_database::Channel, String, String) {
+        let h = &w.harness;
+        let channel = h.new_channel(&w.server).await;
+        let messages = format!("/channels/{}/messages", channel.id());
+        let body = json!({ "content": "Before the launch" });
+        let sent = ok_json(call(h, &w.owner, Method::Post, &messages, Some(body)).await).await;
+        let message_id = sent["_id"].as_str().expect("the message id").to_string();
+
+        let created = new_launch_goal(h, &w.server, &w.owner.user, 10).await;
+        db_pledge(h, &w.member.user.id, &created.id, TARGET).await;
+        assert_eq!(goal(h, &created.id).await.state, v0::ProtGoalState::Funded);
+        (channel, message_id, created.id)
+    }
+
+    /// Owner decision 2026-11-26: with `history_setting` on, the owner's
+    /// launch takes a text channel that already has history (S5b 8.6
+    /// refused it); the boundary and the keep/delete choice belong to the
+    /// later protect (7.2 "S4"). A message is posted through the send route,
+    /// then a funded launch goal is POSTed onto that channel: the goal and
+    /// its new tank are Launching and the message is still stored. Control:
+    /// restore the launch's empty-channel rule in both drivers
+    /// (`launch_prot_goal` refuses a channel with a stored message): the
+    /// launch answers 400 `InvalidOperation`.
+    #[test]
+    fn a_launch_takes_a_text_channel_with_history() {
+        crate::util::test::rt().block_on(async {
+            history_setting(true).await;
+            a_launch_takes_a_text_channel_with_history_case().await
+        })
+    }
+
+    async fn a_launch_takes_a_text_channel_with_history_case() {
+        let w = World::new().await;
+        let h = &w.harness;
+        let (channel, message_id, goal_id) = busy_channel_and_funded_goal(&w).await;
+        let channel_id = channel.id();
+
+        let launch = format!("/prot/goals/{goal_id}/launch");
+        let body = json!({ "channel_id": channel_id });
+        let launched =
+            goal_view(ok_json(call(h, &w.owner, Method::Post, &launch, Some(body)).await).await);
+        assert_eq!(launched.state, v0::ProtGoalState::Launching);
+        assert_eq!(launched.channel_id.as_deref(), Some(channel_id));
+        let new_tank =
+            h.db.fetch_prot_tank_by_channel(channel_id)
+                .await
+                .expect("tank read")
+                .expect("the Launching tank");
+        assert_eq!(new_tank.stage, v0::ProtTankStage::Launching);
+
+        let kept = h.db.fetch_message(&message_id).await.expect("the message");
+        assert_eq!(kept.channel, channel_id);
+        assert!(!h
+            .db
+            .fetch_channel(channel_id)
+            .await
+            .expect("the channel")
+            .is_protected());
+    }
+
+    /// With `history_setting` off (the default, set explicitly here) a
+    /// launch keeps S1's empty-channel rule, as a direct protect does: the
+    /// owner's POST launch onto a text channel with a message answers 400
+    /// `InvalidOperation`, the goal stays Funded and the channel gets no
+    /// tank and no entitlement. Control: launch ignores history_setting:
+    /// this goes red.
+    #[test]
+    fn with_history_setting_off_a_launch_refuses_a_channel_with_history() {
+        crate::util::test::rt().block_on(async {
+            history_setting(false).await;
+            with_history_setting_off_case().await
+        })
+    }
+
+    async fn with_history_setting_off_case() {
+        let w = World::new().await;
+        let h = &w.harness;
+        let (channel, message_id, goal_id) = busy_channel_and_funded_goal(&w).await;
+        let channel_id = channel.id();
+
+        let launch = format!("/prot/goals/{goal_id}/launch");
+        let body = json!({ "channel_id": channel_id });
+        let response = call(h, &w.owner, Method::Post, &launch, Some(body)).await;
+        refused(response, Status::BadRequest, "InvalidOperation").await;
+
+        assert_eq!(goal(h, &goal_id).await.state, v0::ProtGoalState::Funded);
+        assert!(h
+            .db
+            .fetch_prot_tank_by_channel(channel_id)
+            .await
+            .expect("tank read")
+            .is_none());
+        assert!(h
+            .db
+            .fetch_channel_entitlement(channel_id)
+            .await
+            .expect("entitlement read")
+            .is_none());
+        let kept = h.db.fetch_message(&message_id).await.expect("the message");
+        assert_eq!(kept.channel, channel_id);
     }
 
     /// An upgrade goal: only the owner opens it, priced by the server from
